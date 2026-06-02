@@ -1,0 +1,20 @@
+[project]
+name = "writer-backend"
+version = "0.1.0"
+description = "Minimal screenplay agent backend powered by FastAPI and DeepAgents"
+requires-python = ">=3.11"
+dependencies = [
+  "deepagents>=0.5.0",
+  "fastapi>=0.115.0",
+  "langchain-openai>=0.3.0",
+  "pydantic-settings>=2.6.0",
+  "python-docx>=1.1.2",
+  "python-dotenv>=1.0.1",
+  "reportlab>=4.2.0",
+  "uvicorn[standard]>=0.32.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+

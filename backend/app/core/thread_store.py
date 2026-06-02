@@ -1,0 +1,523 @@
+from __future__ import annotations
+
+import json
+import re
+import shutil
+from datetime import UTC, datetime
+from pathlib import Path
+from uuid import uuid4
+
+from app.schemas.character import CharacterGenerateResponse
+from app.schemas.screenplay import (
+    CharacterMarkdownFile,
+    ScreenplayGenerateResponse,
+    ThreadSummary,
+    WorkspaceCharacterContent,
+    WorkspaceDetailOutlineContent,
+    WorkspaceNovelChapter,
+    WorkspaceNovelChaptersContent,
+    WorkspaceNovelContent,
+    WorkspaceOutlineContent,
+    WorkspaceSummary,
+)
+
+
+class ThreadStore:
+    def __init__(self, workspace_root: Path) -> None:
+        self.workspace_root = workspace_root
+        self.workspace_index_path = workspace_root / "workspaces.json"
+        self.thread_index_path = workspace_root / "threads.json"
+        self.workspace_root.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_indexes()
+
+    def list_workspaces(self) -> list[WorkspaceSummary]:
+        workspaces = self._read_workspace_index()
+        threads = self._read_thread_index()
+        summaries = []
+        for workspace in workspaces.values():
+            workspace_id = str(workspace["workspace_id"])
+            workspace["session_count"] = sum(
+                1 for thread in threads.values() if thread["workspace_id"] == workspace_id
+            )
+            summaries.append(self._to_workspace_summary(workspace))
+        return sorted(summaries, key=lambda workspace: workspace.updated_at, reverse=True)
+
+    def create_workspace(self, outline_name: str) -> WorkspaceSummary:
+        normalized_name = outline_name.strip()
+        if not normalized_name:
+            raise ValueError("outline_name cannot be empty")
+
+        now = self._now()
+        workspace_id = self._sanitize_workspace_name(normalized_name)
+        workspace_path = self._workspace_dir(workspace_id)
+        if workspace_path.exists():
+            raise FileExistsError(f"Workspace already exists: {workspace_id}")
+
+        workspace_path.mkdir(parents=True, exist_ok=False)
+        workspace = {
+            "workspace_id": workspace_id,
+            "outline_name": normalized_name,
+            "workspace_path": str(workspace_path),
+            "created_at": now,
+            "updated_at": now,
+            "session_count": 0,
+        }
+
+        workspaces = self._read_workspace_index()
+        workspaces[workspace_id] = workspace
+        self._write_workspace_index(workspaces)
+        return self._to_workspace_summary(workspace)
+
+    def get_workspace(self, workspace_id: str) -> WorkspaceSummary | None:
+        workspace = self._read_workspace_index().get(workspace_id)
+        if workspace is None:
+            return None
+        workspace["session_count"] = sum(
+            1 for thread in self._read_thread_index().values() if thread["workspace_id"] == workspace_id
+        )
+        return self._to_workspace_summary(workspace)
+
+    def list_threads(self, workspace_id: str | None = None) -> list[ThreadSummary]:
+        threads = self._read_thread_index().values()
+        if workspace_id is not None:
+            threads = [thread for thread in threads if thread["workspace_id"] == workspace_id]
+        summaries = [self._to_thread_summary(thread) for thread in threads]
+        return sorted(summaries, key=lambda thread: thread.updated_at, reverse=True)
+
+    def get_thread(self, thread_id: str) -> ThreadSummary | None:
+        thread = self._read_thread_index().get(thread_id)
+        if thread is None:
+            return None
+        return self._to_thread_summary(thread)
+
+    def create_thread(
+        self,
+        workspace_id: str,
+        session_name: str | None = None,
+    ) -> ThreadSummary:
+        workspace = self._read_workspace_index().get(workspace_id)
+        if workspace is None:
+            raise KeyError(f"Workspace not found: {workspace_id}")
+
+        existing_threads = [
+            thread for thread in self._read_thread_index().values() if thread["workspace_id"] == workspace_id
+        ]
+        normalized_name = session_name.strip() if session_name is not None else ""
+        if normalized_name == "":
+            normalized_name = f"会话 {len(existing_threads) + 1}"
+
+        now = self._now()
+        thread_id = self._make_thread_id(workspace_id, normalized_name)
+        thread = {
+            "thread_id": thread_id,
+            "workspace_id": workspace_id,
+            "session_name": normalized_name,
+            "workspace_path": workspace["workspace_path"],
+            "created_at": now,
+            "updated_at": now,
+        }
+
+        threads = self._read_thread_index()
+        threads[thread_id] = thread
+        self._write_thread_index(threads)
+        self._touch_workspace(workspace_id)
+        return self._to_thread_summary(thread)
+
+    def delete_thread(self, thread_id: str) -> bool:
+        threads = self._read_thread_index()
+        thread = threads.get(thread_id)
+        if thread is None:
+            return False
+
+        del threads[thread_id]
+        self._write_thread_index(threads)
+        self._touch_workspace(thread["workspace_id"])
+        return True
+
+    def update_thread_name(self, thread_id: str, session_name: str) -> ThreadSummary | None:
+        normalized_name = session_name.strip()
+        if normalized_name == "":
+            raise ValueError("Session name cannot be empty")
+
+        threads = self._read_thread_index()
+        thread = threads.get(thread_id)
+        if thread is None:
+            return None
+
+        thread["session_name"] = normalized_name
+        thread["updated_at"] = self._now()
+        threads[thread_id] = thread
+        self._write_thread_index(threads)
+        self._touch_workspace(thread["workspace_id"])
+        return self._to_thread_summary(thread)
+
+    def delete_workspace(self, workspace_id: str) -> list[str] | None:
+        workspaces = self._read_workspace_index()
+        workspace = workspaces.get(workspace_id)
+        if workspace is None:
+            return None
+
+        workspace_path = Path(workspace["workspace_path"])
+        if not workspace_path.exists():
+            raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
+
+        threads = self._read_thread_index()
+        deleted_thread_ids = [
+            thread_id
+            for thread_id, thread in threads.items()
+            if thread["workspace_id"] == workspace_id
+        ]
+        remaining_threads = {
+            thread_id: thread
+            for thread_id, thread in threads.items()
+            if thread["workspace_id"] != workspace_id
+        }
+
+        shutil.rmtree(workspace_path)
+        del workspaces[workspace_id]
+        self._write_workspace_index(workspaces)
+        self._write_thread_index(remaining_threads)
+        return deleted_thread_ids
+
+    def read_workspace_outline(self, workspace_id: str) -> WorkspaceOutlineContent | None:
+        workspace = self._read_workspace_index().get(workspace_id)
+        if workspace is None:
+            return None
+
+        workspace_path = Path(workspace["workspace_path"])
+        if not workspace_path.exists():
+            raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
+
+        artifact_path = workspace_path / "outline.md"
+        markdown = artifact_path.read_text(encoding="utf-8") if artifact_path.exists() else ""
+        return WorkspaceOutlineContent(workspace_id=workspace_id, markdown=markdown)
+
+    def read_workspace_detail_outline(self, workspace_id: str) -> WorkspaceDetailOutlineContent | None:
+        workspace = self._read_workspace_index().get(workspace_id)
+        if workspace is None:
+            return None
+
+        workspace_path = Path(workspace["workspace_path"])
+        if not workspace_path.exists():
+            raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
+
+        detail_dir = workspace_path / "detail"
+        sections = []
+        file_count = 0
+        if detail_dir.exists():
+            for artifact_path in sorted(detail_dir.glob("*.md"), key=lambda p: p.name):
+                if artifact_path.name == "evaluation.md":
+                    continue
+                content = artifact_path.read_text(encoding="utf-8").strip()
+                if content:
+                    sections.append(content)
+                    file_count += 1
+
+        markdown = "\n\n---\n\n".join(sections)
+        return WorkspaceDetailOutlineContent(workspace_id=workspace_id, markdown=markdown, file_count=file_count)
+
+    def read_thread_outline(self, thread_id: str) -> WorkspaceOutlineContent | None:
+        thread = self.get_thread(thread_id)
+        if thread is None:
+            return None
+        return self.read_workspace_outline(thread.workspace_id)
+
+    def read_workspace_novel(self, workspace_id: str) -> WorkspaceNovelContent | None:
+        workspace = self._read_workspace_index().get(workspace_id)
+        if workspace is None:
+            return None
+
+        workspace_path = Path(workspace["workspace_path"])
+        if not workspace_path.exists():
+            raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
+
+        chapter_files = self._workspace_chapter_files(workspace_path)
+        if chapter_files:
+            markdown = "\n\n".join(path.read_text(encoding="utf-8").strip() for path in chapter_files)
+            return WorkspaceNovelContent(
+                workspace_id=workspace_id,
+                markdown=f"{markdown}\n" if markdown else "",
+                source="chapter/",
+                chapter_count=len(chapter_files),
+            )
+
+        artifact_path = workspace_path / "novel.md"
+        markdown = artifact_path.read_text(encoding="utf-8") if artifact_path.exists() else ""
+        return WorkspaceNovelContent(
+            workspace_id=workspace_id,
+            markdown=markdown,
+            source="novel.md",
+            chapter_count=0,
+        )
+
+    def read_workspace_novel_chapters(self, workspace_id: str) -> WorkspaceNovelChaptersContent | None:
+        workspace = self._read_workspace_index().get(workspace_id)
+        if workspace is None:
+            return None
+
+        workspace_path = Path(workspace["workspace_path"])
+        if not workspace_path.exists():
+            raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
+
+        chapter_files = self._workspace_chapter_files(workspace_path)
+        if chapter_files:
+            chapters = [
+                WorkspaceNovelChapter(
+                    filename=path.name,
+                    title=self._markdown_title(path.read_text(encoding="utf-8")) or path.stem,
+                    markdown=path.read_text(encoding="utf-8").strip(),
+                )
+                for path in chapter_files
+            ]
+            return WorkspaceNovelChaptersContent(workspace_id=workspace_id, source="chapter/", chapters=chapters)
+
+        artifact_path = workspace_path / "novel.md"
+        markdown = artifact_path.read_text(encoding="utf-8").strip() if artifact_path.exists() else ""
+        chapters = []
+        if markdown:
+            chapters.append(
+                WorkspaceNovelChapter(
+                    filename=artifact_path.name,
+                    title=self._markdown_title(markdown) or str(workspace.get("outline_name") or "小说正文"),
+                    markdown=markdown,
+                )
+            )
+        return WorkspaceNovelChaptersContent(workspace_id=workspace_id, source="novel.md", chapters=chapters)
+
+    def read_workspace_characters(self, workspace_id: str) -> WorkspaceCharacterContent | None:
+        workspace = self._read_workspace_index().get(workspace_id)
+        if workspace is None:
+            return None
+
+        workspace_path = Path(workspace["workspace_path"])
+        if not workspace_path.exists():
+            raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
+
+        character_dir = workspace_path / "character"
+        characters = []
+        if character_dir.exists():
+            for artifact_path in sorted(character_dir.glob("*.md"), key=lambda path: path.stem):
+                characters.append(
+                    CharacterMarkdownFile(
+                        filename=artifact_path.name,
+                        name=artifact_path.stem,
+                        markdown=artifact_path.read_text(encoding="utf-8"),
+                    )
+                )
+
+        return WorkspaceCharacterContent(workspace_id=workspace_id, characters=characters)
+
+    def write_outline(
+        self,
+        thread: ThreadSummary,
+        response: ScreenplayGenerateResponse,
+    ) -> None:
+        workspace_path = Path(thread.workspace_path)
+        if not workspace_path.exists():
+            raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
+
+        artifact_path = workspace_path / "outline.md"
+        markdown = response.markdown.strip() or self._fallback_outline_markdown(response)
+        artifact_path.write_text(f"{markdown}\n", encoding="utf-8")
+
+        evaluation_markdown = response.evaluation_markdown.strip()
+        if evaluation_markdown:
+            evaluation_path = workspace_path / "evaluation.md"
+            evaluation_path.write_text(f"{evaluation_markdown}\n", encoding="utf-8")
+
+        self._touch_thread(thread.thread_id)
+        self._touch_workspace(thread.workspace_id)
+
+    def write_character(
+        self,
+        thread: ThreadSummary,
+        response: CharacterGenerateResponse,
+    ) -> None:
+        workspace_path = Path(thread.workspace_path)
+        if not workspace_path.exists():
+            raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
+
+        artifact_dir = workspace_path / "character"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = artifact_dir / f"{response.name}.md"
+        markdown = response.markdown.strip() or self._fallback_character_markdown(response)
+        artifact_path.write_text(f"{markdown}\n", encoding="utf-8")
+        self._touch_thread(thread.thread_id)
+        self._touch_workspace(thread.workspace_id)
+
+    def _workspace_chapter_files(self, workspace_path: Path) -> list[Path]:
+        chapter_dir = workspace_path / "chapter"
+        if not chapter_dir.exists():
+            return []
+        return sorted(
+            (
+                path
+                for path in chapter_dir.glob("*.md")
+                if path.is_file() and path.read_text(encoding="utf-8").strip()
+            ),
+            key=lambda path: path.name,
+        )
+
+    def _markdown_title(self, markdown: str) -> str:
+        for line in markdown.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                return stripped.lstrip("#").strip()
+            if stripped:
+                return stripped
+        return ""
+
+    def _fallback_character_markdown(
+        self,
+        response: CharacterGenerateResponse,
+    ) -> str:
+        return (
+            f"# {response.name}\n\n"
+            f"## 角色身份\n\n{response.identity}\n\n"
+            f"## 外貌特征\n\n{response.appearance}\n\n"
+            f"## 性格与内心\n\n{response.personality}\n\n"
+            f"## 关系网络\n\n{response.relationships}\n\n"
+            f"## 目前状态\n\n{response.current_state}\n"
+        )
+
+    def _fallback_outline_markdown(
+        self,
+        response: ScreenplayGenerateResponse,
+    ) -> str:
+        beat_lines = "\n".join(
+            f"{index}. {beat}" for index, beat in enumerate(response.beats, start=1)
+        )
+        return (
+            f"# {response.title}\n\n"
+            f"## 一句话梗概\n\n{response.logline}\n\n"
+            f"## 短梗概\n\n{response.synopsis}\n\n"
+            f"## 五个关键剧情节点\n\n{beat_lines}"
+        )
+
+    def _migrate_legacy_indexes(self) -> None:
+        if self.workspace_index_path.exists() and self.thread_index_path.exists():
+            threads = self._read_thread_index()
+            if all("workspace_id" in thread for thread in threads.values()):
+                return
+
+        if not self.thread_index_path.exists():
+            return
+
+        threads = self._read_raw_index(self.thread_index_path)
+        if not threads:
+            return
+        if any("workspace_id" in thread for thread in threads.values()):
+            return
+
+        migrated_workspaces: dict[str, dict[str, str]] = {}
+        migrated_threads: dict[str, dict[str, str]] = {}
+        for thread_id, legacy_thread in threads.items():
+            workspace_id = str(legacy_thread["thread_id"])
+            workspace_path = str(legacy_thread["workspace_path"])
+            outline_name = str(legacy_thread["outline_name"])
+            created_at = str(legacy_thread["created_at"])
+            updated_at = str(legacy_thread["updated_at"])
+            migrated_workspaces[workspace_id] = {
+                "workspace_id": workspace_id,
+                "outline_name": outline_name,
+                "workspace_path": workspace_path,
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "session_count": 1,
+            }
+            migrated_threads[thread_id] = {
+                "thread_id": thread_id,
+                "workspace_id": workspace_id,
+                "session_name": outline_name,
+                "workspace_path": workspace_path,
+                "created_at": created_at,
+                "updated_at": updated_at,
+            }
+
+        self._write_workspace_index(migrated_workspaces)
+        self._write_thread_index(migrated_threads)
+
+    def _read_workspace_index(self) -> dict[str, dict[str, str]]:
+        return self._read_raw_index(self.workspace_index_path)
+
+    def _read_thread_index(self) -> dict[str, dict[str, str]]:
+        return self._read_raw_index(self.thread_index_path)
+
+    def _read_raw_index(self, path: Path) -> dict[str, dict[str, str]]:
+        if not path.exists():
+            return {}
+        with path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+        if not isinstance(data, dict):
+            raise ValueError(f"Invalid index format: {path}")
+        return data
+
+    def _write_workspace_index(self, index: dict[str, dict[str, str]]) -> None:
+        self._write_json(self.workspace_index_path, index)
+
+    def _write_thread_index(self, index: dict[str, dict[str, str]]) -> None:
+        self._write_json(self.thread_index_path, index)
+
+    def _write_json(self, path: Path, value: dict[str, dict[str, str]]) -> None:
+        with path.open("w", encoding="utf-8") as file:
+            json.dump(value, file, ensure_ascii=False, indent=2)
+
+    def _touch_workspace(self, workspace_id: str) -> None:
+        workspaces = self._read_workspace_index()
+        workspace = workspaces.get(workspace_id)
+        if workspace is None:
+            raise KeyError(f"Workspace not found: {workspace_id}")
+        workspace["updated_at"] = self._now()
+        workspace["session_count"] = sum(
+            1 for thread in self._read_thread_index().values() if thread["workspace_id"] == workspace_id
+        )
+        workspaces[workspace_id] = workspace
+        self._write_workspace_index(workspaces)
+
+    def _touch_thread(self, thread_id: str) -> None:
+        threads = self._read_thread_index()
+        thread = threads.get(thread_id)
+        if thread is None:
+            raise KeyError(f"Thread not found: {thread_id}")
+        thread["updated_at"] = self._now()
+        threads[thread_id] = thread
+        self._write_thread_index(threads)
+
+    def clear_workspace_style_reference(self, style_id: str) -> None:
+        workspaces = self._read_workspace_index()
+        changed = False
+        for workspace in workspaces.values():
+            if workspace.get("active_style_id") == style_id:
+                workspace["active_style_id"] = None
+                changed = True
+        if changed:
+            self._write_workspace_index(workspaces)
+
+    def _to_workspace_summary(self, workspace: dict[str, str | int]) -> WorkspaceSummary:
+        workspace.setdefault("active_style_id", None)
+        return WorkspaceSummary(**workspace)
+
+    def _to_thread_summary(self, thread: dict[str, str]) -> ThreadSummary:
+        return ThreadSummary(**thread)
+
+    def _workspace_dir(self, workspace_id: str) -> Path:
+        return self.workspace_root / workspace_id
+
+    def _make_thread_id(self, workspace_id: str, session_name: str) -> str:
+        slug = self._sanitize_thread_name(session_name)[:24] or "session"
+        return f"{workspace_id[:12]}-{slug}-{uuid4().hex[:8]}"
+
+    def _sanitize_workspace_name(self, name: str) -> str:
+        sanitized = self._sanitize_path_name(name)
+        if not sanitized:
+            raise ValueError("outline_name cannot be empty")
+        return sanitized
+
+    def _sanitize_thread_name(self, name: str) -> str:
+        return self._sanitize_path_name(name).lower()
+
+    def _sanitize_path_name(self, name: str) -> str:
+        return re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", name.strip()).strip(".")
+
+    def _now(self) -> str:
+        return datetime.now(UTC).isoformat()
