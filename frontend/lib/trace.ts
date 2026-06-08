@@ -28,15 +28,71 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
   const agentNodeIds = new Set<string>();
   const pendingLlm = new Map<string, TraceLogEvent[]>();
   const pendingTool = new Map<string, TraceLogEvent[]>();
+  // task 边界追踪
+  let currentTaskCallId: string | null = null;
+  const agentLastTask = new Map<string, string | null>();
+  const agentInvocationCounter = new Map<string, number>();
+  const instanceFirstTs = new Map<string, string>();
+  const instanceLastTs = new Map<string, string>();
+
+  function getAgentNodeId(event: TraceLogEvent): string {
+    if (!event.agent_name) return "run";
+    if (agentRole(event.agent_name) === "main") return `agent:${event.agent_name}`;
+    const invocation = agentInvocationCounter.get(event.agent_name);
+    if (invocation != null) return `agent:${event.agent_name}:${invocation}`;
+    return `agent:${event.agent_name}`; // D9 回退
+  }
 
   function ensureAgentNode(event: TraceLogEvent) {
     if (!event.agent_name) return;
-    const nodeId = agentNodeId(event.agent_name);
-    if (agentNodeIds.has(nodeId)) return;
+
+    // ── Meta-agent：保持全局唯一 ──
+    if (agentRole(event.agent_name) === "main") {
+      const nodeId = `agent:${event.agent_name}`;
+      if (agentNodeIds.has(nodeId)) return;
+      agentNodeIds.add(nodeId);
+      nodes.push({
+        node_id: nodeId,
+        parent_node_id: "run",
+        kind: "agent",
+        label: event.agent_name,
+        status: "completed",
+        agent_name: event.agent_name,
+        agent_role: agentRole(event.agent_name),
+        depth: agentDepth(event.agent_name),
+        started_at: event.timestamp,
+        raw_event_ids: [event.event_id],
+        chain_summary: agentSummary(event),
+      });
+      return;
+    }
+
+    // ── Subagent：实例化拆分 ──
+    const currentTask = currentTaskCallId;
+    const lastTask = agentLastTask.get(event.agent_name);
+
+    if (lastTask != null && lastTask === currentTask) return; // 同一实例内
+
+    // 新实例
+    const counter = (agentInvocationCounter.get(event.agent_name) ?? 0) + 1;
+    agentInvocationCounter.set(event.agent_name, counter);
+    agentLastTask.set(event.agent_name, currentTask);
+
+    const nodeId = `agent:${event.agent_name}:${counter}`;
     agentNodeIds.add(nodeId);
+    instanceFirstTs.set(nodeId, event.timestamp);
+
+    // 确定父节点
+    let parentId = "run";
+    if (isEvaluationAgent(event.agent_name)) {
+      const primaryName = evaluationPrimaryAgentName(event.agent_name);
+      const primaryInv = agentInvocationCounter.get(primaryName) ?? 1;
+      parentId = `agent:${primaryName}:${primaryInv}`;
+    }
+
     nodes.push({
       node_id: nodeId,
-      parent_node_id: "run",
+      parent_node_id: parentId,
       kind: "agent",
       label: event.agent_name,
       status: "completed",
@@ -45,6 +101,7 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
       depth: agentDepth(event.agent_name),
       started_at: event.timestamp,
       raw_event_ids: [event.event_id],
+      chain_summary: agentSummary(event),
     });
   }
 
@@ -75,8 +132,24 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
   }
 
   for (const event of events) {
+    // ── N2: task 工具拦截 ──
+    if (event.tool_name === "task" && ["tool_start", "tool_end", "tool_error"].includes(event.type)) {
+      if (event.type === "tool_start") {
+        currentTaskCallId = event.tool_call_id ?? null;
+      } else {
+        currentTaskCallId = null;
+      }
+      continue;
+    }
+
     if (["llm_start", "llm_end", "llm_error", "tool_start", "tool_end", "tool_error"].includes(event.type)) {
       ensureAgentNode(event);
+    }
+
+    // ── 实例时间戳追踪 ──
+    if (event.agent_name && agentRole(event.agent_name) === "subagent") {
+      const instanceId = getAgentNodeId(event);
+      instanceLastTs.set(instanceId, event.timestamp);
     }
 
     if (event.type === "llm_start") {
@@ -110,7 +183,7 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
       );
       nodes.push({
         node_id: nodeId,
-        parent_node_id: agentNodeId(event.agent_name),
+        parent_node_id: getAgentNodeId(event),
         kind: event.type === "llm_error" ? "error" : "llm",
         label: event.model_name || "LLM",
         status: event.status,
@@ -126,6 +199,7 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
         output_context_anchor_id: anchorId,
         raw_event_ids: start ? [start.event_id, event.event_id] : [event.event_id],
         error: event.error,
+        chain_summary: event.type === "llm_error" ? errorSummary(event.error) : llmSummary(event),
       });
       continue;
     }
@@ -145,7 +219,7 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
       );
       nodes.push({
         node_id: nodeId,
-        parent_node_id: agentNodeId(event.agent_name),
+        parent_node_id: getAgentNodeId(event),
         kind: event.type === "tool_error" ? "error" : "tool",
         label: event.tool_name || "Tool",
         status: event.status,
@@ -160,6 +234,7 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
         output_context_anchor_id: anchorId,
         raw_event_ids: start ? [start.event_id, event.event_id] : [event.event_id],
         error: event.error,
+        chain_summary: event.type === "tool_error" ? errorSummary(event.error, event.tool_output) : toolSummary(event.tool_name, event.tool_output),
       });
       continue;
     }
@@ -178,7 +253,19 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
         output_context_anchor_id: anchorId,
         raw_event_ids: [event.event_id],
         error: event.error,
+        chain_summary: errorSummary(event.error),
       });
+    }
+  }
+
+  // ── 回填 agent 节点的 duration ──
+  for (const node of nodes) {
+    if (node.kind !== "agent") continue;
+    const first = instanceFirstTs.get(node.node_id);
+    const last = instanceLastTs.get(node.node_id);
+    if (first && last) {
+      node.ended_at = last;
+      node.duration_ms = tsDiffMs(first, last);
     }
   }
 
@@ -186,7 +273,7 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
     for (const event of events) {
       nodes.push({
         node_id: llmNodeId(event),
-        parent_node_id: agentNodeId(event.agent_name),
+        parent_node_id: getAgentNodeId(event),
         kind: "llm",
         label: event.model_name || "LLM",
         status: "running",
@@ -196,6 +283,7 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
         started_at: event.timestamp,
         model_name: event.model_name,
         raw_event_ids: [event.event_id],
+        chain_summary: llmSummary(event, true),
       });
     }
   }
@@ -204,7 +292,7 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
     for (const event of events) {
       nodes.push({
         node_id: toolNodeId(event),
-        parent_node_id: agentNodeId(event.agent_name),
+        parent_node_id: getAgentNodeId(event),
         kind: "tool",
         label: event.tool_name || "Tool",
         status: "running",
@@ -214,12 +302,129 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
         started_at: event.timestamp,
         tool_name: event.tool_name,
         raw_event_ids: [event.event_id],
+        chain_summary: `${event.tool_name || "Tool"}: 运行中…`,
       });
     }
   }
 
   return { run, events, nodes, context, todos };
 }
+
+// ── chain_summary 生成函数（前端版本，与后端 chain_summary.py 保持一致） ──
+
+function runSummary(run: TraceRunSummary): string {
+  const statusLabel = run.status === "completed" ? "完成" : run.status === "failed" ? "失败" : "运行中";
+  const duration = run.duration_ms != null ? `${(run.duration_ms / 1000).toFixed(run.duration_ms < 10000 ? 1 : 0)}s` : "--";
+  return `${run.endpoint} · ${statusLabel} · ${duration}`;
+}
+
+function agentSummary(event: TraceLogEvent): string {
+  const name = event.agent_name || "Unknown";
+  const role = (event.agent_name || "").endsWith("-subagent") ? "子代理" : "主代理";
+  return `${name} · ${role}`;
+}
+
+function llmSummary(event: TraceLogEvent, isRunning = false): string {
+  const model = event.model_name || "LLM";
+  if (isRunning) return `${model}: 运行中…`;
+  const text = extractLlmText(event.output);
+  if (text) {
+    const truncated = text.length > 100 ? text.slice(0, 100) + "…" : text;
+    return `${model}: ${truncated}`;
+  }
+  // content 为空但有 tool_calls → 直接列工具名
+  const calls = toolCallNames(event.tool_calls);
+  if (calls.length > 0) {
+    return `${model}: ${calls.join(", ")}`;
+  }
+  return `${model}: (无输出)`;
+}
+
+function toolSummary(toolName: string | null | undefined, toolOutput: unknown): string {
+  if (!toolName) return `Tool: ${truncate(String(toolOutput), 80)}`;
+  const builders: Record<string, (out: unknown) => string> = {
+    write_file: (out) => `write_file: ${extractPath(out)}`,
+    write: (out) => `write_file: ${extractPath(out)}`,
+    read_file: (out) => `read_file: ${extractPath(out)}`,
+    read: (out) => `read_file: ${extractPath(out)}`,
+    set_goal: (out) => `set_goal: ${truncate(extractGoal(out), 50)}`,
+    record_goal_completion: (out) => `goal_completion: ${truncate(extractCompleted(out), 50)}`,
+    update_todo_list: () => "update_todo_list",
+  };
+  const builder = builders[toolName];
+  return builder ? builder(toolOutput) : `${toolName}`;
+}
+
+function errorSummary(error: string | null | undefined, toolOutput?: unknown): string {
+  if (error) return `❌ ${truncate(error, 200)}`;
+  if (toolOutput != null) return `❌ ${truncate(String(toolOutput), 200)}`;
+  return "❌ 未知错误";
+}
+
+function extractLlmText(output: unknown): string {
+  if (output == null) return "";
+  if (typeof output === "string") return output;
+  if (typeof output === "object" && output !== null && "messages" in output) {
+    const messages = (output as { messages?: unknown[] }).messages;
+    if (Array.isArray(messages)) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        if (!msg || typeof msg !== "object") continue;
+        const role = ((msg as Record<string, unknown>).type ?? (msg as Record<string, unknown>).role ?? "") as string;
+        if (role === "ai" || role === "assistant") {
+          const content = (msg as Record<string, unknown>).content;
+          if (typeof content === "string") return content;
+          if (Array.isArray(content)) {
+            return content
+              .map((block) => (block && typeof block === "object" && "text" in block ? String(block.text) : ""))
+              .filter(Boolean)
+              .join("\n");
+          }
+        }
+      }
+    }
+  }
+  return String(output);
+}
+
+function extractPath(output: unknown): string {
+  if (typeof output === "string") return truncate(output, 60);
+  if (typeof output === "object" && output !== null) {
+    for (const key of ["path", "file_path", "filename"]) {
+      const value = (output as Record<string, unknown>)[key];
+      if (typeof value === "string") return value;
+    }
+    const content = (output as Record<string, unknown>).content;
+    if (typeof content === "string") return truncate(content, 60);
+  }
+  return truncate(String(output), 60);
+}
+
+function extractGoal(output: unknown): string {
+  if (typeof output === "object" && output !== null) {
+    for (const key of ["goal", "content", "text"]) {
+      const value = (output as Record<string, unknown>)[key];
+      if (typeof value === "string") return value;
+    }
+  }
+  return String(output);
+}
+
+function extractCompleted(output: unknown): string {
+  if (typeof output === "object" && output !== null) {
+    for (const key of ["goal", "content", "completed"]) {
+      const value = (output as Record<string, unknown>)[key];
+      if (typeof value === "string") return truncate(value, 50);
+    }
+  }
+  return truncate(String(output), 50);
+}
+
+function truncate(str: string, max: number): string {
+  return str.length > max ? str.slice(0, max) : str;
+}
+
+// ── 辅助函数 ──
 
 function updateRunFromEvent(run: TraceRunSummary, event: TraceLogEvent): TraceRunSummary {
   if (event.type === "run_end" || event.type === "run_error") {
@@ -247,6 +452,7 @@ function runNode(run: TraceRunSummary, events: TraceLogEvent[]): TraceNode {
     depth: 0,
     raw_event_ids: events.map((event) => event.event_id),
     error: run.error,
+    chain_summary: runSummary(run),
   };
 }
 
@@ -262,6 +468,17 @@ function agentNodeId(agentName?: string | null) {
   return agentName ? `agent:${agentName}` : "run";
 }
 
+function tsDiffMs(start: string, end: string): number | null {
+  try {
+    const t0 = new Date(start).getTime();
+    const t1 = new Date(end).getTime();
+    if (isNaN(t0) || isNaN(t1)) return null;
+    return t1 - t0;
+  } catch {
+    return null;
+  }
+}
+
 function llmNodeId(event: TraceLogEvent) {
   return `llm:${event.event_id}`;
 }
@@ -272,12 +489,22 @@ function toolNodeId(event: TraceLogEvent) {
 
 function agentRole(agentName?: string | null) {
   if (!agentName) return null;
-  return agentName === "meta-agent" ? "main" : "subagent";
+  return agentName.endsWith("-subagent") ? "subagent" : "main";
+}
+
+function isEvaluationAgent(agentName?: string | null): boolean {
+  return !!agentName && agentName.includes("evaluation");
+}
+
+function evaluationPrimaryAgentName(agentName: string): string {
+  if (agentName === "evaluation-subagent") return "outline-subagent";
+  return agentName.replace("-evaluation", "");
 }
 
 function agentDepth(agentName?: string | null) {
   if (!agentName) return 0;
-  return agentName === "meta-agent" ? 1 : 2;
+  if (isEvaluationAgent(agentName)) return 2;
+  return agentName.endsWith("-subagent") ? 1 : 0;
 }
 
 function toolCallNames(toolCalls: unknown) {

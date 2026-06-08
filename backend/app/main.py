@@ -17,7 +17,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
 
-from app.writer.subagents.character import CharacterService
+from app.writer.subagents.character_subagent import CharacterService
 from app.writer.meta_agent import MetaAgentService
 from app.core.settings import get_settings
 from app.create_type.store import CreateTypeStore
@@ -40,6 +40,7 @@ from app.schemas.screenplay import (
     WorkspaceOutlineContent,
     WorkspaceSummary,
 )
+from app.schemas.checkpoint import CheckpointState
 from app.writer.trace import TraceDetail, TraceRunSummary
 
 
@@ -173,14 +174,33 @@ thread_store = ThreadStore(workspace_root)
 style_store = CreateTypeStore(workspace_root, thread_store)
 style_optimizer = StyleOptimizer(settings)
 init_style_module(style_store, style_optimizer)
-agent_service = MetaAgentService(settings, workspace_root, trace_recorder, style_store)
-character_service = CharacterService(settings, workspace_root, trace_recorder, style_store)
-pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+checkpoint_db_path = workspace_root.parent / "checkpoints.db"
+_checkpointer_cm = AsyncSqliteSaver.from_conn_string(str(checkpoint_db_path))
+
+agent_service: MetaAgentService | None = None
+character_service: CharacterService | None = None
+
+
+async def _lifespan(application: FastAPI):
+    global agent_service, character_service
+    checkpointer = await _checkpointer_cm.__aenter__()
+    if agent_service is None:
+        agent_service = MetaAgentService(settings, workspace_root, trace_recorder, style_store, checkpointer)
+    if character_service is None:
+        character_service = CharacterService(settings, workspace_root, trace_recorder, style_store, checkpointer)
+    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+    yield
+    await _checkpointer_cm.__aexit__(None, None, None)
+
 
 app = FastAPI(
     title="Writer Agent API",
     version="0.1.0",
     description="Minimal screenplay generation backend built with DeepAgents and FastAPI.",
+    lifespan=_lifespan,
 )
 app.add_middleware(
     CORSMiddleware,
@@ -430,6 +450,14 @@ def get_thread_outline(thread_id: str) -> WorkspaceOutlineContent:
     return content
 
 
+@app.get("/api/threads/{thread_id}/checkpoint", response_model=CheckpointState)
+async def get_thread_checkpoint(thread_id: str) -> CheckpointState:
+    thread = thread_store.get_thread(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    return await agent_service.get_thread_checkpoint(thread_id)
+
+
 @app.get("/api/threads/{thread_id}/traces", response_model=list[TraceRunSummary])
 def list_thread_traces(thread_id: str) -> list[TraceRunSummary]:
     thread = thread_store.get_thread(thread_id)
@@ -464,18 +492,6 @@ def delete_thread_trace(thread_id: str, trace_id: str) -> dict[str, str]:
     if not deleted:
         raise HTTPException(status_code=404, detail="Trace not found")
     return {"status": "ok", "deleted": trace_id}
-
-
-@app.post("/api/screenplay/generate", response_model=ScreenplayGenerateResponse)
-def generate_screenplay(payload: ScreenplayGenerateRequest) -> ScreenplayGenerateResponse:
-    thread = thread_store.get_thread(payload.thread_id)
-    if thread is None:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if agent_service.is_long_form_request(payload):
-        raise HTTPException(status_code=400, detail="完整小说生成任务耗时较长，请使用 /api/screenplay/generate/stream。")
-    response = agent_service.generate(payload, thread)
-    thread_store.write_outline(thread, response)
-    return response
 
 
 @app.post("/api/screenplay/generate/stream")

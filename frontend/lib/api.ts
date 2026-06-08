@@ -1,4 +1,4 @@
-import type { Style, ThreadSummary, TraceDetail, TraceRunSummary, WorkspaceCharacterContent, WorkspaceDetailOutlineContent, WorkspaceNovelContent, WorkspaceOutlineContent, WorkspaceSummary } from "./types";
+import type { CheckpointState, Style, ThreadSummary, TraceDetail, TraceRunSummary, WorkspaceCharacterContent, WorkspaceDetailOutlineContent, WorkspaceNovelContent, WorkspaceOutlineContent, WorkspaceSummary } from "./types";
 
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:7788";
 
@@ -110,6 +110,12 @@ export async function deleteTrace(threadId: string, traceId: string) {
   });
 
   return parseJsonResponse<{ status: string; deleted: string }>(response);
+}
+
+export async function fetchThreadCheckpoint(threadId: string): Promise<CheckpointState> {
+  const response = await fetch(`${API_BASE_URL}/api/threads/${threadId}/checkpoint`);
+  if (!response.ok) throw new Error("Failed to fetch checkpoint");
+  return response.json();
 }
 
 export async function fetchStyles() {

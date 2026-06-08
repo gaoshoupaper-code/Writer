@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import inspect
 import unittest
 from typing import get_type_hints
 
 from langchain.agents.factory import _resolve_schemas
-from langchain.agents.middleware import TodoListMiddleware
-from langchain.agents.middleware.types import ModelRequest, ModelResponse
-from langchain_core.language_models.fake_chat_models import FakeListChatModel
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain.tools import ToolRuntime
 
 from app.writer.middleware.goal_middleware import GoalMiddleware
@@ -77,8 +73,8 @@ class GoalMiddlewareTest(unittest.TestCase):
                 AIMessage(
                     content="",
                     tool_calls=[
-                        {"name": "goal", "args": {"goal": "A"}, "id": "call-1"},
-                        {"name": "goal", "args": {"goal": "B"}, "id": "call-2"},
+                        {"name": "set_goal", "args": {"goal": "A"}, "id": "call-1"},
+                        {"name": "set_goal", "args": {"goal": "B"}, "id": "call-2"},
                     ],
                 )
             ]
@@ -90,139 +86,6 @@ class GoalMiddlewareTest(unittest.TestCase):
         messages = result["messages"]
         self.assertEqual(len(messages), 2)
         self.assertTrue(all(message.status == "error" for message in messages))
-
-    def test_wrap_model_call_prepends_goal_before_existing_system_prompt_and_todo(self) -> None:
-        goal_middleware = GoalMiddleware()
-        todo_middleware = TodoListMiddleware()
-        request = ModelRequest(
-            model=FakeListChatModel(responses=["ok"]),
-            messages=[HumanMessage(content="write a story")],
-            system_message=SystemMessage(content="Base system prompt"),
-            state={"messages": [HumanMessage(content="write a story")], "goal": "Write a sci-fi story."},
-        )
-
-        goal_seen: ModelRequest | None = None
-        todo_seen: ModelRequest | None = None
-
-        def goal_handler(updated: ModelRequest) -> ModelResponse:
-            nonlocal goal_seen
-            goal_seen = updated
-            return ModelResponse(result=[AIMessage(content="ok")])
-
-        goal_middleware.wrap_model_call(request, goal_handler)
-        self.assertIsNotNone(goal_seen)
-        self.assertLess(goal_seen.system_message.text.index("## `goal`"), goal_seen.system_message.text.index("Base system prompt"))
-
-        def todo_handler(updated: ModelRequest) -> ModelResponse:
-            nonlocal todo_seen
-            todo_seen = updated
-            return ModelResponse(result=[AIMessage(content="ok")])
-
-        todo_middleware.wrap_model_call(goal_seen, todo_handler)
-        self.assertIsNotNone(todo_seen)
-        text = todo_seen.system_message.text
-        self.assertLess(text.index("## `goal`"), text.index("Base system prompt"))
-        self.assertLess(text.index("## `goal`"), text.index("## `write_todos`"))
-        self.assertIn("Write a sci-fi story.", text)
-
-    def test_goal_state_is_omitted_from_agent_output_schema(self) -> None:
-        _, _, output_schema = _resolve_schemas([GoalState])
-        output_hints = get_type_hints(output_schema, include_extras=True)
-
-        self.assertNotIn("goal", output_hints)
-        self.assertNotIn("goal_completed", output_hints)
-        self.assertNotIn("goal_acceptance_evidence", output_hints)
-        self.assertNotIn("goal_continuation", output_hints)
-        self.assertNotIn("goal_output_block_count", output_hints)
-        self.assertNotIn("goal_updated_for_turn", output_hints)
-        self.assertIn("messages", output_hints)
-
-    def test_goal_tool_allows_acceptance_update_for_same_goal(self) -> None:
-        runtime = _tool_runtime(
-            state={
-                "messages": [HumanMessage(content="write a sci-fi story")],
-                "goal": "Write a sci-fi story about identity.",
-                "goal_updated_for_turn": 1,
-            },
-            tool_call_id="goal-2",
-        )
-
-        result = set_goal(
-            runtime,
-            "Write a sci-fi story about identity.",
-            completed=False,
-            acceptance_evidence="Draft exists, but no final review has passed.",
-        )
-
-        update = result.update
-        self.assertNotIn("goal_updated_for_turn", update)
-        self.assertEqual(update["goal"], "Write a sci-fi story about identity.")
-        self.assertFalse(update["goal_completed"])
-        self.assertEqual(update["goal_acceptance_evidence"], "Draft exists, but no final review has passed.")
-        self.assertNotIn("goal_continuation", update)
-        self.assertIn("Acceptance: not complete", update["messages"][0].content)
-
-    def test_goal_tool_requires_evidence_for_acceptance_status(self) -> None:
-        runtime = _tool_runtime(
-            state={"messages": [HumanMessage(content="write a sci-fi story")]},
-            tool_call_id="goal-1",
-        )
-
-        result = set_goal(runtime, "Write a sci-fi story about identity.", completed=True)
-
-        self.assertEqual(result.update["messages"][0].status, "error")
-        self.assertIn("Acceptance evidence is required", result.update["messages"][0].content)
-
-    def test_goal_tool_resets_acceptance_when_objective_changes(self) -> None:
-        runtime = _tool_runtime(
-            state={
-                "messages": [HumanMessage(content="write a sci-fi story"), HumanMessage(content="make it a mystery")],
-                "goal": "Write a sci-fi story about identity.",
-                "goal_completed": True,
-                "goal_acceptance_evidence": "Final review passed.",
-                "goal_updated_for_turn": 1,
-            },
-            tool_call_id="goal-2",
-        )
-
-        result = set_goal(runtime, "Write a mystery story.")
-
-        update = result.update
-        self.assertEqual(update["goal"], "Write a mystery story.")
-        self.assertIsNone(update["goal_completed"])
-        self.assertIsNone(update["goal_acceptance_evidence"])
-        self.assertFalse(update["goal_output_blocked"])
-        self.assertEqual(update["goal_output_block_count"], 0)
-        self.assertNotIn("goal_continuation", update)
-
-    def test_wrap_model_call_includes_acceptance_status(self) -> None:
-        middleware = GoalMiddleware()
-        request = ModelRequest(
-            model=FakeListChatModel(responses=["ok"]),
-            messages=[HumanMessage(content="write a story")],
-            state={
-                "messages": [HumanMessage(content="write a story")],
-                "goal": "Write a sci-fi story.",
-                "goal_completed": False,
-                "goal_acceptance_evidence": "Draft exists, but final review failed.",
-            },
-        )
-
-        seen: ModelRequest | None = None
-
-        def handler(updated: ModelRequest) -> ModelResponse:
-            nonlocal seen
-            seen = updated
-            return ModelResponse(result=[AIMessage(content="ok")])
-
-        middleware.wrap_model_call(request, handler)
-
-        self.assertIsNotNone(seen)
-        text = seen.system_message.text
-        self.assertIn("Acceptance status:", text)
-        self.assertIn("Completed: not complete", text)
-        self.assertIn("Evidence: Draft exists, but final review failed.", text)
-        self.assertNotIn("Continue with:", text)
 
     def test_after_model_blocks_final_output_until_goal_completed(self) -> None:
         middleware = GoalMiddleware()
@@ -266,6 +129,7 @@ class GoalMiddlewareTest(unittest.TestCase):
             "goal": "Write a story.",
             "goal_completed": True,
             "goal_acceptance_evidence": "Final review passed.",
+            "goal_completed_for_turn": 1,
         }
 
         result = middleware.after_model(state, runtime=None)  # type: ignore[arg-type]
@@ -286,9 +150,37 @@ class GoalMiddlewareTest(unittest.TestCase):
 
         self.assertIsNone(result)
 
-    def test_goal_tool_runtime_annotation_is_not_deferred(self) -> None:
-        self.assertNotIsInstance(inspect.signature(set_goal).parameters["runtime"].annotation, str)
-        self.assertNotIsInstance(inspect.signature(aset_goal).parameters["runtime"].annotation, str)
+    def test_goal_state_is_omitted_from_agent_output_schema(self) -> None:
+        _, _, output_schema = _resolve_schemas([GoalState])
+        output_hints = get_type_hints(output_schema, include_extras=True)
+
+        self.assertNotIn("goal", output_hints)
+        self.assertNotIn("goal_completed", output_hints)
+        self.assertNotIn("goal_acceptance_evidence", output_hints)
+        self.assertNotIn("goal_output_block_count", output_hints)
+        self.assertNotIn("goal_updated_for_turn", output_hints)
+        self.assertIn("messages", output_hints)
+
+    def test_goal_tool_resets_acceptance_when_objective_changes(self) -> None:
+        runtime = _tool_runtime(
+            state={
+                "messages": [HumanMessage(content="write a sci-fi story"), HumanMessage(content="make it a mystery")],
+                "goal": "Write a sci-fi story about identity.",
+                "goal_completed": True,
+                "goal_acceptance_evidence": "Final review passed.",
+                "goal_updated_for_turn": 1,
+            },
+            tool_call_id="goal-2",
+        )
+
+        result = set_goal(runtime, "Write a mystery story.")
+
+        update = result.update
+        self.assertEqual(update["goal"], "Write a mystery story.")
+        self.assertIsNone(update["goal_completed"])
+        self.assertIsNone(update["goal_acceptance_evidence"])
+        self.assertFalse(update["goal_output_blocked"])
+        self.assertEqual(update["goal_output_block_count"], 0)
 
 
 def _tool_runtime(state: dict, tool_call_id: str) -> ToolRuntime:

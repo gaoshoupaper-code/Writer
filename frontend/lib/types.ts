@@ -49,9 +49,15 @@ export type WorkspaceOutlineContent = {
   markdown: string;
 };
 
+export type DetailOutlineChapter = {
+  filename: string;
+  title: string;
+  markdown: string;
+};
+
 export type WorkspaceDetailOutlineContent = {
   workspace_id: string;
-  markdown: string;
+  chapters: DetailOutlineChapter[];
   file_count: number;
 };
 
@@ -155,6 +161,8 @@ export type TraceNode = {
   output_context_anchor_id?: string | null;
   raw_event_ids: string[];
   error?: string | null;
+  chain_summary?: string | null;
+  parallel_group_id?: string | null;
 };
 
 export type TraceContextSegment = {
@@ -222,4 +230,21 @@ export type ChatMessage = {
   content: string;
   tools?: ToolStatus[];
   contentFormat?: "text" | "markdown";
+};
+
+export type CheckpointToolCall = {
+  name: string;
+  id: string;
+};
+
+export type CheckpointMessage = {
+  role: "system" | "human" | "ai" | "tool";
+  content: string;
+  tool_calls?: CheckpointToolCall[];
+  name?: string;
+};
+
+export type CheckpointState = {
+  thread_id: string;
+  messages: CheckpointMessage[];
 };

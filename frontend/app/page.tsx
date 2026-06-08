@@ -41,6 +41,7 @@ import { appendLiveTraceEvent } from "../lib/trace";
 import type {
   CharacterMarkdownFile,
   ChatMessage,
+  DetailOutlineChapter,
   ScreenplayResponse,
   Style,
   StreamEvent,
@@ -257,9 +258,9 @@ export default function Home() {
   const [result, setResult] = useState<ScreenplayResponse | null>(null);
   const [outlineMarkdown, setOutlineMarkdown] = useState("");
   const [outlineLoading, setOutlineLoading] = useState(false);
-  const [detailOutlineMarkdown, setDetailOutlineMarkdown] = useState("");
-  const [detailOutlineFileCount, setDetailOutlineFileCount] = useState(0);
+  const [detailOutlineChapters, setDetailOutlineChapters] = useState<DetailOutlineChapter[]>([]);
   const [detailOutlineLoading, setDetailOutlineLoading] = useState(false);
+  const [activeDetailChapterFilename, setActiveDetailChapterFilename] = useState("");
   const [novelMarkdown, setNovelMarkdown] = useState("");
   const [novelSource, setNovelSource] = useState("");
   const [novelChapterCount, setNovelChapterCount] = useState(0);
@@ -492,8 +493,10 @@ export default function Home() {
     es.addEventListener("detail_outline", (e) => {
       try {
         const d = JSON.parse(e.data) as WorkspaceDetailOutlineContent;
-        setDetailOutlineMarkdown(d.markdown);
-        setDetailOutlineFileCount(d.file_count);
+        setDetailOutlineChapters(d.chapters);
+        setActiveDetailChapterFilename((cur) =>
+          d.chapters.some((c) => c.filename === cur) ? cur : d.chapters[0]?.filename || "",
+        );
         setDetailOutlineLoading(false);
       } catch {}
     });
@@ -565,8 +568,8 @@ export default function Home() {
 
   useEffect(() => {
     if (!activeWorkspaceId) {
-      setDetailOutlineMarkdown("");
-      setDetailOutlineFileCount(0);
+      setDetailOutlineChapters([]);
+      setActiveDetailChapterFilename("");
       return;
     }
 
@@ -577,13 +580,15 @@ export default function Home() {
       try {
         const data = await fetchWorkspaceDetailOutline(activeWorkspaceId);
         if (!ignore) {
-          setDetailOutlineMarkdown(data.markdown);
-          setDetailOutlineFileCount(data.file_count);
+          setDetailOutlineChapters(data.chapters);
+          setActiveDetailChapterFilename((cur) =>
+            data.chapters.some((c) => c.filename === cur) ? cur : data.chapters[0]?.filename || "",
+          );
         }
       } catch {
         if (!ignore) {
-          setDetailOutlineMarkdown("");
-          setDetailOutlineFileCount(0);
+          setDetailOutlineChapters([]);
+          setActiveDetailChapterFilename("");
         }
       } finally {
         if (!ignore) {
@@ -717,8 +722,8 @@ export default function Home() {
       setLiveTraceId("");
       setTraceDetail(null);
       setOutlineMarkdown("");
-      setDetailOutlineMarkdown("");
-      setDetailOutlineFileCount(0);
+      setDetailOutlineChapters([]);
+      setActiveDetailChapterFilename("");
       setNovelMarkdown("");
       setNovelSource("");
       setNovelChapterCount(0);
@@ -1182,9 +1187,10 @@ export default function Home() {
 
         {activePanel === "detail_outline" ? (
           <DetailOutlinePanel
-            markdown={detailOutlineMarkdown}
-            fileCount={detailOutlineFileCount}
+            chapters={detailOutlineChapters}
+            activeFilename={activeDetailChapterFilename}
             loading={detailOutlineLoading}
+            onSelectChapter={setActiveDetailChapterFilename}
           />
         ) : null}
 

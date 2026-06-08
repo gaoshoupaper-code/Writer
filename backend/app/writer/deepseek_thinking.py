@@ -37,6 +37,15 @@ class ReasoningSidecarStore:
 
 
 class DeepSeekThinkingChatModel(ChatOpenAI):
+    """DeepSeek 思考模式适配器。
+
+    profile 属性供 SummarizationMiddleware 等中间件读取模型上下文窗口大小，
+    从而自动选择比例触发的摘要策略，而非固定 token 数的 fallback 策略。
+    """
+
+    # 供 SummarizationMiddleware / compute_summarization_defaults 读取
+    profile: dict[str, int] = {"max_input_tokens": 500_000}
+
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._reasoning_store = ReasoningSidecarStore()

@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from contextlib import suppress
-from functools import cached_property
+
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -12,13 +12,13 @@ from deepagents import CompiledSubAgent, SubAgent, create_deep_agent
 from deepagents.backends import FilesystemBackend
 from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
 from langchain.agents.middleware.types import AgentMiddleware
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
-from app.writer.subagents.character import build_character_subagent
-from app.writer.subagents.detail_outline import build_detail_outline_pipeline_subagent
+from app.writer.subagents.character_subagent import build_character_subagent
+from app.writer.subagents.detail_outline_subagent import build_detail_outline_pipeline_subagent
 from app.writer.models import build_writer_model
-from app.writer.subagents.outline import build_outline_pipeline_subagent
-from app.writer.subagents.writing import build_writing_pipeline_subagent
+from app.writer.subagents.outline_subagent import build_outline_pipeline_subagent
+from app.writer.subagents.writing_subagent import build_writing_pipeline_subagent
 from app.writer.middleware import (
     ArtifactPrerequisite,
     ArtifactPrerequisiteMiddleware,
@@ -36,35 +36,18 @@ from app.schemas.screenplay import (
     ScreenplayGenerateResponse,
     ThreadSummary,
 )
+from app.schemas.checkpoint import CheckpointMessage, CheckpointState, CheckpointToolCall
 
-PROMPT_PATH = Path(__file__).resolve().parent / "prompt" / "meta_agent_system_prompt.txt"
-LONG_FORM_NOVEL_KEYWORDS = (
-    "完整小说",
-    "长篇小说",
-    "中篇小说",
-    "全书",
-    "全文",
-    "一次性成书",
-    "2万字",
-    "3万字",
-    "两万字",
-    "三万字",
-    "20000字",
-    "30000字",
-    "生成小说正文",
-)
+PROMPT_PATH = Path(__file__).resolve().parent / "prompt" / "meta_agent_system_prompt.md"
 
 
 class MetaAgentService:
-    def __init__(self, settings: Settings, workspace_root: Path, trace_recorder: TraceRecorder, style_store: CreateTypeStore) -> None:
+    def __init__(self, settings: Settings, workspace_root: Path, trace_recorder: TraceRecorder, style_store: CreateTypeStore, checkpointer: BaseCheckpointSaver) -> None:
         self.settings = settings
         self.workspace_root = workspace_root
         self.trace_recorder = trace_recorder
         self.style_store = style_store
-
-    @cached_property
-    def checkpointer(self) -> InMemorySaver:
-        return InMemorySaver()
+        self.checkpointer = checkpointer
 
     def _backend_for_workspace(self, workspace_path: Path) -> FilesystemBackend:
         workspace_path.mkdir(parents=True, exist_ok=True)
@@ -108,26 +91,24 @@ class MetaAgentService:
             ]
         return []
 
-    def _resolve_style_text(self, workspace_id: str) -> str | None:
+    def _resolve_style_for_subagent(self, workspace_id: str, style_key: str) -> str | None:
+        """从激活风格中提取指定子代理对应的风格文本（SUFFIX）。
+
+        Args:
+            workspace_id: 工作区 ID
+            style_key:    风格字段名（character_style / outline_style / detail_outline_style / writing_style）
+
+        Returns:
+            风格 SUFFIX 文本，无激活风格或该字段为空时返回 None
+        """
         style_id = self.style_store.get_active_style_id(workspace_id)
         if not style_id:
             return None
         style = self.style_store.get_style(style_id)
         if not style:
             return None
-
-        parts = []
-        name = style.get("name", "")
-        parts.append(f"【写作风格：{name}】")
-        if style.get("character_style"):
-            parts.append(f"\n【角色风格】\n{style['character_style']}")
-        if style.get("outline_style"):
-            parts.append(f"\n【大纲风格】\n{style['outline_style']}")
-        if style.get("detail_outline_style"):
-            parts.append(f"\n【细纲风格】\n{style['detail_outline_style']}")
-        if style.get("writing_style"):
-            parts.append(f"\n【正文写作风格】\n{style['writing_style']}")
-        return "\n".join(parts) if len(parts) > 1 else None
+        text = style.get(style_key, "")
+        return text.strip() if text else None
 
     def _resolve_meta_style(self, workspace_id: str) -> str | None:
         style_id = self.style_store.get_active_style_id(workspace_id)
@@ -138,38 +119,41 @@ class MetaAgentService:
             return None
         return style.get("meta_style") or None
 
-    def _character_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_text: str | None = None) -> SubAgent:
+    def _character_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> SubAgent:
         middleware = self._middleware_for_workspace(workspace_path, trace_id, "character-subagent")
-        return build_character_subagent(workspace_path, middleware, style_text)
+        return build_character_subagent(workspace_path, middleware, style_suffix=style_suffix)
 
-    def _outline_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_text: str | None = None) -> CompiledSubAgent:
+    def _outline_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
         return build_outline_pipeline_subagent(
             workspace_path,
             build_writer_model(self.settings),
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
-            style_text=style_text,
+            style_suffix=style_suffix,
             context_file_paths=["outline.md", "character/*.md"],
+            checkpointer=self.checkpointer,
         )
 
-    def _detail_outline_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_text: str | None = None) -> CompiledSubAgent:
+    def _detail_outline_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
         return build_detail_outline_pipeline_subagent(
             workspace_path,
             build_writer_model(self.settings),
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
-            style_text=style_text,
+            style_suffix=style_suffix,
             context_file_paths=["outline.md", "character/*.md", "detail/overview.md", "detail/chapter-*.md"],
+            checkpointer=self.checkpointer,
         )
 
-    def _writing_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_text: str | None = None) -> CompiledSubAgent:
+    def _writing_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
         return build_writing_pipeline_subagent(
             workspace_path,
             build_writer_model(self.settings),
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
-            style_text=style_text,
+            style_suffix=style_suffix,
             context_file_paths=["outline.md", "character/*.md", "detail/*.md"],
+            checkpointer=self.checkpointer,
         )
 
     def _general_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None) -> SubAgent:
@@ -186,18 +170,22 @@ class MetaAgentService:
         ]
         if trace_id:
             middleware.insert(1, TraceMiddleware(self.trace_recorder, trace_id, "meta-agent"))
-        style_text = self._resolve_style_text(workspace_id) if workspace_id else None
         meta_style = self._resolve_meta_style(workspace_id) if workspace_id else None
+        # 每个子代理只注入对应的风格到 SUFFIX 槽位
+        character_style = self._resolve_style_for_subagent(workspace_id, "character_style") if workspace_id else None
+        outline_style = self._resolve_style_for_subagent(workspace_id, "outline_style") if workspace_id else None
+        detail_outline_style = self._resolve_style_for_subagent(workspace_id, "detail_outline_style") if workspace_id else None
+        writing_style = self._resolve_style_for_subagent(workspace_id, "writing_style") if workspace_id else None
         return create_deep_agent(
             model=model,
             tools=[],
             system_prompt=self._load_system_prompt(meta_style),
             subagents=[
                 self._general_subagent_for_workspace(workspace_path, trace_id),
-                self._character_subagent_for_workspace(workspace_path, trace_id, style_text),
-                self._outline_subagent_for_workspace(workspace_path, trace_id, style_text),
-                self._detail_outline_subagent_for_workspace(workspace_path, trace_id, style_text),
-                self._writing_subagent_for_workspace(workspace_path, trace_id, style_text),
+                self._character_subagent_for_workspace(workspace_path, trace_id, character_style),
+                self._outline_subagent_for_workspace(workspace_path, trace_id, outline_style),
+                self._detail_outline_subagent_for_workspace(workspace_path, trace_id, detail_outline_style),
+                self._writing_subagent_for_workspace(workspace_path, trace_id, writing_style),
             ],
             backend=self._backend_for_workspace(workspace_path),
             checkpointer=self.checkpointer,
@@ -213,13 +201,23 @@ class MetaAgentService:
     def delete_thread_checkpoint(self, thread_id: str) -> None:
         self.checkpointer.delete_thread(thread_id)
 
-    def is_long_form_request(self, payload: ScreenplayGenerateRequest) -> bool:
-        searchable_text = "\n".join(
-            str(value)
-            for value in payload.loose_context().values()
-            if value not in ("", [], {})
-        )
-        return any(keyword in searchable_text for keyword in LONG_FORM_NOVEL_KEYWORDS)
+    async def get_thread_checkpoint(self, thread_id: str) -> CheckpointState:
+        """读取 thread 的最新 checkpoint，规范化为 CheckpointState。"""
+        config = {"configurable": {"thread_id": thread_id}}
+        checkpoint = await self.checkpointer.aget(config)
+        if checkpoint is None:
+            print(f"[checkpoint] thread_id={thread_id} → aget returned None (no checkpoint saved)")
+            return CheckpointState(thread_id=thread_id, messages=[])
+        channel_values = checkpoint.get("channel_values", {})
+        raw_messages = channel_values.get("messages", [])
+        print(f"[checkpoint] thread_id={thread_id} → channel_keys={list(channel_values.keys())}, messages_count={len(raw_messages)}")
+        messages = []
+        for msg in raw_messages:
+            try:
+                messages.append(_normalize_message(msg))
+            except Exception as exc:
+                print(f"[checkpoint] skip message: {exc}")
+        return CheckpointState(thread_id=thread_id, messages=messages)
 
     def generate(
         self,
@@ -412,37 +410,22 @@ class MetaAgentService:
         context = "\n".join(context_lines) or "用户没有提供结构化字段。"
         request_text = free_text or "请根据已有工作目录内容继续优化大纲。"
 
-        if self.is_long_form_request(payload):
-            return self._build_long_form_user_prompt(request_text, context, thread)
-
         return (
-            "请根据用户需求执行创作任务，可生成或优化角色、剧情大纲、短篇片段或样章。\n"
-            "当前工作目录：/\n"
-            f"当前 session：{thread.thread_id}\n"
-            "如果本轮生成或修改了大纲，最终大纲必须写入该目录根目录的 outline.md；"
-            "outline 子代理会在成功写入后自动调用 evaluation 写入 evaluation.md。\n\n"
-            "用户需求：\n"
-            f"{request_text}\n\n"
-            "可用上下文（字段可能不完整，也可能包含额外信息）：\n"
-            f"{context}\n\n"
-            "回复请使用自然语言纯文本，不要返回 JSON。"
-        )
-
-    def _build_long_form_user_prompt(self, request_text: str, context: str, thread: ThreadSummary) -> str:
-        return (
-            "你正在执行完整小说创作任务。\n"
+            "请根据用户需求执行创作任务，根据需求规模自行判断创作范围——可能是角色、大纲、短篇片段、样章，也可能是一篇完整的长篇小说。\n"
             "当前工作目录：/\n"
             f"当前 session：{thread.thread_id}\n\n"
-            "硬性产物要求：\n"
-            "1. 必须按章节写入 chapter/ 目录，每章一个 Markdown 文件，文件名使用 chapter-XX.md。\n"
-            "2. 必须写入 outline.md，记录最终动态大纲。\n"
-            "3. 必须写入 state_log.md，记录全局参数、场景注册表、人物状态变化、大纲变更和完成度检查。\n"
-            "4. 必须写入 review/ 目录，每章一个审查 Markdown 文件。\n"
-            "5. 必须写入 evaluation.md，记录最终整体评估。\n"
-            "6. 必须生成或更新 character/ 下的人物档案，一个人物一个 Markdown 文件。\n\n"
-            "写作流程要求：\n"
+            "## 产物要求\n\n"
+            "所有情况都必须写入 outline.md 和 evaluation.md。\n\n"
+            "如果判定用户需要完整小说（长篇/中篇），还需满足以下额外产物要求：\n"
+            "- 按 chapter-XX.md 格式写入 chapter/ 目录，每章一个文件。\n"
+            "- 写入 state_log.md，记录全局参数、场景注册表、人物状态变化、大纲变更和完成度检查。\n"
+            "- 写入 review/ 目录，每章一个审查文件。\n"
+            "- 生成或更新 character/ 下的人物档案，一个人物一个文件。\n\n"
+            "## 长篇写作流程\n\n"
+            "如果判定为完整小说创作，遵循以下流程：\n"
             "- 第一版目标长度限制为 2万-3万字；不要扩写到 5万字以上。\n"
-            "- 采用分章推进；每次必须调用 writing 子代理只写一个章节，目标约 1000 字，允许 800-1500 字浮动。\n"
+            "- 细纲生成采用分章推进：先调用 detail-outline 子代理生成 overview.md（章节规划总览），获取总章节数；再按章节顺序逐章调用生成各章细纲。每次只委托一个文件。\n"
+            "- 正文写作采用分章推进；每次调用 writing 子代理只写一个章节，目标约 1000 字，允许 800-1500 字浮动。\n"
             "- 调用 writing 子代理时，必须提供总章节数、当前章节编号、剧情大纲、本章目标、出场人物、必须发生的 beat、承接关系、必须保留的事实和禁止改变的内容；不要提供前五章正文，writing 会自行读取 chapter/ 和 detail/。\n"
             "- 每完成一章或关键场景后，立即更新 chapter/ 对应章节文件与 state_log.md，不要等全书完成后才统一写入。\n"
             "- 每次 writing 子代理完成一个章节后，其内部会立即调用 review 子代理审查该章节的逻辑自洽性和表达清晰度，并写入 review/ 下对应章节审查文件。\n"
@@ -538,13 +521,6 @@ class MetaAgentService:
         if not evaluation_markdown:
             raise ValueError(f"Agent wrote an empty evaluation.md: {evaluation_path}")
 
-        if self.is_long_form_request(payload):
-            self._validate_long_form_artifacts(thread)
-            content = (
-                "完整小说已生成，正文已按章节写入 chapter/，最终大纲已写入 outline.md，"
-                "状态日志已写入 state_log.md，章节审查已写入 review/，评估已写入 evaluation.md。"
-            )
-
         return ScreenplayGenerateResponse(
             mode="live",
             thread_id=thread.thread_id,
@@ -556,26 +532,6 @@ class MetaAgentService:
             markdown=markdown,
             evaluation_markdown=evaluation_markdown,
         )
-
-    def _validate_long_form_artifacts(self, thread: ThreadSummary) -> None:
-        workspace_path = Path(thread.workspace_path)
-        state_log_path = workspace_path / "state_log.md"
-        if not state_log_path.exists():
-            raise FileNotFoundError(f"Agent did not write state_log.md: {state_log_path}")
-        if not state_log_path.read_text(encoding="utf-8").strip():
-            raise ValueError(f"Agent wrote an empty state_log.md: {state_log_path}")
-
-        chapter_dir = workspace_path / "chapter"
-        if not chapter_dir.is_dir():
-            raise FileNotFoundError(f"Agent did not write chapter directory: {chapter_dir}")
-        if not any(path.is_file() and path.suffix == ".md" and path.read_text(encoding="utf-8").strip() for path in chapter_dir.iterdir()):
-            raise ValueError(f"Agent did not write any non-empty chapter/*.md file: {chapter_dir}")
-
-        review_dir = workspace_path / "review"
-        if not review_dir.is_dir():
-            raise FileNotFoundError(f"Agent did not write review directory: {review_dir}")
-        if not any(path.is_file() and path.suffix == ".md" and path.read_text(encoding="utf-8").strip() for path in review_dir.iterdir()):
-            raise ValueError(f"Agent did not write any non-empty review/*.md file: {review_dir}")
 
     def _format_outline_markdown(self, response: ScreenplayGenerateResponse) -> str:
         beat_lines = "\n".join(
@@ -634,6 +590,78 @@ def _sse(event_type: str, payload: object) -> str:
     """Format a single Server-Sent Event line."""
     data = json.dumps(payload, ensure_ascii=False, default=str)
     return f"event: {event_type}\ndata: {data}\n\n"
+
+
+def _normalize_message(msg: object) -> CheckpointMessage:
+    """将 LangChain BaseMessage 转为 CheckpointMessage schema。"""
+    # dict 形式（从 checkpoint serde 还原）
+    if isinstance(msg, dict):
+        role = str(msg.get("type", msg.get("role", ""))).lower()
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            # multimodal content blocks → 拼接文本
+            content = "\n".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text" or isinstance(block, str)
+            )
+        content = str(content) if content else ""
+        tool_calls = None
+        raw_calls = msg.get("tool_calls")
+        if isinstance(raw_calls, list):
+            tool_calls = [
+                CheckpointToolCall(name=str(tc.get("name", "")), id=str(tc.get("id", "")))
+                for tc in raw_calls
+                if isinstance(tc, dict)
+            ]
+        name = msg.get("name")
+        return CheckpointMessage(
+            role=_map_role(role),
+            content=content,
+            tool_calls=tool_calls,
+            name=str(name) if name else None,
+        )
+
+    # LangChain message 对象
+    msg_type = getattr(msg, "type", "") or ""
+    content = getattr(msg, "content", "")
+    if isinstance(content, list):
+        content = "\n".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text" or isinstance(block, str)
+        )
+    content = str(content) if content else ""
+
+    tool_calls = None
+    raw_calls = getattr(msg, "tool_calls", None)
+    if isinstance(raw_calls, list):
+        tool_calls = [
+            CheckpointToolCall(name=str(tc.get("name", "")), id=str(tc.get("id", "")))
+            for tc in raw_calls
+            if isinstance(tc, dict)
+        ]
+
+    name = getattr(msg, "name", None)
+    return CheckpointMessage(
+        role=_map_role(msg_type),
+        content=content,
+        tool_calls=tool_calls,
+        name=str(name) if name else None,
+    )
+
+
+def _map_role(msg_type: str) -> str:
+    """将 LangChain 消息类型映射为标准化 role。"""
+    mapping = {
+        "system": "system",
+        "human": "human",
+        "user": "human",
+        "ai": "ai",
+        "assistant": "ai",
+        "tool": "tool",
+    }
+    return mapping.get(msg_type, msg_type)
 
 
 async def _next_trace_update(queue) -> str:

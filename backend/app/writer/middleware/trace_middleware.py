@@ -129,8 +129,15 @@ class TraceMiddleware(AgentMiddleware):
     # ------------------------------------------------------------------
 
     def _record_model_start(self, request: ModelRequest) -> None:
-        """记录模型调用开始事件。"""
+        """记录模型调用开始事件，包含完整输入消息列表和系统提示词。"""
         run_id, parent_run_id = self._current_run_ids()
+        messages_payload = _messages_payload(request.messages)
+        # 系统提示词在 request.system_message 上，不在 messages 列表中
+        system_msg = getattr(request, "system_message", None)
+        if system_msg is not None:
+            messages_payload = [_message_payload(system_msg)] + (
+                messages_payload if isinstance(messages_payload, list) else [messages_payload]
+            )
         self.recorder.append_event(
             self.trace_id,
             {
@@ -141,6 +148,7 @@ class TraceMiddleware(AgentMiddleware):
                 "run_id": run_id,
                 "parent_run_id": parent_run_id,
                 "model_name": _model_name(request.model),
+                "input": {"messages": messages_payload},
             },
         )
 

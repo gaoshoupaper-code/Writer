@@ -100,6 +100,8 @@ class TraceNode(BaseModel):
     output_context_anchor_id: str | None = None
     raw_event_ids: list[str] = Field(default_factory=list)
     error: str | None = None
+    chain_summary: str | None = None
+    parallel_group_id: str | None = None
 
 
 class TraceContextSegment(BaseModel):

@@ -12,7 +12,7 @@ const SIDEBAR_ITEMS: SidebarItem[] = [
   { id: "script", label: "大纲", description: "查看当前工作目录大纲" },
   { id: "detail_outline", label: "细纲", description: "查看逐章详细规划" },
   { id: "novel", label: "正文", description: "查看完整小说正文" },
-  { id: "trace", label: "Trace", description: "查看 Agent 执行追踪" },
+  { id: "trace", label: "检测系统", description: "执行追踪与 Token 图检测" },
 ];
 
 type SidebarProps = {

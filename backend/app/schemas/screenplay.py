@@ -40,9 +40,15 @@ class WorkspaceOutlineContent(BaseModel):
     markdown: str
 
 
+class DetailOutlineChapter(BaseModel):
+    filename: str
+    title: str
+    markdown: str
+
+
 class WorkspaceDetailOutlineContent(BaseModel):
     workspace_id: str
-    markdown: str
+    chapters: list[DetailOutlineChapter]
     file_count: int = 0
 
 

@@ -11,7 +11,7 @@
 #   ContextAssemblerMiddleware      — 通用上下文组装：由主代理配置文件路径，新阶段时读取并注入
 #   ErrorRecoveryMiddleware         — 工具调用出错时自动重试，耗尽后注入恢复建议
 #   FilesystemPathGuardMiddleware   — 拦截非法文件写入路径，防止越权或路径穿越
-#   GoalMiddleware                  — 维护写作目标状态，阻止未达标时输出最终答案
+#   GoalMiddleware                  — 注册目标工具和状态 schema，拦截未达标的最终输出
 #   TraceMiddleware                 — 记录模型调用和工具调用的开始/完成/错误事件
 #   TraceCallbackHandler            — LangChain 回调处理器，注册 run 层级的父子关系
 # ==============================================================================

@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 from app.schemas.screenplay import ThreadSummary
 from app.writer.trace.projector import TraceProjector
 from app.writer.trace.schemas import TraceDetail, TraceLogEvent, TraceRunSummary
+from app.writer.trace.summary_export import export_trace_summary
 
 
 @dataclass
@@ -137,7 +138,7 @@ class TraceRecorder:
                 agent_name=self._optional_str(values.get("agent_name")),
                 node_name=self._optional_str(values.get("node_name")),
                 model_name=self._optional_str(values.get("model_name")),
-                input=None if event_type.startswith("llm") else values.get("input"),
+                input=values.get("input"),
                 output=_sanitize_tool_call_inputs(values.get("output")),
                 usage=values.get("usage"),
                 tool_calls=_tool_calls_payload(values.get("tool_calls")),
@@ -282,7 +283,38 @@ class TraceRecorder:
         run["error"] = error
         runs[trace_id] = run
         self._write_index(thread, runs)
+
+        # 导出模型可读的执行记录摘要（包括失败的 trace）
+        self._export_summary(thread, trace_id, run)
+
         self._cleanup_run_state(trace_id)
+
+    def _export_summary(
+        self,
+        thread: ThreadSummary,
+        trace_id: str,
+        run_data: dict[str, Any],
+    ) -> None:
+        """trace 结束后自动导出摘要 JSON。"""
+        try:
+            trace_path = Path(thread.workspace_path) / str(run_data["path"])
+            if not trace_path.exists():
+                return
+            events = self._read_events(trace_path)
+            run_summary = TraceRunSummary.model_validate(run_data)
+            projection = self._projector.project(run_summary, events)
+            detail = TraceDetail(
+                run=run_summary,
+                events=events,
+                nodes=projection.nodes,
+                context=projection.context,
+                todos=projection.todos,
+            )
+            summary_path = trace_path.with_name(f"{trace_id}_summary.json")
+            export_trace_summary(detail, summary_path)
+        except Exception:
+            # 摘要导出失败不应影响 trace 正常结束流程
+            pass
 
     def _delete_run_from_index(
         self,
@@ -297,6 +329,10 @@ class TraceRecorder:
         trace_path = Path(thread.workspace_path) / str(run["path"])
         if trace_path.exists():
             trace_path.unlink()
+        # 同时清理摘要文件
+        summary_path = trace_path.with_name(f"{trace_id}_summary.json")
+        if summary_path.exists():
+            summary_path.unlink()
         del runs[trace_id]
         self._cleanup_run_state(trace_id)
 
@@ -362,7 +398,7 @@ def _sanitize_event_data(event_data: dict[str, Any]) -> dict[str, Any]:
     event_type = str(event_data.get("type") or "")
     sanitized = dict(event_data)
     if event_type.startswith("llm"):
-        sanitized.pop("input", None)
+        pass  # input 保留：包含模型完整输入（系统提示词、注入上下文、对话历史）
     sanitized.pop("tool_args", None)
     if "output" in sanitized:
         sanitized["output"] = _sanitize_tool_call_inputs(sanitized["output"])

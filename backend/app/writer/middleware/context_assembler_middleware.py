@@ -1,24 +1,24 @@
 """ContextAssemblerMiddleware — 通用上下文组装中间件。
 
 职责：
-  由主代理配置文件路径列表，在新阶段开始时从文件系统读取指定文件，
-  组装为结构化上下文并注入模型请求。
+  由主代理配置文件路径列表，在第一次模型调用前从文件系统读取指定文件，
+  将上下文作为 HumanMessage 永久注入到 state.messages。
+  后续模型调用通过重排序保证上下文位于任务前面，确保缓存前缀稳定。
 
-  合并了原 StageControlMiddleware（阶段检测）和 ContextAssemblerMiddleware
-  （文件读取 + 上下文注入）的职责，消除了子代理中的重复实现。
-
-阶段检测机制（原 StageControlMiddleware 职责）：
-  - 消息包含 ToolMessage → 工具调用循环中 → 透传
-  - 消息不含 ToolMessage → 新阶段 → 读取文件并注入上下文
+注入策略（双钩子协作）：
+  1. before_model（一次性）：
+     - 检测 state.messages 中是否已存在上下文消息
+     - 首次调用时读取文件，构建上下文 HumanMessage，追加到 state.messages
+     - 由于 add_messages reducer 只能 append，上下文会被追加到末尾
+  2. wrap_model_call（每次）：
+     - 将上下文消息从末尾移到列表开头（通过 request.override 临时重排序）
+     - 模型始终看到 [上下文, 任务, ...] 的顺序
+     - 缓存前缀 [上下文, 任务] 在整个调用过程中保持不变 → 命中缓存
 
 文件路径配置：
   由主代理在构建子代理时通过 file_paths 参数指定。
   支持通配符模式（如 "character/*.md"、"detail/chapter-*.md"）。
   文件按列表顺序读取，确保 prompt caching 前缀稳定。
-
-消息替换策略：
-  新阶段时丢弃旧消息，用 [上下文, 任务] 重新开始。
-  这是有意为之：保持上下文窗口可控，避免过期信息残留。
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from typing import Any
 
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
+from typing_extensions import override
 
 # 文件路径配置：静态列表或根据任务文本动态计算的回调函数
 FilePaths = list[str] | Callable[[str], list[str]]
@@ -37,8 +38,8 @@ FilePaths = list[str] | Callable[[str], list[str]]
 class ContextAssemblerMiddleware(AgentMiddleware):
     """通用上下文组装中间件。
 
-    由主代理配置文件路径，在新阶段时读取文件并注入上下文。
-    工具调用循环中直接透传，不做任何修改。
+    由主代理配置文件路径，在第一次模型调用前永久注入上下文到 state。
+    后续调用通过 wrap_model_call 重排序，将上下文放在任务前面，保证缓存命中。
 
     file_paths 支持两种模式：
     - 静态列表：每次注入相同文件集，适用于 outline、detail-outline 等
@@ -63,21 +64,65 @@ class ContextAssemblerMiddleware(AgentMiddleware):
         self.workspace = workspace_root
         self._file_paths = file_paths
         self.context_label = context_label
+        self._context_prefix = f"{context_label}："
+
+    # ------------------------------------------------------------------
+    # before_model: 一次性永久注入上下文到 state
+    # ------------------------------------------------------------------
+
+    @override
+    def before_model(self, state, runtime) -> dict[str, Any] | None:
+        """在第一次模型调用前，将文件上下文永久注入到 state.messages。
+
+        检测 state.messages 中是否已存在上下文消息：
+        - 已存在（前缀匹配）：跳过，避免重复注入
+        - 不存在：读取文件，构建上下文，作为 HumanMessage 追加到 state
+
+        注意：add_messages reducer 只能 append，所以上下文会被放在末尾。
+        实际的重排序（上下文移到 task 前面）由 wrap_model_call 负责。
+        """
+        messages = state.get("messages", [])
+        if _find_context_index(messages, self._context_prefix) is not None:
+            return None
+        task = _extract_task(messages)
+        context = self._build(task)
+        if not context:
+            return None
+        return {"messages": [HumanMessage(content=context)]}
+
+    @override
+    async def abefore_model(self, state, runtime) -> dict[str, Any] | None:
+        """异步版本。逻辑与同步版本完全相同。"""
+        messages = state.get("messages", [])
+        if _find_context_index(messages, self._context_prefix) is not None:
+            return None
+        task = _extract_task(messages)
+        context = self._build(task)
+        if not context:
+            return None
+        return {"messages": [HumanMessage(content=context)]}
+
+    # ------------------------------------------------------------------
+    # wrap_model_call: 重排序消息，上下文放最前面
+    # ------------------------------------------------------------------
 
     def wrap_model_call(
         self,
         request: ModelRequest[Any],
         handler: Callable[[ModelRequest[Any]], ModelResponse[Any]],
     ) -> ModelResponse[Any] | AIMessage:
-        """新阶段时读取文件并注入上下文，工具循环中直接透传。"""
-        if _has_tool_messages(request.messages):
+        """将上下文 HumanMessage 移到消息列表开头，保证缓存前缀稳定。
+
+        before_model 已将上下文追加到 state.messages 末尾，
+        这里通过 request.override 将其移到开头，让模型看到 [上下文, 任务, ...] 的顺序。
+        如果上下文已经在开头或不存在，直接透传。
+        """
+        idx = _find_context_index(request.messages, self._context_prefix)
+        if idx is None or idx == 0:
             return handler(request)
-        task = _extract_task(request.messages)
-        context = self._build(task)
-        return handler(request.override(messages=[
-            HumanMessage(content=context),
-            HumanMessage(content=task),
-        ]))
+        reordered = list(request.messages)
+        reordered.insert(0, reordered.pop(idx))
+        return handler(request.override(messages=reordered))
 
     async def awrap_model_call(
         self,
@@ -85,14 +130,12 @@ class ContextAssemblerMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest[Any]], Awaitable[ModelResponse[Any]]],
     ) -> ModelResponse[Any] | AIMessage:
         """异步版本。逻辑与同步版本完全相同。"""
-        if _has_tool_messages(request.messages):
+        idx = _find_context_index(request.messages, self._context_prefix)
+        if idx is None or idx == 0:
             return await handler(request)
-        task = _extract_task(request.messages)
-        context = self._build(task)
-        return await handler(request.override(messages=[
-            HumanMessage(content=context),
-            HumanMessage(content=task),
-        ]))
+        reordered = list(request.messages)
+        reordered.insert(0, reordered.pop(idx))
+        return await handler(request.override(messages=reordered))
 
     # ------------------------------------------------------------------
     # 上下文组装 — 通用，基于配置的文件路径
@@ -155,12 +198,15 @@ class ContextAssemblerMiddleware(AgentMiddleware):
 # ======================================================================
 
 
-def _has_tool_messages(messages: list[AnyMessage]) -> bool:
-    """检测消息列表中是否包含 ToolMessage。
+def _find_context_index(messages: list[AnyMessage], context_prefix: str) -> int | None:
+    """找到上下文 HumanMessage 在消息列表中的索引。
 
-    包含 ToolMessage 表示模型正在工具调用循环中。
+    通过 context_label 前缀匹配，确保只匹配本中间件注入的消息。
     """
-    return any(isinstance(m, ToolMessage) for m in messages)
+    for i, msg in enumerate(messages):
+        if isinstance(msg, HumanMessage) and isinstance(msg.content, str) and msg.content.startswith(context_prefix):
+            return i
+    return None
 
 
 def _file_block(path: Path, display_path: str) -> str:

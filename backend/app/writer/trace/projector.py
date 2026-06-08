@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, TypeVar
 
 T = TypeVar("T")
@@ -14,6 +15,14 @@ from app.writer.trace.schemas import (
     TraceUsage,
     TraceTodoItem,
     TraceTodoSnapshot,
+)
+from app.writer.trace.chain_summary import (
+    agent_summary,
+    build_tool_summary,
+    error_summary,
+    llm_summary,
+    run_summary,
+    todo_summary,
 )
 
 TODO_TOOL_NAMES = {"write_todos", "write_todo"}
@@ -31,6 +40,7 @@ class _PendingEvent:
     event: TraceLogEvent
     node_id: str
     input_range: TraceContextRange | None = None
+    parallel_group_id: str | None = None
 
 
 class TraceProjector:
@@ -45,21 +55,60 @@ class TraceProjector:
         llm_starts: dict[str, list[_PendingEvent]] = {}
         tool_starts: dict[str, list[_PendingEvent]] = {}
 
+        # ── 并行检测局部状态 ──
+        parallel_tc_to_group: dict[str, str] = {}   # tool_call_id → group_id
+        parallel_run_to_group: dict[str, str] = {}   # run_id → group_id（一级传播）
+        pg_counter: int = 0
+
         for event in events:
+            # ── N2: task 工具拦截 ──
+            if event.tool_name == "task" and event.type in {"tool_start", "tool_end", "tool_error"}:
+                if event.type == "tool_start":
+                    state.current_task_call_id = event.tool_call_id
+                    # 清理并行组追踪（防止泄漏）
+                    if event.tool_call_id:
+                        parallel_tc_to_group.pop(event.tool_call_id, None)
+                else:  # tool_end / tool_error
+                    state.current_task_call_id = None
+                continue  # ← 不创建 tool 节点、不创建 context
+
             if event.type in {"llm_start", "llm_end", "llm_error", "tool_start", "tool_end", "tool_error"}:
                 state.ensure_agent_node(event)
             if event.type == "llm_start":
+                # 检查 parent_run_id 是否属于并行组（一级传播）
+                pg_id = parallel_run_to_group.get(str(event.parent_run_id) if event.parent_run_id else "")
                 node_id = _llm_node_id(event)
-                llm_starts.setdefault(_event_pair_key(event), []).append(_PendingEvent(event=event, node_id=node_id))
+                llm_starts.setdefault(_event_pair_key(event), []).append(
+                    _PendingEvent(event=event, node_id=node_id, parallel_group_id=pg_id)
+                )
             elif event.type == "llm_end":
+                # 检测多 tool_calls → 注册并行组
+                if (event.tool_calls
+                        and isinstance(event.tool_calls, list)
+                        and len(event.tool_calls) > 1):
+                    pg_counter += 1
+                    pg_id = f"pg-{pg_counter}"
+                    for tc in event.tool_calls:
+                        if isinstance(tc, dict):
+                            tc_id = tc.get("id")
+                            if tc_id:
+                                parallel_tc_to_group[str(tc_id)] = pg_id
                 start = _pop_pending(llm_starts, _event_pair_key(event))
                 state.add_llm_node(start, event)
             elif event.type == "llm_error":
                 start = _pop_pending(llm_starts, _event_pair_key(event))
                 state.add_llm_error_node(start, event)
             elif event.type == "tool_start":
+                # 匹配 tool_call_id → 注册 run_id 一级传播
+                pg_id = None
+                if event.tool_call_id:
+                    pg_id = parallel_tc_to_group.pop(event.tool_call_id, None)
+                    if pg_id and event.run_id:
+                        parallel_run_to_group[str(event.run_id)] = pg_id
                 node_id = _tool_node_id(event)
-                tool_starts.setdefault(_event_pair_key(event), []).append(_PendingEvent(event=event, node_id=node_id))
+                tool_starts.setdefault(_event_pair_key(event), []).append(
+                    _PendingEvent(event=event, node_id=node_id, parallel_group_id=pg_id)
+                )
             elif event.type == "tool_end":
                 start = _pop_pending(tool_starts, _event_pair_key(event))
                 state.add_tool_node(start, event)
@@ -68,6 +117,21 @@ class TraceProjector:
                 state.add_tool_error_node(start, event)
             elif event.type == "run_error":
                 state.add_run_error(event)
+
+            # ── 实例时间戳追踪 ──
+            if event.agent_name and _agent_role(event.agent_name) == "subagent":
+                instance_id = state._agent_node_id(event)
+                state.instance_last_ts[instance_id] = event.timestamp
+
+        # ── 回填 agent 节点的 duration ──
+        for node in projection.nodes:
+            if node.kind != "agent":
+                continue
+            first = state.instance_first_ts.get(node.node_id)
+            last = state.instance_last_ts.get(node.node_id)
+            if first and last:
+                node.ended_at = last
+                node.duration_ms = _ts_diff_ms(first, last)
 
         for pending_events in llm_starts.values():
             for pending in pending_events:
@@ -84,18 +148,81 @@ class _ProjectionState:
         self.projection = projection
         self.agent_nodes: set[str] = set()
         self.context_sequence = 0
+        # task 边界追踪
+        self.current_task_call_id: str | None = None
+        self.agent_last_task: dict[str, str | None] = {}
+        self.agent_invocation_counter: dict[str, int] = {}
+        self.instance_first_ts: dict[str, str] = {}
+        self.instance_last_ts: dict[str, str] = {}
+
+    def _agent_node_id(self, event: TraceLogEvent) -> str:
+        """根据事件所属 agent 和当前实例追踪状态，返回正确的 node_id。"""
+        if not event.agent_name:
+            return "run"
+        if _agent_role(event.agent_name) == "main":
+            return f"agent:{event.agent_name}"
+        # Subagent：查实例表
+        invocation = self.agent_invocation_counter.get(event.agent_name)
+        if invocation is not None:
+            return f"agent:{event.agent_name}:{invocation}"
+        # D9 回退：从未通过 task 调用
+        return f"agent:{event.agent_name}"
 
     def ensure_agent_node(self, event: TraceLogEvent) -> None:
         if not event.agent_name:
             return
-        node_id = _agent_node_id(event)
-        if node_id in self.agent_nodes:
+
+        # ── Meta-agent：保持全局唯一 ──
+        if _agent_role(event.agent_name) == "main":
+            node_id = f"agent:{event.agent_name}"
+            if node_id in self.agent_nodes:
+                return
+            self.agent_nodes.add(node_id)
+            self.projection.nodes.append(
+                TraceNode(
+                    node_id=node_id,
+                    parent_node_id="run",
+                    kind="agent",
+                    label=event.agent_name,
+                    status="completed",
+                    agent_name=event.agent_name,
+                    agent_role=_agent_role(event.agent_name),
+                    depth=_agent_depth(event.agent_name),
+                    started_at=event.timestamp,
+                    raw_event_ids=[event.event_id],
+                    chain_summary=agent_summary(event),
+                )
+            )
             return
+
+        # ── Subagent：实例化拆分 ──
+        current_task = self.current_task_call_id
+        last_task = self.agent_last_task.get(event.agent_name)
+
+        if last_task is not None and last_task == current_task:
+            return  # 同一实例内，不需要新节点
+
+        # 新实例：不同 task_call_id 或首次出现
+        counter = self.agent_invocation_counter.get(event.agent_name, 0) + 1
+        self.agent_invocation_counter[event.agent_name] = counter
+        self.agent_last_task[event.agent_name] = current_task
+
+        node_id = f"agent:{event.agent_name}:{counter}"
         self.agent_nodes.add(node_id)
+        self.instance_first_ts[node_id] = event.timestamp
+
+        # 确定父节点
+        if _is_evaluation_agent(event.agent_name):
+            primary_name = _evaluation_primary_agent_name(event.agent_name)
+            primary_inv = self.agent_invocation_counter.get(primary_name, 1)
+            parent_id = f"agent:{primary_name}:{primary_inv}"
+        else:
+            parent_id = "run"
+
         self.projection.nodes.append(
             TraceNode(
                 node_id=node_id,
-                parent_node_id="run",
+                parent_node_id=parent_id,
                 kind="agent",
                 label=event.agent_name,
                 status="completed",
@@ -104,6 +231,7 @@ class _ProjectionState:
                 depth=_agent_depth(event.agent_name),
                 started_at=event.timestamp,
                 raw_event_ids=[event.event_id],
+                chain_summary=agent_summary(event),
             )
         )
 
@@ -113,10 +241,11 @@ class _ProjectionState:
         input_range = start.input_range if start else None
         raw_event_ids = _raw_ids(start.event if start else None, end)
         usage = end.usage or _usage_from_llm_output(end.output)
+        pg_id = start.parallel_group_id if start else None
         self.projection.nodes.append(
             TraceNode(
                 node_id=node_id,
-                parent_node_id=_agent_node_id(end),
+                parent_node_id=self._agent_node_id(end),
                 kind="llm",
                 label=_llm_label(end),
                 status=end.status,
@@ -132,6 +261,8 @@ class _ProjectionState:
                 input_context_range=input_range,
                 output_context_anchor_id=anchor_id,
                 raw_event_ids=raw_event_ids,
+                chain_summary=llm_summary(end),
+                parallel_group_id=pg_id,
             )
         )
 
@@ -139,10 +270,11 @@ class _ProjectionState:
         node_id = start.node_id if start else _llm_node_id(error)
         anchor_id = self._append_error(error, node_id, "LLM 失败")
         input_range = start.input_range if start else None
+        pg_id = start.parallel_group_id if start else None
         self.projection.nodes.append(
             TraceNode(
                 node_id=node_id,
-                parent_node_id=_agent_node_id(error),
+                parent_node_id=self._agent_node_id(error),
                 kind="error",
                 label=_llm_label(error),
                 status="failed",
@@ -158,6 +290,8 @@ class _ProjectionState:
                 output_context_anchor_id=anchor_id,
                 raw_event_ids=_raw_ids(start.event if start else None, error),
                 error=error.error,
+                chain_summary=error_summary(error.error),
+                parallel_group_id=pg_id,
             )
         )
 
@@ -166,7 +300,7 @@ class _ProjectionState:
         self.projection.nodes.append(
             TraceNode(
                 node_id=pending.node_id,
-                parent_node_id=_agent_node_id(event),
+                parent_node_id=self._agent_node_id(event),
                 kind="llm",
                 label=_llm_label(event),
                 status="running",
@@ -178,6 +312,8 @@ class _ProjectionState:
                 context_anchor_id=_range_start(pending.input_range),
                 input_context_range=pending.input_range,
                 raw_event_ids=[event.event_id],
+                chain_summary=llm_summary(event, is_running=True),
+                parallel_group_id=pending.parallel_group_id,
             )
         )
 
@@ -186,10 +322,11 @@ class _ProjectionState:
         anchor_id = self._append_tool_output(end, tool_node_id)
         input_range = start.input_range if start else None
         tool_error = _tool_error(end.tool_output)
+        pg_id = start.parallel_group_id if start else None
         self.projection.nodes.append(
             TraceNode(
                 node_id=tool_node_id,
-                parent_node_id=_agent_node_id(end),
+                parent_node_id=self._agent_node_id(end),
                 kind="tool",
                 label=_tool_label(end),
                 status="failed" if tool_error else end.status,
@@ -205,6 +342,8 @@ class _ProjectionState:
                 output_context_anchor_id=anchor_id,
                 raw_event_ids=_raw_ids(start.event if start else None, end),
                 error=tool_error,
+                chain_summary=build_tool_summary(end.tool_name, end.tool_output),
+                parallel_group_id=pg_id,
             )
         )
         if end.tool_name in TODO_TOOL_NAMES:
@@ -214,10 +353,11 @@ class _ProjectionState:
         node_id = start.node_id if start else _tool_node_id(error)
         anchor_id = self._append_error(error, node_id, "Tool 失败")
         input_range = start.input_range if start else None
+        pg_id = start.parallel_group_id if start else None
         self.projection.nodes.append(
             TraceNode(
                 node_id=node_id,
-                parent_node_id=_agent_node_id(error),
+                parent_node_id=self._agent_node_id(error),
                 kind="error",
                 label=_tool_label(error),
                 status="failed",
@@ -233,6 +373,8 @@ class _ProjectionState:
                 output_context_anchor_id=anchor_id,
                 raw_event_ids=_raw_ids(start.event if start else None, error),
                 error=error.error,
+                chain_summary=error_summary(error.error, error.tool_output),
+                parallel_group_id=pg_id,
             )
         )
 
@@ -241,7 +383,7 @@ class _ProjectionState:
         self.projection.nodes.append(
             TraceNode(
                 node_id=pending.node_id,
-                parent_node_id=_agent_node_id(event),
+                parent_node_id=self._agent_node_id(event),
                 kind="tool",
                 label=_tool_label(event),
                 status="running",
@@ -253,6 +395,8 @@ class _ProjectionState:
                 context_anchor_id=_range_start(pending.input_range),
                 input_context_range=pending.input_range,
                 raw_event_ids=[event.event_id],
+                chain_summary=f"{event.tool_name or 'Tool'}: 运行中…",
+                parallel_group_id=pending.parallel_group_id,
             )
         )
 
@@ -270,6 +414,7 @@ class _ProjectionState:
                 output_context_anchor_id=anchor_id,
                 raw_event_ids=[event.event_id],
                 error=event.error,
+                chain_summary=error_summary(event.error),
             )
         )
 
@@ -352,7 +497,7 @@ class _ProjectionState:
         self.projection.nodes.append(
             TraceNode(
                 node_id=todo_node_id,
-                parent_node_id=_agent_node_id(end),
+                parent_node_id=self._agent_node_id(end),
                 kind="todo",
                 label="Todo 更新",
                 status=end.status,
@@ -365,6 +510,7 @@ class _ProjectionState:
                 context_anchor_id=anchor_id,
                 output_context_anchor_id=anchor_id,
                 raw_event_ids=_raw_ids(start, end),
+                chain_summary=todo_summary(items),
             )
         )
 
@@ -421,6 +567,7 @@ def _run_node(run: TraceRunSummary, events: list[TraceLogEvent]) -> TraceNode:
         duration_ms=run.duration_ms,
         raw_event_ids=[event.event_id for event in events if event.type in {"run_start", "run_end", "run_error"}],
         error=run.error,
+        chain_summary=run_summary(run),
     )
 
 
@@ -466,10 +613,14 @@ def _phase_metadata(phase: str, event_type: str, **values: Any) -> dict[str, Any
     return {"phase": phase, "event_type": event_type, **{key: value for key, value in values.items() if value is not None}}
 
 
-def _agent_node_id(event: TraceLogEvent) -> str:
-    if not event.agent_name:
-        return "run"
-    return f"agent:{event.agent_name}"
+def _ts_diff_ms(start: str, end: str) -> int | None:
+    """计算两个 ISO 时间戳之间的毫秒差。"""
+    try:
+        t0 = datetime.fromisoformat(start)
+        t1 = datetime.fromisoformat(end)
+        return int((t1 - t0).total_seconds() * 1000)
+    except (ValueError, TypeError):
+        return None
 
 
 def _agent_role(agent_name: str | None) -> str | None:
@@ -480,7 +631,25 @@ def _agent_role(agent_name: str | None) -> str | None:
     return "main"
 
 
+def _is_evaluation_agent(agent_name: str | None) -> bool:
+    return bool(agent_name and "evaluation" in agent_name)
+
+
+def _evaluation_primary_agent_name(agent_name: str) -> str:
+    """evaluation agent → 其所属 primary subagent 的 agent_name。
+
+    - "evaluation-subagent"                → "outline-subagent"
+    - "detail-outline-evaluation-subagent" → "detail-outline-subagent"
+    - "writing-evaluation-subagent"        → "writing-subagent"
+    """
+    if agent_name == "evaluation-subagent":
+        return "outline-subagent"
+    return agent_name.replace("-evaluation", "")
+
+
 def _agent_depth(agent_name: str | None) -> int:
+    if _is_evaluation_agent(agent_name):
+        return 2
     return 1 if _agent_role(agent_name) == "subagent" else 0
 
 

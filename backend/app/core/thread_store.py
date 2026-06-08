@@ -10,6 +10,7 @@ from uuid import uuid4
 from app.schemas.character import CharacterGenerateResponse
 from app.schemas.screenplay import (
     CharacterMarkdownFile,
+    DetailOutlineChapter,
     ScreenplayGenerateResponse,
     ThreadSummary,
     WorkspaceCharacterContent,
@@ -202,19 +203,22 @@ class ThreadStore:
             raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
 
         detail_dir = workspace_path / "detail"
-        sections = []
-        file_count = 0
+        chapters: list[DetailOutlineChapter] = []
         if detail_dir.exists():
-            for artifact_path in sorted(detail_dir.glob("*.md"), key=lambda p: p.name):
+            for artifact_path in sorted(detail_dir.glob("*.md"), key=lambda p: (p.name != "overview.md", p.name)):
                 if artifact_path.name == "evaluation.md":
                     continue
                 content = artifact_path.read_text(encoding="utf-8").strip()
                 if content:
-                    sections.append(content)
-                    file_count += 1
+                    chapters.append(
+                        DetailOutlineChapter(
+                            filename=artifact_path.name,
+                            title=self._detail_outline_title(artifact_path.name),
+                            markdown=content,
+                        )
+                    )
 
-        markdown = "\n\n---\n\n".join(sections)
-        return WorkspaceDetailOutlineContent(workspace_id=workspace_id, markdown=markdown, file_count=file_count)
+        return WorkspaceDetailOutlineContent(workspace_id=workspace_id, chapters=chapters, file_count=len(chapters))
 
     def read_thread_outline(self, thread_id: str) -> WorkspaceOutlineContent | None:
         thread = self.get_thread(thread_id)
@@ -344,6 +348,15 @@ class ThreadStore:
         artifact_path.write_text(f"{markdown}\n", encoding="utf-8")
         self._touch_thread(thread.thread_id)
         self._touch_workspace(thread.workspace_id)
+
+    def _detail_outline_title(self, filename: str) -> str:
+        """从文件名推导显示标题：overview.md → 总览，chapter-01.md → 第1章"""
+        if filename == "overview.md":
+            return "总览"
+        match = re.match(r"chapter-(\d+)\.md$", filename)
+        if match:
+            return f"第{int(match.group(1))}章"
+        return Path(filename).stem
 
     def _workspace_chapter_files(self, workspace_path: Path) -> list[Path]:
         chapter_dir = workspace_path / "chapter"
