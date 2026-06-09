@@ -17,8 +17,8 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
 
-from app.writer.subagents.character_subagent import CharacterService
-from app.writer.meta_agent import MetaAgentService
+from app.writer.expert_agent.services.character import CharacterService
+from app.writer.meta import MetaAgentService
 from app.core.settings import get_settings
 from app.create_type.store import CreateTypeStore
 from app.create_type.optimizer import StyleOptimizer

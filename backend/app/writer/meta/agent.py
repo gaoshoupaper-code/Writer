@@ -14,11 +14,10 @@ from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
 from langchain.agents.middleware.types import AgentMiddleware
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
-from app.writer.subagents.character_subagent import build_character_deep_subagent
-from app.writer.subagents.detail_outline_subagent import build_detail_outline_deep_subagent
+from app.writer.expert_agent.agents.storybuilding import build_storybuilding_deep_subagent
+from app.writer.expert_agent.agents.detail_outline import build_detail_outline_deep_subagent
 from app.writer.models import build_writer_model
-from app.writer.subagents.outline_subagent import build_outline_deep_subagent
-from app.writer.subagents.writing_subagent import build_writing_deep_subagent
+from app.writer.expert_agent.agents.writing import build_writing_deep_subagent
 from app.writer.middleware import (
     ArtifactPrerequisite,
     ArtifactPrerequisiteMiddleware,
@@ -38,7 +37,7 @@ from app.schemas.screenplay import (
 )
 from app.schemas.checkpoint import CheckpointMessage, CheckpointState, CheckpointToolCall
 
-PROMPT_PATH = Path(__file__).resolve().parent / "prompt" / "meta_agent_system_prompt.md"
+PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "system.md"
 
 
 class MetaAgentService:
@@ -76,12 +75,12 @@ class MetaAgentService:
         workspace_path: Path,
         agent_name: str,
     ) -> list[ArtifactPrerequisite]:
-        if agent_name == "outline-subagent":
-            return [ArtifactPrerequisite("character design", workspace_path / "character", markdown_directory=True)]
         if agent_name == "detail-outline-subagent":
             return [
                 ArtifactPrerequisite("character design", workspace_path / "character", markdown_directory=True),
                 ArtifactPrerequisite("plot outline", workspace_path / "outline.md"),
+                ArtifactPrerequisite("worldview", workspace_path / "worldview.md"),
+                ArtifactPrerequisite("storylines", workspace_path / "storyline", markdown_directory=True),
             ]
         if agent_name == "writing-subagent":
             return [
@@ -119,23 +118,13 @@ class MetaAgentService:
             return None
         return style.get("meta_style") or None
 
-    def _character_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
-        return build_character_deep_subagent(
+    def _storybuilding_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
+        return build_storybuilding_deep_subagent(
             workspace_path,
             build_writer_model(self.settings),
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_workspace(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
-        )
-
-    def _outline_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
-        return build_outline_deep_subagent(
-            workspace_path,
-            build_writer_model(self.settings),
-            self._backend_for_workspace(workspace_path),
-            lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
-            style_suffix=style_suffix,
-            context_file_paths=["outline.md", "character/*.md"],
         )
 
     def _detail_outline_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
@@ -145,7 +134,7 @@ class MetaAgentService:
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
-            context_file_paths=["outline.md", "character/*.md", "detail/overview.md", "detail/chapter-*.md"],
+            context_file_paths=["outline.md", "character/*.md", "storyline/*.md", "worldview.md", "volume/*.md", "detail/overview.md", "detail/chapter-*.md"],
         )
 
     def _writing_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
@@ -155,7 +144,7 @@ class MetaAgentService:
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
-            context_file_paths=["outline.md", "character/*.md", "detail/*.md"],
+            context_file_paths=["outline.md", "character/*.md", "storyline/*.md", "worldview.md", "volume/*.md", "detail/*.md"],
         )
 
     def _general_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None) -> SubAgent:
@@ -174,8 +163,7 @@ class MetaAgentService:
             middleware.insert(1, TraceMiddleware(self.trace_recorder, trace_id, "meta-agent"))
         meta_style = self._resolve_meta_style(workspace_id) if workspace_id else None
         # 每个子代理只注入对应的风格到 SUFFIX 槽位
-        character_style = self._resolve_style_for_subagent(workspace_id, "character_style") if workspace_id else None
-        outline_style = self._resolve_style_for_subagent(workspace_id, "outline_style") if workspace_id else None
+        storybuilding_style = self._resolve_style_for_subagent(workspace_id, "storybuilding_style") if workspace_id else None
         detail_outline_style = self._resolve_style_for_subagent(workspace_id, "detail_outline_style") if workspace_id else None
         writing_style = self._resolve_style_for_subagent(workspace_id, "writing_style") if workspace_id else None
         return create_deep_agent(
@@ -184,8 +172,7 @@ class MetaAgentService:
             system_prompt=self._load_system_prompt(meta_style),
             subagents=[
                 self._general_subagent_for_workspace(workspace_path, trace_id),
-                self._character_subagent_for_workspace(workspace_path, trace_id, character_style),
-                self._outline_subagent_for_workspace(workspace_path, trace_id, outline_style),
+                self._storybuilding_subagent_for_workspace(workspace_path, trace_id, storybuilding_style),
                 self._detail_outline_subagent_for_workspace(workspace_path, trace_id, detail_outline_style),
                 self._writing_subagent_for_workspace(workspace_path, trace_id, writing_style),
             ],
@@ -413,29 +400,41 @@ class MetaAgentService:
         request_text = free_text or "请根据已有工作目录内容继续优化大纲。"
 
         return (
-            "请根据用户需求执行创作任务，根据需求规模自行判断创作范围——可能是角色、大纲、短篇片段、样章，也可能是一篇完整的长篇小说。\n"
+            "请根据用户需求执行创作任务。\n"
             "当前工作目录：/\n"
             f"当前 session：{thread.thread_id}\n\n"
+
+            "## 故事构建流程\n\n"
+            "对于需要完整故事构建的需求（长篇/中篇），采用迭代式构建：\n"
+            "1. 判断故事规模，确定需要的迭代轮数（通常 2-4 轮）。\n"
+            "2. 每轮委托 storybuilding 子代理，传入：当前轮次编号、用户扩展方向（如有）、本轮焦点。\n"
+            "3. 每轮返回后检查评估结果；如标记质量风险，在下一轮优先修复。\n"
+            "4. 循环结束后进入 detail-outline → writing 阶段。\n\n"
+
+            "## storybuilding 委托规范\n\n"
+            "每次委托 storybuilding 时必须明确传达：\n"
+            "- 当前轮次（第几轮/共几轮）\n"
+            "- 本轮焦点：优先扩展哪些维度（人物/故事线/世界观/总纲/卷纲）\n"
+            "- 用户的扩展方向（如有）\n"
+            "- 前几轮评估中发现的问题（如有）\n\n"
+
+            "## 后续阶段\n\n"
+            "storybuilding 迭代完成后，进入细纲和正文阶段：\n"
+            "- detail-outline：先调用生成 detail/overview.md（章节规划总览），获取总章节数；再按章节顺序逐章调用，每次只委托一个文件。\n"
+            "- writing：每次调用只写一个章节，目标约 1000 字，允许 800-1500 字浮动。\n"
+            "- 调用 writing 子代理时，必须提供总章节数、当前章节编号、剧情大纲、本章目标、出场人物、必须发生的 beat、承接关系、必须保留的事实和禁止改变的内容；不要提供前五章正文，writing 会自行读取 chapter/ 和 detail/。\n"
+            "- 每完成一章后，立即更新对应章节文件，不要等全书完成后才统一写入。\n"
+            "- writing 子代理内部 evolution 会自动审查章节质量，最多 3 轮；若仍未通过，接受当前最好版本并在返回摘要中标记质量风险。\n"
+            "- 允许动态调整大纲：小改自动接受；中改和大改由你作为 Director 决策。\n"
+            "- 最终回复只给摘要，不要在回复中输出章节正文全文。\n\n"
+
             "## 产物要求\n\n"
             "所有情况都必须写入 outline.md 和 evaluation.md。\n\n"
             "如果判定用户需要完整小说（长篇/中篇），还需满足以下额外产物要求：\n"
             "- 按 chapter-XX.md 格式写入 chapter/ 目录，每章一个文件。\n"
             "- 写入 state_log.md，记录全局参数、场景注册表、人物状态变化、大纲变更和完成度检查。\n"
-            "- 写入 review/ 目录，每章一个审查文件。\n"
-            "- 生成或更新 character/ 下的人物档案，一个人物一个文件。\n\n"
-            "## 长篇写作流程\n\n"
-            "如果判定为完整小说创作，遵循以下流程：\n"
-            "- 第一版目标长度限制为 2万-3万字；不要扩写到 5万字以上。\n"
-            "- 细纲生成采用分章推进：先调用 detail-outline 子代理生成 overview.md（章节规划总览），获取总章节数；再按章节顺序逐章调用生成各章细纲。每次只委托一个文件。\n"
-            "- 正文写作采用分章推进；每次调用 writing 子代理只写一个章节，目标约 1000 字，允许 800-1500 字浮动。\n"
-            "- 调用 writing 子代理时，必须提供总章节数、当前章节编号、剧情大纲、本章目标、出场人物、必须发生的 beat、承接关系、必须保留的事实和禁止改变的内容；不要提供前五章正文，writing 会自行读取 chapter/ 和 detail/。\n"
-            "- 每完成一章或关键场景后，立即更新 chapter/ 对应章节文件与 state_log.md，不要等全书完成后才统一写入。\n"
-            "- 每次 writing 子代理完成一个章节后，其内部 evolution 子代理会自动审查该章节的逻辑自洽性和表达清晰度，并写入 review/ 下对应章节审查文件。\n"
-            "- writing 子代理内部会根据 evolution 审查结论自动修订同一章节，最多 3 轮；若仍未通过，会接受当前最好版本并在返回摘要中标记质量风险，由你决定是否调整 outline/state_log 或后续补救。\n"
-            "- 允许动态调整大纲：小改自动接受；中改和大改由你作为 Director 决策，并写入 state_log.md。\n"
-            "- 每个场景最多修订 3 轮；超过后必须由你决定接受、重写、调整大纲或丢弃重来。\n"
-            "- 最终必须确认 outline 子代理返回时已包含最新 evaluation.md（其内部 evolution 会自动生成）；如果最后一次 outline 调用已经自动生成了最新 evaluation.md，可以直接基于该评估收尾。\n"
-            "- 最终回复只给摘要，不要在回复中输出章节正文全文。\n\n"
+            "- 写入 review/ 目录，每章一个审查文件。\n\n"
+
             "用户需求：\n"
             f"{request_text}\n\n"
             "可用上下文（字段可能不完整，也可能包含额外信息）：\n"

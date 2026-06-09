@@ -29,13 +29,15 @@ def build_deep_subagent(
     backend: object | None = None,
     artifact_paths: list[Path] | None = None,
     max_revisions: int = 3,
+    skills: list[str] | None = None,
 ) -> CompiledSubAgent:
     """将创作型子代理构建为 DeepAgent（内含 evolution 评估子代理）。
 
     架构：
       create_deep_agent(
           subagents=[evolution SubAgent],
-          middleware=[...项目中间件, RevisionLimitMiddleware, ArtifactValidationMiddleware]
+          middleware=[...项目中间件, RevisionLimitMiddleware, ArtifactValidationMiddleware],
+          skills=[...SKILL.md 所在目录路径]
       ) → 包装为 CompiledSubAgent 返回
 
     流程（由 DeepAgent 自主决策）：
@@ -51,11 +53,12 @@ def build_deep_subagent(
         model:               聊天模型
         system_prompt:       子代理系统提示词（含修订指令）
         evolution_spec:      已构建好的 evolution SubAgent 规格字典
-                             （由调用方通过 build_evaluation_subagent 构建）
+                             （由调用方通过 build_*_evaluator 构建）
         subagent_middleware: 子代理的额外中间件（可选，由调用方注入 PathGuard/Trace/Goal 等）
         backend:             DeepAgents 后端（文件系统）
         artifact_paths:      期望的产物文件路径列表（用于 ArtifactValidationMiddleware）
         max_revisions:       最大修订（evolution 调用）次数，默认 3
+        skills:              DeepAgent Skill 目录路径列表（可选）
 
     Returns:
         编译后的子代理字典 {name, description, runnable}，可直接注册到父代理
@@ -79,6 +82,7 @@ def build_deep_subagent(
         # checkpointer=None: 子代理在父代理的 task 工具调用内执行，
         # 父代理的 checkpointer 已捕获完整对话历史，无需独立持久化
         checkpointer=None,
+        skills=skills or [],
     )
 
     # ---- 3. 包装为 CompiledSubAgent ----

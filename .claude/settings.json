@@ -1,50 +1,5 @@
 {
-  "hooks": {
-    "UserPromptExpansion": [
-      {
-        "matcher": "require|design",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python .claude/hooks/trace_recorder.py expansion"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python .claude/hooks/trace_recorder.py stop"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python .claude/hooks/trace_recorder.py submit"
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python .claude/hooks/trace_recorder.py post_tool"
-          }
-        ]
-      }
-    ]
-  },
+  "hooks": {},
   "permissions": {
     "allow": [
       "Bash(pytest repos/geli-ai/tests/test_tool_builder_service.py -q)",
