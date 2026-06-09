@@ -1,335 +1,97 @@
 from __future__ import annotations
 
+# NOTE: 原测试文件（336 行）测试已废弃的 _build_compiled_pipeline_subagent 管道。
+# Pipeline 已被 DeepAgent 架构替代（build_xxx_deep_subagent）。
+# 以下测试覆盖新架构的关键组件：RevisionLimitMiddleware 和 ArtifactValidationMiddleware。
+# 完整集成测试需要通过前端触发实际创作流程。
+
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage
-from langchain_core.runnables import RunnableLambda
+from langchain_core.messages import AIMessage, ToolMessage
 
-from app.core.settings import Settings
-from app.writer.middleware import GoalMiddleware
-from app.writer.meta_agent import MetaAgentService
-from app.writer.subagents.detail_outline_subagent import (
-    _build_revision_instruction as _detail_revision_instruction,
-)
-from app.writer.subagents.outline_subagent import _build_compiled_pipeline_subagent
-from app.writer.trace import TraceRecorder
+from app.writer.middleware.revision_limit_middleware import RevisionLimitMiddleware
+from app.writer.middleware.artifact_validation_middleware import ArtifactValidationMiddleware
 
 
-class _FakeStyleStore:
-    """Minimal style store stub for tests."""
-    def get_active_style_id(self, workspace_id: str) -> str | None:
-        return None
-    def get_style(self, style_id: str) -> dict | None:
-        return None
+class TestRevisionLimitMiddleware(unittest.TestCase):
+    """测试修订次数硬上限中间件。"""
+
+    def _make_request(self, tool_name: str, target: str | None = None) -> Any:
+        """构建 mock 的 tool call request 对象。"""
+        class MockRequest:
+            def __init__(self, name, subagent_type):
+                self.tool_call = {
+                    "name": name,
+                    "args": {"subagent_type": subagent_type} if subagent_type else {},
+                    "id": "test-call-1",
+                }
+        return MockRequest(tool_name, target)
+
+    def test_non_task_tool_passes_through(self):
+        """非 task 工具调用应该直接放行。"""
+        mw = RevisionLimitMiddleware(max_revisions=3)
+        req = self._make_request("write_file")
+        result = mw.wrap_tool_call(req, lambda r: "ok")
+        self.assertEqual(result, "ok")
+
+    def test_evolution_call_within_limit(self):
+        """evolution 调用在限制内应该放行。"""
+        mw = RevisionLimitMiddleware(max_revisions=3)
+        req = self._make_request("task", "evolution")
+        result = mw.wrap_tool_call(req, lambda r: "eval-result")
+        self.assertEqual(result, "eval-result")
+
+    def test_evolution_call_exceeds_limit(self):
+        """evolution 调用超过限制应该返回终止消息。"""
+        mw = RevisionLimitMiddleware(max_revisions=2)
+        req = self._make_request("task", "evolution")
+        # 前 2 次放行
+        mw.wrap_tool_call(req, lambda r: "eval-1")
+        mw.wrap_tool_call(req, lambda r: "eval-2")
+        # 第 3 次应该被拦截
+        result = mw.wrap_tool_call(req, lambda r: "should-not-reach")
+        self.assertIsInstance(result, ToolMessage)
+        self.assertIn("修订上限", result.content)
+
+    def test_non_evolution_task_passes_through(self):
+        """task 工具但目标不是 evolution 时应该放行。"""
+        mw = RevisionLimitMiddleware(max_revisions=1)
+        req = self._make_request("task", "other-subagent")
+        result = mw.wrap_tool_call(req, lambda r: "ok")
+        self.assertEqual(result, "ok")
 
 
-class PipelineSubagentsTest(unittest.TestCase):
-    def test_outline_pipeline_runs_evaluation_after_outline_success(self) -> None:
-        calls: list[str] = []
+class TestArtifactValidationMiddleware(unittest.TestCase):
+    """测试产物文件校验中间件。"""
+
+    def test_empty_artifact_paths_always_passes(self):
+        """没有配置产物路径时应该始终放行。"""
+        mw = ArtifactValidationMiddleware(artifact_paths=[])
+        state = {"messages": [AIMessage(content="done")]}
+        result = mw.after_model(state, None)
+        self.assertIsNone(result)
+
+    def test_tool_call_passes_through(self):
+        """AI 消息含工具调用时应该放行。"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            workspace = Path(tmpdir)
+            artifact = Path(tmpdir) / "test.md"
+            mw = ArtifactValidationMiddleware(artifact_paths=[artifact])
+            state = {"messages": [AIMessage(content="", tool_calls=[{"name": "write_file", "args": {}, "id": "1"}])]}
+            result = mw.after_model(state, None)
+            self.assertIsNone(result)
 
-            def outline_agent(state: dict[str, Any]) -> dict[str, list[AIMessage]]:
-                calls.append("outline")
-                (workspace / "outline.md").write_text("outline", encoding="utf-8")
-                return {"messages": [AIMessage(content="outline done")]}
-
-            def evaluation_agent(state: dict[str, Any]) -> dict[str, list[AIMessage]]:
-                calls.append("evaluation")
-                (workspace / "evaluation.md").write_text("evaluation", encoding="utf-8")
-                return {"messages": [AIMessage(content="evaluation done")]}
-
-            spec = _build_compiled_pipeline_subagent(
-                name="outline",
-                description="outline pipeline",
-                workspace_root=workspace,
-                primary_agent=RunnableLambda(outline_agent),
-                secondary_agent=RunnableLambda(evaluation_agent),
-                primary_artifact="outline.md",
-                secondary_artifact="evaluation.md",
-                primary_label="outline",
-                secondary_label="evaluation",
-                secondary_instruction="evaluate outline",
-            )
-
-            result = spec["runnable"].invoke({"messages": [HumanMessage(content="build outline")]})
-
-        self.assertEqual(calls, ["outline", "evaluation"])
-        self.assertIn("outline.md：已写入或更新", result["messages"][-1].content)
-        self.assertIn("evaluation.md：已写入", result["messages"][-1].content)
-
-    def test_outline_pipeline_does_not_run_evaluation_when_outline_missing(self) -> None:
-        calls: list[str] = []
+    def test_missing_artifact_triggers_block(self):
+        """产物文件缺失时应该拦截输出。"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            workspace = Path(tmpdir)
-
-            def outline_agent(state: dict[str, Any]) -> dict[str, list[AIMessage]]:
-                calls.append("outline")
-                return {"messages": [AIMessage(content="outline skipped")]}
-
-            def evaluation_agent(state: dict[str, Any]) -> dict[str, list[AIMessage]]:
-                calls.append("evaluation")
-                (workspace / "evaluation.md").write_text("evaluation", encoding="utf-8")
-                return {"messages": [AIMessage(content="evaluation done")]}
-
-            spec = _build_compiled_pipeline_subagent(
-                name="outline",
-                description="outline pipeline",
-                workspace_root=workspace,
-                primary_agent=RunnableLambda(outline_agent),
-                secondary_agent=RunnableLambda(evaluation_agent),
-                primary_artifact="outline.md",
-                secondary_artifact="evaluation.md",
-                primary_label="outline",
-                secondary_label="evaluation",
-                secondary_instruction="evaluate outline",
-            )
-
-            with self.assertRaises(FileNotFoundError):
-                spec["runnable"].invoke({"messages": [HumanMessage(content="build outline")]})
-
-        self.assertEqual(calls, ["outline"])
-
-    def test_outline_pipeline_rebuilds_evaluation_input_on_revision(self) -> None:
-        evaluation_calls: list[list[str]] = []
-        with tempfile.TemporaryDirectory() as tmpdir:
-            workspace = Path(tmpdir)
-            revision_state = {"count": 0}
-
-            def outline_agent(state: dict[str, Any]) -> dict[str, list[AIMessage]]:
-                prompt = cast(HumanMessage, state["messages"][-1]).content
-                if not isinstance(prompt, str):
-                    raise TypeError("Expected text prompt for outline agent.")
-                if revision_state["count"] == 0:
-                    (workspace / "outline.md").write_text("draft v1", encoding="utf-8")
-                    return {"messages": [AIMessage(content="outline draft ready")]}
-                self.assertIn("请先读取 evaluation.md 获取完整评估报告", prompt)
-                (workspace / "outline.md").write_text("draft v2", encoding="utf-8")
-                return {"messages": [AIMessage(content="outline revised")]}
-
-            def evaluation_agent(state: dict[str, Any]) -> dict[str, list[AIMessage]]:
-                texts = [
-                    message.content
-                    for message in state["messages"]
-                    if isinstance(message, HumanMessage) and isinstance(message.content, str)
-                ]
-                evaluation_calls.append(texts)
-                self.assertEqual(len(texts), 1)
-                self.assertIn("上游子代理返回摘要", texts[0])
-                self.assertIn("后置任务：\nevaluate outline", texts[0])
-                self.assertNotIn("请重新评估", texts[0])
-                if revision_state["count"] == 0:
-                    (workspace / "evaluation.md").write_text(
-                        "总分：70\n修改建议：建议修改\n是否需要主代理再次调用 outline 修订：是",
-                        encoding="utf-8",
-                    )
-                    revision_state["count"] = 1
-                    return {"messages": [AIMessage(content="总分：70\n修改建议：建议修改\n是否需要主代理再次调用 outline 修订：是")]}
-                (workspace / "evaluation.md").write_text(
-                    "总分：92\n修改建议：无需修改\n是否需要主代理再次调用 outline 修订：否",
-                    encoding="utf-8",
-                )
-                return {"messages": [AIMessage(content="总分：92\n修改建议：无需修改\n是否需要主代理再次调用 outline 修订：否")]}
-
-            spec = _build_compiled_pipeline_subagent(
-                name="outline",
-                description="outline pipeline",
-                workspace_root=workspace,
-                primary_agent=RunnableLambda(outline_agent),
-                secondary_agent=RunnableLambda(evaluation_agent),
-                primary_artifact="outline.md",
-                secondary_artifact="evaluation.md",
-                primary_label="outline",
-                secondary_label="evaluation",
-                secondary_instruction="evaluate outline",
-                enable_revision_loop=True,
-                max_revision_count=2,
-                secondary_result_parser=lambda result: {
-                    "decision": (
-                        "revise"
-                        if "是否需要主代理再次调用 outline 修订：是" in result
-                        else "accept"
-                    ),
-                    "revision_instruction": (
-                        "请修订大纲"
-                        if "是否需要主代理再次调用 outline 修订：是" in result
-                        else ""
-                    ),
-                },
-                revision_instruction_builder=lambda state: "请先读取 evaluation.md 获取完整评估报告，然后修订 outline.md。",
-            )
-
-            result = spec["runnable"].invoke({"messages": [HumanMessage(content="build outline")]})
-
-        self.assertEqual(len(evaluation_calls), 2)
-        self.assertEqual(len(evaluation_calls[0]), 1)
-        self.assertEqual(len(evaluation_calls[1]), 1)
-        self.assertIn("outline draft ready", evaluation_calls[0][0])
-        self.assertIn("outline revised", evaluation_calls[1][0])
-        self.assertNotIn("outline draft ready", evaluation_calls[1][0])
-        self.assertIn("修订轮数：1/2", result["messages"][-1].content)
-
-    def test_detail_outline_pipeline_runs_single_file_generation(self) -> None:
-        calls: list[str] = []
-        with tempfile.TemporaryDirectory() as tmpdir:
-            workspace = Path(tmpdir)
-            (workspace / "detail").mkdir()
-
-            def detail_agent(state: dict[str, Any]) -> dict[str, list[AIMessage]]:
-                calls.append("detail-outline")
-                (workspace / "detail" / "overview.md").write_text("overview content", encoding="utf-8")
-                return {"messages": [AIMessage(content="overview done")]}
-
-            def evaluation_agent(state: dict[str, Any]) -> dict[str, list[AIMessage]]:
-                calls.append("evaluation")
-                (workspace / "detail" / "evaluation.md").write_text("evaluation content", encoding="utf-8")
-                return {"messages": [AIMessage(content="evaluation done")]}
-
-            spec = _build_compiled_pipeline_subagent(
-                name="detail-outline",
-                description="detail outline pipeline",
-                workspace_root=workspace,
-                primary_agent=RunnableLambda(detail_agent),
-                secondary_agent=RunnableLambda(evaluation_agent),
-                primary_artifact="detail/",
-                secondary_artifact="detail/evaluation.md",
-                primary_label="detail-outline",
-                secondary_label="evaluation",
-                secondary_instruction="evaluate detail outline",
-            )
-
-            result = spec["runnable"].invoke({"messages": [HumanMessage(content="生成 overview")]})
-
-        self.assertEqual(calls, ["detail-outline", "evaluation"])
-        self.assertIn("detail/：已写入或更新", result["messages"][-1].content)
-
-    def test_detail_outline_revision_instruction_includes_context(self) -> None:
-        state = {
-            "messages": [HumanMessage(content="生成 chapter-01 细纲")],
-            "primary_result": "chapter-01 细纲已生成",
-            "secondary_result": "总分：70\n修改建议：建议修改",
-        }
-        instruction = _detail_revision_instruction(state)
-
-        self.assertIn("生成 chapter-01 细纲", instruction)
-        self.assertIn("chapter-01 细纲已生成", instruction)
-        self.assertIn("总分：70", instruction)
-        self.assertIn("detail/evaluation.md", instruction)
-        self.assertIn("detail/", instruction)
-
-    def test_writing_pipeline_runs_review_after_writing_success(self) -> None:
-        calls: list[str] = []
-        with tempfile.TemporaryDirectory() as tmpdir:
-            workspace = Path(tmpdir)
-
-            def writing_agent(state: dict[str, Any]) -> dict[str, list[AIMessage]]:
-                calls.append("writing")
-                (workspace / "novel.md").write_text("novel", encoding="utf-8")
-                return {"messages": [AIMessage(content="writing done")]}
-
-            def review_agent(state: dict[str, Any]) -> dict[str, list[AIMessage]]:
-                calls.append("review")
-                (workspace / "review").mkdir()
-                (workspace / "review" / "chapter-01.md").write_text("review", encoding="utf-8")
-                return {"messages": [AIMessage(content="review done")]}
-
-            spec = _build_compiled_pipeline_subagent(
-                name="writing",
-                description="writing pipeline",
-                workspace_root=workspace,
-                primary_agent=RunnableLambda(writing_agent),
-                secondary_agent=RunnableLambda(review_agent),
-                primary_artifact="novel.md",
-                secondary_artifact="review/",
-                primary_label="writing",
-                secondary_label="review",
-                secondary_instruction="review latest chapter",
-            )
-
-            result = spec["runnable"].invoke({"messages": [HumanMessage(content="write scene")]})
-
-        self.assertEqual(calls, ["writing", "review"])
-        self.assertIn("novel.md：已写入或更新", result["messages"][-1].content)
-        self.assertIn("review/：已写入或更新", result["messages"][-1].content)
-
-    def test_writing_pipeline_does_not_run_review_when_novel_missing(self) -> None:
-        calls: list[str] = []
-        with tempfile.TemporaryDirectory() as tmpdir:
-            workspace = Path(tmpdir)
-
-            def writing_agent(state: dict[str, Any]) -> dict[str, list[AIMessage]]:
-                calls.append("writing")
-                return {"messages": [AIMessage(content="writing skipped")]}
-
-            def review_agent(state: dict[str, Any]) -> dict[str, list[AIMessage]]:
-                calls.append("review")
-                (workspace / "review").mkdir()
-                (workspace / "review" / "chapter-01.md").write_text("review", encoding="utf-8")
-                return {"messages": [AIMessage(content="review done")]}
-
-            spec = _build_compiled_pipeline_subagent(
-                name="writing",
-                description="writing pipeline",
-                workspace_root=workspace,
-                primary_agent=RunnableLambda(writing_agent),
-                secondary_agent=RunnableLambda(review_agent),
-                primary_artifact="novel.md",
-                secondary_artifact="review/",
-                primary_label="writing",
-                secondary_label="review",
-                secondary_instruction="review latest chapter",
-            )
-
-            with self.assertRaises(FileNotFoundError):
-                spec["runnable"].invoke({"messages": [HumanMessage(content="write scene")]})
-
-        self.assertEqual(calls, ["writing"])
-
-
-class MetaAgentSubagentRegistrationTest(unittest.TestCase):
-    def test_outline_and_writing_are_compiled_subagents(self) -> None:
-        settings = Settings(
-            writer_model="openai:test-model",
-            writer_agent_mode="live",
-            writer_frontend_origin="http://localhost:5173",
-            openai_api_key="test-key",
-            openai_base_url="http://localhost:1234/v1",
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            workspace = Path(tmpdir)
-            service = MetaAgentService(settings, workspace, TraceRecorder(), _FakeStyleStore())
-
-            outline = service._outline_subagent_for_workspace(workspace)
-            writing = service._writing_subagent_for_workspace(workspace)
-
-        self.assertEqual(outline["name"], "outline")
-        self.assertIn("runnable", outline)
-        self.assertEqual(writing["name"], "writing")
-        self.assertIn("runnable", writing)
-
-    def test_subagent_specs_receive_goal_middleware(self) -> None:
-        settings = Settings(
-            writer_model="openai:test-model",
-            writer_agent_mode="live",
-            writer_frontend_origin="http://localhost:5173",
-            openai_api_key="test-key",
-            openai_base_url="http://localhost:1234/v1",
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            workspace = Path(tmpdir)
-            service = MetaAgentService(settings, workspace, TraceRecorder(), _FakeStyleStore())
-            subagents = [
-                service._general_subagent_for_workspace(workspace),
-                service._character_subagent_for_workspace(workspace),
-            ]
-
-        for subagent in subagents:
-            with self.subTest(name=subagent["name"]):
-                middleware = subagent.get("middleware", [])
-                self.assertTrue(any(isinstance(item, GoalMiddleware) for item in middleware))
+            artifact = Path(tmpdir) / "nonexistent.md"
+            mw = ArtifactValidationMiddleware(artifact_paths=[artifact])
+            state = {"messages": [AIMessage(content="I'm done")]}
+            result = mw.after_model(state, None)
+            self.assertIsNotNone(result)
+            self.assertIn("jump_to", result)
 
 
 if __name__ == "__main__":

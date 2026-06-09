@@ -1,25 +1,26 @@
 """统一评估子代理构建器。
 
-将 outline evaluation、detail outline evaluation、writing review
-三个独立评估子代理合并为统一的构建函数。
+将 outline evaluation、detail outline evaluation、writing review、
+character evaluation 四个独立评估子代理合并为统一的构建函数。
 
 职责：
   根据 EvaluationType 选择对应的提示词、权限，构建统一的评估子代理规格。
   可选注入 ContextAssemblerMiddleware，由调用方传入文件路径自动读取并注入上下文。
 
 使用方式：
-  由 outline / detail_outline / writing 管道的 secondary_node 调用，
-  不直接由主代理委托。
+  作为 evolution SubAgent 注册到各子代理的 create_deep_agent 中。
 
 类型映射：
   EvaluationType.OUTLINE        → outline_evaluation.md,  写入 /evaluation.md
   EvaluationType.DETAIL_OUTLINE → detail_outline_evaluation.md, 写入 /detail/evaluation.md
   EvaluationType.WRITING        → review_evaluation.md,   写入 /review/*.md
+  EvaluationType.CHARACTER      → character_evaluation.md, 写入 /character/evaluation.md
 
 调用对应关系：
-  outline 管道        → build_evaluation_subagent(EvaluationType.OUTLINE, ...)
-  detail_outline 管道 → build_evaluation_subagent(EvaluationType.DETAIL_OUTLINE, ...)
-  writing 管道        → build_evaluation_subagent(EvaluationType.WRITING, ...)
+  outline DeepAgent        → build_evaluation_subagent(EvaluationType.OUTLINE, ...)
+  detail_outline DeepAgent → build_evaluation_subagent(EvaluationType.DETAIL_OUTLINE, ...)
+  writing DeepAgent        → build_evaluation_subagent(EvaluationType.WRITING, ...)
+  character DeepAgent      → build_evaluation_subagent(EvaluationType.CHARACTER, ...)
 """
 from __future__ import annotations
 
@@ -42,13 +43,15 @@ class EvaluationType(StrEnum):
     """评估类型，决定提示词、权限和输出路径。
 
     调用对应关系：
-      EvaluationType.OUTLINE        — outline 管道评估大纲
-      EvaluationType.DETAIL_OUTLINE — detail_outline 管道评估细纲
-      EvaluationType.WRITING        — writing 管道审查正文
+      EvaluationType.OUTLINE        — outline DeepAgent 评估大纲
+      EvaluationType.DETAIL_OUTLINE — detail_outline DeepAgent 评估细纲
+      EvaluationType.WRITING        — writing DeepAgent 审查正文
+      EvaluationType.CHARACTER      — character DeepAgent 评估角色档案
     """
     OUTLINE = "outline"
     DETAIL_OUTLINE = "detail_outline"
     WRITING = "writing"
+    CHARACTER = "character"
 
 
 # ---------- 子代理规格类型 ----------
@@ -69,6 +72,7 @@ _PROMPT_PATHS: dict[EvaluationType, Path] = {
     EvaluationType.OUTLINE: _PROMPT_DIR / "outline_evaluation.md",
     EvaluationType.DETAIL_OUTLINE: _PROMPT_DIR / "detail_outline_evaluation.md",
     EvaluationType.WRITING: _PROMPT_DIR / "review_evaluation.md",
+    EvaluationType.CHARACTER: _PROMPT_DIR / "character_evaluation.md",
 }
 
 # 写入权限映射：每种类型只能写入对应的报告文件
@@ -85,6 +89,10 @@ _WRITE_PERMISSIONS: dict[EvaluationType, list[FilesystemPermission]] = {
         FilesystemPermission(operations=["write"], paths=["/review/*.md"], mode="allow"),
         FilesystemPermission(operations=["write"], paths=["/**"], mode="deny"),
     ],
+    EvaluationType.CHARACTER: [
+        FilesystemPermission(operations=["write"], paths=["/character/evaluation.md"], mode="allow"),
+        FilesystemPermission(operations=["write"], paths=["/**"], mode="deny"),
+    ],
 }
 
 
@@ -99,7 +107,7 @@ def build_evaluation_subagent(
     """构建统一的评估子代理规格。
 
     Args:
-        evaluation_type:    评估类型（outline / detail_outline / writing）
+        evaluation_type:    评估类型（outline / detail_outline / writing / character）
         workspace_root:     工作区根目录
         middleware:         额外中间件列表（可选）
         context_file_paths: 上下文文件路径列表（相对于工作区根目录），

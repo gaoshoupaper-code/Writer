@@ -1,13 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import type { TraceContextSegment, TraceNode, TraceTodoItem } from "../../lib/types";
 import { ChainIcon, SegmentIcon } from "./ChainNodeIcon";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 
 /**
  * 链路视图右侧抽屉 — 展开节点详情。
- * - LLM: 展示关联 segments
- * - Todo: 展示任务列表
- * - Error: 展示完整错误栈
- * - 底部: 「查看全部上下文」按钮，展示全部 context segments
+ * 保持原有的 position: absolute 定位（在 trace-chain-layout 内），
+ * 避免全屏覆盖阻挡滚动。使用 Badge/Button 等增强视觉。
  */
 
 type TraceChainDrawerProps = {
@@ -15,12 +15,10 @@ type TraceChainDrawerProps = {
   context: TraceContextSegment[];
   todos: { anchor_id: string; items: TraceTodoItem[]; active_item?: string | null }[];
   inputMessages: unknown[] | null;
-  /** 从 llm_end / tool_end 事件直接获取的节点输出（非 projector 重建） */
   nodeOutput: unknown[] | unknown | null;
   onClose: () => void;
 };
 
-/** segment kind → 标签 + 样式映射 */
 const SEGMENT_KIND_CONFIG: Record<string, { label: string; className: string }> = {
   system: { label: "System", className: "system" },
   human: { label: "Human", className: "human" },
@@ -33,12 +31,10 @@ const SEGMENT_KIND_CONFIG: Record<string, { label: string; className: string }> 
 export function TraceChainDrawer({ node, context, todos, inputMessages, nodeOutput, onClose }: TraceChainDrawerProps) {
   const [drawerView, setDrawerView] = useState<"detail" | "all">("detail");
 
-  // 节点切换时重置视图
   useEffect(() => {
     setDrawerView("detail");
   }, [node?.node_id]);
 
-  // N4: 选中 subagent 时过滤掉 main agent 段落
   const filteredContext = useMemo(() => {
     if (!node || node.agent_role === "main") return context;
     return context.filter(seg => seg.agent_role !== "main");
@@ -84,31 +80,30 @@ export function TraceChainDrawer({ node, context, todos, inputMessages, nodeOutp
         )}
       </div>
 
-      {/* 底部操作 — 仅 LLM/Tool 节点显示 */}
+      {/* 底部操作 */}
       {drawerView === "detail" && canShowContext ? (
         <div className="drawer-footer">
-          <button
-            className="drawer-jump-btn"
+          <Button
+            variant="outline"
+            className="w-full rounded-full text-xs"
             type="button"
             onClick={() => setDrawerView("all")}
           >
             查看全部上下文
-          </button>
+          </Button>
         </div>
       ) : null}
     </aside>
   );
 }
 
-// ── 全部上下文视图 — 模型输入（messages） + 节点输出（从事件直接获取） ──
+// ── 全部上下文视图 ──
 
 function AllContextView({ inputMessages, nodeOutput }: { inputMessages: unknown[] | null; nodeOutput: unknown[] | unknown | null }) {
-  // 节点输出：消息数组（LLM）或任意 JSON（Tool）
   const outputIsMessages = Array.isArray(nodeOutput) && nodeOutput.length > 0 && typeof nodeOutput[0] === "object" && nodeOutput[0] !== null && ("type" in (nodeOutput[0] as Record<string, unknown>) || "role" in (nodeOutput[0] as Record<string, unknown>));
 
   return (
     <div className="checkpoint-messages">
-      {/* 模型输入消息（系统提示词 + 注入上下文 + 对话历史） */}
       {inputMessages && inputMessages.length > 0 ? (
         <>
           <div className="checkpoint-section-label">模型输入</div>
@@ -120,7 +115,6 @@ function AllContextView({ inputMessages, nodeOutput }: { inputMessages: unknown[
         </>
       ) : null}
 
-      {/* 节点输出 */}
       {nodeOutput != null ? (
         <>
           <div className="checkpoint-section-label">节点输出</div>
@@ -142,7 +136,6 @@ function AllContextView({ inputMessages, nodeOutput }: { inputMessages: unknown[
   );
 }
 
-/** 模型输入消息渲染 */
 const MSG_KIND_CONFIG: Record<string, { label: string; className: string }> = {
   system: { label: "System", className: "system" },
   human: { label: "Human", className: "human" },
@@ -156,7 +149,6 @@ function ModelInputMessage({ message }: { message: Record<string, unknown> }) {
   const msgType = String(message.type ?? message.role ?? "unknown").toLowerCase();
   const config = MSG_KIND_CONFIG[msgType] ?? { label: msgType, className: "" };
 
-  // 正确提取文本：处理 string / content blocks 数组 / 其他
   const rawContent = message.content;
   const text = extractMessageText(rawContent);
   const lines = text.split("\n");
@@ -168,7 +160,7 @@ function ModelInputMessage({ message }: { message: Record<string, unknown> }) {
   return (
     <article className={`checkpoint-msg ${config.className}`}>
       <header className="checkpoint-msg-header">
-        <span className={`checkpoint-msg-badge ${config.className}`}>{config.label}</span>
+        <Badge variant="muted" className="text-[10px]">{config.label}</Badge>
         {message.name ? <span className="checkpoint-msg-tool-name">{String(message.name)}</span> : null}
         {msgType === "human" && text.length > 50 && text.includes("：\n") ? (
           <span className="checkpoint-msg-inject-tag">注入上下文</span>
@@ -198,11 +190,9 @@ function ModelInputMessage({ message }: { message: Record<string, unknown> }) {
   );
 }
 
-/** 从 content 中提取纯文本，处理 string / content blocks / 其他 */
 function extractMessageText(content: unknown): string {
   if (content == null) return "";
   if (typeof content === "string") return content;
-  // content blocks: [{"type": "text", "text": "..."}, ...]
   if (Array.isArray(content)) {
     return content
       .filter((block): block is Record<string, unknown> =>
@@ -214,26 +204,19 @@ function extractMessageText(content: unknown): string {
   return JSON.stringify(content, null, 2);
 }
 
-/** 渲染单行 — 把 # 标题、- 列表等转为 HTML */
 function MarkdownLine({ line }: { line: string }) {
-  // ### 标题
   const h3 = line.match(/^###\s+(.+)/);
   if (h3) return <div className="md-h3">{h3[1]}</div>;
-  // ## 标题
   const h2 = line.match(/^##\s+(.+)/);
   if (h2) return <div className="md-h2">{h2[1]}</div>;
-  // # 标题
   const h1 = line.match(/^#\s+(.+)/);
   if (h1) return <div className="md-h1">{h1[1]}</div>;
-  // 空行
   if (line.trim() === "") return <div className="md-blank" />;
-  // 普通行
   return <div className="md-text">{line}</div>;
 }
 
 // ── 节点详情视图 ──
 
-/** LLM 展开 — 按 related_node_id 筛选 segments */
 function DrawerLLMContent({ node, context }: { node: TraceNode; context: TraceContextSegment[] }) {
   const segments = context.filter(
     (seg) => seg.related_node_id === node.node_id
@@ -262,17 +245,16 @@ function DrawerLLMContent({ node, context }: { node: TraceNode; context: TraceCo
   );
 }
 
-/** 单个 segment 渲染 */
 function DrawerSegmentItem({ segment }: { segment: TraceContextSegment }) {
   const config = SEGMENT_KIND_CONFIG[segment.kind] ?? { label: segment.kind, className: "" };
 
   return (
     <article className={`drawer-segment ${config.className}`}>
       <header className="drawer-segment-header">
-        <span className={`drawer-segment-badge ${config.className}`}>
-          <SegmentIcon kind={segment.kind} size={12} />
-        </span>
-        <span className="drawer-segment-kind-label">{config.label}</span>
+        <Badge variant="muted" className="gap-1 text-[10px]">
+          <SegmentIcon kind={segment.kind} size={10} />
+          {config.label}
+        </Badge>
         <span className="drawer-segment-title">{segment.title}</span>
       </header>
       <DrawerSegmentContent value={segment.content} kind={segment.kind} />
@@ -280,7 +262,6 @@ function DrawerSegmentItem({ segment }: { segment: TraceContextSegment }) {
   );
 }
 
-/** segment 内容渲染 */
 function DrawerSegmentContent({ value, kind }: { value: unknown; kind: string }) {
   if (kind === "todo" && Array.isArray(value)) {
     return (
@@ -302,7 +283,6 @@ function DrawerSegmentContent({ value, kind }: { value: unknown; kind: string })
   return <pre className="drawer-segment-json">{JSON.stringify(value, null, 2)}</pre>;
 }
 
-/** Todo 展开 — 按 anchor_id 匹配 todo snapshot */
 function DrawerTodoContent({
   node,
   todos,
@@ -312,7 +292,6 @@ function DrawerTodoContent({
 }) {
   const anchorId = node.context_anchor_id || node.output_context_anchor_id;
   const snapshot = todos.find((t) => t.anchor_id === anchorId);
-
   const items = snapshot?.items ?? [];
 
   if (items.length === 0) {
@@ -338,7 +317,6 @@ function DrawerTodoContent({
   );
 }
 
-/** Error 展开 — 显示完整错误信息 */
 function DrawerErrorContent({ node, context }: { node: TraceNode; context: TraceContextSegment[] }) {
   const errorText = node.error;
   const errorSegments = context.filter(
@@ -370,7 +348,6 @@ function todoStatusLabel(status: string): string {
   return "待办";
 }
 
-/** 从 raw_event_ids 中提取首个事件序号，如 ["trace-xx-4","trace-xx-5"] → "#4" */
 function eventNumberLabel(rawEventIds?: string[]): string | null {
   if (!rawEventIds || rawEventIds.length === 0) return null;
   const id = rawEventIds[0];

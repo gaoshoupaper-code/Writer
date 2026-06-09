@@ -1,4 +1,4 @@
-import type { CheckpointState, Style, ThreadSummary, TraceDetail, TraceRunSummary, WorkspaceCharacterContent, WorkspaceDetailOutlineContent, WorkspaceNovelContent, WorkspaceOutlineContent, WorkspaceSummary } from "./types";
+import type { CheckpointState, InitResponse, Style, ThreadSummary, TraceDetail, TraceRunSummary, WorkspaceBootstrapResponse, WorkspaceCharacterContent, WorkspaceDetailOutlineContent, WorkspaceNovelContent, WorkspaceOutlineContent, WorkspaceSummary } from "./types";
 
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:7788";
 
@@ -13,6 +13,16 @@ async function parseJsonResponse<T>(response: Response): Promise<T> {
 export async function fetchWorkspaces() {
   const response = await fetch(`${API_BASE_URL}/api/workspaces`);
   return parseJsonResponse<WorkspaceSummary[]>(response);
+}
+
+export async function fetchInit() {
+  const response = await fetch(`${API_BASE_URL}/api/init`);
+  return parseJsonResponse<InitResponse>(response);
+}
+
+export async function fetchWorkspaceBootstrap(workspaceId: string) {
+  const response = await fetch(`${API_BASE_URL}/api/workspaces/${workspaceId}/bootstrap`);
+  return parseJsonResponse<WorkspaceBootstrapResponse>(response);
 }
 
 export async function createWorkspace(outlineName: string) {

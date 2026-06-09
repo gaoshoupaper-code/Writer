@@ -64,12 +64,13 @@ class TraceProjector:
             # ── N2: task 工具拦截 ──
             if event.tool_name == "task" and event.type in {"tool_start", "tool_end", "tool_error"}:
                 if event.type == "tool_start":
-                    state.current_task_call_id = event.tool_call_id
-                    # 清理并行组追踪（防止泄漏）
                     if event.tool_call_id:
+                        state.task_call_stack.append(event.tool_call_id)
+                        # 清理并行组追踪（防止泄漏）
                         parallel_tc_to_group.pop(event.tool_call_id, None)
                 else:  # tool_end / tool_error
-                    state.current_task_call_id = None
+                    if state.task_call_stack:
+                        state.task_call_stack.pop()
                 continue  # ← 不创建 tool 节点、不创建 context
 
             if event.type in {"llm_start", "llm_end", "llm_error", "tool_start", "tool_end", "tool_error"}:
@@ -148,8 +149,8 @@ class _ProjectionState:
         self.projection = projection
         self.agent_nodes: set[str] = set()
         self.context_sequence = 0
-        # task 边界追踪
-        self.current_task_call_id: str | None = None
+        # task 边界追踪（栈结构：支持嵌套 task 委托）
+        self.task_call_stack: list[str] = []
         self.agent_last_task: dict[str, str | None] = {}
         self.agent_invocation_counter: dict[str, int] = {}
         self.instance_first_ts: dict[str, str] = {}
@@ -161,12 +162,18 @@ class _ProjectionState:
             return "run"
         if _agent_role(event.agent_name) == "main":
             return f"agent:{event.agent_name}"
+        agent_name = event.agent_name
         # Subagent：查实例表
-        invocation = self.agent_invocation_counter.get(event.agent_name)
+        invocation = self.agent_invocation_counter.get(agent_name)
         if invocation is not None:
-            return f"agent:{event.agent_name}:{invocation}"
+            return f"agent:{agent_name}:{invocation}"
         # D9 回退：从未通过 task 调用
-        return f"agent:{event.agent_name}"
+        return f"agent:{agent_name}"
+
+    def _node_agent_attrs(self, event: TraceLogEvent) -> dict[str, Any]:
+        """返回 agent_name / agent_role / depth。"""
+        name = event.agent_name
+        return {"agent_name": name, "agent_role": _agent_role(name), "depth": _agent_depth(name)}
 
     def ensure_agent_node(self, event: TraceLogEvent) -> None:
         if not event.agent_name:
@@ -195,8 +202,8 @@ class _ProjectionState:
             )
             return
 
-        # ── Subagent：实例化拆分 ──
-        current_task = self.current_task_call_id
+        # ── Subagent（含 evaluation agent）：实例化拆分 ──
+        current_task = self.task_call_stack[-1] if self.task_call_stack else None
         last_task = self.agent_last_task.get(event.agent_name)
 
         if last_task is not None and last_task == current_task:
@@ -211,11 +218,11 @@ class _ProjectionState:
         self.agent_nodes.add(node_id)
         self.instance_first_ts[node_id] = event.timestamp
 
-        # 确定父节点
+        # 确定父节点：evaluation agent → 挂到对应 primary subagent 下
         if _is_evaluation_agent(event.agent_name):
             primary_name = _evaluation_primary_agent_name(event.agent_name)
-            primary_inv = self.agent_invocation_counter.get(primary_name, 1)
-            parent_id = f"agent:{primary_name}:{primary_inv}"
+            primary_inv = self.agent_invocation_counter.get(primary_name)
+            parent_id = f"agent:{primary_name}:{primary_inv}" if primary_inv else f"agent:{primary_name}"
         else:
             parent_id = "run"
 
@@ -249,9 +256,7 @@ class _ProjectionState:
                 kind="llm",
                 label=_llm_label(end),
                 status=end.status,
-                agent_name=end.agent_name,
-                agent_role=_agent_role(end.agent_name),
-                depth=_agent_depth(end.agent_name),
+                **self._node_agent_attrs(end),
                 started_at=start.event.timestamp if start else None,
                 ended_at=end.timestamp,
                 duration_ms=end.duration_ms,
@@ -278,9 +283,7 @@ class _ProjectionState:
                 kind="error",
                 label=_llm_label(error),
                 status="failed",
-                agent_name=error.agent_name,
-                agent_role=_agent_role(error.agent_name),
-                depth=_agent_depth(error.agent_name),
+                **self._node_agent_attrs(error),
                 started_at=start.event.timestamp if start else None,
                 ended_at=error.timestamp,
                 duration_ms=error.duration_ms,
@@ -304,9 +307,7 @@ class _ProjectionState:
                 kind="llm",
                 label=_llm_label(event),
                 status="running",
-                agent_name=event.agent_name,
-                agent_role=_agent_role(event.agent_name),
-                depth=_agent_depth(event.agent_name),
+                **self._node_agent_attrs(event),
                 started_at=event.timestamp,
                 model_name=event.model_name,
                 context_anchor_id=_range_start(pending.input_range),
@@ -330,9 +331,7 @@ class _ProjectionState:
                 kind="tool",
                 label=_tool_label(end),
                 status="failed" if tool_error else end.status,
-                agent_name=end.agent_name,
-                agent_role=_agent_role(end.agent_name),
-                depth=_agent_depth(end.agent_name),
+                **self._node_agent_attrs(end),
                 started_at=start.event.timestamp if start else None,
                 ended_at=end.timestamp,
                 duration_ms=end.duration_ms,
@@ -361,9 +360,7 @@ class _ProjectionState:
                 kind="error",
                 label=_tool_label(error),
                 status="failed",
-                agent_name=error.agent_name,
-                agent_role=_agent_role(error.agent_name),
-                depth=_agent_depth(error.agent_name),
+                **self._node_agent_attrs(error),
                 started_at=start.event.timestamp if start else None,
                 ended_at=error.timestamp,
                 duration_ms=error.duration_ms,
@@ -387,9 +384,7 @@ class _ProjectionState:
                 kind="tool",
                 label=_tool_label(event),
                 status="running",
-                agent_name=event.agent_name,
-                agent_role=_agent_role(event.agent_name),
-                depth=_agent_depth(event.agent_name),
+                **self._node_agent_attrs(event),
                 started_at=event.timestamp,
                 tool_name=event.tool_name,
                 context_anchor_id=_range_start(pending.input_range),
@@ -501,9 +496,7 @@ class _ProjectionState:
                 kind="todo",
                 label="Todo 更新",
                 status=end.status,
-                agent_name=end.agent_name,
-                agent_role=_agent_role(end.agent_name),
-                depth=_agent_depth(end.agent_name),
+                **self._node_agent_attrs(end),
                 started_at=start.timestamp if start else None,
                 ended_at=end.timestamp,
                 duration_ms=end.duration_ms,
@@ -651,6 +644,13 @@ def _agent_depth(agent_name: str | None) -> int:
     if _is_evaluation_agent(agent_name):
         return 2
     return 1 if _agent_role(agent_name) == "subagent" else 0
+
+
+def _effective_agent_name(agent_name: str | None) -> str | None:
+    """evaluation agent → 映射到 primary subagent 名称，用于折叠 evaluation 节点。"""
+    if agent_name and _is_evaluation_agent(agent_name):
+        return _evaluation_primary_agent_name(agent_name)
+    return agent_name
 
 
 def _llm_label(event: TraceLogEvent) -> str:

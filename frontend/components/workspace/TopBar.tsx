@@ -1,4 +1,13 @@
+import { useEffect, useRef, useState } from "react";
 import type { WorkspaceSummary } from "../../lib/types";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
+import { Button } from "@/components/ui/button";
 
 type ThemeMode = "light" | "dark";
 
@@ -10,7 +19,7 @@ type TopBarProps = {
   theme: ThemeMode;
   onWorkspaceChange: (workspaceId: string) => void;
   onCreateWorkspace: () => void;
-  onRequestDeleteWorkspace: () => void;
+  onDeleteWorkspace: (workspaceId: string) => void;
   onThemeToggle: () => void;
 };
 
@@ -22,9 +31,12 @@ export function TopBar({
   theme,
   onWorkspaceChange,
   onCreateWorkspace,
-  onRequestDeleteWorkspace,
+  onDeleteWorkspace,
   onThemeToggle,
 }: TopBarProps) {
+  const activeWorkspace = workspaces.find((w) => w.workspace_id === activeWorkspaceId);
+  const displayLabel = activeWorkspace?.outline_name || "选择一个工作目录";
+
   return (
     <header className="dashboard-topbar">
       <div className="brand">
@@ -37,34 +49,53 @@ export function TopBar({
 
       <div className="workspace-switcher" aria-label="工作目录管理">
         <div className="workspace-control-row">
-          <select
-            className="thread-select workspace-select"
-            id="workspace-select"
-            value={activeWorkspaceId}
-            onChange={(event) => onWorkspaceChange(event.target.value)}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button className="workspace-menu-trigger" type="button">
+                <span>{displayLabel}</span>
+                <span className="session-menu-caret">▾</span>
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="center" className="w-[340px]">
+              {workspaces.length ? (
+                workspaces.map((workspace) => (
+                  <DropdownMenuItem
+                    key={workspace.workspace_id}
+                    className={`flex items-center justify-between gap-2 ${workspace.workspace_id === activeWorkspaceId ? "bg-primary/5" : ""}`}
+                    onClick={() => onWorkspaceChange(workspace.workspace_id)}
+                  >
+                    <span className="truncate text-sm">{workspace.outline_name}</span>
+                    <button
+                      className="session-option-delete"
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onDeleteWorkspace(workspace.workspace_id);
+                      }}
+                      disabled={deletingWorkspace || creatingWorkspace}
+                      aria-label={`删除 ${workspace.outline_name}`}
+                    >
+                      删除
+                    </button>
+                  </DropdownMenuItem>
+                ))
+              ) : (
+                <p className="session-empty">还没有工作目录。</p>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <Button
+            className="thread-button workspace-create-button bg-gradient-to-br from-[var(--teal)] to-[var(--blue)] shadow-md hover:shadow-lg hover:-translate-y-px transition-all"
+            type="button"
+            onClick={onCreateWorkspace}
+            disabled={creatingWorkspace}
           >
-            <option value="">选择一个工作目录</option>
-            {workspaces.map((workspace) => (
-              <option key={workspace.workspace_id} value={workspace.workspace_id}>
-                {workspace.outline_name}
-              </option>
-            ))}
-          </select>
-          <button className="thread-button workspace-create-button" type="button" onClick={onCreateWorkspace} disabled={creatingWorkspace}>
             {creatingWorkspace ? "创建中" : "新建"}
-          </button>
+          </Button>
         </div>
       </div>
 
       <div className="workspace-actions">
-        <button
-          className="delete-button topbar-delete-button"
-          type="button"
-          onClick={onRequestDeleteWorkspace}
-          disabled={!activeWorkspaceId || deletingWorkspace}
-        >
-          删除目录
-        </button>
         <button
           className="theme-toggle"
           type="button"

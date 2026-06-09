@@ -27,11 +27,13 @@ from app.core.thread_store import ThreadStore
 from app.writer.trace import TraceRecorder
 from app.schemas.character import CharacterGenerateRequest, CharacterGenerateResponse
 from app.schemas.screenplay import (
+    InitResponse,
     ScreenplayGenerateRequest,
     ScreenplayGenerateResponse,
     ThreadCreateRequest,
     ThreadSummary,
     ThreadUpdateRequest,
+    WorkspaceBootstrapResponse,
     WorkspaceCharacterContent,
     WorkspaceCreateRequest,
     WorkspaceDetailOutlineContent,
@@ -215,6 +217,31 @@ app.include_router(style_router)
 @app.get("/health")
 def healthcheck() -> dict[str, str]:
     return {"status": "ok", "mode": settings.writer_agent_mode}
+
+
+@app.get("/api/init", response_model=InitResponse)
+def init_page() -> InitResponse:
+    """页面首次加载：一次返回 workspaces + styles，替代 2 个独立请求。"""
+    return InitResponse(
+        workspaces=thread_store.list_workspaces(),
+        styles=style_store.list_styles(),
+    )
+
+
+@app.get("/api/workspaces/{workspace_id}/bootstrap", response_model=WorkspaceBootstrapResponse)
+def bootstrap_workspace(workspace_id: str) -> WorkspaceBootstrapResponse:
+    """选中工作区后：一次返回 threads + 全部面板内容，替代 5 个独立请求。"""
+    workspace = thread_store.get_workspace(workspace_id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    return WorkspaceBootstrapResponse(
+        threads=thread_store.list_threads(workspace_id),
+        outline=thread_store.read_workspace_outline(workspace_id),
+        detail_outline=thread_store.read_workspace_detail_outline(workspace_id),
+        characters=thread_store.read_workspace_characters(workspace_id),
+        novel=thread_store.read_workspace_novel(workspace_id),
+    )
 
 
 @app.get("/api/workspaces", response_model=list[WorkspaceSummary])

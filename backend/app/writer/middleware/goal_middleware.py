@@ -28,6 +28,11 @@ from app.writer.tools import (
     build_goal_tools,
 )
 
+# 拦截时注入的引导消息
+_GOAL_BLOCK_GUIDANCE = (
+    "当前目标尚未完成，需要自主决定下一步操作并继续执行。"
+)
+
 # 最大连续拦截次数：超过后强制终止并报告失败
 _MAX_GOAL_OUTPUT_BLOCKS = 3
 # 连续拦截达到上限时的失败提示
@@ -113,7 +118,14 @@ def _guard_goal_completion_before_output(state: GoalState[ResponseT]) -> dict[st
         "jump_to": "model",
         "goal_output_blocked": True,
         "goal_output_block_count": block_count,
-        "messages": [blocked_message] if blocked_message else [],
+        "messages": [
+            msg
+            for msg in [
+                blocked_message,
+                AIMessage(content=_GOAL_BLOCK_GUIDANCE),
+            ]
+            if msg
+        ],
     }
 
 

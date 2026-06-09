@@ -2,6 +2,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.create_type.schemas import StyleSummary
+
 
 class WorkspaceCreateRequest(BaseModel):
     outline_name: str = Field(min_length=1)
@@ -120,3 +122,18 @@ class ScreenplayGenerateResponse(BaseModel):
     beats: list[str] = Field(default_factory=list)
     markdown: str = ""
     evaluation_markdown: str = ""
+
+
+class InitResponse(BaseModel):
+    """GET /api/init — 页面首次加载时一次性返回 workspaces + styles。"""
+    workspaces: list[WorkspaceSummary]
+    styles: list[StyleSummary]
+
+
+class WorkspaceBootstrapResponse(BaseModel):
+    """GET /api/workspaces/{id}/bootstrap — 选中工作区后一次性返回全部面板数据。"""
+    threads: list[ThreadSummary]
+    outline: WorkspaceOutlineContent | None = None
+    detail_outline: WorkspaceDetailOutlineContent | None = None
+    characters: WorkspaceCharacterContent | None = None
+    novel: WorkspaceNovelContent | None = None

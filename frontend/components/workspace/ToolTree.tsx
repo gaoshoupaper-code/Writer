@@ -1,4 +1,6 @@
 import type { ToolStatus } from "../../lib/types";
+import { Badge } from "@/components/ui/badge";
+import { Skeleton } from "@/components/ui/skeleton";
 
 const TOOL_STATUS_LABELS: Record<ToolStatus["status"], string> = {
   running: "调用中",
@@ -6,17 +8,38 @@ const TOOL_STATUS_LABELS: Record<ToolStatus["status"], string> = {
   failed: "失败",
 };
 
+const TOOL_STATUS_VARIANT: Record<ToolStatus["status"], "running" | "completed" | "failed"> = {
+  running: "running",
+  done: "completed",
+  failed: "failed",
+};
+
 function ToolTreeItem({ tool, isChild = false }: { tool: ToolStatus; isChild?: boolean }) {
   const isTask = tool.name === "task";
-  const classNames = ["tool-status", tool.status, isTask ? "is-task" : "", isChild ? "is-child" : ""]
-    .filter(Boolean)
-    .join(" ");
 
   return (
-    <li className={classNames}>
-      {isChild && tool.subagentName ? <span className="subagent-label">{tool.subagentName}</span> : null}
+    <li
+      className={[
+        "tool-status",
+        tool.status,
+        isTask ? "is-task" : "",
+        isChild ? "is-child" : "",
+      ].filter(Boolean).join(" ")}
+    >
+      {isChild && tool.subagentName ? (
+        <Badge variant="muted" className="text-[9px] py-0 px-1.5">{tool.subagentName}</Badge>
+      ) : null}
       <span className="tool-status-name">{tool.name}</span>
-      <span className="tool-status-state">{TOOL_STATUS_LABELS[tool.status]}</span>
+      {tool.status === "running" ? (
+        <span className="flex items-center gap-1.5">
+          <Skeleton className="h-2 w-2 rounded-full" />
+          <Badge variant="running" className="text-[10px] py-0 px-1.5">{TOOL_STATUS_LABELS[tool.status]}</Badge>
+        </span>
+      ) : (
+        <Badge variant={TOOL_STATUS_VARIANT[tool.status]} className="text-[10px] py-0 px-1.5">
+          {TOOL_STATUS_LABELS[tool.status]}
+        </Badge>
+      )}
     </li>
   );
 }

@@ -1,8 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { TraceDetail, TraceNode, TraceRunSummary } from "../../lib/types";
 import { TokenChartPanel } from "./TokenChartPanel";
 import { TraceChainTimeline } from "./TraceChainTimeline";
 import { TraceChainDrawer } from "./TraceChainDrawer";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from "@/components/ui/dropdown-menu";
+import { Badge } from "@/components/ui/badge";
+import { Skeleton } from "@/components/ui/skeleton";
 
 type TracePanelProps = {
   runs: TraceRunSummary[];
@@ -29,7 +37,6 @@ export function TracePanel({ runs, detail, activeTraceId, loading, hasActiveThre
   const [activeTab, setActiveTab] = useState<"trace" | "chart">("trace");
   const [drawerNodeId, setDrawerNodeId] = useState<string | null>(null);
 
-  // ── 双向跳转高亮状态 ──
   const [highlightedNodeId, setHighlightedNodeId] = useState<string | null>(null);
   const [highlightedLoopIndex, setHighlightedLoopIndex] = useState<number | null>(null);
 
@@ -39,7 +46,6 @@ export function TracePanel({ runs, detail, activeTraceId, loading, hasActiveThre
   const todos = detail?.run.trace_id === activeTraceId ? detail.todos : [];
   const drawerNode = drawerNodeId ? nodes.find((n) => n.node_id === drawerNodeId) ?? null : null;
 
-  // 提取当前抽屉节点的 llm_start 输入消息（系统提示词 + 注入上下文 + 对话历史）
   const drawerInputMessages = useMemo(() => {
     if (!drawerNode || !detail || drawerNode.kind !== "llm") return null;
     const startId = drawerNode.raw_event_ids[0];
@@ -50,7 +56,6 @@ export function TracePanel({ runs, detail, activeTraceId, loading, hasActiveThre
     return Array.isArray(input.messages) ? input.messages : null;
   }, [drawerNode, detail]);
 
-  // 提取当前抽屉节点的输出（直接从 llm_end/tool_end 事件获取，而非 projector 重建）
   const drawerNodeOutput = useMemo(() => {
     if (!drawerNode || !detail) return null;
     if (drawerNode.raw_event_ids.length < 2) return null;
@@ -80,30 +85,32 @@ export function TracePanel({ runs, detail, activeTraceId, loading, hasActiveThre
     setDrawerNodeId(null);
   }
 
-  // ── 图 → 追踪：点击图数据点，切换到执行追踪 tab 并高亮对应 LLM 节点 ──
   const handleJumpToTrace = useCallback((nodeId: string) => {
     setActiveTab("trace");
     setHighlightedNodeId(nodeId);
     setHighlightedLoopIndex(null);
   }, []);
 
-  // ── 追踪 → 图：点击 LLM 跳转按钮，切换到图检测 tab 并高亮对应数据点 ──
   const handleJumpToChart = useCallback((loopIndex: number) => {
     setActiveTab("chart");
     setHighlightedLoopIndex(loopIndex);
     setHighlightedNodeId(null);
   }, []);
 
-  // ── 清除高亮 ──
   const clearHighlight = useCallback(() => {
     setHighlightedNodeId(null);
     setHighlightedLoopIndex(null);
   }, []);
 
-  // 切换 trace 时清除高亮
   useEffect(() => {
     clearHighlight();
   }, [activeTraceId]);
+
+  const statusVariant = (status: string): "running" | "completed" | "failed" => {
+    if (status === "completed") return "completed";
+    if (status === "failed") return "failed";
+    return "running";
+  };
 
   return (
     <section className="content-panel panel-surface trace-panel">
@@ -114,7 +121,9 @@ export function TracePanel({ runs, detail, activeTraceId, loading, hasActiveThre
         </div>
         <div className="trace-heading-actions">
           <TraceDropdownSelector runs={runs} activeTraceId={activeTraceId} onSelect={onSelectTrace} />
-          <span className={`trace-status ${activeRun?.status ?? "running"}`}>{activeRun ? statusLabel(activeRun.status) : "等待 Trace"}</span>
+          <Badge variant={activeRun ? statusVariant(activeRun.status) : "muted"}>
+            {activeRun ? statusLabel(activeRun.status) : "等待 Trace"}
+          </Badge>
           <button
             className="trace-delete-button"
             type="button"
@@ -127,13 +136,21 @@ export function TracePanel({ runs, detail, activeTraceId, loading, hasActiveThre
         </div>
       </header>
 
+      {/* 保持原始 DOM 结构：nav + 两个 div，确保 3 行 grid 正确 */}
       <nav className="inspection-tabs">
         <button className={`inspection-tab ${activeTab === "trace" ? "active" : ""}`} type="button" onClick={() => setActiveTab("trace")}>执行追踪</button>
         <button className={`inspection-tab ${activeTab === "chart" ? "active" : ""}`} type="button" onClick={() => setActiveTab("chart")}>图检测</button>
       </nav>
 
       <div className="trace-panel-body" style={activeTab !== "trace" ? { display: "none" } : undefined}>
-        {!hasActiveThread ? (
+        {loading && nodes.length === 0 ? (
+          <div style={{ padding: 20, display: "grid", gap: 12 }}>
+            <Skeleton className="h-8 w-48" />
+            <Skeleton className="h-20 w-full" />
+            <Skeleton className="h-20 w-full" />
+            <Skeleton className="h-20 w-3/4" />
+          </div>
+        ) : !hasActiveThread ? (
           <div className="empty-state trace-empty-state">
             <span className="card-line" />
             <h3>先选择一个会话</h3>
@@ -141,7 +158,7 @@ export function TracePanel({ runs, detail, activeTraceId, loading, hasActiveThre
           </div>
         ) : null}
 
-        {hasActiveThread ? (
+        {hasActiveThread && (nodes.length > 0 || !loading) ? (
           <div className="trace-layout trace-chain-layout">
             <TraceChainTimeline
               nodes={nodes}
@@ -178,70 +195,49 @@ export function TracePanel({ runs, detail, activeTraceId, loading, hasActiveThre
   );
 }
 
-// ── TraceDropdownSelector: 替代原 TraceRunList 侧边栏 ──
+// ── TraceDropdownSelector: 使用 shadcn DropdownMenu ──
 
 function TraceDropdownSelector({ runs, activeTraceId, onSelect }: { runs: TraceRunSummary[]; activeTraceId: string; onSelect: (traceId: string) => void }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-
-  // 点击外部关闭
-  useEffect(() => {
-    if (!open) return;
-    function handleClick(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    }
-    document.addEventListener("mousedown", handleClick);
-    return () => document.removeEventListener("mousedown", handleClick);
-  }, [open]);
-
   const activeRun = runs.find((r) => r.trace_id === activeTraceId);
 
   if (runs.length === 0) {
-    return <span className="trace-dropdown-placeholder">无 Trace 记录</span>;
+    return <span className="text-xs font-bold text-muted-foreground">无 Trace 记录</span>;
   }
 
   return (
-    <div className="trace-dropdown" ref={ref}>
-      <button
-        className="trace-dropdown-trigger"
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-      >
-        <span className="trace-dropdown-trigger-text">
-          {activeRun ? activeRun.session_name || activeRun.endpoint : "选择 Trace"}
-        </span>
-        <span className={`trace-dropdown-arrow ${open ? "open" : ""}`}>▾</span>
-      </button>
-      {open ? (
-        <ul className="trace-dropdown-list">
-          {runs.map((run) => (
-            <li key={run.trace_id}>
-              <button
-                className={`trace-dropdown-item ${run.trace_id === activeTraceId ? "active" : ""}`}
-                type="button"
-                onClick={() => { onSelect(run.trace_id); setOpen(false); }}
-              >
-                <span className="trace-dropdown-item-dot">
-                  {run.trace_id === activeTraceId ? "●" : "○"}
-                </span>
-                <span className="trace-dropdown-item-body">
-                  <strong>{run.session_name || run.endpoint}</strong>
-                  <small>
-                    {formatTime(run.started_at)} · {statusLabel(run.status)} · {run.event_count} events
-                  </small>
-                </span>
-              </button>
-            </li>
-          ))}
-        </ul>
-      ) : null}
-    </div>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button className="trace-dropdown-trigger" type="button">
+          <span className="trace-dropdown-trigger-text">
+            {activeRun ? activeRun.session_name || activeRun.endpoint : "选择 Trace"}
+          </span>
+          <span className="trace-dropdown-arrow">▾</span>
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="w-[320px]">
+        {runs.map((run) => (
+          <DropdownMenuItem
+            key={run.trace_id}
+            className={run.trace_id === activeTraceId ? "bg-primary/5" : ""}
+            onClick={() => onSelect(run.trace_id)}
+          >
+            <span className="flex-shrink-0 text-xs">
+              {run.trace_id === activeTraceId ? "●" : "○"}
+            </span>
+            <span className="flex flex-col gap-0.5 min-w-0">
+              <strong className="text-xs truncate">{run.session_name || run.endpoint}</strong>
+              <small className="text-[11px] text-muted-foreground">
+                {formatTime(run.started_at)} · {statusLabel(run.status)} · {run.event_count} events
+              </small>
+            </span>
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
-// ── 链路视图复用的辅助函数 ──
+// ── 辅助函数 ──
 
 function statusLabel(status: TraceRunSummary["status"]) {
   if (status === "completed") return "完成";

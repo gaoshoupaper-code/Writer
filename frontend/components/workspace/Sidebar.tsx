@@ -24,17 +24,20 @@ export function Sidebar({ activePanel, onPanelChange }: SidebarProps) {
   return (
     <aside className="dashboard-sidebar" aria-label="工作台模块">
       <nav className="sidebar-nav">
-        {SIDEBAR_ITEMS.map((item) => (
-          <button
-            className={`sidebar-item ${activePanel === item.id ? "active" : ""}`}
-            type="button"
-            key={item.id}
-            onClick={() => onPanelChange(item.id)}
-          >
-            <span>{item.label}</span>
-            <small>{item.description}</small>
-          </button>
-        ))}
+        {SIDEBAR_ITEMS.map((item) => {
+          const isActive = activePanel === item.id;
+          return (
+            <button
+              className={`sidebar-item ${isActive ? "active" : ""} transition-all duration-150`}
+              type="button"
+              key={item.id}
+              onClick={() => onPanelChange(item.id)}
+            >
+              <span>{item.label}</span>
+              <small>{item.description}</small>
+            </button>
+          );
+        })}
       </nav>
     </aside>
   );

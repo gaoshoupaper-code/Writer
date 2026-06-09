@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
 import { AppShell } from "../components/workspace/AppShell";
 import { CharactersPanel } from "../components/workspace/CharactersPanel";
 import { ChatPanel } from "../components/workspace/ChatPanel";
@@ -22,10 +23,12 @@ import {
   deleteThread as deleteThreadRequest,
   deleteTrace as deleteTraceRequest,
   deleteWorkspace as deleteWorkspaceRequest,
+  fetchInit,
   fetchStyles as fetchStylesRequest,
   fetchThreadTraces,
   fetchThreads,
   fetchTraceDetail,
+  fetchWorkspaceBootstrap,
   fetchWorkspaceCharacters,
   fetchWorkspaceDetailOutline,
   fetchWorkspaceNovel,
@@ -273,7 +276,6 @@ export default function Home() {
   const [liveTraceId, setLiveTraceId] = useState("");
   const [traceDetail, setTraceDetail] = useState<TraceDetail | null>(null);
   const [traceLoading, setTraceLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [creatingWorkspace, setCreatingWorkspace] = useState(false);
   const [creatingThread, setCreatingThread] = useState(false);
@@ -284,6 +286,7 @@ export default function Home() {
   const [themeReady, setThemeReady] = useState(false);
   const [workspaceCreateOpen, setWorkspaceCreateOpen] = useState(false);
   const [workspaceDeleteOpen, setWorkspaceDeleteOpen] = useState(false);
+  const [pendingDeleteWorkspaceId, setPendingDeleteWorkspaceId] = useState("");
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
   const [styles, setStyles] = useState<Style[]>([]);
   const [styleModalOpen, setStyleModalOpen] = useState(false);
@@ -305,32 +308,153 @@ export default function Home() {
     }
   }, [theme, themeReady]);
 
+  // ── 首次加载：2 个请求完成全部初始化 ──
+  const bootstrappedRef = useRef(false);
+
   useEffect(() => {
-    async function loadWorkspaces() {
+    if (bootstrappedRef.current) return;
+    bootstrappedRef.current = true;
+
+    let ignore = false;
+
+    async function bootstrap() {
       try {
-        const data = await fetchWorkspaces();
-        setWorkspaces(data);
-        setActiveWorkspaceId((current) => current || data[0]?.workspace_id || "");
-      } catch (workspaceError) {
-        setError(workspaceError instanceof Error ? workspaceError.message : "无法加载工作目录列表。");
+        // 请求 1：workspaces + styles
+        const { workspaces: ws, styles: st } = await fetchInit();
+        if (ignore) return;
+        setWorkspaces(ws);
+        setStyles(st);
+
+        const firstWorkspaceId = ws[0]?.workspace_id || "";
+        setActiveWorkspaceId(firstWorkspaceId);
+        if (!firstWorkspaceId) return;
+
+        // 请求 2：选中工作区的全部面板数据
+        const data = await fetchWorkspaceBootstrap(firstWorkspaceId);
+        if (ignore) return;
+        setThreads(data.threads);
+        setActiveThreadId(data.threads[0]?.thread_id || "");
+        if (data.outline) setOutlineMarkdown(data.outline.markdown);
+        if (data.detail_outline) {
+          setDetailOutlineChapters(data.detail_outline.chapters);
+          setActiveDetailChapterFilename(
+            data.detail_outline.chapters[0]?.filename || "",
+          );
+        }
+        if (data.characters) {
+          setCharacters(data.characters.characters);
+          setActiveCharacterFilename(
+            data.characters.characters[0]?.filename || "",
+          );
+        }
+        if (data.novel) {
+          setNovelMarkdown(data.novel.markdown);
+          setNovelSource(data.novel.source);
+          setNovelChapterCount(data.novel.chapter_count);
+        }
+        setOutlineLoading(false);
+        setDetailOutlineLoading(false);
+        setCharactersLoading(false);
+        setNovelLoading(false);
+      } catch (err) {
+        if (!ignore) {
+          toast.error(err instanceof Error ? err.message : "初始化加载失败。");
+        }
       }
     }
 
-    loadWorkspaces();
+    setOutlineLoading(true);
+    setDetailOutlineLoading(true);
+    setCharactersLoading(true);
+    setNovelLoading(true);
+    bootstrap();
+
+    return () => { ignore = true; };
   }, []);
 
+  // ── 后续切换工作区：用 bootstrap 接口替代 5 个单独请求 ──
+  const initialBootDone = useRef(false);
+
   useEffect(() => {
-    async function loadStyles() {
+    if (!activeWorkspaceId) return;
+
+    // 跳过首次加载（上面已经处理了）
+    if (!initialBootDone.current) {
+      initialBootDone.current = true;
+      return;
+    }
+
+    let ignore = false;
+
+    async function loadWorkspace() {
+      setOutlineLoading(true);
+      setDetailOutlineLoading(true);
+      setCharactersLoading(true);
+      setNovelLoading(true);
+
       try {
-        const data = await fetchStylesRequest();
-        setStyles(data);
-      } catch {
-        setStyles([]);
+        const [threadData, bootData] = await Promise.all([
+          fetchThreads(activeWorkspaceId),
+          fetchWorkspaceBootstrap(activeWorkspaceId),
+        ]);
+        if (ignore) return;
+        setThreads(threadData);
+        setActiveThreadId(
+          threadData.some((t) => t.thread_id === activeThreadId)
+            ? activeThreadId
+            : threadData[0]?.thread_id || "",
+        );
+        if (bootData.outline) setOutlineMarkdown(bootData.outline.markdown);
+        else setOutlineMarkdown("");
+        if (bootData.detail_outline) {
+          setDetailOutlineChapters(bootData.detail_outline.chapters);
+          setActiveDetailChapterFilename(
+            bootData.detail_outline.chapters.some((c) => c.filename === activeDetailChapterFilename)
+              ? activeDetailChapterFilename
+              : bootData.detail_outline.chapters[0]?.filename || "",
+          );
+        } else {
+          setDetailOutlineChapters([]);
+          setActiveDetailChapterFilename("");
+        }
+        if (bootData.characters) {
+          setCharacters(bootData.characters.characters);
+          setActiveCharacterFilename(
+            bootData.characters.characters.some((c) => c.filename === activeCharacterFilename)
+              ? activeCharacterFilename
+              : bootData.characters.characters[0]?.filename || "",
+          );
+        } else {
+          setCharacters([]);
+          setActiveCharacterFilename("");
+        }
+        if (bootData.novel) {
+          setNovelMarkdown(bootData.novel.markdown);
+          setNovelSource(bootData.novel.source);
+          setNovelChapterCount(bootData.novel.chapter_count);
+        } else {
+          setNovelMarkdown("");
+          setNovelSource("");
+          setNovelChapterCount(0);
+        }
+      } catch (err) {
+        if (!ignore) {
+          toast.error(err instanceof Error ? err.message : "无法加载工作区数据。");
+        }
+      } finally {
+        if (!ignore) {
+          setOutlineLoading(false);
+          setDetailOutlineLoading(false);
+          setCharactersLoading(false);
+          setNovelLoading(false);
+        }
       }
     }
 
-    loadStyles();
-  }, []);
+    loadWorkspace();
+
+    return () => { ignore = true; };
+  }, [activeWorkspaceId]);
 
   const activeWorkspace = useMemo(
     () => workspaces.find((workspace) => workspace.workspace_id === activeWorkspaceId) ?? null,
@@ -342,26 +466,6 @@ export default function Home() {
     if (!activeStyleId) return null;
     return styles.find((s) => s.style_id === activeStyleId)?.name ?? null;
   }, [activeWorkspace?.active_style_id, styles]);
-
-  useEffect(() => {
-    async function loadThreads() {
-      if (!activeWorkspaceId) {
-        setThreads([]);
-        setActiveThreadId("");
-        return;
-      }
-
-      try {
-        const data = await fetchThreads(activeWorkspaceId);
-        setThreads(data);
-        setActiveThreadId((current) => (data.some((thread) => thread.thread_id === current) ? current : data[0]?.thread_id || ""));
-      } catch (threadError) {
-        setError(threadError instanceof Error ? threadError.message : "无法加载会话列表。");
-      }
-    }
-
-    loadThreads();
-  }, [activeWorkspaceId]);
 
   const activeThread = useMemo(
     () => threads.find((thread) => thread.thread_id === activeThreadId) ?? null,
@@ -419,7 +523,7 @@ export default function Home() {
           setTraceRuns([]);
           setActiveTraceId("");
           setTraceDetail(null);
-          setError(traceError instanceof Error ? traceError.message : "无法加载 Trace 列表。");
+          toast.error(traceError instanceof Error ? traceError.message : "无法加载 Trace 列表。");
         }
       } finally {
         if (!ignore) {
@@ -457,7 +561,7 @@ export default function Home() {
       } catch (traceError) {
         if (!ignore) {
           setTraceDetail(null);
-          setError(traceError instanceof Error ? traceError.message : "无法加载 Trace 详情。");
+          toast.error(traceError instanceof Error ? traceError.message : "无法加载 Trace 详情。");
         }
       } finally {
         if (!ignore) {
@@ -527,166 +631,11 @@ export default function Home() {
     };
   }, [activeWorkspaceId]);
 
-  useEffect(() => {
-    if (!activeWorkspaceId) {
-      setOutlineMarkdown("");
-      return;
-    }
-
-    if (result?.workspace_id === activeWorkspaceId && result.markdown?.trim()) {
-      setOutlineMarkdown(result.markdown);
-      return;
-    }
-
-    let ignore = false;
-    setOutlineLoading(true);
-
-    async function loadOutline() {
-      try {
-        const data = await fetchWorkspaceOutline(activeWorkspaceId);
-        if (!ignore) {
-          setOutlineMarkdown(data.markdown);
-        }
-      } catch (outlineError) {
-        if (!ignore) {
-          setOutlineMarkdown("");
-          setError(outlineError instanceof Error ? outlineError.message : "无法加载剧情内容。");
-        }
-      } finally {
-        if (!ignore) {
-          setOutlineLoading(false);
-        }
-      }
-    }
-
-    loadOutline();
-
-    return () => {
-      ignore = true;
-    };
-  }, [activeWorkspaceId, result]);
-
-  useEffect(() => {
-    if (!activeWorkspaceId) {
-      setDetailOutlineChapters([]);
-      setActiveDetailChapterFilename("");
-      return;
-    }
-
-    let ignore = false;
-    setDetailOutlineLoading(true);
-
-    async function loadDetailOutline() {
-      try {
-        const data = await fetchWorkspaceDetailOutline(activeWorkspaceId);
-        if (!ignore) {
-          setDetailOutlineChapters(data.chapters);
-          setActiveDetailChapterFilename((cur) =>
-            data.chapters.some((c) => c.filename === cur) ? cur : data.chapters[0]?.filename || "",
-          );
-        }
-      } catch {
-        if (!ignore) {
-          setDetailOutlineChapters([]);
-          setActiveDetailChapterFilename("");
-        }
-      } finally {
-        if (!ignore) {
-          setDetailOutlineLoading(false);
-        }
-      }
-    }
-
-    loadDetailOutline();
-
-    return () => {
-      ignore = true;
-    };
-  }, [activeWorkspaceId, result]);
-
-  useEffect(() => {
-    if (!activeWorkspaceId) {
-      setNovelMarkdown("");
-      return;
-    }
-
-    let ignore = false;
-    setNovelLoading(true);
-
-    async function loadNovel() {
-      try {
-        const data = await fetchWorkspaceNovel(activeWorkspaceId);
-        if (!ignore) {
-          setNovelMarkdown(data.markdown);
-          setNovelSource(data.source);
-          setNovelChapterCount(data.chapter_count);
-        }
-      } catch (novelError) {
-        if (!ignore) {
-          setNovelMarkdown("");
-          setNovelSource("");
-          setNovelChapterCount(0);
-          setError(novelError instanceof Error ? novelError.message : "无法加载小说正文。");
-        }
-      } finally {
-        if (!ignore) {
-          setNovelLoading(false);
-        }
-      }
-    }
-
-    loadNovel();
-
-    return () => {
-      ignore = true;
-    };
-  }, [activeWorkspaceId, result]);
-
-  useEffect(() => {
-    if (!activeWorkspaceId) {
-      setCharacters([]);
-      setActiveCharacterFilename("");
-      return;
-    }
-
-    let ignore = false;
-    setCharactersLoading(true);
-
-    async function loadCharacters() {
-      try {
-        const data = await fetchWorkspaceCharacters(activeWorkspaceId);
-        if (!ignore) {
-          setCharacters(data.characters);
-          setActiveCharacterFilename((current) =>
-            data.characters.some((character) => character.filename === current) ? current : data.characters[0]?.filename || "",
-          );
-        }
-      } catch (charactersError) {
-        if (!ignore) {
-          setCharacters([]);
-          setActiveCharacterFilename("");
-          setError(charactersError instanceof Error ? charactersError.message : "无法加载人物信息。");
-        }
-      } finally {
-        if (!ignore) {
-          setCharactersLoading(false);
-        }
-      }
-    }
-
-    loadCharacters();
-
-    return () => {
-      ignore = true;
-    };
-  }, [activeWorkspaceId, result]);
-
   async function handleCreateWorkspace() {
     const outlineName = newWorkspaceName.trim();
     if (!outlineName || creatingWorkspace) return;
 
     setCreatingWorkspace(true);
-    setError(null);
 
     try {
       const workspace = await createWorkspaceRequest(outlineName);
@@ -695,46 +644,52 @@ export default function Home() {
       setNewWorkspaceName("失忆编剧大纲");
       setWorkspaceCreateOpen(false);
     } catch (createError) {
-      setError(createError instanceof Error ? createError.message : "无法创建工作目录。");
+      toast.error(createError instanceof Error ? createError.message : "无法创建工作目录。");
     } finally {
       setCreatingWorkspace(false);
     }
   }
 
   async function handleDeleteWorkspace() {
-    if (!activeWorkspaceId || deletingWorkspace) return;
+    if (!pendingDeleteWorkspaceId || deletingWorkspace) return;
 
     setDeletingWorkspace(true);
-    setError(null);
 
     try {
-      await deleteWorkspaceRequest(activeWorkspaceId);
+      await deleteWorkspaceRequest(pendingDeleteWorkspaceId);
       threadMessagesRef.current.clear();
       setWorkspaces((current) => {
-        const next = current.filter((workspace) => workspace.workspace_id !== activeWorkspaceId);
-        setActiveWorkspaceId(next[0]?.workspace_id || "");
+        const next = current.filter((workspace) => workspace.workspace_id !== pendingDeleteWorkspaceId);
+        // 如果删的是当前激活的工作目录，切换到剩余的第一个
+        if (pendingDeleteWorkspaceId === activeWorkspaceId) {
+          setActiveWorkspaceId(next[0]?.workspace_id || "");
+        }
         return next;
       });
-      setThreads([]);
-      setActiveThreadId("");
-      setTraceRuns([]);
-      setActiveTraceId("");
-      setLiveTraceId("");
-      setTraceDetail(null);
-      setOutlineMarkdown("");
-      setDetailOutlineChapters([]);
-      setActiveDetailChapterFilename("");
-      setNovelMarkdown("");
-      setNovelSource("");
-      setNovelChapterCount(0);
-      setCharacters([]);
-      setActiveCharacterFilename("");
-      setResult(null);
-      setMessages([initialAssistantMessage]);
+      // 如果删的是当前激活的工作目录，清空所有面板数据
+      if (pendingDeleteWorkspaceId === activeWorkspaceId) {
+        setThreads([]);
+        setActiveThreadId("");
+        setTraceRuns([]);
+        setActiveTraceId("");
+        setLiveTraceId("");
+        setTraceDetail(null);
+        setOutlineMarkdown("");
+        setDetailOutlineChapters([]);
+        setActiveDetailChapterFilename("");
+        setNovelMarkdown("");
+        setNovelSource("");
+        setNovelChapterCount(0);
+        setCharacters([]);
+        setActiveCharacterFilename("");
+        setResult(null);
+        setMessages([initialAssistantMessage]);
+        setSessionMenuOpen(false);
+      }
       setWorkspaceDeleteOpen(false);
-      setSessionMenuOpen(false);
+      setPendingDeleteWorkspaceId("");
     } catch (deleteError) {
-      setError(deleteError instanceof Error ? deleteError.message : "无法删除工作目录。");
+      toast.error(deleteError instanceof Error ? deleteError.message : "无法删除工作目录。");
     } finally {
       setDeletingWorkspace(false);
     }
@@ -742,58 +697,53 @@ export default function Home() {
 
   async function handleCreateStyle(name: string, metaStyle: string, characterStyle: string, outlineStyle: string, detailOutlineStyle: string, writingStyle: string) {
     setCreatingStyle(true);
-    setError(null);
     try {
       const style = await createStyleRequest(name, metaStyle, characterStyle, outlineStyle, detailOutlineStyle, writingStyle);
       setStyles((current) => [...current, style]);
     } catch (createStyleError) {
-      setError(createStyleError instanceof Error ? createStyleError.message : "无法创建风格。");
+      toast.error(createStyleError instanceof Error ? createStyleError.message : "无法创建风格。");
     } finally {
       setCreatingStyle(false);
     }
   }
 
   async function handleUpdateStyle(styleId: string, fields: Record<string, string>) {
-    setError(null);
     try {
       const updated = await updateStyleRequest(styleId, fields);
       setStyles((current) => current.map((s) => (s.style_id === updated.style_id ? updated : s)));
     } catch (updateError) {
-      setError(updateError instanceof Error ? updateError.message : "无法更新风格。");
+      toast.error(updateError instanceof Error ? updateError.message : "无法更新风格。");
     }
   }
 
   async function handleOptimizeStyle(styleType: string, content: string): Promise<string> {
-    setError(null);
     try {
       const result = await optimizeStyleRequest(styleType, content);
       return result.optimized;
     } catch (optimizeError) {
-      setError(optimizeError instanceof Error ? optimizeError.message : "AI 优化失败。");
+      toast.error(optimizeError instanceof Error ? optimizeError.message : "AI 优化失败。");
       return content;
     }
   }
 
   async function handleDeleteStyle(styleId: string) {
-    setError(null);
     try {
       await deleteStyleRequest(styleId);
       setStyles((current) => current.filter((s) => s.style_id !== styleId));
     } catch (deleteStyleError) {
-      setError(deleteStyleError instanceof Error ? deleteStyleError.message : "无法删除风格。");
+      toast.error(deleteStyleError instanceof Error ? deleteStyleError.message : "无法删除风格。");
     }
   }
 
   async function handleSelectStyle(styleId: string | null) {
     if (!activeWorkspaceId) return;
-    setError(null);
     try {
       const updated = await activateStyleRequest(activeWorkspaceId, styleId);
       setWorkspaces((current) =>
         current.map((w) => (w.workspace_id === updated.workspace_id ? updated : w)),
       );
     } catch (activateError) {
-      setError(activateError instanceof Error ? activateError.message : "无法设置风格。");
+      toast.error(activateError instanceof Error ? activateError.message : "无法设置风格。");
     }
   }
 
@@ -805,7 +755,6 @@ export default function Home() {
     }
 
     setCreatingThread(true);
-    setError(null);
 
     try {
       const thread = await createThreadRequest(activeWorkspaceId);
@@ -814,7 +763,7 @@ export default function Home() {
       setResult(null);
       setActiveThreadId(thread.thread_id);
     } catch (createError) {
-      setError(createError instanceof Error ? createError.message : "无法创建新会话。");
+      toast.error(createError instanceof Error ? createError.message : "无法创建新会话。");
     } finally {
       setCreatingThread(false);
     }
@@ -832,7 +781,6 @@ export default function Home() {
     if (!threadId || deleting) return;
 
     setDeleting(true);
-    setError(null);
 
     try {
       await deleteThreadRequest(threadId);
@@ -849,7 +797,7 @@ export default function Home() {
         return next;
       });
     } catch (deleteError) {
-      setError(deleteError instanceof Error ? deleteError.message : "删除失败。");
+      toast.error(deleteError instanceof Error ? deleteError.message : "删除失败。");
     } finally {
       setDeleting(false);
     }
@@ -859,12 +807,11 @@ export default function Home() {
     if (!activeThreadId || !traceId || deletingTraceId) return;
     const run = traceRuns.find((item) => item.trace_id === traceId);
     if (run?.status === "running") {
-      setError("运行中的 Trace 不能删除。");
+      toast.error("运行中的 Trace 不能删除。");
       return;
     }
 
     setDeletingTraceId(traceId);
-    setError(null);
 
     try {
       await deleteTraceRequest(activeThreadId, traceId);
@@ -881,7 +828,7 @@ export default function Home() {
       });
     } catch (deleteError) {
       const message = deleteError instanceof Error ? deleteError.message : "";
-      setError(message.includes("409") ? "运行中的 Trace 不能删除。" : "无法删除 Trace。");
+      toast.error(message.includes("409") ? "运行中的 Trace 不能删除。" : "无法删除 Trace。");
     } finally {
       setDeletingTraceId("");
     }
@@ -897,12 +844,11 @@ export default function Home() {
     const trimmedPrompt = prompt.trim();
     if (!trimmedPrompt || loading) return;
     if (!activeWorkspaceId) {
-      setError("请先选择或创建一个工作目录。");
+      toast.error("请先选择或创建一个工作目录。");
       return;
     }
 
     setLoading(true);
-    setError(null);
     setResult(null);
     setLiveTraceId("");
     setTraceDetail(null);
@@ -949,7 +895,7 @@ export default function Home() {
             );
           })
           .catch((renameError) => {
-            setError(renameError instanceof Error ? renameError.message : "无法更新会话名称。");
+            toast.error(renameError instanceof Error ? renameError.message : "无法更新会话名称。");
           });
       }
 
@@ -1111,7 +1057,7 @@ export default function Home() {
         return;
       }
 
-      setError(submitError instanceof Error ? submitError.message : "Unexpected request failure.");
+      toast.error(submitError instanceof Error ? submitError.message : "Unexpected request failure.");
       setMessages((current) => [
         ...current,
         {
@@ -1139,7 +1085,10 @@ export default function Home() {
             theme={theme}
             onWorkspaceChange={setActiveWorkspaceId}
             onCreateWorkspace={() => setWorkspaceCreateOpen(true)}
-            onRequestDeleteWorkspace={() => setWorkspaceDeleteOpen(true)}
+            onDeleteWorkspace={(workspaceId: string) => {
+              setPendingDeleteWorkspaceId(workspaceId);
+              setWorkspaceDeleteOpen(true);
+            }}
             onThemeToggle={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
           />
         }
@@ -1216,7 +1165,6 @@ export default function Home() {
           />
         ) : null}
 
-        {error ? <p className="status-copy error-copy dashboard-error">{error}</p> : null}
       </AppShell>
 
       {workspaceCreateOpen ? (
@@ -1261,12 +1209,15 @@ export default function Home() {
 
       <ConfirmDialog
         open={workspaceDeleteOpen}
-        title="删除当前工作目录？"
+        title={`删除工作目录「${workspaces.find((w) => w.workspace_id === pendingDeleteWorkspaceId)?.outline_name || ""}」？`}
         description="这会删除该工作目录以及目录下的所有创作会话。该操作不可撤销。"
         confirmLabel="删除工作目录"
         loading={deletingWorkspace}
         onConfirm={handleDeleteWorkspace}
-        onCancel={() => setWorkspaceDeleteOpen(false)}
+        onCancel={() => {
+          setWorkspaceDeleteOpen(false);
+          setPendingDeleteWorkspaceId("");
+        }}
       />
 
       {styleModalOpen ? (

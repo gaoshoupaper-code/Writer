@@ -14,11 +14,11 @@ from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
 from langchain.agents.middleware.types import AgentMiddleware
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
-from app.writer.subagents.character_subagent import build_character_subagent
-from app.writer.subagents.detail_outline_subagent import build_detail_outline_pipeline_subagent
+from app.writer.subagents.character_subagent import build_character_deep_subagent
+from app.writer.subagents.detail_outline_subagent import build_detail_outline_deep_subagent
 from app.writer.models import build_writer_model
-from app.writer.subagents.outline_subagent import build_outline_pipeline_subagent
-from app.writer.subagents.writing_subagent import build_writing_pipeline_subagent
+from app.writer.subagents.outline_subagent import build_outline_deep_subagent
+from app.writer.subagents.writing_subagent import build_writing_deep_subagent
 from app.writer.middleware import (
     ArtifactPrerequisite,
     ArtifactPrerequisiteMiddleware,
@@ -119,41 +119,43 @@ class MetaAgentService:
             return None
         return style.get("meta_style") or None
 
-    def _character_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> SubAgent:
-        middleware = self._middleware_for_workspace(workspace_path, trace_id, "character-subagent")
-        return build_character_subagent(workspace_path, middleware, style_suffix=style_suffix)
+    def _character_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
+        return build_character_deep_subagent(
+            workspace_path,
+            build_writer_model(self.settings),
+            self._backend_for_workspace(workspace_path),
+            lambda agent_name: self._middleware_for_workspace(workspace_path, trace_id, agent_name),
+            style_suffix=style_suffix,
+        )
 
     def _outline_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
-        return build_outline_pipeline_subagent(
+        return build_outline_deep_subagent(
             workspace_path,
             build_writer_model(self.settings),
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
             context_file_paths=["outline.md", "character/*.md"],
-            checkpointer=self.checkpointer,
         )
 
     def _detail_outline_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
-        return build_detail_outline_pipeline_subagent(
+        return build_detail_outline_deep_subagent(
             workspace_path,
             build_writer_model(self.settings),
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
             context_file_paths=["outline.md", "character/*.md", "detail/overview.md", "detail/chapter-*.md"],
-            checkpointer=self.checkpointer,
         )
 
     def _writing_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
-        return build_writing_pipeline_subagent(
+        return build_writing_deep_subagent(
             workspace_path,
             build_writer_model(self.settings),
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
             context_file_paths=["outline.md", "character/*.md", "detail/*.md"],
-            checkpointer=self.checkpointer,
         )
 
     def _general_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None) -> SubAgent:
@@ -428,11 +430,11 @@ class MetaAgentService:
             "- 正文写作采用分章推进；每次调用 writing 子代理只写一个章节，目标约 1000 字，允许 800-1500 字浮动。\n"
             "- 调用 writing 子代理时，必须提供总章节数、当前章节编号、剧情大纲、本章目标、出场人物、必须发生的 beat、承接关系、必须保留的事实和禁止改变的内容；不要提供前五章正文，writing 会自行读取 chapter/ 和 detail/。\n"
             "- 每完成一章或关键场景后，立即更新 chapter/ 对应章节文件与 state_log.md，不要等全书完成后才统一写入。\n"
-            "- 每次 writing 子代理完成一个章节后，其内部会立即调用 review 子代理审查该章节的逻辑自洽性和表达清晰度，并写入 review/ 下对应章节审查文件。\n"
-            "- writing 子代理内部会根据 review 结论自动修订同一章节，最多 3 轮；若仍未通过，会接受当前最好版本并在返回摘要中标记质量风险，由你决定是否调整 outline/state_log 或后续补救。\n"
+            "- 每次 writing 子代理完成一个章节后，其内部 evolution 子代理会自动审查该章节的逻辑自洽性和表达清晰度，并写入 review/ 下对应章节审查文件。\n"
+            "- writing 子代理内部会根据 evolution 审查结论自动修订同一章节，最多 3 轮；若仍未通过，会接受当前最好版本并在返回摘要中标记质量风险，由你决定是否调整 outline/state_log 或后续补救。\n"
             "- 允许动态调整大纲：小改自动接受；中改和大改由你作为 Director 决策，并写入 state_log.md。\n"
             "- 每个场景最多修订 3 轮；超过后必须由你决定接受、重写、调整大纲或丢弃重来。\n"
-            "- 最终必须调用 evaluation 子代理评估完整小说；如果最后一次 outline 调用已经自动生成了最新 evaluation.md，可以直接基于该评估收尾。\n"
+            "- 最终必须确认 outline 子代理返回时已包含最新 evaluation.md（其内部 evolution 会自动生成）；如果最后一次 outline 调用已经自动生成了最新 evaluation.md，可以直接基于该评估收尾。\n"
             "- 最终回复只给摘要，不要在回复中输出章节正文全文。\n\n"
             "用户需求：\n"
             f"{request_text}\n\n"

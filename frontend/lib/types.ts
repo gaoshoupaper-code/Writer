@@ -248,3 +248,16 @@ export type CheckpointState = {
   thread_id: string;
   messages: CheckpointMessage[];
 };
+
+export type InitResponse = {
+  workspaces: WorkspaceSummary[];
+  styles: Style[];
+};
+
+export type WorkspaceBootstrapResponse = {
+  threads: ThreadSummary[];
+  outline: WorkspaceOutlineContent | null;
+  detail_outline: WorkspaceDetailOutlineContent | null;
+  characters: WorkspaceCharacterContent | null;
+  novel: WorkspaceNovelContent | null;
+};

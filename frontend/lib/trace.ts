@@ -28,8 +28,8 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
   const agentNodeIds = new Set<string>();
   const pendingLlm = new Map<string, TraceLogEvent[]>();
   const pendingTool = new Map<string, TraceLogEvent[]>();
-  // task 边界追踪
-  let currentTaskCallId: string | null = null;
+  // task 边界追踪（栈结构：支持嵌套 task 委托）
+  const taskCallStack: string[] = [];
   const agentLastTask = new Map<string, string | null>();
   const agentInvocationCounter = new Map<string, number>();
   const instanceFirstTs = new Map<string, string>();
@@ -37,10 +37,16 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
 
   function getAgentNodeId(event: TraceLogEvent): string {
     if (!event.agent_name) return "run";
-    if (agentRole(event.agent_name) === "main") return `agent:${event.agent_name}`;
-    const invocation = agentInvocationCounter.get(event.agent_name);
-    if (invocation != null) return `agent:${event.agent_name}:${invocation}`;
-    return `agent:${event.agent_name}`; // D9 回退
+    const name = event.agent_name;
+    if (agentRole(name) === "main") return `agent:${name}`;
+    const invocation = agentInvocationCounter.get(name);
+    if (invocation != null) return `agent:${name}:${invocation}`;
+    return `agent:${name}`; // D9 回退
+  }
+
+  function nodeAgentAttrs(event: TraceLogEvent) {
+    const name = event.agent_name;
+    return { agent_name: name, agent_role: agentRole(name), depth: agentDepth(name) };
   }
 
   function ensureAgentNode(event: TraceLogEvent) {
@@ -67,8 +73,8 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
       return;
     }
 
-    // ── Subagent：实例化拆分 ──
-    const currentTask = currentTaskCallId;
+    // ── Subagent（含 evaluation agent）：实例化拆分 ──
+    const currentTask = taskCallStack.length > 0 ? taskCallStack[taskCallStack.length - 1] : null;
     const lastTask = agentLastTask.get(event.agent_name);
 
     if (lastTask != null && lastTask === currentTask) return; // 同一实例内
@@ -82,12 +88,12 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
     agentNodeIds.add(nodeId);
     instanceFirstTs.set(nodeId, event.timestamp);
 
-    // 确定父节点
+    // 确定父节点：evaluation agent → 挂到对应 primary subagent 下
     let parentId = "run";
     if (isEvaluationAgent(event.agent_name)) {
       const primaryName = evaluationPrimaryAgentName(event.agent_name);
-      const primaryInv = agentInvocationCounter.get(primaryName) ?? 1;
-      parentId = `agent:${primaryName}:${primaryInv}`;
+      const primaryInvocation = agentInvocationCounter.get(primaryName);
+      parentId = primaryInvocation != null ? `agent:${primaryName}:${primaryInvocation}` : `agent:${primaryName}`;
     }
 
     nodes.push({
@@ -106,13 +112,14 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
   }
 
   function appendContext(event: TraceLogEvent, nodeId: string, kind: TraceContextSegment["kind"], title: string, content: unknown) {
+    const attrs = nodeAgentAttrs(event);
     const segment: TraceContextSegment = {
       anchor_id: `ctx-${event.sequence}-${context.length + 1}`,
       sequence: context.length + 1,
       kind,
-      agent_name: event.agent_name,
-      agent_role: agentRole(event.agent_name),
-      depth: agentDepth(event.agent_name),
+      agent_name: attrs.agent_name,
+      agent_role: attrs.agent_role,
+      depth: attrs.depth,
       title,
       content: content ?? "",
       metadata: {
@@ -134,10 +141,10 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
   for (const event of events) {
     // ── N2: task 工具拦截 ──
     if (event.tool_name === "task" && ["tool_start", "tool_end", "tool_error"].includes(event.type)) {
-      if (event.type === "tool_start") {
-        currentTaskCallId = event.tool_call_id ?? null;
-      } else {
-        currentTaskCallId = null;
+      if (event.type === "tool_start" && event.tool_call_id) {
+        taskCallStack.push(event.tool_call_id);
+      } else if (event.type !== "tool_start" && taskCallStack.length > 0) {
+        taskCallStack.pop();
       }
       continue;
     }
@@ -187,9 +194,7 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
         kind: event.type === "llm_error" ? "error" : "llm",
         label: event.model_name || "LLM",
         status: event.status,
-        agent_name: event.agent_name,
-        agent_role: agentRole(event.agent_name),
-        depth: agentDepth(event.agent_name),
+        ...nodeAgentAttrs(event),
         started_at: start?.timestamp,
         ended_at: event.timestamp,
         duration_ms: event.duration_ms,
@@ -223,9 +228,7 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
         kind: event.type === "tool_error" ? "error" : "tool",
         label: event.tool_name || "Tool",
         status: event.status,
-        agent_name: event.agent_name,
-        agent_role: agentRole(event.agent_name),
-        depth: agentDepth(event.agent_name),
+        ...nodeAgentAttrs(event),
         started_at: start?.timestamp,
         ended_at: event.timestamp,
         duration_ms: event.duration_ms,
@@ -277,9 +280,7 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
         kind: "llm",
         label: event.model_name || "LLM",
         status: "running",
-        agent_name: event.agent_name,
-        agent_role: agentRole(event.agent_name),
-        depth: agentDepth(event.agent_name),
+        ...nodeAgentAttrs(event),
         started_at: event.timestamp,
         model_name: event.model_name,
         raw_event_ids: [event.event_id],
@@ -296,9 +297,7 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
         kind: "tool",
         label: event.tool_name || "Tool",
         status: "running",
-        agent_name: event.agent_name,
-        agent_role: agentRole(event.agent_name),
-        depth: agentDepth(event.agent_name),
+        ...nodeAgentAttrs(event),
         started_at: event.timestamp,
         tool_name: event.tool_name,
         raw_event_ids: [event.event_id],
@@ -505,6 +504,11 @@ function agentDepth(agentName?: string | null) {
   if (!agentName) return 0;
   if (isEvaluationAgent(agentName)) return 2;
   return agentName.endsWith("-subagent") ? 1 : 0;
+}
+
+function effectiveAgentName(agentName?: string | null): string | null | undefined {
+  if (agentName && isEvaluationAgent(agentName)) return evaluationPrimaryAgentName(agentName);
+  return agentName;
 }
 
 function toolCallNames(toolCalls: unknown) {

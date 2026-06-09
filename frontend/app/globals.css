@@ -1,3 +1,37 @@
+/* ── Tailwind CSS v4 ── */
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/*
+ * shadcn/ui 主题 Token → 映射到现有设计变量
+ * 所有 shadcn 组件自动继承暖色调体系
+ */
+@theme inline {
+  --color-background: var(--bg);
+  --color-foreground: var(--ink);
+  --color-card: var(--panel-solid);
+  --color-card-foreground: var(--ink);
+  --color-popover: var(--panel-solid);
+  --color-popover-foreground: var(--ink);
+  --color-primary: var(--teal);
+  --color-primary-foreground: #fff;
+  --color-secondary: var(--panel-soft);
+  --color-secondary-foreground: var(--ink);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted);
+  --color-accent: var(--hover);
+  --color-accent-foreground: var(--ink);
+  --color-destructive: var(--danger);
+  --color-destructive-foreground: #fff;
+  --color-border: var(--line-strong);
+  --color-input: var(--line-strong);
+  --color-ring: var(--teal);
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+}
+
 :root {
   --bg: #efe3c8;
   --ink: #2e2618;
@@ -108,6 +142,8 @@ a {
 }
 
 .dashboard-topbar {
+  position: relative;
+  z-index: 10;
   display: grid;
   grid-template-columns: minmax(210px, 0.7fr) minmax(340px, 0.9fr) max-content;
   align-items: flex-end;
@@ -261,6 +297,53 @@ a {
   align-items: center;
 }
 
+.workspace-menu {
+  position: relative;
+}
+
+.workspace-menu-trigger {
+  width: 100%;
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  padding: 0 14px;
+  background: var(--card);
+  color: var(--ink);
+  font-size: 0.92rem;
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.workspace-menu-trigger:hover {
+  border-color: var(--teal);
+  box-shadow: 0 0 0 2px rgba(45, 156, 142, 0.12);
+}
+
+.workspace-menu-trigger span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-menu-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 20;
+  width: 100%;
+  min-width: 260px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--card);
+  box-shadow: 0 10px 36px rgba(0, 0, 0, 0.13);
+  padding: 10px;
+}
+
 .workspace-actions {
   display: flex;
   align-items: flex-end;
@@ -321,19 +404,6 @@ a {
 
 .theme-toggle[aria-checked="true"] .theme-toggle-thumb {
   transform: translateX(16px);
-}
-
-.topbar-delete-button {
-  min-height: 42px;
-  width: auto;
-  margin: 0;
-  padding: 0 13px;
-  border-color: rgba(201, 74, 80, 0.28);
-  border-radius: 999px;
-  color: var(--danger);
-  background: color-mix(in srgb, var(--panel-solid) 76%, transparent);
-  font-size: 13px;
-  font-weight: 900;
 }
 
 .conversation-panel {
@@ -1491,7 +1561,8 @@ a {
   color: var(--ink);
 }
 
-.inspection-tab.active {
+.inspection-tab.active,
+.inspection-tab[data-state="active"] {
   color: var(--teal);
   border-bottom-color: var(--teal);
 }
@@ -3262,6 +3333,8 @@ html[data-theme="dark"] :is(
   .sidebar-item.active,
   .session-menu-trigger,
   .session-menu-popover,
+  .workspace-menu-trigger,
+  .workspace-menu-popover,
   .message,
   .trace-delete-button,
   .trace-run-item,
@@ -3488,7 +3561,7 @@ html[data-theme="dark"] .panel-heading {
   }
 
   .workspace-actions {
-    grid-template-columns: 88px 88px;
+    justify-content: center;
   }
 }
 
@@ -3563,7 +3636,7 @@ html[data-theme="dark"] .panel-heading {
 
 @media (max-width: 620px) {
   .workspace-actions {
-    grid-template-columns: 1fr;
+    justify-content: flex-end;
   }
 
   .sidebar-nav {
@@ -3589,6 +3662,10 @@ html[data-theme="dark"] .panel-heading {
   .session-menu-popover {
     left: 0;
     right: auto;
+    width: 100%;
+  }
+
+  .workspace-menu-popover {
     width: 100%;
   }
 }

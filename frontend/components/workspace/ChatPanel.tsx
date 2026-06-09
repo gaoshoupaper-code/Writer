@@ -3,6 +3,8 @@ import ReactMarkdown from "react-markdown";
 import type { ChatMessage, ThreadSummary } from "../../lib/types";
 import { SessionMenu } from "./SessionMenu";
 import { ToolTree } from "./ToolTree";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 
 type ChatPanelProps = {
   messages: ChatMessage[];
@@ -65,7 +67,6 @@ export function ChatPanel({
 
   function handleInputKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
-
     event.preventDefault();
     event.currentTarget.form?.requestSubmit();
   }
@@ -118,9 +119,13 @@ export function ChatPanel({
       <div className="message-list">
         {messages.map((message, index) => {
           const label = message.role === "assistant" ? "Agent" : "你";
+          const isLastAssistant = message.role === "assistant" && index === messages.length - 1 && loading;
 
           return (
-            <article className={`message ${message.role}`} key={`${message.role}-${index}`}>
+            <article
+              className={`message ${message.role} animate-in fade-in-0 slide-in-from-bottom-2 duration-300`}
+              key={`${message.role}-${index}`}
+            >
               <span className="message-role">{label}</span>
               {message.role === "assistant" && message.tools?.length ? <ToolTree tools={message.tools} /> : null}
               <div className="message-content">
@@ -130,6 +135,14 @@ export function ChatPanel({
                   <p>{message.content}</p>
                 )}
               </div>
+              {/* 最后一条 assistant 消息 + loading 态 → 显示 shimmer */}
+              {isLastAssistant && !message.content ? (
+                <div className="grid gap-2 mt-2">
+                  <Skeleton className="h-4 w-3/4" />
+                  <Skeleton className="h-4 w-1/2" />
+                  <Skeleton className="h-4 w-2/3" />
+                </div>
+              ) : null}
             </article>
           );
         })}
@@ -159,13 +172,22 @@ export function ChatPanel({
         </div>
         <div className="composer-actions">
           {loading ? (
-            <button className="stop-button" type="button" onClick={onStop}>
+            <Button
+              variant="outline"
+              className="stop-button min-h-[46px] rounded-[14px] px-4 text-sm font-black text-red-700 border-red-200 hover:bg-red-50"
+              type="button"
+              onClick={onStop}
+            >
               停止
-            </button>
+            </Button>
           ) : null}
-          <button className="send-button" type="submit" disabled={loading}>
+          <Button
+            className="send-button min-h-[46px] rounded-[14px] px-4 text-sm font-black bg-gradient-to-br from-[var(--coral)] to-[var(--gold)] shadow-lg hover:shadow-xl hover:-translate-y-px transition-all"
+            type="submit"
+            disabled={loading}
+          >
             {loading ? "生成中" : "发送"}
-          </button>
+          </Button>
         </div>
       </form>
     </section>

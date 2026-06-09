@@ -24,10 +24,10 @@
 
 from __future__ import annotations
 
-
+from collections.abc import Callable
 from pathlib import Path
 
-from deepagents import SubAgent, create_deep_agent
+from deepagents import CompiledSubAgent, SubAgent, create_deep_agent
 from deepagents.backends import FilesystemBackend
 from deepagents.middleware.filesystem import FilesystemPermission
 from langchain.agents.middleware.types import AgentMiddleware
@@ -35,6 +35,8 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from app.writer.middleware import FilesystemPathGuardMiddleware, TraceCallbackHandler, TraceMiddleware
 from app.writer.models import build_writer_model
+from app.writer.subagents.deep_subagent_factory import build_deep_subagent
+from app.writer.subagents.evaluation_subagent import EvaluationType, build_evaluation_subagent
 from app.core.settings import Settings
 from app.create_type.store import CreateTypeStore
 from app.writer.trace import TraceRecorder
@@ -97,6 +99,86 @@ def build_character_subagent(workspace_root: Path, middleware: list[AgentMiddlew
     if middleware is not None:
         spec["middleware"] = middleware
     return spec
+
+
+def build_character_deep_subagent(
+    workspace_root: Path,
+    model: object,
+    backend: object,
+    middleware_factory: Callable[[str], list[AgentMiddleware]],
+    style_suffix: str | None = None,
+) -> CompiledSubAgent:
+    """构建基于 DeepAgent 的 character 子代理（内含 evolution 评估循环）。
+
+    替代裸的 build_character_subagent，用于 meta_agent 路径。
+    子代理自主决策：生成角色 → 调用 evolution 评估 → 根据反馈修订（最多 3 轮）。
+
+    注意：CharacterService 独立 API 端点仍使用 create_deep_agent（无 evolution），
+    本函数仅用于 meta_agent 的子代理注册。
+
+    Args:
+        workspace_root:      工作区根目录
+        model:               聊天模型
+        backend:             DeepAgents 后端（文件系统）
+        middleware_factory:  中间件工厂函数，按 agent_name 生成对应中间件列表
+        style_suffix:        角色风格 SUFFIX 文本（可选）
+
+    Returns:
+        编译后的子代理字典 {name, description, runnable}
+    """
+    # ---- 主代理 system prompt + permissions ----
+    primary_middleware = list(middleware_factory("character-subagent"))
+    primary_spec = build_character_subagent(workspace_root, primary_middleware, style_suffix)
+
+    # ---- evolution 子代理规格 ----
+    evaluation_spec = build_evaluation_subagent(
+        EvaluationType.CHARACTER,
+        workspace_root,
+        middleware_factory("character-evaluation-subagent"),
+        context_file_paths=["character/*.md"],
+    )
+
+    # ---- 构建 evolution SubAgent dict ----
+    evolution = SubAgent(
+        name="evolution",
+        description="评估角色档案的塑造质量，写入 character/evaluation.md，返回评分和修订建议。",
+        system_prompt=evaluation_spec["system_prompt"],
+        permissions=evaluation_spec.get("permissions"),
+        middleware=evaluation_spec.get("middleware"),
+    )
+
+    # ---- 组装 system prompt：追加 evolution 使用指令 ----
+    base_prompt = primary_spec["system_prompt"]
+    if "评估机制" in base_prompt:
+        base_prompt = base_prompt.split("评估机制")[0].rstrip()
+    evolution_suffix = (
+        "评估机制（evolution 子代理）：\n"
+        "- 你有一个名为 \"evolution\" 的子代理，用于评估你的角色塑造质量。\n"
+        "- 工作流程：完成 character/ 下角色档案写入后，调用 evolution 子代理评估质量。\n"
+        "- evolution 会读取 character/ 下的所有角色文件并写入评估报告到 character/evaluation.md，然后返回评分和修改建议。\n"
+        "- 如果 evolution 返回\"建议修改\"或\"必须修改\"，你**必须**读取 character/evaluation.md 中的详细评估报告，"
+        "根据核心问题和修改建议修订角色档案，然后再次调用 evolution 评估修订后的版本。\n"
+        "- 如果 evolution 返回\"无需修改\"，直接向父代理返回结果。\n"
+        "- 最多调用 evolution 3 次（含首次评估），超过后系统会强制终止评估循环。\n"
+        "- 返回父代理时，请在回复中包含：修订轮数、是否有质量风险。"
+    )
+    system_prompt = f"{base_prompt}\n\n{evolution_suffix}"
+
+    # ---- 调用工厂 ----
+    return build_deep_subagent(
+        name="character",
+        description=(
+            "适用：需要生成或修改角色档案、人物关系、动机、心理矛盾或角色弧光时调用。"
+            "内置 evolution 评估循环：生成角色后自动评估质量，如果评估建议修订会自动修订，最多 3 轮。"
+            "委托时不要只给文件路径；请说明角色任务目标、故事上下文、已有设定、关键约束和期望产物。"
+        ),
+        model=model,
+        system_prompt=system_prompt,
+        evolution_spec=evolution,
+        subagent_middleware=primary_spec.get("middleware"),
+        backend=backend,
+        max_revisions=3,
+    )
 
 
 class CharacterService:
