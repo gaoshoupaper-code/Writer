@@ -31,12 +31,26 @@ class NormalizeWorkspaceWritePathTest(unittest.TestCase):
 
             self.assertEqual(normalize_workspace_write_path("outline.md", workspace), "/outline.md")
             self.assertEqual(normalize_workspace_write_path("/outline.md", workspace), "/outline.md")
+            self.assertEqual(normalize_workspace_write_path("worldview.md", workspace), "/worldview.md")
+            self.assertEqual(normalize_workspace_write_path("/worldview.md", workspace), "/worldview.md")
             self.assertEqual(normalize_workspace_write_path("evaluation.md", workspace), "/evaluation.md")
             self.assertEqual(normalize_workspace_write_path("/evaluation.md", workspace), "/evaluation.md")
             self.assertEqual(normalize_workspace_write_path("novel.md", workspace), "/novel.md")
             self.assertEqual(normalize_workspace_write_path("/novel.md", workspace), "/novel.md")
             self.assertEqual(normalize_workspace_write_path("review/chapter-01.md", workspace), "/review/chapter-01.md")
             self.assertEqual(normalize_workspace_write_path("/review/chapter-01.md", workspace), "/review/chapter-01.md")
+
+    def test_accepts_storybuilding_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+
+            # storyline
+            self.assertEqual(normalize_workspace_write_path("storyline/主线.md", workspace), "/storyline/主线.md")
+            self.assertEqual(normalize_workspace_write_path("/storyline/主线.md", workspace), "/storyline/主线.md")
+            self.assertEqual(normalize_workspace_write_path(r"storyline\主线.md", workspace), "/storyline/主线.md")
+            # volume
+            self.assertEqual(normalize_workspace_write_path("volume/第一卷.md", workspace), "/volume/第一卷.md")
+            self.assertEqual(normalize_workspace_write_path("/volume/第一卷.md", workspace), "/volume/第一卷.md")
 
     def test_accepts_workspace_absolute_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

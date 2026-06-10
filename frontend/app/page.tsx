@@ -13,6 +13,7 @@ import { Sidebar } from "../components/workspace/Sidebar";
 import { StyleModal } from "../components/workspace/StyleModal";
 import { TopBar } from "../components/workspace/TopBar";
 import { TracePanel } from "../components/workspace/TracePanel";
+import { WorldviewPanel } from "../components/workspace/WorldviewPanel";
 import {
   API_BASE_URL,
   activateStyle as activateStyleRequest,
@@ -53,11 +54,14 @@ import type {
   TraceDetail,
   TraceLogEvent,
   TraceRunSummary,
+  VolumeChapter,
   WorkspaceCharacterContent,
   WorkspaceDetailOutlineContent,
   WorkspaceNovelContent,
   WorkspaceOutlineContent,
   WorkspacePanel,
+  WorkspaceVolumeContent,
+  WorkspaceWorldviewContent,
   WorkspaceSummary,
 } from "../lib/types";
 
@@ -271,6 +275,11 @@ export default function Home() {
   const [characters, setCharacters] = useState<CharacterMarkdownFile[]>([]);
   const [charactersLoading, setCharactersLoading] = useState(false);
   const [activeCharacterFilename, setActiveCharacterFilename] = useState("");
+  const [worldviewMarkdown, setWorldviewMarkdown] = useState("");
+  const [worldviewLoading, setWorldviewLoading] = useState(false);
+  const [volumeChapters, setVolumeChapters] = useState<VolumeChapter[]>([]);
+  const [activeVolumeFilename, setActiveVolumeFilename] = useState("");
+  const [outlineTab, setOutlineTab] = useState<"outline" | "volume">("outline");
   const [traceRuns, setTraceRuns] = useState<TraceRunSummary[]>([]);
   const [activeTraceId, setActiveTraceId] = useState("");
   const [liveTraceId, setLiveTraceId] = useState("");
@@ -335,6 +344,13 @@ export default function Home() {
         setThreads(data.threads);
         setActiveThreadId(data.threads[0]?.thread_id || "");
         if (data.outline) setOutlineMarkdown(data.outline.markdown);
+        if (data.worldview) setWorldviewMarkdown(data.worldview.markdown);
+        if (data.volume) {
+          setVolumeChapters(data.volume.chapters);
+          setActiveVolumeFilename(
+            data.volume.chapters[0]?.filename || "",
+          );
+        }
         if (data.detail_outline) {
           setDetailOutlineChapters(data.detail_outline.chapters);
           setActiveDetailChapterFilename(
@@ -356,6 +372,7 @@ export default function Home() {
         setDetailOutlineLoading(false);
         setCharactersLoading(false);
         setNovelLoading(false);
+        setWorldviewLoading(false);
       } catch (err) {
         if (!ignore) {
           toast.error(err instanceof Error ? err.message : "初始化加载失败。");
@@ -367,6 +384,7 @@ export default function Home() {
     setDetailOutlineLoading(true);
     setCharactersLoading(true);
     setNovelLoading(true);
+    setWorldviewLoading(true);
     bootstrap();
 
     return () => { ignore = true; };
@@ -374,6 +392,7 @@ export default function Home() {
 
   // ── 后续切换工作区：用 bootstrap 接口替代 5 个单独请求 ──
   const initialBootDone = useRef(false);
+  const skipNextBootstrap = useRef(false);
 
   useEffect(() => {
     if (!activeWorkspaceId) return;
@@ -384,6 +403,12 @@ export default function Home() {
       return;
     }
 
+    // 跳过新创建的空工作区（数据已在 handleCreateWorkspace 中预设为空）
+    if (skipNextBootstrap.current) {
+      skipNextBootstrap.current = false;
+      return;
+    }
+
     let ignore = false;
 
     async function loadWorkspace() {
@@ -391,21 +416,32 @@ export default function Home() {
       setDetailOutlineLoading(true);
       setCharactersLoading(true);
       setNovelLoading(true);
+      setWorldviewLoading(true);
 
       try {
-        const [threadData, bootData] = await Promise.all([
-          fetchThreads(activeWorkspaceId),
-          fetchWorkspaceBootstrap(activeWorkspaceId),
-        ]);
+        const bootData = await fetchWorkspaceBootstrap(activeWorkspaceId);
         if (ignore) return;
-        setThreads(threadData);
+        setThreads(bootData.threads);
         setActiveThreadId(
-          threadData.some((t) => t.thread_id === activeThreadId)
+          bootData.threads.some((t) => t.thread_id === activeThreadId)
             ? activeThreadId
-            : threadData[0]?.thread_id || "",
+            : bootData.threads[0]?.thread_id || "",
         );
         if (bootData.outline) setOutlineMarkdown(bootData.outline.markdown);
         else setOutlineMarkdown("");
+        if (bootData.worldview) setWorldviewMarkdown(bootData.worldview.markdown);
+        else setWorldviewMarkdown("");
+        if (bootData.volume) {
+          setVolumeChapters(bootData.volume.chapters);
+          setActiveVolumeFilename(
+            bootData.volume.chapters.some((c) => c.filename === activeVolumeFilename)
+              ? activeVolumeFilename
+              : bootData.volume.chapters[0]?.filename || "",
+          );
+        } else {
+          setVolumeChapters([]);
+          setActiveVolumeFilename("");
+        }
         if (bootData.detail_outline) {
           setDetailOutlineChapters(bootData.detail_outline.chapters);
           setActiveDetailChapterFilename(
@@ -447,6 +483,7 @@ export default function Home() {
           setDetailOutlineLoading(false);
           setCharactersLoading(false);
           setNovelLoading(false);
+          setWorldviewLoading(false);
         }
       }
     }
@@ -594,6 +631,24 @@ export default function Home() {
       } catch {}
     });
 
+    es.addEventListener("worldview", (e) => {
+      try {
+        const d = JSON.parse(e.data) as WorkspaceWorldviewContent;
+        setWorldviewMarkdown(d.markdown);
+        setWorldviewLoading(false);
+      } catch {}
+    });
+
+    es.addEventListener("volume", (e) => {
+      try {
+        const d = JSON.parse(e.data) as WorkspaceVolumeContent;
+        setVolumeChapters(d.chapters);
+        setActiveVolumeFilename((cur) =>
+          d.chapters.some((c) => c.filename === cur) ? cur : d.chapters[0]?.filename || "",
+        );
+      } catch {}
+    });
+
     es.addEventListener("detail_outline", (e) => {
       try {
         const d = JSON.parse(e.data) as WorkspaceDetailOutlineContent;
@@ -639,6 +694,25 @@ export default function Home() {
 
     try {
       const workspace = await createWorkspaceRequest(outlineName);
+
+      // 新工作区一定是空的，直接设空值避免触发无意义的 bootstrap 请求
+      setThreads([]);
+      setActiveThreadId("");
+      setResult(null);
+      setOutlineMarkdown("");
+      setWorldviewMarkdown("");
+      setVolumeChapters([]);
+      setActiveVolumeFilename("");
+      setDetailOutlineChapters([]);
+      setActiveDetailChapterFilename("");
+      setCharacters([]);
+      setActiveCharacterFilename("");
+      setNovelMarkdown("");
+      setNovelSource("");
+      setNovelChapterCount(0);
+      setMessages([initialAssistantMessage]);
+      skipNextBootstrap.current = true;
+
       setWorkspaces((current) => [workspace, ...current]);
       setActiveWorkspaceId(workspace.workspace_id);
       setNewWorkspaceName("失忆编剧大纲");
@@ -675,6 +749,9 @@ export default function Home() {
         setLiveTraceId("");
         setTraceDetail(null);
         setOutlineMarkdown("");
+        setWorldviewMarkdown("");
+        setVolumeChapters([]);
+        setActiveVolumeFilename("");
         setDetailOutlineChapters([]);
         setActiveDetailChapterFilename("");
         setNovelMarkdown("");
@@ -695,10 +772,10 @@ export default function Home() {
     }
   }
 
-  async function handleCreateStyle(name: string, metaStyle: string, characterStyle: string, outlineStyle: string, detailOutlineStyle: string, writingStyle: string) {
+  async function handleCreateStyle(name: string, metaStyle: string, storybuildingStyle: string, detailOutlineStyle: string, writingStyle: string) {
     setCreatingStyle(true);
     try {
-      const style = await createStyleRequest(name, metaStyle, characterStyle, outlineStyle, detailOutlineStyle, writingStyle);
+      const style = await createStyleRequest(name, metaStyle, storybuildingStyle, detailOutlineStyle, writingStyle);
       setStyles((current) => [...current, style]);
     } catch (createStyleError) {
       toast.error(createStyleError instanceof Error ? createStyleError.message : "无法创建风格。");
@@ -707,12 +784,14 @@ export default function Home() {
     }
   }
 
-  async function handleUpdateStyle(styleId: string, fields: Record<string, string>) {
+  async function handleUpdateStyle(styleId: string, fields: Record<string, string>): Promise<boolean> {
     try {
       const updated = await updateStyleRequest(styleId, fields);
       setStyles((current) => current.map((s) => (s.style_id === updated.style_id ? updated : s)));
+      return true;
     } catch (updateError) {
       toast.error(updateError instanceof Error ? updateError.message : "无法更新风格。");
+      return false;
     }
   }
 
@@ -1131,7 +1210,16 @@ export default function Home() {
         ) : null}
 
         {activePanel === "script" ? (
-          <ScriptPanel workspacePath={workspacePath} markdown={currentOutlineMarkdown} loading={outlineLoading} />
+          <ScriptPanel
+            workspacePath={workspacePath}
+            outlineMarkdown={currentOutlineMarkdown}
+            volumeChapters={volumeChapters}
+            activeVolumeFilename={activeVolumeFilename}
+            loading={outlineLoading}
+            activeTab={outlineTab}
+            onTabChange={setOutlineTab}
+            onSelectVolume={setActiveVolumeFilename}
+          />
         ) : null}
 
         {activePanel === "detail_outline" ? (
@@ -1149,6 +1237,14 @@ export default function Home() {
             activeFilename={activeCharacterFilename}
             loading={charactersLoading}
             onSelectCharacter={setActiveCharacterFilename}
+          />
+        ) : null}
+
+        {activePanel === "worldview" ? (
+          <WorldviewPanel
+            workspacePath={workspacePath}
+            markdown={worldviewMarkdown}
+            loading={worldviewLoading}
           />
         ) : null}
 

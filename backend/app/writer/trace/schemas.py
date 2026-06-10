@@ -16,9 +16,9 @@ TraceEventType = Literal[
     "tool_end",
     "tool_error",
 ]
-TraceNodeKind = Literal["run", "agent", "llm", "tool", "todo", "error"]
+TraceNodeKind = Literal["run", "agent", "llm", "tool", "todo", "error", "skill"]
 TraceAgentRole = Literal["main", "subagent"]
-TraceContextKind = Literal["system", "human", "ai", "tool", "todo", "error"]
+TraceContextKind = Literal["system", "human", "ai", "tool", "todo", "error", "skill"]
 TraceTodoStatus = Literal["pending", "in_progress", "completed"]
 
 
@@ -78,6 +78,7 @@ class TraceLogEvent(BaseModel):
     input_context_range: TraceContextRange | None = None
     output_context_anchor_id: str | None = None
     error: str | None = None
+    skill_name: str | None = None
 
 
 class TraceNode(BaseModel):
@@ -94,6 +95,7 @@ class TraceNode(BaseModel):
     duration_ms: int | None = None
     model_name: str | None = None
     tool_name: str | None = None
+    skill_name: str | None = None
     usage: TraceUsage | None = None
     context_anchor_id: str | None = None
     input_context_range: TraceContextRange | None = None

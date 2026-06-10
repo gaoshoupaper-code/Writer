@@ -1,5 +1,4 @@
 {
-  "hooks": {},
   "permissions": {
     "allow": [
       "Bash(pytest repos/geli-ai/tests/test_tool_builder_service.py -q)",
@@ -66,11 +65,14 @@
       "Bash(PYTEST_ADDOPTS='' poetry -C repos/geli-ai run pytest tests/test_tool_builder_service.py::test_tool_builder_trace_middleware_records_full_exception_details tests/test_tool_builder_service.py::test_tool_builder_stream_turn_persists_llm_schema_preview_outputs tests/test_tool_builder_service.py::test_tool_builder_stream_turn_emits_and_persists_final_schemas -q --no-cov)",
       "Bash(PYTEST_ADDOPTS='' poetry -C repos/geli-ai run pytest tests/test_tool_builder_service.py::test_tool_builder_runs_production_order_api_document_to_complete_final_schemas -q --no-cov)",
       "Bash(poetry -C repos/geli-ai run python -m py_compile app/services/tool_builder/service.py app/services/tool_builder/generation/trace/projector.py tests/test_tool_builder_service.py)",
-      "Bash(npx tsc *)"
+      "Bash(npx tsc *)",
+      "Bash(cd d:/Desktop/Writer/backend/app/writer/expert_agent/skills && mkdir -p storybuilding detail_outline writing && ls -la)"
     ],
     "additionalDirectories": [
       "C:\\Users\\h2640\\AppData\\Local\\Temp\\claude",
-      "C:\\Users\\h2640\\.claude"
+      "C:\\Users\\h2640\\.claude",
+      "d:\\Desktop\\Writer\\backend\\app\\writer\\expert_agent\\skills"
     ]
-  }
+  },
+  "hooks": {}
 }

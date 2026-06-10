@@ -40,6 +40,8 @@ from app.schemas.screenplay import (
     WorkspaceNovelChaptersContent,
     WorkspaceNovelContent,
     WorkspaceOutlineContent,
+    WorkspaceVolumeContent,
+    WorkspaceWorldviewContent,
     WorkspaceSummary,
 )
 from app.schemas.checkpoint import CheckpointState
@@ -192,7 +194,7 @@ async def _lifespan(application: FastAPI):
     if agent_service is None:
         agent_service = MetaAgentService(settings, workspace_root, trace_recorder, style_store, checkpointer)
     if character_service is None:
-        character_service = CharacterService(settings, workspace_root, trace_recorder, style_store, checkpointer)
+        character_service = CharacterService(settings, workspace_root, trace_recorder, checkpointer)
     pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
     yield
     await _checkpointer_cm.__aexit__(None, None, None)
@@ -231,16 +233,18 @@ def init_page() -> InitResponse:
 @app.get("/api/workspaces/{workspace_id}/bootstrap", response_model=WorkspaceBootstrapResponse)
 def bootstrap_workspace(workspace_id: str) -> WorkspaceBootstrapResponse:
     """选中工作区后：一次返回 threads + 全部面板内容，替代 5 个独立请求。"""
-    workspace = thread_store.get_workspace(workspace_id)
-    if workspace is None:
+    data = thread_store.bootstrap_workspace(workspace_id)
+    if data is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
     return WorkspaceBootstrapResponse(
-        threads=thread_store.list_threads(workspace_id),
-        outline=thread_store.read_workspace_outline(workspace_id),
-        detail_outline=thread_store.read_workspace_detail_outline(workspace_id),
-        characters=thread_store.read_workspace_characters(workspace_id),
-        novel=thread_store.read_workspace_novel(workspace_id),
+        threads=data["threads"],
+        outline=data["outline"],
+        volume=data["volume"],
+        detail_outline=data["detail_outline"],
+        characters=data["characters"],
+        novel=data["novel"],
+        worldview=data["worldview"],
     )
 
 
@@ -270,6 +274,22 @@ def get_workspace_outline(workspace_id: str) -> WorkspaceOutlineContent:
 @app.get("/api/workspaces/{workspace_id}/detail-outline", response_model=WorkspaceDetailOutlineContent)
 def get_workspace_detail_outline(workspace_id: str) -> WorkspaceDetailOutlineContent:
     content = thread_store.read_workspace_detail_outline(workspace_id)
+    if content is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return content
+
+
+@app.get("/api/workspaces/{workspace_id}/worldview", response_model=WorkspaceWorldviewContent)
+def get_workspace_worldview(workspace_id: str) -> WorkspaceWorldviewContent:
+    content = thread_store.read_workspace_worldview(workspace_id)
+    if content is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return content
+
+
+@app.get("/api/workspaces/{workspace_id}/volume", response_model=WorkspaceVolumeContent)
+def get_workspace_volume(workspace_id: str) -> WorkspaceVolumeContent:
+    content = thread_store.read_workspace_volume(workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
@@ -309,6 +329,10 @@ def _classify_changes(changes, workspace_path: Path) -> set[str]:
         top = parts[0]
         if top in ("outline.md", "evaluation.md"):
             categories.add("outline")
+        elif top == "worldview.md":
+            categories.add("worldview")
+        elif len(parts) > 1 and parts[0] == "volume":
+            categories.add("volume")
         elif len(parts) > 1 and parts[0] == "detail":
             categories.add("detail_outline")
         elif len(parts) > 1 and parts[0] == "character":
@@ -336,6 +360,14 @@ async def _workspace_watch_generator(workspace_id: str, workspace_path: Path):
             content = thread_store.read_workspace_outline(workspace_id)
             if content is not None:
                 yield _sse_event("outline", content.model_dump())
+        if "worldview" in categories:
+            content = thread_store.read_workspace_worldview(workspace_id)
+            if content is not None:
+                yield _sse_event("worldview", content.model_dump())
+        if "volume" in categories:
+            content = thread_store.read_workspace_volume(workspace_id)
+            if content is not None:
+                yield _sse_event("volume", content.model_dump())
         if "detail_outline" in categories:
             content = thread_store.read_workspace_detail_outline(workspace_id)
             if content is not None:

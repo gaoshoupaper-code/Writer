@@ -9,8 +9,9 @@ type SidebarItem = {
 const SIDEBAR_ITEMS: SidebarItem[] = [
   { id: "chat", label: "对话", description: "与 Agent 协作推进故事" },
   { id: "characters", label: "人物", description: "从剧本章节提取角色" },
-  { id: "script", label: "大纲", description: "查看当前工作目录大纲" },
+  { id: "script", label: "大纲", description: "查看总纲与卷纲" },
   { id: "detail_outline", label: "细纲", description: "查看逐章详细规划" },
+  { id: "worldview", label: "世界观", description: "查看故事世界观设定" },
   { id: "novel", label: "正文", description: "查看完整小说正文" },
   { id: "trace", label: "检测系统", description: "执行追踪与 Token 图检测" },
 ];

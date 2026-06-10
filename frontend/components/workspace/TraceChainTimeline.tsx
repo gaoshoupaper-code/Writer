@@ -25,7 +25,7 @@ type TraceChainTimelineProps = {
 
 /** 判断节点是否可打开抽屉 */
 function isExpandable(node: TraceNode): boolean {
-  return node.kind === "llm" || node.kind === "todo" || node.kind === "error";
+  return node.kind === "llm" || node.kind === "todo" || node.kind === "error" || node.kind === "skill";
 }
 
 type RenderItem =
@@ -108,15 +108,16 @@ export function TraceChainTimeline({ nodes, activeRun, activeNodeId, onSelectNod
     return counts;
   }, [chainNodes, agentNodeIds]);
 
-  // 并行组映射：groupId → 同组节点列表（仅 depth=0，符合设计 D4）
+  // 并行组映射：groupId@parentNodeId → 同组节点列表（全深度，按父节点隔离）
   const parallelGroups = useMemo(() => {
     const groups = new Map<string, TraceNode[]>();
     for (const node of chainNodes) {
-      if (node.parallel_group_id && node.depth === 0) {
-        if (!groups.has(node.parallel_group_id)) {
-          groups.set(node.parallel_group_id, []);
+      if (node.parallel_group_id) {
+        const key = `${node.parallel_group_id}@${node.parent_node_id || "run"}`;
+        if (!groups.has(key)) {
+          groups.set(key, []);
         }
-        groups.get(node.parallel_group_id)!.push(node);
+        groups.get(key)!.push(node);
       }
     }
     return groups;
@@ -128,11 +129,12 @@ export function TraceChainTimeline({ nodes, activeRun, activeNodeId, onSelectNod
     const consumed = new Set<string>();
     for (const node of visibleNodes) {
       if (consumed.has(node.node_id)) continue;
-      // 仅 depth=0 的并行组做横向分组（D4）
-      if (node.parallel_group_id && node.depth === 0) {
-        const group = parallelGroups.get(node.parallel_group_id);
+      // 全深度并行组横向分组，按 groupId@parentNodeId 隔离
+      if (node.parallel_group_id) {
+        const key = `${node.parallel_group_id}@${node.parent_node_id || "run"}`;
+        const group = parallelGroups.get(key);
         if (group && group.length > 1) {
-          items.push({ type: "parallel", groupId: node.parallel_group_id, nodes: group });
+          items.push({ type: "parallel", groupId: key, nodes: group });
           group.forEach((n) => consumed.add(n.node_id));
           continue;
         }
@@ -189,8 +191,11 @@ export function TraceChainTimeline({ nodes, activeRun, activeNodeId, onSelectNod
         ) : null}
         {renderItems.map((item) => {
           if (item.type === "parallel") {
+            // 并行组容器继承第一个节点的 depth 缩进
+            const firstNode = item.nodes[0];
+            const groupIndent = firstNode?.depth && firstNode.depth > 0 ? 28 * firstNode.depth : 0;
             return (
-              <div key={item.groupId} className="chain-parallel-group">
+              <div key={item.groupId} className="chain-parallel-group" style={{ paddingLeft: groupIndent || undefined }}>
                 {item.nodes.map((node, i) => (
                   <Fragment key={node.node_id}>
                     {i > 0 && <div className="chain-parallel-divider" />}
@@ -377,6 +382,7 @@ function nodeBodyLabel(node: TraceNode): string {
   }
   if (node.kind === "llm") return node.model_name || "LLM";
   if (node.kind === "tool") return node.tool_name || "Tool";
+  if (node.kind === "skill") return node.skill_name || "Skill";
   if (node.kind === "todo") return "Todo 更新";
   if (node.kind === "error") return "错误";
   return node.label || node.kind;

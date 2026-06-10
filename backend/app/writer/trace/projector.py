@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, TypeVar
 
 T = TypeVar("T")
@@ -22,6 +24,7 @@ from app.writer.trace.chain_summary import (
     error_summary,
     llm_summary,
     run_summary,
+    skill_summary,
     todo_summary,
 )
 
@@ -324,24 +327,39 @@ class _ProjectionState:
         input_range = start.input_range if start else None
         tool_error = _tool_error(end.tool_output)
         pg_id = start.parallel_group_id if start else None
+        # 检测 SKILL.md 调用
+        skill_name = _detect_skill(end)
+        if skill_name:
+            kind = "skill"
+            label = skill_name
+            summary = skill_summary(skill_name)
+        elif tool_error:
+            kind = "error"
+            label = _tool_label(end)
+            summary = build_tool_summary(end.tool_name, end.tool_output)
+        else:
+            kind = "tool"
+            label = _tool_label(end)
+            summary = build_tool_summary(end.tool_name, end.tool_output)
         self.projection.nodes.append(
             TraceNode(
                 node_id=tool_node_id,
                 parent_node_id=self._agent_node_id(end),
-                kind="tool",
-                label=_tool_label(end),
+                kind=kind,
+                label=label,
                 status="failed" if tool_error else end.status,
                 **self._node_agent_attrs(end),
                 started_at=start.event.timestamp if start else None,
                 ended_at=end.timestamp,
                 duration_ms=end.duration_ms,
                 tool_name=end.tool_name,
+                skill_name=skill_name,
                 context_anchor_id=_range_start(input_range) or anchor_id,
                 input_context_range=input_range,
                 output_context_anchor_id=anchor_id,
                 raw_event_ids=_raw_ids(start.event if start else None, end),
-                error=tool_error,
-                chain_summary=build_tool_summary(end.tool_name, end.tool_output),
+                error=tool_error if not skill_name else None,
+                chain_summary=summary,
                 parallel_group_id=pg_id,
             )
         )
@@ -799,6 +817,47 @@ def _tool_error(output: Any) -> str | None:
         content = output.get("content")
         return str(content) if content is not None else "Tool returned error status."
     return None
+
+
+def _skill_text_content(output: Any) -> str | None:
+    """从 tool_output 中提取 SKILL.md 文件内容文本。"""
+    if isinstance(output, str):
+        return output
+    if isinstance(output, dict):
+        content = output.get("content")
+        if isinstance(content, str):
+            return content
+        text = output.get("text")
+        if isinstance(text, str):
+            return text
+    return None
+
+
+def _detect_skill(event: TraceLogEvent) -> str | None:
+    """从 tool 事件中检测 SKILL.md 调用，返回技能名。
+
+    两步检测：
+    1. 从 tool_output 提取路径，检查是否以 SKILL.md 结尾
+    2. 从 tool_output 的内容中解析 YAML front matter 的 name 字段
+
+    注意：virtual_mode 下路径被重写为 /_skills_0/SKILL.md，
+    因此不依赖路径目录名，而是解析 SKILL.md 内容的 name 字段。
+    """
+    if event.tool_name not in {"read_file", "read"}:
+        return None
+    # 从 output 中提取路径，检查是否以 SKILL.md 结尾
+    from app.writer.trace.chain_summary import _extract_path
+
+    path = _extract_path(event.tool_output)
+    if not path or not path.rstrip("/").endswith("SKILL.md"):
+        return None
+    # 从内容中提取 YAML front matter 的 name 字段
+    content = _skill_text_content(event.tool_output)
+    if content:
+        match = re.match(r"^---\s*\n.*?^name:\s*(.+)$", content, re.MULTILINE | re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    return "unknown-skill"
 
 
 def _todo_items(tool_output: Any) -> list[TraceTodoItem]:

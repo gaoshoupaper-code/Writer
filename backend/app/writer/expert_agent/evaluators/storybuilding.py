@@ -1,6 +1,7 @@
 """Storybuilding 统一评估子代理构建器。
 
 评估所有故事维度的跨维度一致性，写入 evaluation.md。
+评估器自主读取所有文件，不依赖 ContextAssemblerMiddleware。
 """
 from __future__ import annotations
 
@@ -9,7 +10,6 @@ from pathlib import Path
 from deepagents.middleware.filesystem import FilesystemPermission
 from langchain.agents.middleware.types import AgentMiddleware
 
-from app.writer.middleware.context_assembler_middleware import ContextAssemblerMiddleware
 from app.writer.expert_agent.types import SubAgentSpec
 
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "storybuilding_evaluation.md"
@@ -23,14 +23,15 @@ _WRITE_PERMISSIONS: list[FilesystemPermission] = [
 def build_storybuilding_evaluator(
     workspace_root: Path,
     middleware: list[AgentMiddleware] | None = None,
-    context_file_paths: list[str] | None = None,
 ) -> SubAgentSpec:
     """构建统一评估子代理规格。
 
+    评估器自主读取所有文件，不使用 ContextAssemblerMiddleware。
+    system prompt 中已列出需要读取的文件清单。
+
     Args:
-        workspace_root:     工作区根目录
-        middleware:         额外中间件（可选）
-        context_file_paths: 需要注入为评估上下文的文件路径模式列表
+        workspace_root: 工作区根目录
+        middleware:     额外中间件（可选）
 
     Returns:
         评估子代理规格字典
@@ -43,14 +44,6 @@ def build_storybuilding_evaluator(
     permissions.extend(_WRITE_PERMISSIONS)
 
     eval_middleware: list[AgentMiddleware] = []
-    if context_file_paths:
-        eval_middleware.append(
-            ContextAssemblerMiddleware(
-                workspace_root,
-                file_paths=context_file_paths,
-                context_label="评估前置上下文：所有故事维度产物",
-            )
-        )
     if middleware is not None:
         eval_middleware.extend(middleware)
 

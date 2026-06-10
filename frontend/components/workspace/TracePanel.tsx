@@ -76,7 +76,7 @@ export function TracePanel({ runs, detail, activeTraceId, loading, hasActiveThre
 
   function selectNode(node: TraceNode) {
     setActiveNodeId(node.node_id);
-    if (node.kind === "llm" || node.kind === "todo" || node.kind === "error") {
+    if (node.kind === "llm" || node.kind === "todo" || node.kind === "error" || node.kind === "skill") {
       setDrawerNodeId(node.node_id);
     }
   }

@@ -13,12 +13,15 @@ from app.schemas.screenplay import (
     DetailOutlineChapter,
     ScreenplayGenerateResponse,
     ThreadSummary,
+    VolumeChapter,
     WorkspaceCharacterContent,
     WorkspaceDetailOutlineContent,
     WorkspaceNovelChapter,
     WorkspaceNovelChaptersContent,
     WorkspaceNovelContent,
     WorkspaceOutlineContent,
+    WorkspaceVolumeContent,
+    WorkspaceWorldviewContent,
     WorkspaceSummary,
 )
 
@@ -193,6 +196,52 @@ class ThreadStore:
         markdown = artifact_path.read_text(encoding="utf-8") if artifact_path.exists() else ""
         return WorkspaceOutlineContent(workspace_id=workspace_id, markdown=markdown)
 
+    def read_workspace_worldview(self, workspace_id: str) -> WorkspaceWorldviewContent | None:
+        workspace = self._read_workspace_index().get(workspace_id)
+        if workspace is None:
+            return None
+
+        workspace_path = Path(workspace["workspace_path"])
+        if not workspace_path.exists():
+            raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
+
+        artifact_path = workspace_path / "worldview.md"
+        markdown = artifact_path.read_text(encoding="utf-8") if artifact_path.exists() else ""
+        return WorkspaceWorldviewContent(workspace_id=workspace_id, markdown=markdown)
+
+    def _volume_chapter_title(self, filename: str) -> str:
+        if filename == "overview.md":
+            return "总览"
+        match = re.match(r"volume-(\d+)\.md$", filename)
+        if match:
+            return f"第{int(match.group(1))}卷"
+        return Path(filename).stem
+
+    def read_workspace_volume(self, workspace_id: str) -> WorkspaceVolumeContent | None:
+        workspace = self._read_workspace_index().get(workspace_id)
+        if workspace is None:
+            return None
+
+        workspace_path = Path(workspace["workspace_path"])
+        if not workspace_path.exists():
+            raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
+
+        volume_dir = workspace_path / "volume"
+        chapters: list[VolumeChapter] = []
+        if volume_dir.exists():
+            for artifact_path in sorted(volume_dir.glob("*.md"), key=lambda p: p.name):
+                content = artifact_path.read_text(encoding="utf-8").strip()
+                if content:
+                    chapters.append(
+                        VolumeChapter(
+                            filename=artifact_path.name,
+                            title=self._volume_chapter_title(artifact_path.name),
+                            markdown=content,
+                        )
+                    )
+
+        return WorkspaceVolumeContent(workspace_id=workspace_id, chapters=chapters, file_count=len(chapters))
+
     def read_workspace_detail_outline(self, workspace_id: str) -> WorkspaceDetailOutlineContent | None:
         workspace = self._read_workspace_index().get(workspace_id)
         if workspace is None:
@@ -310,6 +359,117 @@ class ThreadStore:
                 )
 
         return WorkspaceCharacterContent(workspace_id=workspace_id, characters=characters)
+
+    def bootstrap_workspace(self, workspace_id: str) -> dict | None:
+        """一次读取 index 文件，批量返回 bootstrap 所需的全部数据。"""
+        workspaces = self._read_workspace_index()
+        workspace = workspaces.get(workspace_id)
+        if workspace is None:
+            return None
+
+        workspace_path = Path(workspace["workspace_path"])
+        if not workspace_path.exists():
+            raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
+
+        # threads: 只读一次 thread index
+        threads_index = self._read_thread_index()
+        thread_summaries = [
+            self._to_thread_summary(t)
+            for t in threads_index.values()
+            if t["workspace_id"] == workspace_id
+        ]
+
+        # outline
+        artifact_path = workspace_path / "outline.md"
+        outline = WorkspaceOutlineContent(
+            workspace_id=workspace_id,
+            markdown=artifact_path.read_text(encoding="utf-8") if artifact_path.exists() else "",
+        )
+
+        # worldview
+        worldview_path = workspace_path / "worldview.md"
+        worldview = WorkspaceWorldviewContent(
+            workspace_id=workspace_id,
+            markdown=worldview_path.read_text(encoding="utf-8") if worldview_path.exists() else "",
+        )
+
+        # volume
+        volume_dir = workspace_path / "volume"
+        volume_chapters: list[VolumeChapter] = []
+        if volume_dir.exists():
+            for ap in sorted(volume_dir.glob("*.md"), key=lambda p: p.name):
+                content = ap.read_text(encoding="utf-8").strip()
+                if content:
+                    volume_chapters.append(
+                        VolumeChapter(
+                            filename=ap.name,
+                            title=self._volume_chapter_title(ap.name),
+                            markdown=content,
+                        )
+                    )
+        volume = WorkspaceVolumeContent(
+            workspace_id=workspace_id, chapters=volume_chapters, file_count=len(volume_chapters),
+        )
+
+        # detail_outline
+        detail_dir = workspace_path / "detail"
+        detail_chapters: list[DetailOutlineChapter] = []
+        if detail_dir.exists():
+            for ap in sorted(detail_dir.glob("*.md"), key=lambda p: (p.name != "overview.md", p.name)):
+                if ap.name == "evaluation.md":
+                    continue
+                content = ap.read_text(encoding="utf-8").strip()
+                if content:
+                    detail_chapters.append(
+                        DetailOutlineChapter(
+                            filename=ap.name,
+                            title=self._detail_outline_title(ap.name),
+                            markdown=content,
+                        )
+                    )
+        detail_outline = WorkspaceDetailOutlineContent(
+            workspace_id=workspace_id, chapters=detail_chapters, file_count=len(detail_chapters),
+        )
+
+        # characters
+        character_dir = workspace_path / "character"
+        characters: list[CharacterMarkdownFile] = []
+        if character_dir.exists():
+            for ap in sorted(character_dir.glob("*.md"), key=lambda p: p.stem):
+                characters.append(
+                    CharacterMarkdownFile(filename=ap.name, name=ap.stem, markdown=ap.read_text(encoding="utf-8")),
+                )
+        character_content = WorkspaceCharacterContent(workspace_id=workspace_id, characters=characters)
+
+        # novel
+        chapter_files = self._workspace_chapter_files(workspace_path)
+        if chapter_files:
+            novel_markdown = "\n\n".join(p.read_text(encoding="utf-8").strip() for p in chapter_files)
+            novel = WorkspaceNovelContent(
+                workspace_id=workspace_id,
+                markdown=f"{novel_markdown}\n" if novel_markdown else "",
+                source="chapter/",
+                chapter_count=len(chapter_files),
+            )
+        else:
+            novel_artifact = workspace_path / "novel.md"
+            novel = WorkspaceNovelContent(
+                workspace_id=workspace_id,
+                markdown=novel_artifact.read_text(encoding="utf-8") if novel_artifact.exists() else "",
+                source="novel.md",
+                chapter_count=0,
+            )
+
+        return {
+            "workspace": workspace,
+            "threads": sorted(thread_summaries, key=lambda t: t.updated_at, reverse=True),
+            "outline": outline,
+            "volume": volume,
+            "detail_outline": detail_outline,
+            "characters": character_content,
+            "worldview": worldview,
+            "novel": novel,
+        }
 
     def write_outline(
         self,

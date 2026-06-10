@@ -11,11 +11,54 @@ from __future__ import annotations
 from pathlib import Path
 
 from deepagents import CompiledSubAgent, SubAgent, create_deep_agent
+from deepagents.backends.filesystem import FilesystemBackend
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 
 from app.writer.middleware.artifact_validation_middleware import ArtifactValidationMiddleware
 from app.writer.middleware.revision_limit_middleware import RevisionLimitMiddleware
+
+
+def _compose_skills_backend(
+    backend: object,
+    skill_paths: list[str],
+) -> tuple[object, list[str]]:
+    """当 backend 是 virtual_mode FilesystemBackend 时，为 skills 创建路由。
+
+    FilesystemBackend(virtual_mode=True) 要求所有路径是相对于 root_dir 的虚拟路径，
+    无法解析 Windows 绝对路径。skills 目录是应用代码的一部分，不在 workspace 内。
+
+    解决方案：用 CompositeBackend 将 skills 前缀路由到独立的 FilesystemBackend，
+    workspace 操作走默认 backend，互不干扰。
+
+    Args:
+        backend:     原始 backend（通常是 virtual_mode FilesystemBackend）
+        skill_paths: skills 目录的绝对文件系统路径列表
+
+    Returns:
+        (effective_backend, virtual_skill_sources) 元组
+    """
+    is_virtual_fs = (
+        isinstance(backend, FilesystemBackend)
+        and getattr(backend, "virtual_mode", False)
+    )
+    # 非 virtual backend 可以直接用绝对路径，无需 CompositeBackend
+    if not is_virtual_fs:
+        return backend, skill_paths
+
+    from deepagents.backends.composite import CompositeBackend
+
+    routes: dict[str, FilesystemBackend] = {}
+    virtual_sources: list[str] = []
+
+    for i, skill_dir in enumerate(skill_paths):
+        prefix = f"/_skills_{i}/"
+        # virtual_mode=True 让 ls("/") 列出 skill_dir 内容
+        routes[prefix] = FilesystemBackend(root_dir=skill_dir, virtual_mode=True)
+        virtual_sources.append(prefix)
+
+    composite = CompositeBackend(default=backend, routes=routes)
+    return composite, virtual_sources
 
 
 def build_deep_subagent(
@@ -63,6 +106,12 @@ def build_deep_subagent(
     Returns:
         编译后的子代理字典 {name, description, runnable}，可直接注册到父代理
     """
+    # ---- 0. Compose backend with skill routes if needed ----
+    effective_backend = backend
+    skill_sources: list[str] = []
+    if skills:
+        effective_backend, skill_sources = _compose_skills_backend(backend, skills)
+
     # ---- 1. 组装子代理 middleware ----
     mw: list[AgentMiddleware] = list(subagent_middleware) if subagent_middleware else []
     # RevisionLimitMiddleware 拦截 evolution 调用次数，提供硬上限
@@ -78,11 +127,11 @@ def build_deep_subagent(
         system_prompt=system_prompt,
         subagents=[evolution_spec],
         middleware=mw,
-        backend=backend,
+        backend=effective_backend,
         # checkpointer=None: 子代理在父代理的 task 工具调用内执行，
         # 父代理的 checkpointer 已捕获完整对话历史，无需独立持久化
         checkpointer=None,
-        skills=skills or [],
+        skills=skill_sources,
     )
 
     # ---- 3. 包装为 CompiledSubAgent ----

@@ -42,6 +42,23 @@ class WorkspaceOutlineContent(BaseModel):
     markdown: str
 
 
+class WorkspaceWorldviewContent(BaseModel):
+    workspace_id: str
+    markdown: str
+
+
+class VolumeChapter(BaseModel):
+    filename: str
+    title: str
+    markdown: str
+
+
+class WorkspaceVolumeContent(BaseModel):
+    workspace_id: str
+    chapters: list[VolumeChapter]
+    file_count: int = 0
+
+
 class DetailOutlineChapter(BaseModel):
     filename: str
     title: str
@@ -134,6 +151,8 @@ class WorkspaceBootstrapResponse(BaseModel):
     """GET /api/workspaces/{id}/bootstrap — 选中工作区后一次性返回全部面板数据。"""
     threads: list[ThreadSummary]
     outline: WorkspaceOutlineContent | None = None
+    volume: WorkspaceVolumeContent | None = None
     detail_outline: WorkspaceDetailOutlineContent | None = None
     characters: WorkspaceCharacterContent | None = None
     novel: WorkspaceNovelContent | None = None
+    worldview: WorkspaceWorldviewContent | None = None

@@ -89,7 +89,7 @@ def build_detail_outline_deep_subagent(
     evaluation_spec = build_detail_outline_evaluator(
         workspace_root,
         middleware_factory("detail-outline-evaluation-subagent"),
-        context_file_paths=["outline.md", "character/*.md", "storyline/*.md", "volume/*.md", "detail/*.md"],
+        context_file_paths=["outline.md", "character/*.md", "volume/*.md", "detail/*.md"],
     )
 
     # ---- 构建 evolution SubAgent dict ----
@@ -105,7 +105,7 @@ def build_detail_outline_deep_subagent(
     system_prompt = primary_spec["system_prompt"]
 
     # ---- Skill 路径 ----
-    skills_path = str(Path(__file__).resolve().parent.parent / "skills")
+    skills_path = str(Path(__file__).resolve().parent.parent / "skills" / "detail_outline")
 
     # ---- 调用工厂 ----
     return build_deep_subagent(

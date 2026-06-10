@@ -21,12 +21,10 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from app.writer.middleware import FilesystemPathGuardMiddleware, TraceCallbackHandler, TraceMiddleware
 from app.writer.models import build_writer_model
-from app.writer.expert_agent.types import apply_style_suffix
 
 # 独立于 agents/character.py 的 prompt 路径（该 agent 已被 storybuilding 替代）
 _CHARACTER_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "character_system.md"
 from app.core.settings import Settings
-from app.create_type.store import CreateTypeStore
 from app.writer.trace import TraceRecorder
 from app.schemas.character import (
     CharacterGenerateRequest,
@@ -48,19 +46,17 @@ class CharacterService:
     支持 live 模式（真实代理调用）和 mock 模式（模拟返回，用于测试）。
     """
 
-    def __init__(self, settings: Settings, workspace_root: Path, trace_recorder: TraceRecorder, style_store: CreateTypeStore, checkpointer: BaseCheckpointSaver) -> None:
+    def __init__(self, settings: Settings, workspace_root: Path, trace_recorder: TraceRecorder, checkpointer: BaseCheckpointSaver) -> None:
         """
         Args:
             settings:       应用配置（包含模型、模式等设置）
             workspace_root: 工作区根目录
             trace_recorder: 追踪记录器
-            style_store:    写作风格存储
             checkpointer:   检查点存储器（由外部注入，支持持久化）
         """
         self.settings = settings
         self.workspace_root = workspace_root
         self.trace_recorder = trace_recorder
-        self.style_store = style_store
         self.checkpointer = checkpointer
 
     def _backend_for_workspace(self, workspace_path: Path) -> FilesystemBackend:
@@ -75,33 +71,18 @@ class CharacterService:
             middleware.insert(1, TraceMiddleware(self.trace_recorder, trace_id, agent_name))
         return middleware
 
-    def _agent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None):
+    def _agent_for_workspace(self, workspace_path: Path, trace_id: str | None = None):
         """为指定工作区构建完整的代理。"""
         model = build_writer_model(self.settings)
         middleware = self._middleware_for_workspace(workspace_path, trace_id, "character-service")
         return create_deep_agent(
             model=model,
             tools=[],
-            system_prompt=self._load_system_prompt(style_suffix),
+            system_prompt=_CHARACTER_PROMPT_PATH.read_text(encoding="utf-8").strip(),
             backend=self._backend_for_workspace(workspace_path),
             checkpointer=self.checkpointer,
             middleware=middleware,
         )
-
-    def _load_system_prompt(self, style_suffix: str | None = None) -> str:
-        """加载系统提示词，可选追加写作风格 SUFFIX。"""
-        return apply_style_suffix(_CHARACTER_PROMPT_PATH.read_text(encoding="utf-8").strip(), style_suffix)
-
-    def _resolve_style_suffix(self, workspace_id: str) -> str | None:
-        """从风格存储中获取当前工作区的激活角色风格 SUFFIX。"""
-        style_id = self.style_store.get_active_style_id(workspace_id)
-        if not style_id:
-            return None
-        style = self.style_store.get_style(style_id)
-        if not style:
-            return None
-        text = style.get("character_style", "")
-        return text.strip() if text else None
 
     def delete_thread_checkpoint(self, thread_id: str) -> None:
         """删除指定线程的检查点数据。"""
@@ -119,8 +100,7 @@ class CharacterService:
         trace = self.trace_recorder.create_run(thread, "character.generate")
         try:
             prompt = self._build_user_prompt(payload, thread)
-            style_suffix = self._resolve_style_suffix(thread.workspace_id)
-            agent = self._agent_for_workspace(Path(thread.workspace_path), trace.trace_id, style_suffix)
+            agent = self._agent_for_workspace(Path(thread.workspace_path), trace.trace_id)
             result = agent.invoke(
                 {"messages": [{"role": "user", "content": prompt}]},
                 config={

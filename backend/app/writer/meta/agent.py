@@ -53,8 +53,9 @@ class MetaAgentService:
         return FilesystemBackend(root_dir=workspace_path, virtual_mode=True)
 
     def _middleware_for_workspace(self, workspace_path: Path, trace_id: str | None, agent_name: str) -> list[AgentMiddleware]:
+        # GoalMiddleware 仅安装在 Meta Agent 层级（见 _agent_for_workspace），
+        # 子代理不需要——它们通过 evolution 评估循环和 ArtifactValidation 控制质量。
         middleware: list[AgentMiddleware] = [
-            GoalMiddleware(),
             ErrorRecoveryMiddleware(),
             FilesystemPathGuardMiddleware(workspace_path),
         ]
@@ -80,7 +81,7 @@ class MetaAgentService:
                 ArtifactPrerequisite("character design", workspace_path / "character", markdown_directory=True),
                 ArtifactPrerequisite("plot outline", workspace_path / "outline.md"),
                 ArtifactPrerequisite("worldview", workspace_path / "worldview.md"),
-                ArtifactPrerequisite("storylines", workspace_path / "storyline", markdown_directory=True),
+                ArtifactPrerequisite("storylines", workspace_path / "volume", markdown_directory=True),
             ]
         if agent_name == "writing-subagent":
             return [
@@ -95,7 +96,7 @@ class MetaAgentService:
 
         Args:
             workspace_id: 工作区 ID
-            style_key:    风格字段名（character_style / outline_style / detail_outline_style / writing_style）
+            style_key:    风格字段名（storybuilding_style / detail_outline_style / writing_style）
 
         Returns:
             风格 SUFFIX 文本，无激活风格或该字段为空时返回 None
@@ -125,6 +126,7 @@ class MetaAgentService:
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_workspace(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
+            context_file_paths=["demand.md"],
         )
 
     def _detail_outline_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
@@ -134,7 +136,7 @@ class MetaAgentService:
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
-            context_file_paths=["outline.md", "character/*.md", "storyline/*.md", "worldview.md", "volume/*.md", "detail/overview.md", "detail/chapter-*.md"],
+            context_file_paths=["demand.md", "outline.md", "character/*.md", "worldview.md", "volume/*.md", "detail/overview.md", "detail/chapter-*.md"],
         )
 
     def _writing_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
@@ -144,7 +146,7 @@ class MetaAgentService:
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
-            context_file_paths=["outline.md", "character/*.md", "storyline/*.md", "worldview.md", "volume/*.md", "detail/*.md"],
+            context_file_paths=["demand.md", "outline.md", "character/*.md", "worldview.md", "volume/*.md", "detail/*.md"],
         )
 
     def _general_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None) -> SubAgent:
@@ -407,13 +409,14 @@ class MetaAgentService:
             "## 故事构建流程\n\n"
             "对于需要完整故事构建的需求（长篇/中篇），采用迭代式构建：\n"
             "1. 判断故事规模，确定需要的迭代轮数（通常 2-4 轮）。\n"
-            "2. 每轮委托 storybuilding 子代理，传入：当前轮次编号、用户扩展方向（如有）、本轮焦点。\n"
-            "3. 每轮返回后检查评估结果；如标记质量风险，在下一轮优先修复。\n"
-            "4. 循环结束后进入 detail-outline → writing 阶段。\n\n"
+            "2. 第 1 轮委托 storybuilding，任务描述中写明「使用 skeleton skill」。\n"
+            "3. 第 2+ 轮委托 storybuilding，任务描述中写明「使用 expand skill」，传入：用户扩展方向（如有）、本轮焦点。\n"
+            "4. 每轮返回后检查评估结果；如标记质量风险，在下一轮优先修复。\n"
+            "5. 循环结束后进入 detail-outline → writing 阶段。\n\n"
 
             "## storybuilding 委托规范\n\n"
             "每次委托 storybuilding 时必须明确传达：\n"
-            "- 当前轮次（第几轮/共几轮）\n"
+            "- 使用哪套 skill：skeleton（第 1 轮）或 expand（第 2+ 轮）\n"
             "- 本轮焦点：优先扩展哪些维度（人物/故事线/世界观/总纲/卷纲）\n"
             "- 用户的扩展方向（如有）\n"
             "- 前几轮评估中发现的问题（如有）\n\n"

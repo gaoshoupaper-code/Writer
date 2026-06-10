@@ -5,8 +5,7 @@ import type { Style } from "../../lib/types";
 
 const STYLE_TABS = [
   { key: "meta_style", label: "主控风格" },
-  { key: "character_style", label: "角色风格" },
-  { key: "outline_style", label: "大纲风格" },
+  { key: "storybuilding_style", label: "故事构建风格" },
   { key: "detail_outline_style", label: "细纲风格" },
   { key: "writing_style", label: "写作风格" },
 ] as const;
@@ -17,8 +16,8 @@ type StyleModalProps = {
   styles: Style[];
   activeStyleId: string | null;
   creating: boolean;
-  onCreateStyle: (name: string, metaStyle: string, characterStyle: string, outlineStyle: string, detailOutlineStyle: string, writingStyle: string) => Promise<void>;
-  onUpdateStyle: (styleId: string, fields: Record<string, string>) => Promise<void>;
+  onCreateStyle: (name: string, metaStyle: string, storybuildingStyle: string, detailOutlineStyle: string, writingStyle: string) => Promise<void>;
+  onUpdateStyle: (styleId: string, fields: Record<string, string>) => Promise<boolean>;
   onDeleteStyle: (styleId: string) => Promise<void>;
   onSelectStyle: (styleId: string | null) => void;
   onOptimizeStyle: (styleType: string, content: string) => Promise<string>;
@@ -39,7 +38,7 @@ export function StyleModal({
   const [mode, setMode] = useState<"list" | "create">("list");
   const [activeTab, setActiveTab] = useState<StyleTabKey>("meta_style");
   const [newName, setNewName] = useState("");
-  const [newFields, setNewFields] = useState({ meta_style: "", character_style: "", outline_style: "", detail_outline_style: "", writing_style: "" });
+  const [newFields, setNewFields] = useState({ meta_style: "", storybuilding_style: "", detail_outline_style: "", writing_style: "" });
   const [deletingId, setDeletingId] = useState("");
   const [optimizing, setOptimizing] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -62,9 +61,9 @@ export function StyleModal({
   async function handleCreate() {
     const name = newName.trim();
     if (!name || creating) return;
-    await onCreateStyle(name, newFields.meta_style, newFields.character_style, newFields.outline_style, newFields.detail_outline_style, newFields.writing_style);
+    await onCreateStyle(name, newFields.meta_style, newFields.storybuilding_style, newFields.detail_outline_style, newFields.writing_style);
     setNewName("");
-    setNewFields({ meta_style: "", character_style: "", outline_style: "", detail_outline_style: "", writing_style: "" });
+    setNewFields({ meta_style: "", storybuilding_style: "", detail_outline_style: "", writing_style: "" });
     setMode("list");
   }
 
@@ -106,9 +105,11 @@ export function StyleModal({
         }
       }
       if (hasChanges) {
-        await onUpdateStyle(activeStyleId, fields);
-        setEditDirty({});
-        setEditDirtyName(null);
+        const ok = await onUpdateStyle(activeStyleId, fields);
+        if (ok) {
+          setEditDirty({});
+          setEditDirtyName(null);
+        }
       }
     } finally {
       setSaving(false);

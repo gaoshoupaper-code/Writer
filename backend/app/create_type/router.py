@@ -47,8 +47,7 @@ def create_style(payload: StyleCreateRequest) -> StyleSummary:
     return _require_store().create_style(
         name=payload.name,
         meta_style=payload.meta_style,
-        character_style=payload.character_style,
-        outline_style=payload.outline_style,
+        storybuilding_style=payload.storybuilding_style,
         detail_outline_style=payload.detail_outline_style,
         writing_style=payload.writing_style,
     )
@@ -61,8 +60,7 @@ def update_style(style_id: str, payload: StyleUpdateRequest) -> StyleSummary:
         style_id,
         name=payload.name,
         meta_style=payload.meta_style,
-        character_style=payload.character_style,
-        outline_style=payload.outline_style,
+        storybuilding_style=payload.storybuilding_style,
         detail_outline_style=payload.detail_outline_style,
         writing_style=payload.writing_style,
     )

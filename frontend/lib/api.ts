@@ -1,4 +1,4 @@
-import type { CheckpointState, InitResponse, Style, ThreadSummary, TraceDetail, TraceRunSummary, WorkspaceBootstrapResponse, WorkspaceCharacterContent, WorkspaceDetailOutlineContent, WorkspaceNovelContent, WorkspaceOutlineContent, WorkspaceSummary } from "./types";
+import type { CharacterGenerateRequest, CharacterGenerateResponse, CheckpointState, InitResponse, Style, ThreadSummary, TraceDetail, TraceRunSummary, WorkspaceBootstrapResponse, WorkspaceCharacterContent, WorkspaceDetailOutlineContent, WorkspaceNovelContent, WorkspaceOutlineContent, WorkspaceVolumeContent, WorkspaceWorldviewContent, WorkspaceSummary } from "./types";
 
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:7788";
 
@@ -81,6 +81,16 @@ export async function fetchWorkspaceOutline(workspaceId: string) {
   return parseJsonResponse<WorkspaceOutlineContent>(response);
 }
 
+export async function fetchWorkspaceWorldview(workspaceId: string) {
+  const response = await fetch(`${API_BASE_URL}/api/workspaces/${workspaceId}/worldview`);
+  return parseJsonResponse<WorkspaceWorldviewContent>(response);
+}
+
+export async function fetchWorkspaceVolume(workspaceId: string) {
+  const response = await fetch(`${API_BASE_URL}/api/workspaces/${workspaceId}/volume`);
+  return parseJsonResponse<WorkspaceVolumeContent>(response);
+}
+
 export async function fetchWorkspaceDetailOutline(workspaceId: string) {
   const response = await fetch(`${API_BASE_URL}/api/workspaces/${workspaceId}/detail-outline`);
   return parseJsonResponse<WorkspaceDetailOutlineContent>(response);
@@ -133,15 +143,14 @@ export async function fetchStyles() {
   return parseJsonResponse<Style[]>(response);
 }
 
-export async function createStyle(name: string, metaStyle = "", characterStyle = "", outlineStyle = "", detailOutlineStyle = "", writingStyle = "") {
+export async function createStyle(name: string, metaStyle = "", storybuildingStyle = "", detailOutlineStyle = "", writingStyle = "") {
   const response = await fetch(`${API_BASE_URL}/api/styles`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       name,
       meta_style: metaStyle,
-      character_style: characterStyle,
-      outline_style: outlineStyle,
+      storybuilding_style: storybuildingStyle,
       detail_outline_style: detailOutlineStyle,
       writing_style: writingStyle,
     }),
@@ -152,7 +161,7 @@ export async function createStyle(name: string, metaStyle = "", characterStyle =
 
 export async function updateStyle(
   styleId: string,
-  fields: { name?: string; meta_style?: string; character_style?: string; outline_style?: string; detail_outline_style?: string; writing_style?: string },
+  fields: { name?: string; meta_style?: string; storybuilding_style?: string; detail_outline_style?: string; writing_style?: string },
 ) {
   const response = await fetch(`${API_BASE_URL}/api/styles/${styleId}`, {
     method: "PUT",
@@ -189,4 +198,19 @@ export async function activateStyle(workspaceId: string, styleId: string | null)
   });
 
   return parseJsonResponse<WorkspaceSummary>(response);
+}
+
+export async function fetchThreadOutline(threadId: string) {
+  const response = await fetch(`${API_BASE_URL}/api/threads/${threadId}/outline`);
+  return parseJsonResponse<WorkspaceOutlineContent>(response);
+}
+
+export async function generateCharacter(payload: CharacterGenerateRequest) {
+  const response = await fetch(`${API_BASE_URL}/api/character/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  return parseJsonResponse<CharacterGenerateResponse>(response);
 }

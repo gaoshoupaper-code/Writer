@@ -4,6 +4,7 @@ import type {
   TraceLogEvent,
   TraceNode,
   TraceRunSummary,
+  TraceTodoItem,
   TraceTodoSnapshot,
 } from "./types";
 
@@ -21,13 +22,27 @@ export function appendLiveTraceEvent(
   return projectTraceDetail(run, events);
 }
 
+interface PendingEvent {
+  event: TraceLogEvent;
+  nodeId: string;
+  parallelGroupId: string | null;
+}
+
+const TODO_TOOL_NAMES = new Set(["write_todos", "write_todo"]);
+
 function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): TraceDetail {
   const nodes: TraceNode[] = [runNode(run, events)];
   const context: TraceContextSegment[] = [];
   const todos: TraceTodoSnapshot[] = [];
   const agentNodeIds = new Set<string>();
-  const pendingLlm = new Map<string, TraceLogEvent[]>();
-  const pendingTool = new Map<string, TraceLogEvent[]>();
+  const pendingLlm = new Map<string, PendingEvent[]>();
+  const pendingTool = new Map<string, PendingEvent[]>();
+
+  // ── 并行检测局部状态 ──
+  const parallelTcToGroup = new Map<string, string>();  // tool_call_id → group_id
+  const parallelRunToGroup = new Map<string, string>();  // run_id → group_id
+  let pgCounter = 0;
+
   // task 边界追踪（栈结构：支持嵌套 task 委托）
   const taskCallStack: string[] = [];
   const agentLastTask = new Map<string, string | null>();
@@ -143,6 +158,8 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
     if (event.tool_name === "task" && ["tool_start", "tool_end", "tool_error"].includes(event.type)) {
       if (event.type === "tool_start" && event.tool_call_id) {
         taskCallStack.push(event.tool_call_id);
+        // 清理并行组追踪（防止泄漏）
+        parallelTcToGroup.delete(event.tool_call_id);
       } else if (event.type !== "tool_start" && taskCallStack.length > 0) {
         taskCallStack.pop();
       }
@@ -160,17 +177,29 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
     }
 
     if (event.type === "llm_start") {
+      // 检查 parent_run_id 是否属于并行组（一级传播）
+      const pgId = event.parent_run_id ? parallelRunToGroup.get(event.parent_run_id) ?? null : null;
+      const nodeId = llmNodeId(event);
       const key = pairKey(event);
       const list = pendingLlm.get(key) ?? [];
-      list.push(event);
+      list.push({ event, nodeId, parallelGroupId: pgId });
       pendingLlm.set(key, list);
       continue;
     }
 
     if (event.type === "tool_start") {
+      // 匹配 tool_call_id → 注册 run_id 一级传播
+      let pgId: string | null = null;
+      if (event.tool_call_id) {
+        pgId = parallelTcToGroup.get(event.tool_call_id) ?? null;
+        if (pgId && event.run_id) {
+          parallelRunToGroup.set(event.run_id, pgId);
+        }
+      }
+      const nodeId = toolNodeId(event);
       const key = pairKey(event);
       const list = pendingTool.get(key) ?? [];
-      list.push(event);
+      list.push({ event, nodeId, parallelGroupId: pgId });
       pendingTool.set(key, list);
       continue;
     }
@@ -178,9 +207,27 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
     if (event.type === "llm_end" || event.type === "llm_error") {
       const key = pairKey(event);
       const list = pendingLlm.get(key);
-      const start = list?.shift();
+      const pending = list?.shift();
       if (list && list.length === 0) pendingLlm.delete(key);
-      const nodeId = llmNodeId(start ?? event);
+
+      // 检测多 tool_calls → 注册并行组
+      if (event.type === "llm_end") {
+        const calls = event.tool_calls;
+        if (Array.isArray(calls) && calls.length > 1) {
+          pgCounter++;
+          const pgId = `pg-${pgCounter}`;
+          for (const tc of calls) {
+            if (tc && typeof tc === "object" && "id" in tc) {
+              const tcId = String((tc as { id: unknown }).id);
+              if (tcId) parallelTcToGroup.set(tcId, pgId);
+            }
+          }
+        }
+      }
+
+      const start = pending?.event;
+      const nodeId = pending?.nodeId ?? llmNodeId(event);
+      const pgId = pending?.parallelGroupId ?? null;
       const anchorId = appendContext(
         event,
         nodeId,
@@ -205,6 +252,7 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
         raw_event_ids: start ? [start.event_id, event.event_id] : [event.event_id],
         error: event.error,
         chain_summary: event.type === "llm_error" ? errorSummary(event.error) : llmSummary(event),
+        parallel_group_id: pgId,
       });
       continue;
     }
@@ -212,33 +260,76 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
     if (event.type === "tool_end" || event.type === "tool_error") {
       const key = pairKey(event);
       const list = pendingTool.get(key);
-      const start = list?.shift();
+      const pending = list?.shift();
       if (list && list.length === 0) pendingTool.delete(key);
-      const nodeId = toolNodeId(start ?? event);
+
+      const start = pending?.event;
+      const nodeId = pending?.nodeId ?? toolNodeId(event);
+      const pgId = pending?.parallelGroupId ?? null;
+      const isToolError = !!toolError(event.tool_output);
+
+      // 检测 SKILL.md 调用
+      const skillName = detectSkill(event);
+      const nodeKind = skillName ? "skill" : (isToolError ? "error" : "tool");
+
       const anchorId = appendContext(
         event,
         nodeId,
-        event.type === "tool_error" ? "error" : "tool",
-        event.type === "tool_error" ? "Tool 失败" : `Tool 输出 · ${event.tool_name || "Tool"}`,
-        event.type === "tool_error" ? event.error : event.tool_output,
+        isToolError && !skillName ? "error" : (skillName ? "skill" : "tool"),
+        isToolError && !skillName ? "Tool 失败" : (skillName ? `Skill 输出 · ${skillName}` : `Tool 输出 · ${event.tool_name || "Tool"}`),
+        isToolError && !skillName ? event.error : event.tool_output,
       );
+
       nodes.push({
         node_id: nodeId,
         parent_node_id: getAgentNodeId(event),
-        kind: event.type === "tool_error" ? "error" : "tool",
-        label: event.tool_name || "Tool",
-        status: event.status,
+        kind: nodeKind,
+        label: skillName ?? (event.tool_name || "Tool"),
+        status: isToolError && !skillName ? "failed" : event.status,
         ...nodeAgentAttrs(event),
         started_at: start?.timestamp,
         ended_at: event.timestamp,
         duration_ms: event.duration_ms,
         tool_name: event.tool_name,
+        skill_name: skillName,
         context_anchor_id: anchorId,
         output_context_anchor_id: anchorId,
         raw_event_ids: start ? [start.event_id, event.event_id] : [event.event_id],
-        error: event.error,
-        chain_summary: event.type === "tool_error" ? errorSummary(event.error, event.tool_output) : toolSummary(event.tool_name, event.tool_output),
+        error: isToolError && !skillName ? event.error : undefined,
+        chain_summary: skillName ? `📖 ${skillName}` : (isToolError ? errorSummary(event.error, event.tool_output) : toolSummary(event.tool_name, event.tool_output)),
+        parallel_group_id: pgId,
       });
+
+      // ── Todo 生成 ──
+      if (event.tool_name && TODO_TOOL_NAMES.has(event.tool_name)) {
+        const items = findTodos(event.tool_output);
+        if (items && items.length > 0) {
+          const todoNodeId = `todo:${event.event_id}`;
+          const todoAnchorId = appendContext(event, todoNodeId, "todo", "Todo 更新", items);
+          const activeItem = items.find((item) => item.status === "in_progress")?.content ?? null;
+          todos.push({
+            anchor_id: todoAnchorId,
+            agent_name: event.agent_name,
+            items,
+            active_item: activeItem,
+          });
+          nodes.push({
+            node_id: todoNodeId,
+            parent_node_id: getAgentNodeId(event),
+            kind: "todo",
+            label: "Todo 更新",
+            status: event.status,
+            ...nodeAgentAttrs(event),
+            started_at: start?.timestamp,
+            ended_at: event.timestamp,
+            duration_ms: event.duration_ms,
+            context_anchor_id: todoAnchorId,
+            output_context_anchor_id: todoAnchorId,
+            raw_event_ids: start ? [start.event_id, event.event_id] : [event.event_id],
+            chain_summary: todoSummary(items),
+          });
+        }
+      }
       continue;
     }
 
@@ -272,36 +363,39 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
     }
   }
 
-  for (const events of pendingLlm.values()) {
-    for (const event of events) {
+  // ── running 节点（带 parallel_group_id）──
+  for (const pendingList of pendingLlm.values()) {
+    for (const pending of pendingList) {
       nodes.push({
-        node_id: llmNodeId(event),
-        parent_node_id: getAgentNodeId(event),
+        node_id: pending.nodeId,
+        parent_node_id: getAgentNodeId(pending.event),
         kind: "llm",
-        label: event.model_name || "LLM",
+        label: pending.event.model_name || "LLM",
         status: "running",
-        ...nodeAgentAttrs(event),
-        started_at: event.timestamp,
-        model_name: event.model_name,
-        raw_event_ids: [event.event_id],
-        chain_summary: llmSummary(event, true),
+        ...nodeAgentAttrs(pending.event),
+        started_at: pending.event.timestamp,
+        model_name: pending.event.model_name,
+        raw_event_ids: [pending.event.event_id],
+        chain_summary: llmSummary(pending.event, true),
+        parallel_group_id: pending.parallelGroupId,
       });
     }
   }
 
-  for (const events of pendingTool.values()) {
-    for (const event of events) {
+  for (const pendingList of pendingTool.values()) {
+    for (const pending of pendingList) {
       nodes.push({
-        node_id: toolNodeId(event),
-        parent_node_id: getAgentNodeId(event),
+        node_id: pending.nodeId,
+        parent_node_id: getAgentNodeId(pending.event),
         kind: "tool",
-        label: event.tool_name || "Tool",
+        label: pending.event.tool_name || "Tool",
         status: "running",
-        ...nodeAgentAttrs(event),
-        started_at: event.timestamp,
-        tool_name: event.tool_name,
-        raw_event_ids: [event.event_id],
-        chain_summary: `${event.tool_name || "Tool"}: 运行中…`,
+        ...nodeAgentAttrs(pending.event),
+        started_at: pending.event.timestamp,
+        tool_name: pending.event.tool_name,
+        raw_event_ids: [pending.event.event_id],
+        chain_summary: `${pending.event.tool_name || "Tool"}: 运行中…`,
+        parallel_group_id: pending.parallelGroupId,
       });
     }
   }
@@ -358,6 +452,88 @@ function errorSummary(error: string | null | undefined, toolOutput?: unknown): s
   if (error) return `❌ ${truncate(error, 200)}`;
   if (toolOutput != null) return `❌ ${truncate(String(toolOutput), 200)}`;
   return "❌ 未知错误";
+}
+
+function todoSummary(items: TraceTodoItem[]): string {
+  if (!items.length) return "0 个任务";
+  const active = items.find((item) => item.status === "in_progress")?.content;
+  if (active) return `${items.length} 个任务，当前: ${active}`;
+  return `${items.length} 个任务`;
+}
+
+// ── Skill 检测 ──
+
+function skillTextContent(output: unknown): string | null {
+  if (typeof output === "string") return output;
+  if (output && typeof output === "object") {
+    const obj = output as Record<string, unknown>;
+    if (typeof obj.content === "string") return obj.content;
+    if (typeof obj.text === "string") return obj.text;
+  }
+  return null;
+}
+
+function detectSkill(event: TraceLogEvent): string | null {
+  if (event.tool_name !== "read_file" && event.tool_name !== "read") return null;
+  const path = extractPath(event.tool_output);
+  if (!path || !path.replace(/\/$/, "").endsWith("SKILL.md")) return null;
+  const content = skillTextContent(event.tool_output);
+  if (content) {
+    const match = content.match(/^---\s*\n[\s\S]*?^name:\s*(.+)$/m);
+    if (match) return match[1].trim();
+  }
+  return "unknown-skill";
+}
+
+// ── Todo 提取 ──
+
+function findTodos(output: unknown): TraceTodoItem[] | null {
+  if (!output || typeof output !== "object") return null;
+  const obj = output as Record<string, unknown>;
+  // 三种嵌套结构：output.todos / output.update.todos / output.args.todos
+  if (Array.isArray(obj.todos)) return parseTodoItems(obj.todos);
+  const update = obj.update;
+  if (update && typeof update === "object" && Array.isArray((update as Record<string, unknown>).todos)) {
+    return parseTodoItems((update as Record<string, unknown>).todos as unknown[]);
+  }
+  const args = obj.args;
+  if (args && typeof args === "object" && Array.isArray((args as Record<string, unknown>).todos)) {
+    return parseTodoItems((args as Record<string, unknown>).todos as unknown[]);
+  }
+  return null;
+}
+
+function parseTodoItems(raw: unknown[]): TraceTodoItem[] {
+  return raw.map((item, index) => {
+    if (!item || typeof item !== "object") {
+      return { id: String(index + 1), content: String(item), status: "pending" as const };
+    }
+    const obj = item as Record<string, unknown>;
+    const content = obj.content ?? obj.title;
+    let status = obj.status;
+    if (status !== "pending" && status !== "in_progress" && status !== "completed") {
+      status = "pending";
+    }
+    const id = obj.id;
+    return {
+      id: id != null ? String(id) : String(index + 1),
+      content: String(content),
+      status: status as TraceTodoItem["status"],
+    };
+  });
+}
+
+// ── Tool error 提取 ──
+
+function toolError(output: unknown): string | null {
+  if (output && typeof output === "object") {
+    const obj = output as Record<string, unknown>;
+    if (obj.status === "error") {
+      const content = obj.content;
+      return content != null ? String(content) : "Tool returned error status.";
+    }
+  }
+  return null;
 }
 
 function extractLlmText(output: unknown): string {

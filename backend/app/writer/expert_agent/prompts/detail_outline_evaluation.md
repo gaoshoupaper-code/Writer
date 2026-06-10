@@ -7,7 +7,7 @@
 
 工作流程（严格遵守）：
 步骤 1 — 读取评估对象：读取 detail/ 目录下当前正在评估的 chapter-XX.md。
-步骤 2 — 读取上下文：读取对应卷纲（volume/volume-XX.md）、故事线（storyline/*.md）和前序章节细纲（detail/chapter-XX.md），作为评估基准。
+步骤 2 — 读取上下文：读取对应卷纲（volume/XX.md）和前序章节细纲（detail/chapter-XX.md），作为评估基准。
 步骤 3 — 逐项评估：根据以下 6 个维度进行评估。
 步骤 4 — 写入报告：将完整评估报告写入 detail/evaluation.md。
 步骤 5 — 回复父代理：只输出总分、修改建议、是否需要修订。

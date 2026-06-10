@@ -1,11 +1,10 @@
-export type WorkspacePanel = "chat" | "characters" | "script" | "detail_outline" | "novel" | "trace";
+export type WorkspacePanel = "chat" | "characters" | "script" | "detail_outline" | "worldview" | "novel" | "trace";
 
 export type Style = {
   style_id: string;
   name: string;
   meta_style: string;
-  character_style: string;
-  outline_style: string;
+  storybuilding_style: string;
   detail_outline_style: string;
   writing_style: string;
   created_at: string;
@@ -18,11 +17,12 @@ export type ScreenplayResponse = {
   session_name: string;
   workspace_path: string;
   title: string;
+  content: string;
   logline: string;
   synopsis: string;
   beats: string[];
-  markdown?: string;
-  evaluation_markdown?: string;
+  markdown: string;
+  evaluation_markdown: string;
 };
 
 export type ThreadSummary = {
@@ -47,6 +47,23 @@ export type WorkspaceSummary = {
 export type WorkspaceOutlineContent = {
   workspace_id: string;
   markdown: string;
+};
+
+export type WorkspaceWorldviewContent = {
+  workspace_id: string;
+  markdown: string;
+};
+
+export type VolumeChapter = {
+  filename: string;
+  title: string;
+  markdown: string;
+};
+
+export type WorkspaceVolumeContent = {
+  workspace_id: string;
+  chapters: VolumeChapter[];
+  file_count: number;
 };
 
 export type DetailOutlineChapter = {
@@ -108,9 +125,9 @@ export type TraceContextRange = {
   end_anchor_id?: string | null;
 };
 
-export type TraceNodeKind = "run" | "agent" | "llm" | "tool" | "todo" | "error" | (string & {});
+export type TraceNodeKind = "run" | "agent" | "llm" | "tool" | "todo" | "error" | "skill" | (string & {});
 export type TraceAgentRole = "main" | "subagent" | (string & {});
-export type TraceContextKind = "system" | "human" | "ai" | "tool" | "todo" | "error" | (string & {});
+export type TraceContextKind = "system" | "human" | "ai" | "tool" | "todo" | "error" | "skill" | (string & {});
 
 export type TraceLogEvent = {
   trace_id: string;
@@ -139,6 +156,7 @@ export type TraceLogEvent = {
   input_context_range?: TraceContextRange | null;
   output_context_anchor_id?: string | null;
   error?: string | null;
+  skill_name?: string | null;
 };
 
 export type TraceNode = {
@@ -155,6 +173,7 @@ export type TraceNode = {
   duration_ms?: number | null;
   model_name?: string | null;
   tool_name?: string | null;
+  skill_name?: string | null;
   usage?: TraceUsage | null;
   context_anchor_id?: string | null;
   input_context_range?: TraceContextRange | null;
@@ -254,10 +273,37 @@ export type InitResponse = {
   styles: Style[];
 };
 
+export type CharacterGenerateRequest = {
+  thread_id: string;
+  prompt?: string;
+  content?: string;
+  text?: string;
+  name?: string;
+  role?: string;
+  description?: string;
+};
+
+export type CharacterGenerateResponse = {
+  mode: string;
+  thread_id: string;
+  workspace_id: string;
+  session_name: string;
+  workspace_path: string;
+  name: string;
+  identity: string;
+  appearance: string;
+  personality: string;
+  current_state: string;
+  relationships: string;
+  markdown: string;
+};
+
 export type WorkspaceBootstrapResponse = {
   threads: ThreadSummary[];
   outline: WorkspaceOutlineContent | null;
+  volume: WorkspaceVolumeContent | null;
   detail_outline: WorkspaceDetailOutlineContent | null;
   characters: WorkspaceCharacterContent | null;
   novel: WorkspaceNovelContent | null;
+  worldview: WorkspaceWorldviewContent | null;
 };

@@ -1567,6 +1567,37 @@ a {
   border-bottom-color: var(--teal);
 }
 
+/* ── Outline Panel: Sub-Tab Switcher ── */
+
+.outline-sub-tabs {
+  display: flex;
+  gap: 0;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px;
+}
+
+.outline-sub-tab {
+  padding: 6px 14px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--muted);
+  transition: color 0.15s, background 0.15s;
+}
+
+.outline-sub-tab:hover {
+  color: var(--ink);
+}
+
+.outline-sub-tab.active {
+  color: #fff;
+  background: linear-gradient(135deg, var(--teal), var(--blue));
+}
+
 /* ── Chain View: Sub-Tabs ── */
 
 /* ── Chain View: Layout ── */
@@ -1853,6 +1884,11 @@ a {
 .chain-node-icon.error {
   color: #9f3338;
   background: rgba(229, 72, 77, 0.14);
+}
+
+.chain-node-icon.skill {
+  color: #7c3aed;
+  background: rgba(139, 92, 246, 0.14);
 }
 
 .chain-node-duration {
@@ -3359,6 +3395,8 @@ html[data-theme="dark"] :is(
   .detail-outline-sidebar,
   .detail-outline-list-item,
   .detail-outline-markdown,
+  .outline-sub-tabs,
+  .outline-sub-tab,
   .empty-state,
   .modal-content
 ) {

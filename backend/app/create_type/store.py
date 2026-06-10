@@ -22,15 +22,14 @@ class CreateTypeStore:
     def get_style(self, style_id: str) -> dict | None:
         return self._read_index().get(style_id)
 
-    def create_style(self, name: str, meta_style: str = "", character_style: str = "", outline_style: str = "", detail_outline_style: str = "", writing_style: str = "") -> StyleSummary:
+    def create_style(self, name: str, meta_style: str = "", storybuilding_style: str = "", detail_outline_style: str = "", writing_style: str = "") -> StyleSummary:
         now = self._now()
         style_id = f"style-{uuid4().hex[:8]}"
         style = {
             "style_id": style_id,
             "name": name.strip(),
             "meta_style": meta_style.strip(),
-            "character_style": character_style.strip(),
-            "outline_style": outline_style.strip(),
+            "storybuilding_style": storybuilding_style.strip(),
             "detail_outline_style": detail_outline_style.strip(),
             "writing_style": writing_style.strip(),
             "created_at": now,
@@ -98,13 +97,19 @@ class CreateTypeStore:
         for style_id, style in data.items():
             if "description" in style and "writing_style" not in style:
                 desc = style.pop("description", "")
-                style.setdefault("character_style", "")
-                style.setdefault("outline_style", "")
                 style.setdefault("detail_outline_style", "")
                 style.setdefault("writing_style", desc)
                 migrated = True
             if "meta_style" not in style:
                 style["meta_style"] = ""
+                migrated = True
+            # outline_style → storybuilding_style (agent architecture refactor)
+            if "outline_style" in style and "storybuilding_style" not in style:
+                style["storybuilding_style"] = style.pop("outline_style", "")
+                migrated = True
+            # character_style removed (merged into storybuilding agent)
+            if "character_style" in style:
+                del style["character_style"]
                 migrated = True
         if migrated:
             self._write_index(data)

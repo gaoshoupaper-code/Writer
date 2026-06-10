@@ -167,3 +167,8 @@ def error_summary(error: str | None, tool_output: Any = None) -> str:
     if tool_output is not None:
         return f"❌ {str(tool_output)[:200]}"
     return "❌ 未知错误"
+
+
+def skill_summary(skill_name: str) -> str:
+    """生成 skill 节点的 chain_summary。"""
+    return f"📖 {skill_name}"
