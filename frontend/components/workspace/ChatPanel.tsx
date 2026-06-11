@@ -1,5 +1,6 @@
 import { KeyboardEvent, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { ChatMessage, ThreadSummary } from "../../lib/types";
 import { SessionMenu } from "./SessionMenu";
 import { ToolTree } from "./ToolTree";
@@ -130,7 +131,7 @@ export function ChatPanel({
               {message.role === "assistant" && message.tools?.length ? <ToolTree tools={message.tools} /> : null}
               <div className="message-content">
                 {message.role === "assistant" && message.contentFormat === "markdown" ? (
-                  <ReactMarkdown>{message.content}</ReactMarkdown>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
                 ) : (
                   <p>{message.content}</p>
                 )}

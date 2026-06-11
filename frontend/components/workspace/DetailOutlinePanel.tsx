@@ -1,4 +1,5 @@
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { DetailOutlineChapter } from "../../lib/types";
 
 type DetailOutlinePanelProps = {
@@ -42,7 +43,7 @@ export function DetailOutlinePanel({ chapters, activeFilename, loading, onSelect
 
             <article className="outline-markdown detail-outline-markdown">
               {activeChapter?.markdown.trim() ? (
-                <ReactMarkdown>{activeChapter.markdown}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{activeChapter.markdown}</ReactMarkdown>
               ) : (
                 <p>该章节暂无内容。</p>
               )}

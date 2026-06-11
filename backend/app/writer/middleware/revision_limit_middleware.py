@@ -6,7 +6,7 @@
 
 使用方式：
   在构建 DeepAgent 子代理时加入中间件列表。
-  max_revisions: 最大修订（evolution 调用）次数，默认 3。
+  max_revisions: 最大修订（evolution 调用）次数，默认 1。
   evolution_name: evolution 子代理的名称，默认 "evolution"。
 """
 from __future__ import annotations
@@ -25,10 +25,10 @@ class RevisionLimitMiddleware(AgentMiddleware):
     超过上限后返回包含终止指令的 ToolMessage，阻止继续修订。
     """
 
-    def __init__(self, *, max_revisions: int = 3, evolution_name: str = "evolution") -> None:
+    def __init__(self, *, max_revisions: int = 1, evolution_name: str = "evolution") -> None:
         """
         Args:
-            max_revisions: 最大修订次数（即 evolution 子代理最大被调用次数），默认 3
+            max_revisions: 最大修订次数（即 evolution 子代理最大被调用次数），默认 1
             evolution_name: evolution 子代理的注册名称，用于匹配 task 工具调用的目标
         """
         self.max_revisions = max_revisions

@@ -1,4 +1,5 @@
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type NovelPanelProps = {
   workspacePath?: string;
@@ -57,7 +58,7 @@ export function NovelPanel({
         </div>
 
         <div className="outline-markdown novel-markdown">
-          {hasMarkdown ? <ReactMarkdown>{markdown}</ReactMarkdown> : <p>工作目录中的 chapter/ 章节正文会在这里合并显示。</p>}
+          {hasMarkdown ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{markdown}</ReactMarkdown> : <p>工作目录中的 chapter/ 章节正文会在这里合并显示。</p>}
         </div>
       </div>
     </section>

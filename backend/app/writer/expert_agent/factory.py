@@ -71,7 +71,7 @@ def build_deep_subagent(
     subagent_middleware: list[AgentMiddleware] | None = None,
     backend: object | None = None,
     artifact_paths: list[Path] | None = None,
-    max_revisions: int = 3,
+    max_revisions: int = 1,
     skills: list[str] | None = None,
 ) -> CompiledSubAgent:
     """将创作型子代理构建为 DeepAgent（内含 evolution 评估子代理）。
@@ -87,7 +87,7 @@ def build_deep_subagent(
       1. 接收父代理委托，生成/修改创作产物
       2. 调用 evolution 子代理评估产物质量
       3. 根据 evolution 返回的评估结果决定是否修订
-      4. 修订后再次调用 evolution（最多 max_revisions 轮）
+      4. 若需修订，修订一次后不再二次评估（evolution 全程仅调用 1 次）
       5. 向父代理返回汇总结果
 
     Args:
@@ -100,7 +100,7 @@ def build_deep_subagent(
         subagent_middleware: 子代理的额外中间件（可选，由调用方注入 PathGuard/Trace/Goal 等）
         backend:             DeepAgents 后端（文件系统）
         artifact_paths:      期望的产物文件路径列表（用于 ArtifactValidationMiddleware）
-        max_revisions:       最大修订（evolution 调用）次数，默认 3
+        max_revisions:       最大修订（evolution 调用）次数，默认 1
         skills:              DeepAgent Skill 目录路径列表（可选）
 
     Returns:

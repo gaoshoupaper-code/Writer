@@ -8,10 +8,21 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.schemas.character import CharacterGenerateResponse
+
+
+def _read_text(path: Path) -> str:
+    """读取文件文本，UTF-8 失败时回退 GB18030（GBK 超集，兼容中文 Windows）。"""
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="gb18030", errors="replace")
+
+
 from app.schemas.screenplay import (
     CharacterMarkdownFile,
     DetailOutlineChapter,
     ScreenplayGenerateResponse,
+    StorylineEntry,
     ThreadSummary,
     VolumeChapter,
     WorkspaceCharacterContent,
@@ -20,6 +31,7 @@ from app.schemas.screenplay import (
     WorkspaceNovelChaptersContent,
     WorkspaceNovelContent,
     WorkspaceOutlineContent,
+    WorkspaceStorylineContent,
     WorkspaceVolumeContent,
     WorkspaceWorldviewContent,
     WorkspaceSummary,
@@ -193,8 +205,41 @@ class ThreadStore:
             raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
 
         artifact_path = workspace_path / "outline.md"
-        markdown = artifact_path.read_text(encoding="utf-8") if artifact_path.exists() else ""
+        markdown = _read_text(artifact_path) if artifact_path.exists() else ""
         return WorkspaceOutlineContent(workspace_id=workspace_id, markdown=markdown)
+
+    def read_workspace_storyline(self, workspace_id: str) -> WorkspaceStorylineContent | None:
+        workspace = self._read_workspace_index().get(workspace_id)
+        if workspace is None:
+            return None
+
+        workspace_path = Path(workspace["workspace_path"])
+        if not workspace_path.exists():
+            raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
+
+        index_path = workspace_path / "storyline.md"
+        index_markdown = _read_text(index_path) if index_path.exists() else ""
+
+        entries: list[StorylineEntry] = []
+        storyline_dir = workspace_path / "storyline"
+        if storyline_dir.exists():
+            for artifact_path in sorted(storyline_dir.glob("*.md"), key=lambda p: p.name):
+                content = _read_text(artifact_path).strip()
+                if content:
+                    entries.append(
+                        StorylineEntry(
+                            filename=artifact_path.name,
+                            title=artifact_path.stem,
+                            markdown=content,
+                        )
+                    )
+
+        return WorkspaceStorylineContent(
+            workspace_id=workspace_id,
+            index_markdown=index_markdown,
+            entries=entries,
+            file_count=len(entries),
+        )
 
     def read_workspace_worldview(self, workspace_id: str) -> WorkspaceWorldviewContent | None:
         workspace = self._read_workspace_index().get(workspace_id)
@@ -206,7 +251,7 @@ class ThreadStore:
             raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
 
         artifact_path = workspace_path / "worldview.md"
-        markdown = artifact_path.read_text(encoding="utf-8") if artifact_path.exists() else ""
+        markdown = _read_text(artifact_path) if artifact_path.exists() else ""
         return WorkspaceWorldviewContent(workspace_id=workspace_id, markdown=markdown)
 
     def _volume_chapter_title(self, filename: str) -> str:
@@ -230,7 +275,7 @@ class ThreadStore:
         chapters: list[VolumeChapter] = []
         if volume_dir.exists():
             for artifact_path in sorted(volume_dir.glob("*.md"), key=lambda p: p.name):
-                content = artifact_path.read_text(encoding="utf-8").strip()
+                content = _read_text(artifact_path).strip()
                 if content:
                     chapters.append(
                         VolumeChapter(
@@ -257,7 +302,7 @@ class ThreadStore:
             for artifact_path in sorted(detail_dir.glob("*.md"), key=lambda p: (p.name != "overview.md", p.name)):
                 if artifact_path.name == "evaluation.md":
                     continue
-                content = artifact_path.read_text(encoding="utf-8").strip()
+                content = _read_text(artifact_path).strip()
                 if content:
                     chapters.append(
                         DetailOutlineChapter(
@@ -286,7 +331,7 @@ class ThreadStore:
 
         chapter_files = self._workspace_chapter_files(workspace_path)
         if chapter_files:
-            markdown = "\n\n".join(path.read_text(encoding="utf-8").strip() for path in chapter_files)
+            markdown = "\n\n".join(_read_text(path).strip() for path in chapter_files)
             return WorkspaceNovelContent(
                 workspace_id=workspace_id,
                 markdown=f"{markdown}\n" if markdown else "",
@@ -295,7 +340,7 @@ class ThreadStore:
             )
 
         artifact_path = workspace_path / "novel.md"
-        markdown = artifact_path.read_text(encoding="utf-8") if artifact_path.exists() else ""
+        markdown = _read_text(artifact_path) if artifact_path.exists() else ""
         return WorkspaceNovelContent(
             workspace_id=workspace_id,
             markdown=markdown,
@@ -317,15 +362,15 @@ class ThreadStore:
             chapters = [
                 WorkspaceNovelChapter(
                     filename=path.name,
-                    title=self._markdown_title(path.read_text(encoding="utf-8")) or path.stem,
-                    markdown=path.read_text(encoding="utf-8").strip(),
+                    title=self._markdown_title(_read_text(path)) or path.stem,
+                    markdown=_read_text(path).strip(),
                 )
                 for path in chapter_files
             ]
             return WorkspaceNovelChaptersContent(workspace_id=workspace_id, source="chapter/", chapters=chapters)
 
         artifact_path = workspace_path / "novel.md"
-        markdown = artifact_path.read_text(encoding="utf-8").strip() if artifact_path.exists() else ""
+        markdown = _read_text(artifact_path).strip() if artifact_path.exists() else ""
         chapters = []
         if markdown:
             chapters.append(
@@ -354,7 +399,7 @@ class ThreadStore:
                     CharacterMarkdownFile(
                         filename=artifact_path.name,
                         name=artifact_path.stem,
-                        markdown=artifact_path.read_text(encoding="utf-8"),
+                        markdown=_read_text(artifact_path),
                     )
                 )
 
@@ -383,14 +428,36 @@ class ThreadStore:
         artifact_path = workspace_path / "outline.md"
         outline = WorkspaceOutlineContent(
             workspace_id=workspace_id,
-            markdown=artifact_path.read_text(encoding="utf-8") if artifact_path.exists() else "",
+            markdown=_read_text(artifact_path) if artifact_path.exists() else "",
+        )
+
+        # storyline（索引 storyline.md + 各故事线详情 storyline/*.md）
+        storyline_index_path = workspace_path / "storyline.md"
+        storyline_entries: list[StorylineEntry] = []
+        storyline_dir = workspace_path / "storyline"
+        if storyline_dir.exists():
+            for ap in sorted(storyline_dir.glob("*.md"), key=lambda p: p.name):
+                content = _read_text(ap).strip()
+                if content:
+                    storyline_entries.append(
+                        StorylineEntry(
+                            filename=ap.name,
+                            title=ap.stem,
+                            markdown=content,
+                        )
+                    )
+        storyline = WorkspaceStorylineContent(
+            workspace_id=workspace_id,
+            index_markdown=_read_text(storyline_index_path) if storyline_index_path.exists() else "",
+            entries=storyline_entries,
+            file_count=len(storyline_entries),
         )
 
         # worldview
         worldview_path = workspace_path / "worldview.md"
         worldview = WorkspaceWorldviewContent(
             workspace_id=workspace_id,
-            markdown=worldview_path.read_text(encoding="utf-8") if worldview_path.exists() else "",
+            markdown=_read_text(worldview_path) if worldview_path.exists() else "",
         )
 
         # volume
@@ -398,7 +465,7 @@ class ThreadStore:
         volume_chapters: list[VolumeChapter] = []
         if volume_dir.exists():
             for ap in sorted(volume_dir.glob("*.md"), key=lambda p: p.name):
-                content = ap.read_text(encoding="utf-8").strip()
+                content = _read_text(ap).strip()
                 if content:
                     volume_chapters.append(
                         VolumeChapter(
@@ -418,7 +485,7 @@ class ThreadStore:
             for ap in sorted(detail_dir.glob("*.md"), key=lambda p: (p.name != "overview.md", p.name)):
                 if ap.name == "evaluation.md":
                     continue
-                content = ap.read_text(encoding="utf-8").strip()
+                content = _read_text(ap).strip()
                 if content:
                     detail_chapters.append(
                         DetailOutlineChapter(
@@ -437,14 +504,14 @@ class ThreadStore:
         if character_dir.exists():
             for ap in sorted(character_dir.glob("*.md"), key=lambda p: p.stem):
                 characters.append(
-                    CharacterMarkdownFile(filename=ap.name, name=ap.stem, markdown=ap.read_text(encoding="utf-8")),
+                    CharacterMarkdownFile(filename=ap.name, name=ap.stem, markdown=_read_text(ap)),
                 )
         character_content = WorkspaceCharacterContent(workspace_id=workspace_id, characters=characters)
 
         # novel
         chapter_files = self._workspace_chapter_files(workspace_path)
         if chapter_files:
-            novel_markdown = "\n\n".join(p.read_text(encoding="utf-8").strip() for p in chapter_files)
+            novel_markdown = "\n\n".join(_read_text(p).strip() for p in chapter_files)
             novel = WorkspaceNovelContent(
                 workspace_id=workspace_id,
                 markdown=f"{novel_markdown}\n" if novel_markdown else "",
@@ -455,7 +522,7 @@ class ThreadStore:
             novel_artifact = workspace_path / "novel.md"
             novel = WorkspaceNovelContent(
                 workspace_id=workspace_id,
-                markdown=novel_artifact.read_text(encoding="utf-8") if novel_artifact.exists() else "",
+                markdown=_read_text(novel_artifact) if novel_artifact.exists() else "",
                 source="novel.md",
                 chapter_count=0,
             )
@@ -464,6 +531,7 @@ class ThreadStore:
             "workspace": workspace,
             "threads": sorted(thread_summaries, key=lambda t: t.updated_at, reverse=True),
             "outline": outline,
+            "storyline": storyline,
             "volume": volume,
             "detail_outline": detail_outline,
             "characters": character_content,
@@ -526,7 +594,7 @@ class ThreadStore:
             (
                 path
                 for path in chapter_dir.glob("*.md")
-                if path.is_file() and path.read_text(encoding="utf-8").strip()
+                if path.is_file() and _read_text(path).strip()
             ),
             key=lambda path: path.name,
         )

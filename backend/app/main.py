@@ -40,6 +40,7 @@ from app.schemas.screenplay import (
     WorkspaceNovelChaptersContent,
     WorkspaceNovelContent,
     WorkspaceOutlineContent,
+    WorkspaceStorylineContent,
     WorkspaceVolumeContent,
     WorkspaceWorldviewContent,
     WorkspaceSummary,
@@ -240,6 +241,7 @@ def bootstrap_workspace(workspace_id: str) -> WorkspaceBootstrapResponse:
     return WorkspaceBootstrapResponse(
         threads=data["threads"],
         outline=data["outline"],
+        storyline=data["storyline"],
         volume=data["volume"],
         detail_outline=data["detail_outline"],
         characters=data["characters"],
@@ -266,6 +268,14 @@ def create_workspace(payload: WorkspaceCreateRequest) -> WorkspaceSummary:
 @app.get("/api/workspaces/{workspace_id}/outline", response_model=WorkspaceOutlineContent)
 def get_workspace_outline(workspace_id: str) -> WorkspaceOutlineContent:
     content = thread_store.read_workspace_outline(workspace_id)
+    if content is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return content
+
+
+@app.get("/api/workspaces/{workspace_id}/storyline", response_model=WorkspaceStorylineContent)
+def get_workspace_storyline(workspace_id: str) -> WorkspaceStorylineContent:
+    content = thread_store.read_workspace_storyline(workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
@@ -329,6 +339,8 @@ def _classify_changes(changes, workspace_path: Path) -> set[str]:
         top = parts[0]
         if top in ("outline.md", "evaluation.md"):
             categories.add("outline")
+        elif top == "storyline.md" or (len(parts) > 1 and parts[0] == "storyline"):
+            categories.add("storyline")
         elif top == "worldview.md":
             categories.add("worldview")
         elif len(parts) > 1 and parts[0] == "volume":
@@ -360,6 +372,10 @@ async def _workspace_watch_generator(workspace_id: str, workspace_path: Path):
             content = thread_store.read_workspace_outline(workspace_id)
             if content is not None:
                 yield _sse_event("outline", content.model_dump())
+        if "storyline" in categories:
+            content = thread_store.read_workspace_storyline(workspace_id)
+            if content is not None:
+                yield _sse_event("storyline", content.model_dump())
         if "worldview" in categories:
             content = thread_store.read_workspace_worldview(workspace_id)
             if content is not None:

@@ -54,12 +54,14 @@ import type {
   TraceDetail,
   TraceLogEvent,
   TraceRunSummary,
+  StorylineEntry,
   VolumeChapter,
   WorkspaceCharacterContent,
   WorkspaceDetailOutlineContent,
   WorkspaceNovelContent,
   WorkspaceOutlineContent,
   WorkspacePanel,
+  WorkspaceStorylineContent,
   WorkspaceVolumeContent,
   WorkspaceWorldviewContent,
   WorkspaceSummary,
@@ -279,7 +281,10 @@ export default function Home() {
   const [worldviewLoading, setWorldviewLoading] = useState(false);
   const [volumeChapters, setVolumeChapters] = useState<VolumeChapter[]>([]);
   const [activeVolumeFilename, setActiveVolumeFilename] = useState("");
-  const [outlineTab, setOutlineTab] = useState<"outline" | "volume">("outline");
+  const [storylineMarkdown, setStorylineMarkdown] = useState("");
+  const [storylineEntries, setStorylineEntries] = useState<StorylineEntry[]>([]);
+  const [activeStorylineFilename, setActiveStorylineFilename] = useState("");
+  const [outlineTab, setOutlineTab] = useState<"outline" | "storyline" | "volume">("outline");
   const [traceRuns, setTraceRuns] = useState<TraceRunSummary[]>([]);
   const [activeTraceId, setActiveTraceId] = useState("");
   const [liveTraceId, setLiveTraceId] = useState("");
@@ -344,6 +349,11 @@ export default function Home() {
         setThreads(data.threads);
         setActiveThreadId(data.threads[0]?.thread_id || "");
         if (data.outline) setOutlineMarkdown(data.outline.markdown);
+        if (data.storyline) {
+          setStorylineMarkdown(data.storyline.index_markdown);
+          setStorylineEntries(data.storyline.entries);
+          setActiveStorylineFilename(data.storyline.entries[0]?.filename || "");
+        }
         if (data.worldview) setWorldviewMarkdown(data.worldview.markdown);
         if (data.volume) {
           setVolumeChapters(data.volume.chapters);
@@ -376,6 +386,14 @@ export default function Home() {
       } catch (err) {
         if (!ignore) {
           toast.error(err instanceof Error ? err.message : "初始化加载失败。");
+        }
+      } finally {
+        if (!ignore) {
+          setOutlineLoading(false);
+          setDetailOutlineLoading(false);
+          setCharactersLoading(false);
+          setNovelLoading(false);
+          setWorldviewLoading(false);
         }
       }
     }
@@ -429,6 +447,17 @@ export default function Home() {
         );
         if (bootData.outline) setOutlineMarkdown(bootData.outline.markdown);
         else setOutlineMarkdown("");
+        if (bootData.storyline) {
+          setStorylineMarkdown(bootData.storyline.index_markdown);
+          setStorylineEntries(bootData.storyline.entries);
+          setActiveStorylineFilename((cur) =>
+            bootData.storyline!.entries.some((e) => e.filename === cur) ? cur : bootData.storyline!.entries[0]?.filename || "",
+          );
+        } else {
+          setStorylineMarkdown("");
+          setStorylineEntries([]);
+          setActiveStorylineFilename("");
+        }
         if (bootData.worldview) setWorldviewMarkdown(bootData.worldview.markdown);
         else setWorldviewMarkdown("");
         if (bootData.volume) {
@@ -631,6 +660,18 @@ export default function Home() {
       } catch {}
     });
 
+    es.addEventListener("storyline", (e) => {
+      try {
+        const d = JSON.parse(e.data) as WorkspaceStorylineContent;
+        setStorylineMarkdown(d.index_markdown);
+        setStorylineEntries(d.entries);
+        setActiveStorylineFilename((cur) =>
+          d.entries.some((entry) => entry.filename === cur) ? cur : d.entries[0]?.filename || "",
+        );
+        setOutlineLoading(false);
+      } catch {}
+    });
+
     es.addEventListener("worldview", (e) => {
       try {
         const d = JSON.parse(e.data) as WorkspaceWorldviewContent;
@@ -700,6 +741,9 @@ export default function Home() {
       setActiveThreadId("");
       setResult(null);
       setOutlineMarkdown("");
+      setStorylineMarkdown("");
+      setStorylineEntries([]);
+      setActiveStorylineFilename("");
       setWorldviewMarkdown("");
       setVolumeChapters([]);
       setActiveVolumeFilename("");
@@ -749,6 +793,9 @@ export default function Home() {
         setLiveTraceId("");
         setTraceDetail(null);
         setOutlineMarkdown("");
+        setStorylineMarkdown("");
+        setStorylineEntries([]);
+        setActiveStorylineFilename("");
         setWorldviewMarkdown("");
         setVolumeChapters([]);
         setActiveVolumeFilename("");
@@ -1211,14 +1258,11 @@ export default function Home() {
 
         {activePanel === "script" ? (
           <ScriptPanel
-            workspacePath={workspacePath}
-            outlineMarkdown={currentOutlineMarkdown}
-            volumeChapters={volumeChapters}
-            activeVolumeFilename={activeVolumeFilename}
+            storylineMarkdown={storylineMarkdown}
+            storylineEntries={storylineEntries}
+            activeStorylineFilename={activeStorylineFilename}
             loading={outlineLoading}
-            activeTab={outlineTab}
-            onTabChange={setOutlineTab}
-            onSelectVolume={setActiveVolumeFilename}
+            onSelectStoryline={setActiveStorylineFilename}
           />
         ) : null}
 

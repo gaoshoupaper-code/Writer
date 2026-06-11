@@ -73,7 +73,7 @@ def build_writing_deep_subagent(
 ) -> CompiledSubAgent:
     """构建基于 DeepAgent 的 writing 子代理（内含 evolution 审查循环）。
 
-    子代理自主决策：写作 → 调用 evolution 审查 → 根据反馈修订（最多 3 轮）。
+    子代理自主决策：写作 → 调用 evolution 审查 → 根据反馈修订（单次审查修订）。
 
     Args:
         workspace_root:      工作区根目录
@@ -99,7 +99,7 @@ def build_writing_deep_subagent(
     evaluation_spec = build_writing_evaluator(
         workspace_root,
         middleware_factory("writing-evaluation-subagent"),
-        context_file_paths=["outline.md", "volume/*.md", "character/*.md", "detail/*.md", "chapter/*.md"],
+        context_file_paths=["outline.md", "storyline.md", "storyline/*.md", "volume/*.md", "character/*.md", "detail/*.md", "chapter/*.md"],
     )
 
     # ---- 构建 evolution SubAgent dict ----
@@ -122,7 +122,7 @@ def build_writing_deep_subagent(
         name="writing",
         description=(
             "适用：需要生成、追加或修订单个正文章节时调用；不用于大纲、角色或评估。"
-            "内置 evolution 审查循环：写作后自动审查质量，如果审查建议修订会自动修订，最多 3 轮。"
+            "内置 evolution 审查：写作后自动审查质量，如果审查建议修订会自动修订（单次审查修订，仅 1 次）。"
             "输入上下文包含 character/（角色设计）、outline.md（大纲剧情）和 detail/（对应细纲）。"
             "委托时请说明章节编号、本章目标、出场人物和关键约束。"
         ),
@@ -131,6 +131,6 @@ def build_writing_deep_subagent(
         evolution_spec=evolution,
         subagent_middleware=primary_spec.get("middleware"),
         backend=backend,
-        max_revisions=3,
+        max_revisions=1,
         skills=[skills_path],
     )

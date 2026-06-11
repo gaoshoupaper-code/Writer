@@ -64,7 +64,7 @@ def build_detail_outline_deep_subagent(
     """构建基于 DeepAgent 的 detail-outline 子代理（内含 evolution 评估循环）。
 
     替代 build_detail_outline_pipeline_subagent 的 StateGraph 管道模式。
-    子代理自主决策：生成 → 调用 evolution 评估 → 根据反馈修订（最多 3 轮）。
+    子代理自主决策：生成 → 调用 evolution 评估 → 根据反馈修订（单次评估修订）。
 
     Args:
         workspace_root:      工作区根目录
@@ -89,7 +89,7 @@ def build_detail_outline_deep_subagent(
     evaluation_spec = build_detail_outline_evaluator(
         workspace_root,
         middleware_factory("detail-outline-evaluation-subagent"),
-        context_file_paths=["outline.md", "character/*.md", "volume/*.md", "detail/*.md"],
+        context_file_paths=["outline.md", "character/*.md", "storyline.md", "storyline/*.md", "volume/*.md", "detail/*.md"],
     )
 
     # ---- 构建 evolution SubAgent dict ----
@@ -113,7 +113,7 @@ def build_detail_outline_deep_subagent(
         description=(
             "适用：卷纲通过 evaluation 后，需要将卷纲拆解为逐章细纲时调用。"
             "每次调用批量生成 3 章细纲文件（chapter-XX.md ~ chapter-XX+2.md），"
-            "内置 evolution 评估循环：3 章生成后统一评估质量，如果评估建议修订会自动修订，最多 3 轮。"
+            "内置 evolution 评估：3 章生成后统一评估质量，如果评估建议修订会自动修订（单次评估修订，仅 1 次）。"
             "主代理控制批次推进节奏：每次指定起始章节编号。"
             "委托时请说明本次要生成的起始章节编号和创作目标。"
         ),
@@ -122,6 +122,6 @@ def build_detail_outline_deep_subagent(
         evolution_spec=evolution,
         subagent_middleware=primary_spec.get("middleware"),
         backend=backend,
-        max_revisions=3,
+        max_revisions=1,
         skills=[skills_path],
     )

@@ -1,16 +1,12 @@
-"""Storybuilding 子代理 — 两层渐进式故事构建。
+"""Storybuilding 子代理 — 双层渐进式故事构建。
 
 架构：
-- 总纲层：管理全局时间轴和锚点（叙事里程碑），写入 outline.md
-- 卷纲层：管理相邻锚点之间的故事线、事件、钩子，写入 volume/XX.md
+- 索引文件 storyline.md：故事核心 + 故事线一览表
+- 故事线详情 storyline/S{XX}-{名}.md：每条线一个文件，含事件组与事件详情
+- 人物（character/*.md）和世界观（worldview.md）由单代理统一维护
 
-同时管理人物（character/*.md）和世界观（worldview.md），
-由单代理统一维护跨维度一致性。
-
-故事线信息内嵌于 volume/ 文件和 outline.md 故事线全局表，
-不再使用独立的 storyline/ 目录。
-
-每轮产出后自动调用 evolution 进行跨维度统一评估，最多 3 轮修订。
+事件以事件组为单位插入故事线，按三幕式比例编排。
+每次产出后自动调用 evolution 进行跨维度统一评估，单次评估修订（仅调用 1 次 evolution）。
 
 导出的公共 API：
   - build_storybuilding_subagent():        构建故事构建子代理规格
@@ -28,6 +24,9 @@ from langchain.agents.middleware.types import AgentMiddleware
 from app.writer.expert_agent.factory import build_deep_subagent
 from app.writer.expert_agent.evaluators.storybuilding import build_storybuilding_evaluator
 from app.writer.expert_agent.types import apply_style_suffix
+from app.writer.expert_agent.middleware.storyline_single_line_limit import (
+    StorylineSingleLineLimitMiddleware,
+)
 from app.writer.middleware.context_assembler_middleware import ContextAssemblerMiddleware
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "storybuilding_system.md"
@@ -41,8 +40,7 @@ def build_storybuilding_subagent(
 ) -> SubAgent:
     """构建故事构建子代理规格。
 
-    写入权限覆盖 4 个维度：character/, worldview.md, outline.md, volume/
-    故事线信息内嵌于 volume/ 文件 + outline.md 全局表。
+    写入权限覆盖：character/, worldview.md, storyline.md, storyline/*.md
 
     Args:
         workspace_root: 工作区根目录
@@ -60,11 +58,11 @@ def build_storybuilding_subagent(
     permissions = [
         # 读取：允许读取所有文件
         FilesystemPermission(operations=["read"], paths=["/**"], mode="allow"),
-        # 写入：允许写入 4 个维度
+        # 写入：允许写入 3 个维度
         FilesystemPermission(operations=["write"], paths=["/character/*.md"], mode="allow"),
         FilesystemPermission(operations=["write"], paths=["/worldview.md"], mode="allow"),
-        FilesystemPermission(operations=["write"], paths=["/outline.md"], mode="allow"),
-        FilesystemPermission(operations=["write"], paths=["/volume/*.md"], mode="allow"),
+        FilesystemPermission(operations=["write"], paths=["/storyline.md"], mode="allow"),
+        FilesystemPermission(operations=["write"], paths=["/storyline/*.md"], mode="allow"),
         # 拒绝：禁止写入其他所有文件
         FilesystemPermission(operations=["write"], paths=["/**"], mode="deny"),
     ]
@@ -73,11 +71,10 @@ def build_storybuilding_subagent(
         name="storybuilding",
         description=(
             "适用：需要构建或扩展小说故事世界时调用——包括人物、世界观、"
-            "总纲（锚点时间轴）和卷纲（故事线+事件+钩子）。"
-            "两层渐进式架构：总纲管锚点，卷纲管线和事件。"
-            "支持增量迭代：初构建首卷骨架，增量在已有骨架上扩展。"
-            "内置统一评估：每轮产出后自动评估跨维度一致性，最多 3 轮修订。"
-            "委托时必须说明：使用初构还是增量 Skill、本轮焦点、用户扩展方向。"
+            "故事核心、故事线（含事件组）。"
+            "增量迭代：按人物/故事线的比值分流——人物充足(>3)新增一条故事线，"
+            "人物不足(≤3)新增一个人物并融入现有故事(不新增故事线)；"
+            "每次调用只执行一种模式，可循环多次调用。"
         ),
         system_prompt=system_prompt,
         permissions=permissions,
@@ -114,6 +111,8 @@ def build_storybuilding_deep_subagent(
     """
     # ---- 主代理 middleware ----
     storybuilding_middleware = list(middleware_factory("storybuilding-subagent"))
+    # 单次单线硬约束：每次 storybuilding 运行最多新增 1 条 storyline（见需求 B1/B4）
+    storybuilding_middleware.append(StorylineSingleLineLimitMiddleware(workspace_root, max_new_lines=1))
     if context_file_paths:
         storybuilding_middleware.append(ContextAssemblerMiddleware(
             workspace_root,
@@ -134,7 +133,7 @@ def build_storybuilding_deep_subagent(
     evolution = SubAgent(
         name="evolution",
         description=(
-            "统一评估所有故事维度（人物、世界观、总纲、卷纲）的跨维度一致性。"
+            "统一评估所有故事维度（人物、世界观、故事核心、故事线、事件组）的跨维度一致性。"
             "自主读取所有产物，写入 evaluation.md，返回评分和修订建议。"
         ),
         system_prompt=evaluation_spec["system_prompt"],
@@ -153,10 +152,14 @@ def build_storybuilding_deep_subagent(
         name="storybuilding",
         description=(
             "适用：需要构建或扩展小说故事世界时调用——包括人物、世界观、"
-            "总纲（锚点时间轴）和卷纲（故事线+事件+钩子）。"
-            "两层渐进式架构：总纲管锚点，卷纲管线和事件。"
-            "支持增量迭代：初构建首卷骨架，增量在已有骨架上扩展。"
-            "内置统一评估：每轮产出后自动评估跨维度一致性，最多 3 轮修订。"
+            "故事核心、故事线（含事件组）。"
+            "双层架构：storyline.md 留故事核心+故事线一览表（索引），"
+            "每条故事线详情（含事件组）拆到 storyline/S{XX}-{名}.md，一条一个文件。"
+            "事件以事件组为单位插入，按三幕式比例编排。"
+            "增量迭代：按人物/故事线比值分流两种互斥模式——"
+            "人物充足(>3)新增一条故事线，人物不足(≤3)新增一个人物并融入现有故事、不新增故事线；"
+            "每次调用只执行一种模式，可循环多次调用。"
+            "内置统一评估：产出后调用 evolution 评估跨维度一致性，单次评估修订（仅 1 次）。"
             "委托时必须说明：使用初构还是增量 Skill、本轮焦点、用户扩展方向。"
         ),
         model=model,
@@ -164,7 +167,7 @@ def build_storybuilding_deep_subagent(
         evolution_spec=evolution,
         subagent_middleware=primary_spec.get("middleware"),
         backend=backend,
-        artifact_paths=[workspace_root / "outline.md"],
-        max_revisions=3,
+        artifact_paths=[workspace_root / "storyline.md", workspace_root / "storyline"],
+        max_revisions=1,
         skills=skills,
     )

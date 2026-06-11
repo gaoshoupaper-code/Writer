@@ -15,6 +15,7 @@ from langchain.agents.middleware.types import AgentMiddleware
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from app.writer.expert_agent.agents.storybuilding import build_storybuilding_deep_subagent
+from app.writer.expert_agent.services.storyline_graph import generate_storyline_graph
 from app.writer.expert_agent.agents.detail_outline import build_detail_outline_deep_subagent
 from app.writer.models import build_writer_model
 from app.writer.expert_agent.agents.writing import build_writing_deep_subagent
@@ -81,12 +82,14 @@ class MetaAgentService:
                 ArtifactPrerequisite("character design", workspace_path / "character", markdown_directory=True),
                 ArtifactPrerequisite("plot outline", workspace_path / "outline.md"),
                 ArtifactPrerequisite("worldview", workspace_path / "worldview.md"),
-                ArtifactPrerequisite("storylines", workspace_path / "volume", markdown_directory=True),
+                ArtifactPrerequisite("storylines", workspace_path / "storyline", markdown_directory=True),
+                ArtifactPrerequisite("volumes", workspace_path / "volume", markdown_directory=True),
             ]
         if agent_name == "writing-subagent":
             return [
                 ArtifactPrerequisite("character design", workspace_path / "character", markdown_directory=True),
                 ArtifactPrerequisite("plot outline", workspace_path / "outline.md"),
+                ArtifactPrerequisite("storylines", workspace_path / "storyline", markdown_directory=True),
                 ArtifactPrerequisite("detail outline", workspace_path / "detail", markdown_directory=True),
             ]
         return []
@@ -136,7 +139,7 @@ class MetaAgentService:
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
-            context_file_paths=["demand.md", "outline.md", "character/*.md", "worldview.md", "volume/*.md", "detail/overview.md", "detail/chapter-*.md"],
+            context_file_paths=["demand.md", "outline.md", "character/*.md", "worldview.md", "storyline.md", "storyline/*.md", "volume/*.md", "detail/overview.md", "detail/chapter-*.md"],
         )
 
     def _writing_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
@@ -146,7 +149,7 @@ class MetaAgentService:
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
-            context_file_paths=["demand.md", "outline.md", "character/*.md", "worldview.md", "volume/*.md", "detail/*.md"],
+            context_file_paths=["demand.md", "outline.md", "character/*.md", "worldview.md", "storyline.md", "storyline/*.md", "volume/*.md", "detail/*.md"],
         )
 
     def _general_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None) -> SubAgent:
@@ -232,6 +235,8 @@ class MetaAgentService:
             )
             content = self._extract_text(result)
             response = self._response_from_workspace_artifacts(payload, content, thread)
+            # storybuilding 产物稳定后派生流程图（幂等：非 storybuilding 调用时 storyline.md 未变，图不变）
+            generate_storyline_graph(Path(thread.workspace_path))
             self.trace_recorder.complete_run(thread, trace.trace_id)
             return response
         except BaseException as exc:
@@ -332,7 +337,14 @@ class MetaAgentService:
                         if name == "task":
                             call_id = _extract_tool_call_id(data)
                             if call_id and call_id in active_tasks:
+                                finished_subagent = active_tasks[call_id].get("name")
                                 del active_tasks[call_id]
+                                # storybuilding 完成后派生流程图：确定性、纯后端。
+                                # 失败已被模块内部 try/except 吞掉，这里只读不抛，绝不阻断 SSE 流。
+                                if finished_subagent == "storybuilding":
+                                    await asyncio.to_thread(
+                                        generate_storyline_graph, Path(thread.workspace_path)
+                                    )
                         yield _sse(
                             "tool_output",
                             {
@@ -427,7 +439,7 @@ class MetaAgentService:
             "- writing：每次调用只写一个章节，目标约 1000 字，允许 800-1500 字浮动。\n"
             "- 调用 writing 子代理时，必须提供总章节数、当前章节编号、剧情大纲、本章目标、出场人物、必须发生的 beat、承接关系、必须保留的事实和禁止改变的内容；不要提供前五章正文，writing 会自行读取 chapter/ 和 detail/。\n"
             "- 每完成一章后，立即更新对应章节文件，不要等全书完成后才统一写入。\n"
-            "- writing 子代理内部 evolution 会自动审查章节质量，最多 3 轮；若仍未通过，接受当前最好版本并在返回摘要中标记质量风险。\n"
+            "- writing 子代理内部 evolution 会自动审查章节质量（单次审查修订）；若不通过，接受当前版本并在返回摘要中标记质量风险。\n"
             "- 允许动态调整大纲：小改自动接受；中改和大改由你作为 Director 决策。\n"
             "- 最终回复只给摘要，不要在回复中输出章节正文全文。\n\n"
 

@@ -49,6 +49,19 @@ export type WorkspaceOutlineContent = {
   markdown: string;
 };
 
+export type StorylineEntry = {
+  filename: string;
+  title: string;
+  markdown: string;
+};
+
+export type WorkspaceStorylineContent = {
+  workspace_id: string;
+  index_markdown: string;
+  entries: StorylineEntry[];
+  file_count: number;
+};
+
 export type WorkspaceWorldviewContent = {
   workspace_id: string;
   markdown: string;
@@ -301,6 +314,7 @@ export type CharacterGenerateResponse = {
 export type WorkspaceBootstrapResponse = {
   threads: ThreadSummary[];
   outline: WorkspaceOutlineContent | null;
+  storyline: WorkspaceStorylineContent | null;
   volume: WorkspaceVolumeContent | null;
   detail_outline: WorkspaceDetailOutlineContent | null;
   characters: WorkspaceCharacterContent | null;
