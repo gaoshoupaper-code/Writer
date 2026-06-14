@@ -1,4 +1,4 @@
-import type { CharacterGenerateRequest, CharacterGenerateResponse, CheckpointState, InitResponse, Style, ThreadSummary, TraceDetail, TraceRunSummary, WorkspaceBootstrapResponse, WorkspaceCharacterContent, WorkspaceDetailOutlineContent, WorkspaceNovelContent, WorkspaceOutlineContent, WorkspaceVolumeContent, WorkspaceWorldviewContent, WorkspaceSummary } from "./types";
+import type { CharacterGenerateRequest, CharacterGenerateResponse, CheckpointState, InitResponse, Style, ThreadSummary, TraceDetail, TraceRunSummary, WorkspaceBootstrapResponse, WorkspaceCharacterContent, WorkspaceDetailOutlineContent, WorkspaceNovelContent, WorkspaceOutlineContent, WorkspaceVolumeContent, WorkspaceWorldviewContent, WorkspaceStorylineGraphContent, WorkspaceSummary } from "./types";
 
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:7788";
 
@@ -89,6 +89,11 @@ export async function fetchWorkspaceWorldview(workspaceId: string) {
 export async function fetchWorkspaceVolume(workspaceId: string) {
   const response = await fetch(`${API_BASE_URL}/api/workspaces/${workspaceId}/volume`);
   return parseJsonResponse<WorkspaceVolumeContent>(response);
+}
+
+export async function fetchWorkspaceStorylineGraph(workspaceId: string) {
+  const response = await fetch(`${API_BASE_URL}/api/workspaces/${workspaceId}/storyline-graph`);
+  return parseJsonResponse<WorkspaceStorylineGraphContent>(response);
 }
 
 export async function fetchWorkspaceDetailOutline(workspaceId: string) {

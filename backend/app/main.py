@@ -41,6 +41,7 @@ from app.schemas.screenplay import (
     WorkspaceNovelContent,
     WorkspaceOutlineContent,
     WorkspaceStorylineContent,
+    WorkspaceStorylineGraphContent,
     WorkspaceVolumeContent,
     WorkspaceWorldviewContent,
     WorkspaceSummary,
@@ -300,6 +301,15 @@ def get_workspace_worldview(workspace_id: str) -> WorkspaceWorldviewContent:
 @app.get("/api/workspaces/{workspace_id}/volume", response_model=WorkspaceVolumeContent)
 def get_workspace_volume(workspace_id: str) -> WorkspaceVolumeContent:
     content = thread_store.read_workspace_volume(workspace_id)
+    if content is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return content
+
+
+@app.get("/api/workspaces/{workspace_id}/storyline-graph", response_model=WorkspaceStorylineGraphContent)
+def get_workspace_storyline_graph(workspace_id: str) -> WorkspaceStorylineGraphContent:
+    """故事线流程图（竖向泳道时间轴）。读取时按需生成兜底——图缺失/过期自动重生成。"""
+    content = thread_store.read_workspace_storyline_graph(workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content

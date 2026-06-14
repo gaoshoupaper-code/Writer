@@ -35,6 +35,19 @@ class RevisionLimitMiddleware(AgentMiddleware):
         self.evolution_name = evolution_name
         self._revision_count = 0
 
+    # ------------------------------------------------------------------
+    # 调用周期重置（子代理每次被 task 调用开始时触发）
+    # ------------------------------------------------------------------
+    # 计数周期 = 「storybuilding 每被父 agent task 委托一次」。
+    # 子代理 graph 一次编译、会话内多次复用同一实例，必须靠 before_agent 在每次
+    # graph 执行开始时清零计数，否则额度会跨调用累积（见需求基准计数边界决策）。
+
+    def before_agent(self, state: Any, runtime: Any) -> None:
+        self._revision_count = 0
+
+    async def abefore_agent(self, state: Any, runtime: Any) -> None:
+        self._revision_count = 0
+
     def _is_evolution_task(self, request: Any) -> bool:
         """判断 task 工具调用是否目标是 evolution 子代理。"""
         tool_call = getattr(request, "tool_call", {})
@@ -49,14 +62,15 @@ class RevisionLimitMiddleware(AgentMiddleware):
         return target == self.evolution_name
 
     def _limit_message(self, request: Any) -> ToolMessage:
-        """构造达到修订上限的终止消息。"""
+        """构造达到评估上限的终止消息：停止评估 + 指示子代理在返回摘要中转述（解读A 可见性）。"""
         tool_call = getattr(request, "tool_call", {})
         tool_call_id = _mapping_value(tool_call, "id")
         return ToolMessage(
             content=(
-                f"已达到修订上限（{self.max_revisions} 轮）。"
+                f"已达到本轮评估上限（{self.max_revisions} 次 / 本轮 storybuilding）。"
                 "请接受当前版本，不要再调用 evolution 评估。"
-                "直接基于当前内容向父代理返回结果即可。"
+                "请在返回给父代理的摘要中明确注明：「本轮因达到评估上限，已跳过 evolution 评估」，"
+                "再基于当前内容收尾返回。"
             ),
             name="task",
             tool_call_id=str(tool_call_id or ""),

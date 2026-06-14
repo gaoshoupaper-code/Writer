@@ -10,11 +10,13 @@ backend/.env
 
 # 运行时数据
 backend/workspace/
+backend/checkpoints.db*
 
 # Node
 node_modules/
 .next/
 out/
+*.tsbuildinfo
 
 # IDE
 .vscode/
@@ -23,3 +25,6 @@ out/
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code 本地产物
+.claude/md/

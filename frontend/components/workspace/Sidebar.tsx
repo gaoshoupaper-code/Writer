@@ -10,6 +10,7 @@ const SIDEBAR_ITEMS: SidebarItem[] = [
   { id: "chat", label: "对话", description: "与 Agent 协作推进故事" },
   { id: "characters", label: "人物", description: "从剧本章节提取角色" },
   { id: "script", label: "大纲", description: "查看总纲与卷纲" },
+  { id: "storyline", label: "故事线", description: "故事线时间轴（主线/支线/交汇）" },
   { id: "detail_outline", label: "细纲", description: "查看逐章详细规划" },
   { id: "worldview", label: "世界观", description: "查看故事世界观设定" },
   { id: "novel", label: "正文", description: "查看完整小说正文" },

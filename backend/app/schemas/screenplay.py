@@ -55,6 +55,48 @@ class WorkspaceStorylineContent(BaseModel):
     file_count: int = 0
 
 
+class StorylineGraphStoryline(BaseModel):
+    """故事线（= 图中一列泳道）。"""
+
+    id: str
+    name: str = ""
+    type: str = ""
+    status: str = ""
+    direction: str = ""
+    key_events: list[str] = Field(default_factory=list)
+
+
+class StorylineGraphEvent(BaseModel):
+    """事件节点。storylines 多条 = 交汇事件。"""
+
+    id: str
+    name: str = ""
+    type: str = ""
+    storylines: list[str] = Field(default_factory=list)
+    group: str = ""
+    doc_order: int = 0
+
+
+class WorkspaceStorylineGraphContent(BaseModel):
+    """故事线流程图内容（派生 markdown + 结构化数据）。
+
+    storylines/events/t_map = 结构化数据，供前端 reactflow 自定义布局
+    （按 t_map 统一纵轴对齐时间，主线居中贯穿、支线左右并行）。
+    markdown = 完整 storyline_graph.md 文本（备查）。
+    stale = 本次读取是否触发了按需重生成。
+    """
+
+    workspace_id: str
+    markdown: str
+    storylines: list[StorylineGraphStoryline] = Field(default_factory=list)
+    events: dict[str, StorylineGraphEvent] = Field(default_factory=dict)
+    t_map: dict[str, int] = Field(default_factory=dict)
+    storyline_count: int = 0
+    event_count: int = 0
+    generated_at: str = ""
+    stale: bool = False
+
+
 class WorkspaceWorldviewContent(BaseModel):
     workspace_id: str
     markdown: str

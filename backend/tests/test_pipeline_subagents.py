@@ -12,7 +12,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
 
-from app.writer.middleware.revision_limit_middleware import RevisionLimitMiddleware
+from app.writer.expert_agent.middleware.revision_limit_middleware import RevisionLimitMiddleware
 from app.writer.middleware.artifact_validation_middleware import ArtifactValidationMiddleware
 
 
@@ -54,7 +54,7 @@ class TestRevisionLimitMiddleware(unittest.TestCase):
         # 第 3 次应该被拦截
         result = mw.wrap_tool_call(req, lambda r: "should-not-reach")
         self.assertIsInstance(result, ToolMessage)
-        self.assertIn("修订上限", result.content)
+        self.assertIn("评估上限", result.content)
 
     def test_non_evolution_task_passes_through(self):
         """task 工具但目标不是 evolution 时应该放行。"""

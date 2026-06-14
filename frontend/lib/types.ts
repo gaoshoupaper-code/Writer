@@ -1,4 +1,4 @@
-export type WorkspacePanel = "chat" | "characters" | "script" | "detail_outline" | "worldview" | "novel" | "trace";
+export type WorkspacePanel = "chat" | "characters" | "script" | "detail_outline" | "worldview" | "novel" | "trace" | "storyline";
 
 export type Style = {
   style_id: string;
@@ -60,6 +60,36 @@ export type WorkspaceStorylineContent = {
   index_markdown: string;
   entries: StorylineEntry[];
   file_count: number;
+};
+
+export type StorylineGraphStoryline = {
+  id: string;
+  name: string;
+  type: string;
+  status: string;
+  direction: string;
+  key_events: string[];
+};
+
+export type StorylineGraphEvent = {
+  id: string;
+  name: string;
+  type: string;
+  storylines: string[];
+  group: string;
+  doc_order: number;
+};
+
+export type WorkspaceStorylineGraphContent = {
+  workspace_id: string;
+  markdown: string;
+  storylines: StorylineGraphStoryline[];
+  events: Record<string, StorylineGraphEvent>;
+  t_map: Record<string, number>;
+  storyline_count: number;
+  event_count: number;
+  generated_at: string;
+  stale: boolean;
 };
 
 export type WorkspaceWorldviewContent = {

@@ -16,7 +16,7 @@ from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 
 from app.writer.middleware.artifact_validation_middleware import ArtifactValidationMiddleware
-from app.writer.middleware.revision_limit_middleware import RevisionLimitMiddleware
+from app.writer.expert_agent.middleware.revision_limit_middleware import RevisionLimitMiddleware
 
 
 def _compose_skills_backend(

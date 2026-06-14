@@ -31,10 +31,18 @@ from app.schemas.screenplay import (
     WorkspaceNovelChaptersContent,
     WorkspaceNovelContent,
     WorkspaceOutlineContent,
+    StorylineGraphEvent,
+    StorylineGraphStoryline,
     WorkspaceStorylineContent,
+    WorkspaceStorylineGraphContent,
     WorkspaceVolumeContent,
     WorkspaceWorldviewContent,
     WorkspaceSummary,
+)
+from app.writer.expert_agent.services.storyline_graph import (
+    build_storyline_graph_data,
+    generate_storyline_graph,
+    is_stale,
 )
 
 
@@ -239,6 +247,70 @@ class ThreadStore:
             index_markdown=index_markdown,
             entries=entries,
             file_count=len(entries),
+        )
+
+    def read_workspace_storyline_graph(self, workspace_id: str) -> WorkspaceStorylineGraphContent | None:
+        """读取故事线流程图（storyline_graph.md），缺失或过期时按需生成（幂等兜底）。
+
+        按需兜底：storyline_graph.md 是派生视图，靠 storybuilding 完成触发；
+        但触发链路不可靠（stream 常异常退出），故读取时若 ``is_stale``（图缺失或
+        源文件更新）则重生成，保证前端拿到的图始终与 storyline.md 一致。
+        """
+        workspace = self._read_workspace_index().get(workspace_id)
+        if workspace is None:
+            return None
+        workspace_path = Path(workspace["workspace_path"])
+        if not workspace_path.exists():
+            raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
+
+        stale = is_stale(workspace_path)
+        if stale:
+            generate_storyline_graph(workspace_path)
+
+        data = build_storyline_graph_data(workspace_path)
+        graph_path = workspace_path / "storyline_graph.md"
+        generated_at = (
+            datetime.fromtimestamp(graph_path.stat().st_mtime, tz=UTC).isoformat()
+            if graph_path.exists()
+            else ""
+        )
+        if data is None:
+            return WorkspaceStorylineGraphContent(
+                workspace_id=workspace_id,
+                markdown="",
+                generated_at=generated_at,
+                stale=stale,
+            )
+        return WorkspaceStorylineGraphContent(
+            workspace_id=workspace_id,
+            markdown=data.markdown,
+            storylines=[
+                StorylineGraphStoryline(
+                    id=s.id,
+                    name=s.name,
+                    type=s.type,
+                    status=s.status,
+                    direction=s.direction,
+                    key_events=list(s.key_events),
+                )
+                for s in data.storylines
+            ],
+            events={
+                eid: StorylineGraphEvent(
+                    id=ev.id,
+                    name=ev.name,
+                    type=ev.type,
+                    storylines=list(ev.storylines),
+                    group=ev.group,
+                    doc_order=ev.doc_order,
+                )
+                for eid, ev in data.events.items()
+            },
+            t_map=dict(data.t_map),
+            storyline_count=len(data.storylines),
+            event_count=len(data.events),
+            generated_at=generated_at,
+            stale=stale,
         )
 
     def read_workspace_worldview(self, workspace_id: str) -> WorkspaceWorldviewContent | None:

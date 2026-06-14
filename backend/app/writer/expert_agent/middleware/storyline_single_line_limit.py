@@ -1,7 +1,7 @@
 """StorylineSingleLineLimitMiddleware — 单次单线生成硬上限中间件。
 
 职责：
-  拦截 storybuilding 子代理的 write_file 调用，约束单次运行（= 中间件实例生命周期）
+  拦截 storybuilding 子代理的 write_file 调用，约束单次 storybuilding 子代理调用
   最多新增 ``max_new_lines`` 条故事线（``storyline/*.md``）。超限则返回 ToolMessage
   硬拦截，引导代理停止新增、基于现有内容收尾。
 
@@ -10,7 +10,7 @@
     ``edit`` 只能改已存在文件。故 write_file 到「不存在的 storyline 文件」= 新增。
   - 计数对象 = 新增文件数（非写调用次数）：写入前查物理磁盘 ``.exists()`` 判定，
     已存在 = 非新增（放行），不存在 = 新增（计数，超限拦截）。
-  - 计数周期 = 实例生命周期，与 ``RevisionLimitMiddleware`` 一致。
+  - 计数周期 = 每次 storybuilding 子代理调用（before_agent 在每次 task 调用开始时重置），与 ``RevisionLimitMiddleware`` 一致。
 
 使用方式：
   在 ``build_storybuilding_deep_subagent`` 构建时注入 storybuilding 子代理的 middleware 链。
@@ -48,6 +48,19 @@ class StorylineSingleLineLimitMiddleware(AgentMiddleware):
         """
         self.workspace_path = workspace_path.resolve()
         self.max_new_lines = max_new_lines
+        self._new_line_count = 0
+
+    # ------------------------------------------------------------------
+    # 调用周期重置（子代理每次被 task 调用开始时触发）
+    # ------------------------------------------------------------------
+    # 计数周期 = 「storybuilding 每被父 agent task 委托一次」。
+    # 子代理 graph 一次编译、会话内多次复用同一实例，必须靠 before_agent 在每次
+    # graph 执行开始时清零计数，否则额度会跨调用累积（见需求基准计数边界决策）。
+
+    def before_agent(self, state: Any, runtime: Any) -> None:
+        self._new_line_count = 0
+
+    async def abefore_agent(self, state: Any, runtime: Any) -> None:
         self._new_line_count = 0
 
     # ------------------------------------------------------------------
@@ -114,13 +127,14 @@ class StorylineSingleLineLimitMiddleware(AgentMiddleware):
         return self._limit_message(tool_call)
 
     def _limit_message(self, tool_call: Any) -> ToolMessage:
-        """构造达上限的拦截消息，引导代理停止新增、基于现有内容收尾。"""
+        """构造达上限的拦截消息：停止新增 + 指示子代理在返回摘要中转述（解读A 可见性）。"""
         tool_call_id = _mapping_value(tool_call, "id")
         return ToolMessage(
             content=(
-                f"已达单次单线生成上限（{self.max_new_lines} 条 / storybuilding 运行）。"
-                "本次新增的故事线已写入，请停止创建更多故事线文件，"
-                "基于当前已有内容向父代理返回结果。"
+                f"已达单次单线生成上限（{self.max_new_lines} 条 / 本轮 storybuilding）。"
+                "本次新增的故事线已写入，请停止创建更多故事线文件。"
+                "请在返回给父代理的摘要中明确注明：「本轮因达到单线生成上限，已跳过后续新增」，"
+                "再基于当前已有内容收尾返回。"
             ),
             name="write_file",
             tool_call_id=str(tool_call_id or ""),

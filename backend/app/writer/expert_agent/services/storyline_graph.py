@@ -403,43 +403,90 @@ def _compose_markdown(storylines: list[Storyline], events: dict[str, Event], t_m
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class StorylineGraphData:
+    """故事线图的结构化数据（供前端展示 / 按需生成复用）。
+
+    markdown  = 完整 storyline_graph.md 文本（图例 + 本卷脉络 + mermaid），第一步前端渲染用；
+    storylines/events/t_map = 结构化数据，备第二步（剧情内时间 / 并行对齐）使用。
+    """
+
+    markdown: str
+    storylines: list[Storyline]
+    events: dict[str, Event]
+    t_map: dict[str, int]
+
+
+def _read_storyline_sources(workspace_path: Path) -> str | None:
+    """拼接 storyline.md(索引) + storyline/*.md(各线详情)；无任何产物返回 None。"""
+    chunks: list[str] = []
+    index_path = workspace_path / "storyline.md"
+    if index_path.exists():
+        chunks.append(index_path.read_text(encoding="utf-8"))
+    storyline_dir = workspace_path / "storyline"
+    if storyline_dir.exists():
+        for detail_path in sorted(storyline_dir.glob("*.md"), key=lambda p: p.name):
+            chunks.append(detail_path.read_text(encoding="utf-8"))
+    return "\n\n".join(chunks) if chunks else None
+
+
+def build_storyline_graph_data(workspace_path: Path) -> StorylineGraphData | None:
+    """解析 storyline 产物 → 结构化图数据 + mermaid markdown。
+
+    确定性、纯后端。无产物或解析失败返回 None（图是派生视图，绝不因自身问题上抛）。
+    复用 ``_parse_storyline_md`` + ``_assign_global_t`` + ``_compose_markdown``。
+    """
+    text = _read_storyline_sources(workspace_path)
+    if not text:
+        return None
+    try:
+        storylines, events = _parse_storyline_md(text)
+        if not storylines or not events:
+            return None
+        t_map = _assign_global_t(storylines, events)
+        markdown = _compose_markdown(storylines, events, t_map)
+        return StorylineGraphData(
+            markdown=markdown, storylines=storylines, events=events, t_map=t_map
+        )
+    except Exception as exc:  # noqa: BLE001 — 派生视图：解析异常不阻断
+        print(f"[storyline_graph] 解析失败（{type(exc).__name__}: {exc}）")
+        return None
+
+
+def is_stale(workspace_path: Path) -> bool:
+    """storyline_graph.md 相对源文件是否缺失或过期。
+
+    判定：图不存在，或任一源文件（storyline.md / storyline/*.md）的 mtime 晚于图。
+    供「读取时按需生成」兜底——源文件变了就重生成，保证图与数据一致。
+    """
+    graph_path = workspace_path / "storyline_graph.md"
+    if not graph_path.exists():
+        return True
+    graph_mtime = graph_path.stat().st_mtime
+    sources: list[Path] = [workspace_path / "storyline.md"]
+    storyline_dir = workspace_path / "storyline"
+    if storyline_dir.exists():
+        sources.extend(storyline_dir.glob("*.md"))
+    latest_source = max((p.stat().st_mtime for p in sources if p.exists()), default=0.0)
+    return latest_source > graph_mtime
+
+
 def generate_storyline_graph(workspace_path: Path) -> None:
     """从 workspace/storyline.md(索引)+storyline/*.md(各线详情) 派生 storyline_graph.md。
 
     确定性、纯后端。任何解析异常都吞掉并打日志——图是派生视图，
     绝不因自身问题阻断 storybuilding 主流程。
     """
-    storyline_index = workspace_path / "storyline.md"
-    storyline_dir = workspace_path / "storyline"
-
-    # 拼接索引 + 各故事线详情文件，复刻原单文件结构（一览表 + ### S{XX} + ### E{XXX}）
-    chunks: list[str] = []
-    if storyline_index.exists():
-        chunks.append(storyline_index.read_text(encoding="utf-8"))
-    if storyline_dir.exists():
-        for detail_path in sorted(storyline_dir.glob("*.md"), key=lambda p: p.name):
-            chunks.append(detail_path.read_text(encoding="utf-8"))
-
-    if not chunks:
-        # storybuilding 尚未产出任何故事线产物，属正常状态，静默跳过
+    data = build_storyline_graph_data(workspace_path)
+    if data is None:
+        # 无源文件（storybuilding 尚未产出，常态静默）或解析失败（build 内部已打日志）
         return
-
     try:
-        text = "\n\n".join(chunks)
-        storylines, events = _parse_storyline_md(text)
-        if not storylines or not events:
-            print(
-                "[storyline_graph] 跳过：未解析出故事线/事件详情"
-                "（storyline.md / storyline/*.md 可能缺少 ### S{XX} 详情或 ### E{XXX} 事件段落）"
-            )
-            return
-        t_map = _assign_global_t(storylines, events)
-        markdown = _compose_markdown(storylines, events, t_map)
         graph_path = workspace_path / "storyline_graph.md"
-        graph_path.write_text(markdown, encoding="utf-8")
+        graph_path.write_text(data.markdown, encoding="utf-8")
         print(
             f"[storyline_graph] 已生成 {graph_path.name}"
-            f"（{len(storylines)} 故事线 / {len(events)} 事件 / T01–T{len(t_map):02d}）"
+            f"（{len(data.storylines)} 故事线 / {len(data.events)} 事件 / T01–T{len(data.t_map):02d}）"
         )
-    except Exception as exc:  # noqa: BLE001 — 派生视图：任何失败都不上抛
+    except Exception as exc:  # noqa: BLE001 — 派生视图：写盘失败不上抛
         print(f"[storyline_graph] 跳过生成（{type(exc).__name__}: {exc}）")

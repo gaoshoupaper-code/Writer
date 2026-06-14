@@ -101,6 +101,62 @@ class StorylineSingleLineLimitMiddlewareTest(unittest.TestCase):
             self.assertEqual(result, "passed-through")
             self.assertEqual(mw._new_line_count, 0)
 
+    def test_before_agent_resets_count_for_new_invocation(self) -> None:
+        """同一实例多调用周期：第 1 周期达上限被拦，before_agent 重置后第 2 周期重新放行。
+
+        覆盖真实装配盲区——子代理 graph 一次编译、会话内多次 task 复用同一中间件实例，
+        计数须按「每次子代理调用」重置，而非跨调用累积（这正是线上 bug 的根因）。
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mw = StorylineSingleLineLimitMiddleware(Path(tmpdir), max_new_lines=1)
+            tracker = _CallTracker()
+
+            # 调用周期 1（storybuilding 被父 agent task 委托一次）
+            mw.before_agent(state={}, runtime=None)
+            mw.wrap_tool_call(_request("write_file", "/storyline/S01-主线.md"), tracker)
+            blocked = mw.wrap_tool_call(_request("write_file", "/storyline/S02-支线.md"), tracker)
+            self.assertIsInstance(blocked, ToolMessage)
+            self.assertEqual(mw._new_line_count, 2)
+            self.assertEqual(tracker.calls, 1)  # 仅第 1 次真正放行到 handler
+
+            # 调用周期 2（再次委托）：before_agent 已重置，重新享有额度
+            mw.before_agent(state={}, runtime=None)
+            self.assertEqual(mw._new_line_count, 0)
+            result = mw.wrap_tool_call(_request("write_file", "/storyline/S03-支线.md"), tracker)
+            self.assertEqual(result, "passed-through")
+            self.assertEqual(mw._new_line_count, 1)
+            self.assertEqual(tracker.calls, 2)
+
+
+class _AsyncCallTracker:
+    """异步 handler 记录器，用于断言 awrap_tool_call 的放行/拦截。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(self, request: object) -> str:
+        self.calls += 1
+        return "passed-through"
+
+
+class StorylineSingleLineLimitMiddlewareAsyncTest(unittest.IsolatedAsyncioTestCase):
+    async def test_abefore_agent_resets_count_for_new_invocation(self) -> None:
+        """异步路径（generate_stream → ainvoke → abefore_agent）：同样按调用周期重置。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mw = StorylineSingleLineLimitMiddleware(Path(tmpdir), max_new_lines=1)
+            tracker = _AsyncCallTracker()
+
+            await mw.abefore_agent(state={}, runtime=None)
+            await mw.awrap_tool_call(_request("write_file", "/storyline/S01.md"), tracker)
+            blocked = await mw.awrap_tool_call(_request("write_file", "/storyline/S02.md"), tracker)
+            self.assertIsInstance(blocked, ToolMessage)
+
+            await mw.abefore_agent(state={}, runtime=None)
+            self.assertEqual(mw._new_line_count, 0)
+            result = await mw.awrap_tool_call(_request("write_file", "/storyline/S03.md"), tracker)
+            self.assertEqual(result, "passed-through")
+            self.assertEqual(tracker.calls, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

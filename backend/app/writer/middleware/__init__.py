@@ -22,7 +22,6 @@ from app.writer.middleware.context_assembler_middleware import ContextAssemblerM
 from app.writer.middleware.error_recovery_middleware import ErrorRecoveryMiddleware
 from app.writer.middleware.goal_middleware import GoalMiddleware
 from app.writer.middleware.path_guard_middleware import FilesystemPathGuardMiddleware
-from app.writer.middleware.revision_limit_middleware import RevisionLimitMiddleware
 from app.writer.middleware.trace_callback import TraceCallbackHandler
 from app.writer.middleware.trace_middleware import TraceMiddleware
 
@@ -34,7 +33,6 @@ __all__ = [
     "ErrorRecoveryMiddleware",
     "FilesystemPathGuardMiddleware",
     "GoalMiddleware",
-    "RevisionLimitMiddleware",
     "TraceCallbackHandler",
     "TraceMiddleware",
 ]

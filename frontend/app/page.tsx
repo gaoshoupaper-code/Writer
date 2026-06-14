@@ -9,6 +9,7 @@ import { ConfirmDialog } from "../components/workspace/ConfirmDialog";
 import { DetailOutlinePanel } from "../components/workspace/DetailOutlinePanel";
 import { NovelPanel } from "../components/workspace/NovelPanel";
 import { ScriptPanel } from "../components/workspace/ScriptPanel";
+import { StorylinePanel } from "../components/workspace/StorylinePanel";
 import { Sidebar } from "../components/workspace/Sidebar";
 import { StyleModal } from "../components/workspace/StyleModal";
 import { TopBar } from "../components/workspace/TopBar";
@@ -1291,6 +1292,8 @@ export default function Home() {
             loading={worldviewLoading}
           />
         ) : null}
+
+        {activePanel === "storyline" ? <StorylinePanel workspaceId={activeWorkspaceId} /> : null}
 
         {activePanel === "trace" ? (
           <TracePanel
