@@ -1081,6 +1081,23 @@ export default function Home() {
     const isResume = !!lastAssistant?.awaitingInput;
     // 点3：resume 时复用上一条 assistant 的 trace，把多次 HITL 缝合成同一条 trace
     const resumeTraceId = isResume ? lastAssistant?.traceId ?? null : null;
+    // D4：resume 时立即清空上一条 awaitingInput，让旧 HITL 选项框卸载（根治状态残留 + 防 isResume 误命中/答案串台）。
+    // 在追加新消息之前、isResume 判定之后执行：index 稳定，且不影响本次 resume 判定。
+    // 配合 D3（仅最后一条 assistant 渲染选项框）：提交后旧 assistant 退居非末位，D3 让选项框即时卸载，
+    // 此处同步清空 awaitingInput 字段，保证 isResume / awaitingWithOptions 判定干净。
+    const prevAwaitingInputIdx = isResume
+      ? messagesRef.current.lastIndexOf(lastAssistant!)
+      : -1;
+    if (prevAwaitingInputIdx >= 0) {
+      setMessages((current) => {
+        const target = current[prevAwaitingInputIdx];
+        if (!target || target.role !== "assistant" || !target.awaitingInput) return current;
+        const next = [...current];
+        // 清空 awaitingInput（选项框消失、isResume 不再误命中），保留 content（问题文本留作历史）。
+        next[prevAwaitingInputIdx] = { ...target, awaitingInput: undefined };
+        return next;
+      });
+    }
     if (!activeWorkspaceId) {
       toast.error("请先选择或创建一个工作目录。");
       return;

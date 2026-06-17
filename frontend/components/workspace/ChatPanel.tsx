@@ -167,8 +167,12 @@ export function ChatPanel({
                   <p>{message.content}</p>
                 )}
               </div>
-              {/* HITL 选项化：awaitingInput 带 options 时渲染选项 UI（选中+自定义内联+提交）*/}
-              {message.role === "assistant" && message.awaitingInput?.options?.length ? (
+              {/* HITL 选项化：仅【最后一条 assistant】且 awaitingInput 带 options 时渲染选项 UI。
+                  D3 防御约束：awaitingInput 应在 resume 响应后被清空，此 index 约束兜底，
+                  确保任何历史 HITL 消息（即使 awaitingInput 残留）都不再渲染可点击选项框。*/}
+              {message.role === "assistant" &&
+              index === messages.length - 1 &&
+              message.awaitingInput?.options?.length ? (
                 <InterviewOptions
                   options={message.awaitingInput.options}
                   multiSelect={!!message.awaitingInput.multi_select}
