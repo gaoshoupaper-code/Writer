@@ -86,10 +86,16 @@ def build_detail_outline_deep_subagent(
     primary_spec = build_detail_outline_subagent(project_middleware, style_suffix)
 
     # ---- evolution 子代理规格 ----
+    # 注意：context_file_paths 只注入「评估基准类」文件（大纲/人物/剧情线），
+    # 刻意排除评估对象本体 detail/*.md。原因：detail/*.md 全量注入会超过
+    # FilesystemMiddleware 的消息落盘阈值，被替换为「内容过大已存盘」占位符，
+    # 导致评估子代理实际看不到待评估内容而空转秒退。
+    # 待评估的本批 chapter-XX.md 由父代理在 task description 中给出明确路径，
+    # 评估子代理自行 read_file 读取（见 detail_outline_evaluation.md 步骤 1）。
     evaluation_spec = build_detail_outline_evaluator(
         workspace_root,
         middleware_factory("detail-outline-evaluation-subagent"),
-        context_file_paths=["outline.md", "character/*.md", "storyline.md", "storyline/*.md", "detail/*.md"],
+        context_file_paths=["outline.md", "character/*.md", "storyline.md", "storyline/*.md"],
     )
 
     # ---- 构建 evolution SubAgent dict ----

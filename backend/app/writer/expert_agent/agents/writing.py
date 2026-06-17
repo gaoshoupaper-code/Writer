@@ -96,10 +96,17 @@ def build_writing_deep_subagent(
     primary_spec = build_writing_subagent(writing_middleware, style_suffix)
 
     # ---- evolution 子代理规格 ----
+    # 注意：context_file_paths 只注入「评估基准类」文件（大纲/剧情线/人物），
+    # 刻意排除评估对象本体 chapter/*.md 和细纲 detail/*.md。原因：
+    # chapter/*.md 全量注入会超过 FilesystemMiddleware 的消息落盘阈值，被替换为
+    # 「内容过大已存盘」占位符，导致审查子代理实际看不到待审查正文而空转秒退。
+    # 待审查的本章文件路径由父代理在 task description 中给出，审查子代理自行
+    # read_file 读取（见 writing_evaluation.md 步骤 1）。detail/ 细纲也由子代理
+    # 按需 read_file 做一致性核对，不作为前置上下文注入。
     evaluation_spec = build_writing_evaluator(
         workspace_root,
         middleware_factory("writing-evaluation-subagent"),
-        context_file_paths=["outline.md", "storyline.md", "storyline/*.md", "character/*.md", "detail/*.md", "chapter/*.md"],
+        context_file_paths=["outline.md", "storyline.md", "storyline/*.md", "character/*.md"],
     )
 
     # ---- 构建 evolution SubAgent dict ----

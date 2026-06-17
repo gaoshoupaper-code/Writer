@@ -156,7 +156,10 @@ class TraceMiddleware(AgentMiddleware):
                 "run_id": run_id,
                 "parent_run_id": parent_run_id,
                 "model_name": _model_name(request.model),
-                "input": {"messages": messages_payload},
+                # 截断超长字符串：llm_start 会把完整 system prompt + 注入的全部上下文
+                # 文件 + 对话历史记进去，单条就几十 KB，是 trace jsonl 膨胀的主因
+                # （实测单文件 39MB / 820 事件）。截断后保留头尾可读，体积降两个数量级。
+                "input": _truncate_payload({"messages": messages_payload}),
             },
         )
 
@@ -174,7 +177,7 @@ class TraceMiddleware(AgentMiddleware):
                 "parent_run_id": parent_run_id,
                 "model_name": _model_name(request.model),
                 "duration_ms": _duration_ms(started),
-                "output": _model_output(response),       # 模型输出（消息列表等）
+                "output": _truncate_payload(_model_output(response)),       # 模型输出（消息列表等）
                 "usage": _usage_payload(response),       # token 使用量统计
                 "tool_calls": _tool_calls_payload(response),  # 模型请求的工具调用
             },
@@ -288,6 +291,35 @@ class TraceMiddleware(AgentMiddleware):
 def _duration_ms(started: float) -> int:
     """计算从 started 时间点到现在的毫秒数。"""
     return int((time.perf_counter() - started) * 1000)
+
+
+# 单条 trace 事件内任意字符串的最大保留长度（超出截断为头尾各半 + 省略标记）。
+# 选 10000：保留足够上下文定位问题（system prompt + 注入上下文是排查 Agent 行为
+# 的关键材料，压太狠会切掉诊断信息），同时把单条事件 payload 从几十 KB 压到 ~10KB，
+# 相比原始膨胀仍有大幅压缩，配合方向1 的写盘解耦彻底消除事件循环阻塞。
+_MAX_TRACE_STRING = 10000
+
+
+def _truncate_payload(value: Any) -> Any:
+    """递归截断 payload 中超长的字符串，控制单条 trace 事件体积。
+
+    - str 超长 → 保留头尾各一半 + 省略标记（保留可读性，能看到开头与结尾）
+    - dict/list → 递归处理每个值（结构不变）
+    - 标量/其它 → 原样返回
+
+    幂等、无副作用：返回的是新结构，不修改入参。
+    """
+    if isinstance(value, str):
+        if len(value) <= _MAX_TRACE_STRING:
+            return value
+        keep = _MAX_TRACE_STRING // 2
+        omitted = len(value) - _MAX_TRACE_STRING
+        return f"{value[:keep]}…[truncated {omitted} chars]…{value[-keep:]}"
+    if isinstance(value, Mapping):
+        return {str(k): _truncate_payload(v) for k, v in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+        return [_truncate_payload(item) for item in value]
+    return value
 
 
 def _model_name(model: object) -> str:

@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import deque
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +17,16 @@ from app.schemas.screenplay import ThreadSummary
 from app.writer.trace.projector import TraceProjector
 from app.writer.trace.schemas import TraceDetail, TraceLogEvent, TraceRunSummary
 from app.writer.trace.summary_export import export_trace_summary
+
+# ── 写盘解耦参数 ──────────────────────────────────────────────
+# 根因：append_event 原来在事件循环线程上同步 open("a")+write，单次生成会写
+# 上千个事件（每个几十 KB，trace jsonl 膨胀到 39MB），密集同步 IO 周期性占满
+# 事件循环，导致生成期间所有别的 HTTP 请求（轮询/删除/health）全部排队超时。
+# 修复：append_event 只把待写行 append 进 _pending_writes（deque，微秒级、
+# 纯内存、不占事件循环），由后台 drain 协程成批落盘（to_thread，不占事件循环）。
+# trace 结束（complete_run/fail_run）时同步 flush 该 trace 残余事件保证完整。
+_DRAIN_INTERVAL = 0.5  # 后台 drain 协程每 0.5s 成批写一次
+_FLUSH_BATCH_MAX = 200  # 单批最多写多少行（避免一批太大又阻塞线程池 worker）
 
 
 @dataclass
@@ -35,6 +47,12 @@ class TraceRecorder:
         self._run_names: dict[str, str] = {}
         self._run_metadata: dict[str, dict[str, Any]] = {}
         self._projector = TraceProjector()
+        # 写盘解耦：append_event 只 append 进此缓冲区，后台 drain 协程成批落盘。
+        # deque + Lock 而非 asyncio.Queue：append_event 的调用者含同步回调
+        # (TraceCallbackHandler run_inline=True)，不能 await，必须跨线程安全。
+        self._pending_writes: deque[tuple[Path, str]] = deque()
+        self._pending_lock = RLock()
+        self._drain_task: asyncio.Task[None] | None = None
 
     def create_run(self, thread: ThreadSummary, endpoint: str) -> TraceRunHandle:
         trace_id = f"trace-{uuid4().hex}"
@@ -163,13 +181,28 @@ class TraceRecorder:
             run_path = self._run_paths.get(trace_id)
             if run_path is None:
                 raise KeyError(f"Trace path is not registered: {trace_id}")
-            with run_path.open("a", encoding="utf-8") as file:
-                file.write(event.model_dump_json(exclude_none=True) + "\n")
+            # 写盘解耦：drain 协程运行时（生产 lifespan 场景）只入内存缓冲区，
+            # 后台成批落盘，不占事件循环；drain 未运行时（测试/未走 lifespan 的
+            # 直接调用）退回同步写，保证 append 后立即可读——兼容现有调用契约。
+            json_line = event.model_dump_json(exclude_none=True)
+            if self._drain_active():
+                with self._pending_lock:
+                    self._pending_writes.append((run_path, f"{json_line}\n"))
+            else:
+                try:
+                    with run_path.open("a", encoding="utf-8") as file:
+                        file.write(f"{json_line}\n")
+                except OSError:
+                    pass
 
             queue = self._queues.get(trace_id)
             if queue is not None:
                 queue.put_nowait(event)
             return event
+
+    def _drain_active(self) -> bool:
+        """drain 协程是否在运行（用于 append_event 选择异步/同步写盘路径）。"""
+        return self._drain_task is not None and not self._drain_task.done()
 
     def complete_run(self, thread: ThreadSummary, trace_id: str) -> TraceLogEvent:
         duration_ms = self._duration_ms(trace_id)
@@ -207,6 +240,100 @@ class TraceRecorder:
         )
         self._finalize_run(thread, trace_id, "failed", duration_ms, error_message)
         return event
+
+    # ── 写盘解耦：后台 drain + 同步 flush ────────────────────────
+
+    def start_drain(self) -> None:
+        """启动后台 drain 协程（由应用 lifespan 调用）。
+
+        幂等：重复调用不会创建多个 task。必须在事件循环线程内调用
+        （asyncio.get_event_loop 创建 task 依赖运行中的 loop）。
+        """
+        if self._drain_task is None or self._drain_task.done():
+            self._drain_task = asyncio.create_task(self._drain_loop())
+
+    async def aclose(self) -> None:
+        """关闭：停止 drain 协程，并把残余事件全部落盘（由 lifespan shutdown 调用）。"""
+        if self._drain_task is not None:
+            self._drain_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._drain_task
+            self._drain_task = None
+        # 停 drain 后再同步刷一次，保证进程退出前所有事件落盘。
+        self._flush_all_sync()
+
+    async def _drain_loop(self) -> None:
+        """后台循环：周期性成批把缓冲区事件写盘。
+
+        每轮 await sleep（让出事件循环）→ 取出一批 → to_thread 写盘（不占事件循环）。
+        单批上限 _FLUSH_BATCH_MAX，避免一批太大又把线程池 worker 占住太久。
+        """
+        while True:
+            await asyncio.sleep(_DRAIN_INTERVAL)
+            batch = self._take_pending_batch()
+            if batch:
+                await asyncio.to_thread(self._write_batch_sync, batch)
+
+    def _take_pending_batch(self) -> list[tuple[Path, str]]:
+        """从缓冲区取出一批待写行（线程安全，最多 _FLUSH_BATCH_MAX 条）。"""
+        with self._pending_lock:
+            count = min(len(self._pending_writes), _FLUSH_BATCH_MAX)
+            if count == 0:
+                return []
+            batch = [self._pending_writes.popleft() for _ in range(count)]
+        return batch
+
+    def _write_batch_sync(self, batch: list[tuple[Path, str]]) -> None:
+        """同步写一批事件：按 run_path 分组，每组一次打开（减少 open 次数）。
+
+        此方法在 to_thread 的线程池 worker 里执行，不占事件循环。
+        """
+        grouped: dict[Path, list[str]] = {}
+        for run_path, line in batch:
+            grouped.setdefault(run_path, []).append(line)
+        for run_path, lines in grouped.items():
+            try:
+                with run_path.open("a", encoding="utf-8") as file:
+                    file.writelines(lines)
+            except OSError:
+                # 写盘失败不应中断 drain（trace 是派生数据，不可拖垮主流程）。
+                # 与 generate_storyline_graph 的容错策略一致。
+                pass
+
+    def flush_sync(self, trace_id: str) -> None:
+        """同步刷掉指定 trace 的残余事件（trace 结束时调用，保证数据完整）。
+
+        仅 complete_run/fail_run 路径调用——此时该 trace 已停止产生事件，
+        同步开销可接受；且确保后续 read_run 能读到完整的 jsonl。
+        """
+        run_path = self._run_paths.get(trace_id)
+        if run_path is None:
+            return
+        pending: list[str] = []
+        with self._pending_lock:
+            # 过滤出本 trace 的待写行，其余放回队首（保持顺序）。
+            rest: list[tuple[Path, str]] = []
+            while self._pending_writes:
+                path, line = self._pending_writes.popleft()
+                if path == run_path:
+                    pending.append(line)
+                else:
+                    rest.append((path, line))
+            self._pending_writes.extendleft(reversed(rest))
+        if pending:
+            try:
+                with run_path.open("a", encoding="utf-8") as file:
+                    file.writelines(pending)
+            except OSError:
+                pass
+
+    def _flush_all_sync(self) -> None:
+        """同步刷掉所有残余事件（仅 aclose 关闭时调用）。"""
+        with self._pending_lock:
+            batch = list(self._pending_writes)
+            self._pending_writes.clear()
+        if batch:
+            self._write_batch_sync(batch)
 
     def list_runs(self, thread: ThreadSummary) -> list[TraceRunSummary]:
         runs = self._read_run_index(thread)
@@ -285,6 +412,9 @@ class TraceRecorder:
         duration_ms: int,
         error: str | None,
     ) -> None:
+        # trace 结束：先把该 trace 残余事件同步落盘，再更新 index/导出摘要/清理内存。
+        # 此时该 trace 已停止产生事件，同步 flush 开销可接受且保证数据完整。
+        self.flush_sync(trace_id)
         runs = self._read_run_index(thread)
         run = runs.get(trace_id)
         if run is None:
