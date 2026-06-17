@@ -77,6 +77,17 @@ class TraceRecorder:
         )
         return handle
 
+    def resume_run(self, thread: ThreadSummary, trace_id: str) -> tuple[TraceRunHandle, bool]:
+        """续接活跃 trace（HITL resume 缝合点3）。
+
+        内存活跃（_queues 命中）→ 复用 queue/lock/sequence/monotonic/run_path，
+            is_new=False（不发 run_start，前端主动激活 trace-1）。
+        不活跃（服务重启等内存丢失）→ 降级 create_run，is_new=True（发 run_start）。← D2=A
+        """
+        if trace_id in self._queues:
+            return TraceRunHandle(trace_id=trace_id, queue=self._queues[trace_id]), False
+        return self.create_run(thread, "screenplay.generate.stream"), True
+
     def register_run(
         self,
         run_id: UUID,
@@ -178,7 +189,9 @@ class TraceRecorder:
         return self._fail_run(thread, trace_id, f"{error.__class__.__name__}: {error}")
 
     def cancel_run(self, thread: ThreadSummary, trace_id: str) -> TraceLogEvent:
-        return self._fail_run(thread, trace_id, "User stopped generation")
+        # CancelledError 既可能是用户主动停止，也可能是 cloudflared/Cloudflare 因空闲
+        # 超时掐断连接 —— 这里只如实描述触发条件，不臆断成"用户停止"。
+        return self._fail_run(thread, trace_id, "Stream cancelled (client disconnected or user stopped)")
 
     def _fail_run(self, thread: ThreadSummary, trace_id: str, error_message: str) -> TraceLogEvent:
         duration_ms = self._duration_ms(trace_id)

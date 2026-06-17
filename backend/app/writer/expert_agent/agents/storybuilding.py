@@ -167,7 +167,7 @@ def build_storybuilding_deep_subagent(
         evolution_spec=evolution,
         subagent_middleware=primary_spec.get("middleware"),
         backend=backend,
-        artifact_paths=[workspace_root / "storyline.md", workspace_root / "storyline"],
+        artifact_paths=[workspace_root / "storyline.md", workspace_root / "storyline", workspace_root / "storyline" / "timeline.md"],
         max_revisions=1,
         skills=skills,
     )

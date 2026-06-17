@@ -2,29 +2,35 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from contextlib import suppress
 
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from deepagents import CompiledSubAgent, SubAgent, create_deep_agent
 from deepagents.backends import FilesystemBackend
 from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
 from langchain.agents.middleware.types import AgentMiddleware
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.types import Command
 
 from app.writer.expert_agent.agents.storybuilding import build_storybuilding_deep_subagent
 from app.writer.expert_agent.services.storyline_graph import generate_storyline_graph
 from app.writer.expert_agent.agents.detail_outline import build_detail_outline_deep_subagent
 from app.writer.models import build_writer_model
 from app.writer.expert_agent.agents.writing import build_writing_deep_subagent
+from app.writer.expert_agent.agents.interview import build_interview_deep_subagent
+from app.writer.expert_agent.factory import _compose_skills_backend
+from app.writer.expert_agent.middleware.file_write_serialize import FileWriteSerializeMiddleware
 from app.writer.middleware import (
     ArtifactPrerequisite,
     ArtifactPrerequisiteMiddleware,
     ErrorRecoveryMiddleware,
     FilesystemPathGuardMiddleware,
     GoalMiddleware,
+    MetaReadOnlyMiddleware,
     TraceCallbackHandler,
     TraceMiddleware,
 )
@@ -38,7 +44,12 @@ from app.schemas.screenplay import (
 )
 from app.schemas.checkpoint import CheckpointMessage, CheckpointState, CheckpointToolCall
 
-PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "system.md"
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+META_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
+
+# SSE 心跳间隔：Agent 思考/跑工具期间流是静默的，定期发注释行让 cloudflared /
+# Cloudflare 等中间代理不会因空闲超时掐断连接（免费版边缘约 100s）。
+SSE_HEARTBEAT_INTERVAL = 15
 
 
 class MetaAgentService:
@@ -59,6 +70,7 @@ class MetaAgentService:
         middleware: list[AgentMiddleware] = [
             ErrorRecoveryMiddleware(),
             FilesystemPathGuardMiddleware(workspace_path),
+            FileWriteSerializeMiddleware(),
         ]
         if trace_id:
             middleware.insert(1, TraceMiddleware(self.trace_recorder, trace_id, agent_name))
@@ -83,7 +95,6 @@ class MetaAgentService:
                 ArtifactPrerequisite("plot outline", workspace_path / "outline.md"),
                 ArtifactPrerequisite("worldview", workspace_path / "worldview.md"),
                 ArtifactPrerequisite("storylines", workspace_path / "storyline", markdown_directory=True),
-                ArtifactPrerequisite("volumes", workspace_path / "volume", markdown_directory=True),
             ]
         if agent_name == "writing-subagent":
             return [
@@ -122,6 +133,14 @@ class MetaAgentService:
             return None
         return style.get("meta_style") or None
 
+    def _interview_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None) -> CompiledSubAgent:
+        return build_interview_deep_subagent(
+            workspace_path,
+            build_writer_model(self.settings),
+            self._backend_for_workspace(workspace_path),
+            lambda agent_name: self._middleware_for_workspace(workspace_path, trace_id, agent_name),
+        )
+
     def _storybuilding_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
         return build_storybuilding_deep_subagent(
             workspace_path,
@@ -139,7 +158,7 @@ class MetaAgentService:
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
-            context_file_paths=["demand.md", "outline.md", "character/*.md", "worldview.md", "storyline.md", "storyline/*.md", "volume/*.md", "detail/overview.md", "detail/chapter-*.md"],
+            context_file_paths=["demand.md", "outline.md", "character/*.md", "worldview.md", "storyline.md", "storyline/*.md", "detail/overview.md", "detail/chapter-*.md"],
         )
 
     def _writing_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
@@ -149,7 +168,7 @@ class MetaAgentService:
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
-            context_file_paths=["demand.md", "outline.md", "character/*.md", "worldview.md", "storyline.md", "storyline/*.md", "volume/*.md", "detail/*.md"],
+            context_file_paths=["demand.md", "outline.md", "character/*.md", "worldview.md", "storyline.md", "storyline/*.md", "detail/*.md"],
         )
 
     def _general_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None) -> SubAgent:
@@ -162,7 +181,7 @@ class MetaAgentService:
         middleware: list[AgentMiddleware] = [
             GoalMiddleware(),
             ErrorRecoveryMiddleware(),
-            FilesystemPathGuardMiddleware(workspace_path, allowed_write_paths=("/demand.md",)),
+            MetaReadOnlyMiddleware(),
         ]
         if trace_id:
             middleware.insert(1, TraceMiddleware(self.trace_recorder, trace_id, "meta-agent"))
@@ -171,26 +190,36 @@ class MetaAgentService:
         storybuilding_style = self._resolve_style_for_subagent(workspace_id, "storybuilding_style") if workspace_id else None
         detail_outline_style = self._resolve_style_for_subagent(workspace_id, "detail_outline_style") if workspace_id else None
         writing_style = self._resolve_style_for_subagent(workspace_id, "writing_style") if workspace_id else None
+        backend = self._backend_for_workspace(workspace_path)
+        effective_backend, skill_sources = _compose_skills_backend(backend, self._meta_skill_paths())
         return create_deep_agent(
             model=model,
             tools=[],
             system_prompt=self._load_system_prompt(meta_style),
             subagents=[
                 self._general_subagent_for_workspace(workspace_path, trace_id),
+                self._interview_subagent_for_workspace(workspace_path, trace_id),
                 self._storybuilding_subagent_for_workspace(workspace_path, trace_id, storybuilding_style),
                 self._detail_outline_subagent_for_workspace(workspace_path, trace_id, detail_outline_style),
                 self._writing_subagent_for_workspace(workspace_path, trace_id, writing_style),
             ],
-            backend=self._backend_for_workspace(workspace_path),
+            backend=effective_backend,
             checkpointer=self.checkpointer,
             middleware=middleware,
+            skills=skill_sources,
         )
 
     def _load_system_prompt(self, meta_style: str | None = None) -> str:
-        prompt = PROMPT_PATH.read_text(encoding="utf-8").strip()
+        prompt = (PROMPTS_DIR / "system.md").read_text(encoding="utf-8").strip()
         if meta_style:
             prompt = f"{prompt}\n\n---\n【主控风格】\n{meta_style}\n---"
         return prompt
+
+    def _meta_skill_paths(self) -> list[str]:
+        return [
+            str(META_SKILLS_DIR / "auto-pipeline"),
+            str(META_SKILLS_DIR / "interactive-gating"),
+        ]
 
     def delete_thread_checkpoint(self, thread_id: str) -> None:
         self.checkpointer.delete_thread(thread_id)
@@ -250,38 +279,54 @@ class MetaAgentService:
             yield _sse("final", response.model_dump())
             return
 
-        trace = self.trace_recorder.create_run(thread, "screenplay.generate.stream")
-        yield _sse("status", {"status": "started", "trace_id": trace.trace_id})
+        # HITL resume：带 resume + trace_id 时复用活跃 trace（不发 run_start），
+        # 否则 create_run 新开。内存丢失（服务重启）时 resume_run 会降级 create_run（D2=A）。
+        resume_value = getattr(payload, "resume", None)
+        trace_id_in = getattr(payload, "trace_id", None)
+        if resume_value is not None and trace_id_in:
+            trace, is_new = self.trace_recorder.resume_run(thread, trace_id_in)
+        else:
+            trace = self.trace_recorder.create_run(thread, "screenplay.generate.stream")
+            is_new = True
+        if is_new:
+            yield _sse("status", {"status": "started", "trace_id": trace.trace_id})
         trace_queue = self.trace_recorder.get_active_queue(trace.trace_id)
         if trace_queue is None:
             raise RuntimeError(f"Trace queue was not created: {trace.trace_id}")
         for trace_update in self._trace_updates(trace_queue):
             yield trace_update
 
-        prompt = self._build_user_prompt(payload, thread)
         agent = self._agent_for_workspace(Path(thread.workspace_path), trace.trace_id, thread.workspace_id)
 
-        input_messages: list[dict] = [{"role": "user", "content": prompt}]
+        # resume 分支已在上方判定，据此构造 agent 输入
+        if resume_value is not None:
+            agent_input: object = Command(resume=resume_value)
+        else:
+            prompt = self._build_user_prompt(payload, thread)
+            agent_input = {"messages": [{"role": "user", "content": prompt}]}
         config = {
             "configurable": {"thread_id": thread.thread_id},
             "callbacks": [TraceCallbackHandler(self.trace_recorder, trace.trace_id)],
             "recursion_limit": 200,
         }
         active_tasks: dict[str, dict] = {}
+        # 子代理调用计数：按 subagent_type 累计，用于 storybuilding 轮次与 writing 章节号推断降级（D6）
+        subagent_call_counts: dict[str, int] = {}
 
         trace_pump = asyncio.create_task(_next_trace_update(trace_queue))
         agent_events = agent.astream_events(
-            {"messages": input_messages},
+            agent_input,
             config=config,
             version="v2",
         )
         agent_task = asyncio.create_task(agent_events.__anext__())
+        heartbeat_task = asyncio.create_task(asyncio.sleep(SSE_HEARTBEAT_INTERVAL))
 
         full_result = None
         try:
             while True:
                 done, _ = await asyncio.wait(
-                    {agent_task, trace_pump},
+                    {agent_task, trace_pump, heartbeat_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
 
@@ -290,6 +335,13 @@ class MetaAgentService:
                     if trace_update:
                         yield trace_update
                     trace_pump = asyncio.create_task(_next_trace_update(trace_queue))
+
+                if heartbeat_task in done:
+                    # SSE 注释行：浏览器忽略，但保持字节流动，避免 cloudflared/Cloudflare
+                    # 在 Agent 静默期（思考/跑工具）因空闲超时掐断连接。
+                    heartbeat_task.result()
+                    yield ": ping\n\n"
+                    heartbeat_task = asyncio.create_task(asyncio.sleep(SSE_HEARTBEAT_INTERVAL))
 
                 if agent_task in done:
                     try:
@@ -318,41 +370,80 @@ class MetaAgentService:
                             if isinstance(tc, dict):
                                 tool_name = tc.get("name", "unknown")
                                 call_id = tc.get("id", "")
+                                call_payload: dict[str, Any] = {
+                                    "tool": tool_name,
+                                    "input": tc.get("args", {}),
+                                    "call_id": call_id,
+                                    "parent_task_id": parent_task_id,
+                                    "subagent_name": subagent_name,
+                                }
+                                # task 工具：派发焦点信息（D6/D7）—— 章节号、总章数、轮次
                                 if tool_name == "task":
-                                    sub = _extract_subagent_name(tc.get("args", {}))
+                                    args = tc.get("args", {}) or {}
+                                    sub = _extract_subagent_name(args)
+                                    description = str(args.get("description", "") or "")
+                                    subagent_call_counts[sub] = subagent_call_counts.get(sub, 0) + 1
+                                    call_ordinal = subagent_call_counts[sub]
+                                    chapter_index = _extract_chapter_index(description)
+                                    total_chapters = await asyncio.to_thread(
+                                        _count_total_chapters, Path(thread.workspace_path)
+                                    )
+                                    # writing 章节号降级：正则失败时按 writing 调用序推断（D6）
+                                    if sub == "writing" and chapter_index is None:
+                                        chapter_index = call_ordinal
                                     if call_id:
-                                        active_tasks[call_id] = {"name": sub}
-                                yield _sse(
-                                    "tool_call",
-                                    {
-                                        "tool": tool_name,
-                                        "input": tc.get("args", {}),
-                                        "call_id": call_id,
-                                        "parent_task_id": parent_task_id,
-                                        "subagent_name": subagent_name,
-                                    },
-                                )
+                                        active_tasks[call_id] = {
+                                            "name": sub,
+                                            "chapter_index": chapter_index,
+                                            "total_chapters": total_chapters,
+                                            "iteration": call_ordinal,
+                                        }
+                                    call_payload["subagent_type"] = sub
+                                    call_payload["chapter_index"] = chapter_index
+                                    call_payload["total_chapters"] = total_chapters
+                                    call_payload["iteration"] = call_ordinal
+                                yield _sse("tool_call", call_payload)
 
                     elif kind == "on_tool_end":
+                        output_payload: dict[str, Any] = {
+                            "tool": name,
+                            "output": str(data.get("output", ""))[:2000],
+                            "call_id": _extract_tool_call_id(data),
+                        }
                         if name == "task":
                             call_id = _extract_tool_call_id(data)
                             if call_id and call_id in active_tasks:
-                                finished_subagent = active_tasks[call_id].get("name")
-                                del active_tasks[call_id]
+                                task_meta = active_tasks.pop(call_id)
+                                finished_subagent = task_meta.get("name")
                                 # storybuilding 完成后派生流程图：确定性、纯后端。
                                 # 失败已被模块内部 try/except 吞掉，这里只读不抛，绝不阻断 SSE 流。
                                 if finished_subagent == "storybuilding":
                                     await asyncio.to_thread(
                                         generate_storyline_graph, Path(thread.workspace_path)
                                     )
-                        yield _sse(
-                            "tool_output",
-                            {
-                                "tool": name,
-                                "output": str(data.get("output", ""))[:2000],
-                                "call_id": _extract_tool_call_id(data),
-                            },
-                        )
+                                # writing 写完章节后实时算字数（D7），随 tool_output 推给前端
+                                if finished_subagent == "writing":
+                                    chapter_index = task_meta.get("chapter_index")
+                                    if chapter_index:
+                                        word_count = await asyncio.to_thread(
+                                            _count_chapter_words,
+                                            Path(thread.workspace_path),
+                                            chapter_index,
+                                        )
+                                        if word_count is not None:
+                                            output_payload["word_count"] = word_count
+                                            output_payload["chapter_index"] = chapter_index
+                        yield _sse("tool_output", output_payload)
+
+                    elif kind == "on_tool_error":
+                        # 单工具失败：推 tool_error SSE，前端据此标红/重试中（点1 S4）
+                        # data.error 在部分版本缺失，output 常是异常对象，兜底取
+                        err = data.get("error") or data.get("output") or ""
+                        yield _sse("tool_error", {
+                            "tool": name,
+                            "call_id": _extract_tool_call_id(data),
+                            "error": str(err)[:500],
+                        })
 
                     elif kind == "on_chat_model_stream":
                         chunk = data.get("chunk")
@@ -370,6 +461,25 @@ class MetaAgentService:
 
                 for trace_update in self._trace_updates(trace_queue):
                     yield trace_update
+
+            # HITL：流结束后检查是否因子代理 ask_user 的 interrupt 暂停。
+            # 必须用 aget_state：checkpointer 是 AsyncSqliteSaver，同步 get_state 在
+            # async（主线程 event loop）上下文会抛 InvalidStateError——同步调用仅允许
+            # 跨线程（如 FastAPI 同步端点的线程池），主线程必须走 async 接口。
+            state = await agent.aget_state(config)
+            pending = [t for t in state.tasks if t.interrupts]
+            if pending:
+                iv = pending[0].interrupts[0].value
+                interrupt_payload: dict[str, Any] = {
+                    "thread_id": thread.thread_id,
+                    "source": "interview",
+                }
+                if isinstance(iv, dict):
+                    interrupt_payload["question"] = iv.get("question", "")
+                    interrupt_payload["options"] = iv.get("options")
+                    interrupt_payload["multi_select"] = iv.get("multi_select", False)
+                yield _sse("interrupt", interrupt_payload)
+                return
 
             if full_result is None:
                 raise ValueError("Agent stream ended without a LangGraph final output.")
@@ -392,6 +502,7 @@ class MetaAgentService:
                 yield trace_update
             raise
         finally:
+            heartbeat_task.cancel()
             trace_pump.cancel()
             agent_task.cancel()
             with suppress(BaseException):
@@ -754,3 +865,83 @@ def _current_parent_task(active_tasks: dict[str, dict]) -> tuple[str | None, str
         return None, None
     last_id = next(reversed(active_tasks))
     return last_id, active_tasks[last_id]["name"]
+
+
+# ── 焦点信息辅助（D6/D7）：章节号正则 + 总章数 + 字数，纯后端计算，零侵入 Meta Agent ──
+
+_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _cn_to_int(text: str) -> int | None:
+    """中文数字转整数（支持 十/百，如"二十三"→23）。无法解析返回 None。"""
+    if not text:
+        return None
+    total = 0
+    section = 0
+    for ch in text:
+        if ch in _CN_DIGITS:
+            section = _CN_DIGITS[ch]
+        elif ch == "十":
+            section = section if section else 1
+            total += section * 10
+            section = 0
+        elif ch == "百":
+            section = section if section else 1
+            total += section * 100
+            section = 0
+        else:
+            return None
+    return total + section if (total or section) else None
+
+
+def _cn_or_int(token: str) -> int | None:
+    """将 "3" 或 "二十三" 统一转为整数。"""
+    token = token.strip()
+    if token.isdigit():
+        return int(token)
+    return _cn_to_int(token)
+
+
+def _extract_chapter_index(description: str) -> int | None:
+    """从 task 描述中正则提取章节号（D6）。支持 "第3章" / "第三章" / "chapter 3" 等。"""
+    if not description:
+        return None
+    # "第3章" / "第三章" / "第 3 章"
+    m = re.search(r"第\s*([0-9一二三四五六七八九十百]+)\s*章", description)
+    if m:
+        return _cn_or_int(m.group(1))
+    # "chapter 3" / "chapter-03" / "chapter_3"
+    m = re.search(r"chapter[\s\-_]*([0-9]+)", description, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _count_total_chapters(workspace_path: Path) -> int | None:
+    """总章数 = detail/chapter-*.md 的最大编号（D6）。
+
+    detail 阶段完成后才进入 writing，此时细纲齐全；取最大编号比正则 overview 更鲁棒。
+    """
+    detail_dir = workspace_path / "detail"
+    if not detail_dir.exists():
+        return None
+    nums: list[int] = []
+    for path in detail_dir.glob("chapter-*.md"):
+        m = re.search(r"chapter-(\d+)", path.name)
+        if m:
+            nums.append(int(m.group(1)))
+    return max(nums) if nums else None
+
+
+def _count_chapter_words(workspace_path: Path, chapter_index: int) -> int | None:
+    """读 chapter/chapter-XX.md 算去空白字符数（D7 焦点文案字数）。"""
+    chapter_dir = workspace_path / "chapter"
+    for name in (f"chapter-{chapter_index:02d}.md", f"chapter-{chapter_index}.md"):
+        path = chapter_dir / name
+        if path.exists():
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                return None
+            return len(re.sub(r"\s", "", text))
+    return None

@@ -37,6 +37,8 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
   const agentNodeIds = new Set<string>();
   const pendingLlm = new Map<string, PendingEvent[]>();
   const pendingTool = new Map<string, PendingEvent[]>();
+  // task running 骨架：tool_start 入队、tool_end/tool_error 出队；循环结束残留项回填 running 节点
+  const pendingTask = new Map<string, { event: TraceLogEvent; nodeId: string; startedAt: string }>();
 
   // ── 并行检测局部状态 ──
   const parallelTcToGroup = new Map<string, string>();  // tool_call_id → group_id
@@ -45,6 +47,8 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
 
   // task 边界追踪（栈结构：支持嵌套 task 委托）
   const taskCallStack: string[] = [];
+  // D4: task 工具 started_at 暂存，tool_end/tool_error 时建轻量 task 节点用
+  const taskStartTs = new Map<string, string>();
   const agentLastTask = new Map<string, string | null>();
   const agentInvocationCounter = new Map<string, number>();
   const instanceFirstTs = new Map<string, string>();
@@ -154,14 +158,49 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
   }
 
   for (const event of events) {
-    // ── N2: task 工具拦截 ──
+    // ── N2: task 工具拦截 + D4 建轻量 task 节点 ──
     if (event.tool_name === "task" && ["tool_start", "tool_end", "tool_error"].includes(event.type)) {
-      if (event.type === "tool_start" && event.tool_call_id) {
-        taskCallStack.push(event.tool_call_id);
-        // 清理并行组追踪（防止泄漏）
-        parallelTcToGroup.delete(event.tool_call_id);
-      } else if (event.type !== "tool_start" && taskCallStack.length > 0) {
-        taskCallStack.pop();
+      if (event.type === "tool_start") {
+        if (event.tool_call_id) {
+          taskCallStack.push(event.tool_call_id);
+          // 清理并行组追踪（防止泄漏）
+          parallelTcToGroup.delete(event.tool_call_id);
+          taskStartTs.set(event.tool_call_id, event.timestamp);
+          // 入 pendingTask：若无对应 tool_end（仍在 running），循环结束回填 running 骨架节点
+          pendingTask.set(event.tool_call_id, {
+            event,
+            nodeId: `task:${event.tool_call_id}`,
+            startedAt: event.timestamp,
+          });
+        }
+      } else {
+        // tool_end / tool_error：弹出栈 + 建轻量 task 节点（D4）
+        // task 节点是 stageFlow 的 subStep 骨架：node_id 含 tool_call_id，供 stageFlow 匹配 message.tools
+        if (taskCallStack.length > 0) taskCallStack.pop();
+        const callId = event.tool_call_id;
+        const nodeId = callId ? `task:${callId}` : `task:${event.event_id}`;
+        const isFailed = event.type === "tool_error";
+        const rawSummary = skillTextContent(event.tool_output) ?? (event.error ?? "");
+        nodes.push({
+          node_id: nodeId,
+          parent_node_id: "run",
+          kind: "task",
+          label: "子代理任务",
+          status: isFailed || event.status === "failed" ? "failed" : "completed",
+          agent_name: event.agent_name,
+          agent_role: agentRole(event.agent_name),
+          depth: 0,
+          started_at: (callId ? taskStartTs.get(callId) : undefined) ?? event.timestamp,
+          ended_at: event.timestamp,
+          duration_ms: event.duration_ms,
+          tool_name: "task",
+          raw_event_ids: [event.event_id],
+          chain_summary: truncate(rawSummary.trim(), 200) || "子代理任务",
+        });
+        if (callId) {
+          taskStartTs.delete(callId);
+          pendingTask.delete(callId);
+        }
       }
       continue;
     }
@@ -398,6 +437,26 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
         parallel_group_id: pending.parallelGroupId,
       });
     }
+  }
+
+  // ── running task 骨架节点（pendingTask 回填）──
+  // 镜像 tool_end 分支的 completed task 节点，仅 status=running、无 ended_at/duration_ms。
+  // 同 node_id 不会与 completed 节点并存：tool_end 已 delete(callId)，残留项必为仍在 running 的 task。
+  for (const pending of pendingTask.values()) {
+    nodes.push({
+      node_id: pending.nodeId,
+      parent_node_id: "run",
+      kind: "task",
+      label: "子代理任务",
+      status: "running",
+      agent_name: pending.event.agent_name,
+      agent_role: agentRole(pending.event.agent_name),
+      depth: 0,
+      started_at: pending.startedAt,
+      tool_name: "task",
+      raw_event_ids: [pending.event.event_id],
+      chain_summary: "运行中…",
+    });
   }
 
   return { run, events, nodes, context, todos };

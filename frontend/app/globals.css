@@ -3201,6 +3201,67 @@ a {
   box-shadow: none;
 }
 
+.novel-layout {
+  display: grid;
+  grid-template-columns: minmax(180px, 240px) 1fr;
+  gap: 16px;
+  min-height: 420px;
+}
+
+.novel-sidebar {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 14px;
+  background: var(--panel-soft);
+  box-shadow: none;
+}
+
+.novel-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.novel-list-item {
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  padding: 11px 12px;
+  color: var(--ink);
+  text-align: left;
+  background: rgba(248, 240, 218, 0.76);
+  cursor: pointer;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    transform 140ms ease;
+}
+
+.novel-list-item:hover,
+.novel-list-item.active {
+  border-color: rgba(34, 166, 153, 0.42);
+  background: rgba(34, 166, 153, 0.1);
+}
+
+.novel-list-item:hover {
+  transform: translateX(2px);
+}
+
+.novel-list-item span {
+  display: block;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.novel-detail-markdown {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 24px 28px;
+  background: color-mix(in srgb, var(--panel-solid) 84%, transparent);
+  box-shadow: none;
+}
+
 .empty-state p {
   margin: 0;
   color: var(--muted);
@@ -3388,7 +3449,9 @@ html[data-theme="dark"] :is(
   .stop-button,
   .workspace-card,
   .script-markdown,
-  .novel-markdown,
+  .novel-sidebar,
+  .novel-list-item,
+  .novel-detail-markdown,
   .character-sidebar,
   .character-list-item,
   .character-markdown,
@@ -4115,4 +4178,439 @@ html[data-theme="dark"] .panel-heading {
 .style-detail-hint {
   font-size: 12px;
   opacity: 0.6;
+}
+
+/* ── 阶段流 StageFlowView（创作对话过程可见性，D8 嵌入 message）── */
+.stage-flow {
+  margin: 0 0 10px;
+  border: 1px solid rgba(116, 103, 196, 0.18);
+  border-radius: 12px;
+  background: rgba(248, 240, 218, 0.5);
+  overflow: hidden;
+}
+
+.stage-flow-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  font-size: 13px;
+  color: #4a4772;
+}
+
+.stage-flow-status-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--teal);
+}
+
+.stage-flow[data-flow-status="running"] .stage-flow-status-dot {
+  background: #5f7cff;
+  animation: stage-pulse 1.2s ease-in-out infinite;
+}
+
+.stage-flow[data-flow-status="failed"] .stage-flow-status-dot {
+  background: #e5484d;
+}
+
+.stage-flow-summary-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 700;
+}
+
+.stage-flow-duration {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.stage-flow-caret {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.stage-flow-list {
+  margin: 0;
+  padding: 0 12px 10px;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+}
+
+.stage-flow-stage {
+  border-left: 3px solid var(--line);
+  padding: 6px 0 6px 10px;
+  opacity: 0.62;
+}
+
+.stage-flow-stage.completed {
+  border-left-color: rgba(25, 169, 154, 0.5);
+}
+
+.stage-flow-stage.failed {
+  border-left-color: #e5484d;
+}
+
+.stage-flow-stage.running,
+.stage-flow-stage.is-current {
+  opacity: 1;
+  border-left-color: #5f7cff;
+}
+
+.stage-flow-stage-header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.stage-flow-stage-index {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgba(116, 103, 196, 0.14);
+  color: #4a4772;
+  font-size: 10px;
+  font-weight: 800;
+  display: grid;
+  place-items: center;
+}
+
+.stage-flow-stage-label {
+  font-weight: 700;
+  color: #3a385f;
+}
+
+.stage-flow-stage-meta {
+  width: 100%;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.stage-flow-focus {
+  margin-top: 4px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #5f7cff;
+}
+
+.stage-flow-substeps {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 3px;
+}
+
+.stage-flow-substep {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #5a5878;
+}
+
+.stage-flow-substep-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--line);
+}
+
+.stage-flow-substep.completed .stage-flow-substep-dot {
+  background: var(--teal);
+}
+
+.stage-flow-substep.running .stage-flow-substep-dot {
+  background: #5f7cff;
+  animation: stage-pulse 1.2s ease-in-out infinite;
+}
+
+.stage-flow-substep.failed .stage-flow-substep-dot {
+  background: #e5484d;
+}
+
+.stage-flow-substep-wc {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.stage-flow-summary-toggle {
+  margin-top: 4px;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font-size: 11px;
+  color: var(--teal-dark);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.stage-flow-stage-summary {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(116, 103, 196, 0.06);
+  font-size: 12px;
+  line-height: 1.6;
+  color: #4a4772;
+  white-space: pre-wrap;
+}
+
+@keyframes stage-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* ── D3：当前阶段轻量光晕脉动 + focusText 呼吸 ── */
+.stage-flow-stage.is-current {
+  animation: stage-current-glow 1.8s ease-in-out infinite;
+}
+@keyframes stage-current-glow {
+  0%, 100% { box-shadow: -3px 0 6px rgba(95, 124, 255, 0); }
+  50% { box-shadow: -3px 0 9px rgba(95, 124, 255, 0.35); }
+}
+.stage-flow-focus {
+  animation: stage-focus-breathe 1.8s ease-in-out infinite;
+}
+@keyframes stage-focus-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
+/* ── D1：折叠态推进轨迹缩略链 ── */
+.stage-flow-trail {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+.stage-flow-trail-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.stage-flow-trail-sep {
+  opacity: 0.5;
+  margin: 0 2px;
+}
+.stage-flow-trail-mark.completed {
+  color: var(--teal);
+}
+.stage-flow-trail-mark.running {
+  color: #5f7cff;
+  animation: stage-pulse 1.2s ease-in-out infinite;
+}
+.stage-flow-trail-mark.failed {
+  color: #e5484d;
+}
+
+/* ── D5：无阶段卡片时主 agent 工具的极简兜底 ── */
+.message-action-fallback {
+  margin: 0 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.message-action-fallback::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #5f7cff;
+  animation: stage-pulse 1.2s ease-in-out infinite;
+}
+
+/* ── 工具调用折叠摘要（ToolTree 决策2）── */
+.tool-tree {
+  margin: 0 0 10px;
+}
+
+.tool-tree-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(116, 103, 196, 0.18);
+  border-radius: 999px;
+  padding: 4px 10px;
+  background: rgba(248, 240, 218, 0.58);
+  font-size: 11px;
+  color: #6a6790;
+  cursor: pointer;
+}
+
+.tool-tree-summary:hover {
+  background: rgba(248, 240, 218, 0.8);
+}
+
+.tool-tree-caret {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.tool-tree .tool-status-list {
+  margin-top: 8px;
+}
+
+/* ── 失败/停止态 + 重试（P7 决策9）── */
+.message[data-status="failed"] {
+  border-color: rgba(229, 72, 77, 0.35);
+  background: rgba(229, 72, 77, 0.06);
+}
+
+.message[data-status="stopped"] {
+  border-color: rgba(201, 121, 78, 0.35);
+  background: rgba(201, 121, 78, 0.06);
+}
+
+/* HITL 选项化：访谈 awaitingInput 选项 UI（InterviewOptions.tsx） */
+.interview-options {
+  margin-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.interview-options-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.interview-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.55rem 0.7rem;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  background: color-mix(in srgb, currentColor 5%, transparent);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+  font: inherit;
+}
+
+.interview-option:hover:not(:disabled) {
+  border-color: var(--coral, #ff7a59);
+}
+
+.interview-option.checked {
+  border-color: var(--coral, #ff7a59);
+  background: color-mix(in srgb, var(--coral, #ff7a59) 14%, transparent);
+}
+
+.interview-option:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.interview-option-mark {
+  flex-shrink: 0;
+  font-size: 0.95rem;
+  line-height: 1.4;
+}
+
+.interview-option-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.interview-option-label {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.interview-option-desc {
+  font-size: 0.78rem;
+  opacity: 0.7;
+  line-height: 1.4;
+}
+
+.interview-custom {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.interview-custom-input {
+  width: 100%;
+  resize: vertical;
+  padding: 0.5rem 0.6rem;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  background: color-mix(in srgb, currentColor 5%, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 0.88rem;
+}
+
+.interview-custom-input:focus {
+  outline: none;
+  border-color: var(--coral, #ff7a59);
+}
+
+.interview-options-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.interview-submit {
+  padding: 0.5rem 1.4rem;
+  border-radius: 12px;
+  border: none;
+  background: linear-gradient(135deg, var(--coral, #ff7a59), var(--gold, #f0c987));
+  color: #fff;
+  font-weight: 800;
+  font-size: 0.88rem;
+  cursor: pointer;
+  transition: transform 0.1s ease, opacity 0.15s ease;
+}
+
+.interview-submit:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.interview-submit:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.message-retry {
+  margin-top: 8px;
+  border: 1px solid rgba(95, 124, 255, 0.3);
+  border-radius: 999px;
+  padding: 4px 12px;
+  background: rgba(95, 124, 255, 0.08);
+  color: #3f5bdb;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.message-retry:hover {
+  background: rgba(95, 124, 255, 0.16);
 }

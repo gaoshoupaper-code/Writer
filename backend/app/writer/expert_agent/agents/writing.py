@@ -99,7 +99,7 @@ def build_writing_deep_subagent(
     evaluation_spec = build_writing_evaluator(
         workspace_root,
         middleware_factory("writing-evaluation-subagent"),
-        context_file_paths=["outline.md", "storyline.md", "storyline/*.md", "volume/*.md", "character/*.md", "detail/*.md", "chapter/*.md"],
+        context_file_paths=["outline.md", "storyline.md", "storyline/*.md", "character/*.md", "detail/*.md", "chapter/*.md"],
     )
 
     # ---- 构建 evolution SubAgent dict ----

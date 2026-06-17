@@ -417,16 +417,28 @@ class StorylineGraphData:
     t_map: dict[str, int]
 
 
+def _read_text(path: Path) -> str:
+    """读取文件文本，UTF-8 失败时回退 GB18030（GBK 超集）。
+
+    agent 在中文 Windows 下偶尔会写入 GBK 字节，严格 UTF-8 解码会抛 UnicodeDecodeError，
+    让 storyline-graph 按需生成时整个端点 500。与 thread_store._read_text 保持一致的容错策略。
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="gb18030", errors="replace")
+
+
 def _read_storyline_sources(workspace_path: Path) -> str | None:
     """拼接 storyline.md(索引) + storyline/*.md(各线详情)；无任何产物返回 None。"""
     chunks: list[str] = []
     index_path = workspace_path / "storyline.md"
     if index_path.exists():
-        chunks.append(index_path.read_text(encoding="utf-8"))
+        chunks.append(_read_text(index_path))
     storyline_dir = workspace_path / "storyline"
     if storyline_dir.exists():
         for detail_path in sorted(storyline_dir.glob("*.md"), key=lambda p: p.name):
-            chunks.append(detail_path.read_text(encoding="utf-8"))
+            chunks.append(_read_text(detail_path))
     return "\n\n".join(chunks) if chunks else None
 
 

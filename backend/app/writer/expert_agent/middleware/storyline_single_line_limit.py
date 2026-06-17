@@ -8,8 +8,9 @@
 设计依据（见 .claude/md/20260611_214939_storybuilding单线中间件设计.md）：
   - ``FilesystemBackend.write`` 只创建新文件，对已存在文件返回 error；
     ``edit`` 只能改已存在文件。故 write_file 到「不存在的 storyline 文件」= 新增。
-  - 计数对象 = 新增文件数（非写调用次数）：写入前查物理磁盘 ``.exists()`` 判定，
-    已存在 = 非新增（放行），不存在 = 新增（计数，超限拦截）。
+  - 计数对象 = ``/storyline/S{XX}-*.md`` 新增文件数（非写调用次数）：写入前查物理磁盘
+    ``.exists()`` 判定，已存在 = 非新增（放行），不存在 = 新增（计数，超限拦截）。
+    只认 S{XX} 开头的故事线文件——同目录 timeline.md 等非故事线文件不计入。
   - 计数周期 = 每次 storybuilding 子代理调用（before_agent 在每次 task 调用开始时重置），与 ``RevisionLimitMiddleware`` 一致。
 
 使用方式：
@@ -28,8 +29,10 @@ from langchain_core.messages import ToolMessage
 
 from app.writer.middleware.path_guard_middleware import normalize_workspace_write_path
 
-# 故事线详情文件虚拟路径：/storyline/<name>.md（与 path_guard 白名单一致）
-_STORYLINE_FILE = re.compile(r"^/storyline/[^/]+\.md$")
+# 故事线详情文件虚拟路径：/storyline/S{XX}-<名>.md。只认 S{XX} 开头的故事线文件——
+# 同目录的 timeline.md（全局时间线表，并非故事线）因此不被计入（见需求基准 D3/D4）。
+# 宁严勿松：任何 S\d{2} 开头的 .md 都计入，避免漏算而绕过单线上限。
+_STORYLINE_FILE = re.compile(r"^/storyline/S\d{2}[^/]*\.md$")
 
 
 class StorylineSingleLineLimitMiddleware(AgentMiddleware):

@@ -97,18 +97,6 @@ export type WorkspaceWorldviewContent = {
   markdown: string;
 };
 
-export type VolumeChapter = {
-  filename: string;
-  title: string;
-  markdown: string;
-};
-
-export type WorkspaceVolumeContent = {
-  workspace_id: string;
-  chapters: VolumeChapter[];
-  file_count: number;
-};
-
 export type DetailOutlineChapter = {
   filename: string;
   title: string;
@@ -121,11 +109,17 @@ export type WorkspaceDetailOutlineContent = {
   file_count: number;
 };
 
+// 与后端 WorkspaceNovelChaptersContent 同构：正文按章分文件，侧栏一条对应一个 md
+export type NovelChapter = {
+  filename: string;
+  title: string;
+  markdown: string;
+};
+
 export type WorkspaceNovelContent = {
   workspace_id: string;
-  markdown: string;
   source: string;
-  chapter_count: number;
+  chapters: NovelChapter[];
 };
 
 export type CharacterMarkdownFile = {
@@ -140,7 +134,7 @@ export type WorkspaceCharacterContent = {
 };
 
 export type StreamEvent = {
-  type: "model_output" | "tool_call" | "tool_output" | "model_stream" | "final" | "trace_event" | "trace_snapshot";
+  type: "model_output" | "tool_call" | "tool_output" | "tool_error" | "model_stream" | "final" | "trace_event" | "trace_snapshot" | "interrupt";
   data: Record<string, unknown>;
 };
 
@@ -285,6 +279,18 @@ export type ToolStatus = {
   status: "running" | "done" | "failed";
   parentKey?: string;
   subagentName?: string;
+  // P1 扩展（仅 task 工具有值）：供 stageFlow 生成阶段/章节焦点（D6/D7）
+  subagentType?: string; // storybuilding / detail-outline / writing / general-purpose
+  chapterIndex?: number | null;
+  totalChapters?: number | null;
+  wordCount?: number | null;
+  iteration?: number | null; // storybuilding 轮次 / 调用序
+};
+
+// HITL 选项化：ask_user 的结构化选项（label + 一句话解释）
+export type AskUserOption = {
+  label: string;
+  description: string;
 };
 
 export type ChatMessage = {
@@ -292,6 +298,17 @@ export type ChatMessage = {
   content: string;
   tools?: ToolStatus[];
   contentFormat?: "text" | "markdown";
+  // D2: 关联本次提交的 trace run（一次提交 = 一条 assistant message = 一个 trace）
+  traceId?: string;
+  // D2/P7: 本条消息的执行态（streaming=进行中 / completed / failed / stopped）
+  status?: "streaming" | "completed" | "failed" | "stopped";
+  // HITL: 子代理 ask_user 中断，等待用户回答（resume 提交后清除）
+  awaitingInput?: {
+    question: string;
+    options?: AskUserOption[] | null;
+    multi_select?: boolean;
+    source?: string;
+  };
 };
 
 export type CheckpointToolCall = {
@@ -345,7 +362,6 @@ export type WorkspaceBootstrapResponse = {
   threads: ThreadSummary[];
   outline: WorkspaceOutlineContent | null;
   storyline: WorkspaceStorylineContent | null;
-  volume: WorkspaceVolumeContent | null;
   detail_outline: WorkspaceDetailOutlineContent | null;
   characters: WorkspaceCharacterContent | null;
   novel: WorkspaceNovelContent | null;

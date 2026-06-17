@@ -24,7 +24,6 @@ from app.schemas.screenplay import (
     ScreenplayGenerateResponse,
     StorylineEntry,
     ThreadSummary,
-    VolumeChapter,
     WorkspaceCharacterContent,
     WorkspaceDetailOutlineContent,
     WorkspaceNovelChapter,
@@ -35,7 +34,6 @@ from app.schemas.screenplay import (
     StorylineGraphStoryline,
     WorkspaceStorylineContent,
     WorkspaceStorylineGraphContent,
-    WorkspaceVolumeContent,
     WorkspaceWorldviewContent,
     WorkspaceSummary,
 )
@@ -326,39 +324,6 @@ class ThreadStore:
         markdown = _read_text(artifact_path) if artifact_path.exists() else ""
         return WorkspaceWorldviewContent(workspace_id=workspace_id, markdown=markdown)
 
-    def _volume_chapter_title(self, filename: str) -> str:
-        if filename == "overview.md":
-            return "总览"
-        match = re.match(r"volume-(\d+)\.md$", filename)
-        if match:
-            return f"第{int(match.group(1))}卷"
-        return Path(filename).stem
-
-    def read_workspace_volume(self, workspace_id: str) -> WorkspaceVolumeContent | None:
-        workspace = self._read_workspace_index().get(workspace_id)
-        if workspace is None:
-            return None
-
-        workspace_path = Path(workspace["workspace_path"])
-        if not workspace_path.exists():
-            raise FileNotFoundError(f"Workspace directory missing: {workspace_path}")
-
-        volume_dir = workspace_path / "volume"
-        chapters: list[VolumeChapter] = []
-        if volume_dir.exists():
-            for artifact_path in sorted(volume_dir.glob("*.md"), key=lambda p: p.name):
-                content = _read_text(artifact_path).strip()
-                if content:
-                    chapters.append(
-                        VolumeChapter(
-                            filename=artifact_path.name,
-                            title=self._volume_chapter_title(artifact_path.name),
-                            markdown=content,
-                        )
-                    )
-
-        return WorkspaceVolumeContent(workspace_id=workspace_id, chapters=chapters, file_count=len(chapters))
-
     def read_workspace_detail_outline(self, workspace_id: str) -> WorkspaceDetailOutlineContent | None:
         workspace = self._read_workspace_index().get(workspace_id)
         if workspace is None:
@@ -532,24 +497,6 @@ class ThreadStore:
             markdown=_read_text(worldview_path) if worldview_path.exists() else "",
         )
 
-        # volume
-        volume_dir = workspace_path / "volume"
-        volume_chapters: list[VolumeChapter] = []
-        if volume_dir.exists():
-            for ap in sorted(volume_dir.glob("*.md"), key=lambda p: p.name):
-                content = _read_text(ap).strip()
-                if content:
-                    volume_chapters.append(
-                        VolumeChapter(
-                            filename=ap.name,
-                            title=self._volume_chapter_title(ap.name),
-                            markdown=content,
-                        )
-                    )
-        volume = WorkspaceVolumeContent(
-            workspace_id=workspace_id, chapters=volume_chapters, file_count=len(volume_chapters),
-        )
-
         # detail_outline
         detail_dir = workspace_path / "detail"
         detail_chapters: list[DetailOutlineChapter] = []
@@ -580,31 +527,14 @@ class ThreadStore:
                 )
         character_content = WorkspaceCharacterContent(workspace_id=workspace_id, characters=characters)
 
-        # novel
-        chapter_files = self._workspace_chapter_files(workspace_path)
-        if chapter_files:
-            novel_markdown = "\n\n".join(_read_text(p).strip() for p in chapter_files)
-            novel = WorkspaceNovelContent(
-                workspace_id=workspace_id,
-                markdown=f"{novel_markdown}\n" if novel_markdown else "",
-                source="chapter/",
-                chapter_count=len(chapter_files),
-            )
-        else:
-            novel_artifact = workspace_path / "novel.md"
-            novel = WorkspaceNovelContent(
-                workspace_id=workspace_id,
-                markdown=_read_text(novel_artifact) if novel_artifact.exists() else "",
-                source="novel.md",
-                chapter_count=0,
-            )
+        # novel（分章结构，复用 read_workspace_novel_chapters 统一 chapter/ 与 novel.md 两种来源）
+        novel = self.read_workspace_novel_chapters(workspace_id)
 
         return {
             "workspace": workspace,
             "threads": sorted(thread_summaries, key=lambda t: t.updated_at, reverse=True),
             "outline": outline,
             "storyline": storyline,
-            "volume": volume,
             "detail_outline": detail_outline,
             "characters": character_content,
             "worldview": worldview,

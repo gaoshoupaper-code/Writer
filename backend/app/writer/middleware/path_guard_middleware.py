@@ -13,7 +13,6 @@
 
 允许的写入路径白名单：
   - /character/<name>.md   — 角色档案文件
-  - /volume/<name>.md      — 卷纲文件（含故事线段+事件+钩子）
   - /outline.md            — 大纲文件
   - /storyline.md          — 线纲索引（故事核心+故事线一览表）
   - /storyline/<name>.md   — 故事线详情（每条一个文件）
@@ -46,7 +45,6 @@ _FILESYSTEM_WRITE_TOOLS = {"write_file", "edit_file"}
 # 允许的写入路径正则白名单（虚拟路径格式，如 /outline.md）
 _ALLOWED_WRITE_PATHS = (
     re.compile(r"^/character/[^/]+\.md$"),     # 角色档案
-    re.compile(r"^/volume/[^/]+\.md$"),        # 卷纲（事件）
     re.compile(r"^/outline\.md$"),              # 总纲（锚点）
     re.compile(r"^/storyline\.md$"),            # 线纲索引（故事核心+一览表）
     re.compile(r"^/storyline/[^/]+\.md$"),      # 故事线详情（每条一个文件）
@@ -215,7 +213,7 @@ def normalize_workspace_write_path(
 
     # 检查是否匹配预定义白名单
     if not any(pattern.fullmatch(normalized) for pattern in _ALLOWED_WRITE_PATHS):
-        allowed = "/character/*.md, /volume/*.md, /outline.md, /storyline.md, /storyline/*.md, /worldview.md, /evaluation.md, /novel.md, /chapter/*.md, /review/*.md, /detail/*.md, /state_log.md"
+        allowed = "/character/*.md, /outline.md, /storyline.md, /storyline/*.md, /worldview.md, /evaluation.md, /novel.md, /chapter/*.md, /review/*.md, /detail/*.md, /state_log.md"
         if allowed_write_paths:
             allowed = f"{allowed}, {', '.join(sorted(allowed_write_paths))}"
         raise ValueError(

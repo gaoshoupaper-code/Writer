@@ -35,7 +35,8 @@ export function TopBar({
   onThemeToggle,
 }: TopBarProps) {
   const activeWorkspace = workspaces.find((w) => w.workspace_id === activeWorkspaceId);
-  const displayLabel = activeWorkspace?.outline_name || "选择一个工作目录";
+  // 决策3：顶部「书名：」+ outline_name 静态标签（数据源=现有 outline_name）
+  const displayLabel = activeWorkspace?.outline_name ? `书名：${activeWorkspace.outline_name}` : "选择一个工作目录";
 
   return (
     <header className="dashboard-topbar">

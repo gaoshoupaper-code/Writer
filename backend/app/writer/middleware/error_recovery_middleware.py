@@ -62,7 +62,7 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
                 return handler(request)
             except BaseException as exc:
                 # 不可恢复的异常直接向上抛出
-                if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)) or type(exc).__name__ == "GraphInterrupt":
                     raise
                 last_exc = exc
         # 所有重试都失败，返回包含恢复建议的错误消息
@@ -75,7 +75,7 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
             try:
                 return await handler(request)
             except BaseException as exc:
-                if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)) or type(exc).__name__ == "GraphInterrupt":
                     raise
                 last_exc = exc
                 # 非最后一次重试前等待，延迟按尝试次数递增（0.5s → 1.0s → 1.5s ...）

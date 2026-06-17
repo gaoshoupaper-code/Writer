@@ -101,6 +101,27 @@ class StorylineSingleLineLimitMiddlewareTest(unittest.TestCase):
             self.assertEqual(result, "passed-through")
             self.assertEqual(mw._new_line_count, 0)
 
+    def test_timeline_md_not_counted_as_storyline(self) -> None:
+        """timeline.md 是全局时间线表，不是故事线——写它不应计入单线计数。
+
+        复现初构真实场景：agent 先写主线 S01-{名}.md，再写 timeline.md，
+        两者都应放行，且计数仍为 1（timeline 不占新增故事线额度）。
+        见需求基准 D3/D4。
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mw = StorylineSingleLineLimitMiddleware(Path(tmpdir), max_new_lines=1)
+            tracker = _CallTracker()
+
+            # 写主线（第 1 条故事线）→ 计数 1，放行
+            r1 = mw.wrap_tool_call(_request("write_file", "/storyline/S01-成长主线.md"), tracker)
+            self.assertEqual(r1, "passed-through")
+            self.assertEqual(mw._new_line_count, 1)
+
+            # 写 timeline.md → 非故事线，不计入，放行
+            r2 = mw.wrap_tool_call(_request("write_file", "/storyline/timeline.md"), tracker)
+            self.assertEqual(r2, "passed-through")
+            self.assertEqual(mw._new_line_count, 1)  # 计数不增长
+
     def test_before_agent_resets_count_for_new_invocation(self) -> None:
         """同一实例多调用周期：第 1 周期达上限被拦，before_agent 重置后第 2 周期重新放行。
 

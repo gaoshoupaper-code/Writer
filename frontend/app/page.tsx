@@ -43,10 +43,14 @@ import {
   workspaceNovelWordUrl,
 } from "../lib/api";
 import { appendLiveTraceEvent } from "../lib/trace";
+import { projectStageFlow } from "../lib/stage";
+import type { StageFlow } from "../lib/stage";
 import type {
+  AskUserOption,
   CharacterMarkdownFile,
   ChatMessage,
   DetailOutlineChapter,
+  NovelChapter,
   ScreenplayResponse,
   Style,
   StreamEvent,
@@ -56,14 +60,12 @@ import type {
   TraceLogEvent,
   TraceRunSummary,
   StorylineEntry,
-  VolumeChapter,
   WorkspaceCharacterContent,
   WorkspaceDetailOutlineContent,
   WorkspaceNovelContent,
   WorkspaceOutlineContent,
   WorkspacePanel,
   WorkspaceStorylineContent,
-  WorkspaceVolumeContent,
   WorkspaceWorldviewContent,
   WorkspaceSummary,
 } from "../lib/types";
@@ -72,6 +74,9 @@ type ThemeMode = "light" | "dark";
 
 const initialPrompt = "";
 const themeStorageKey = "writer-theme";
+// 心跳超时：后端 SSE 每 15s 发一次 : ping，若超过该阈值仍收不到任何字节，即判定
+// 连接已被 cloudflared/Cloudflare 静默掐断（此时 read() 因 TCP 半关闭会无限阻塞）。
+const HEARTBEAT_TIMEOUT_MS = 45_000;
 const initialAssistantMessage: ChatMessage = {
   role: "assistant",
   content: "先选择一个工作目录，再开启或恢复创作会话。",
@@ -99,11 +104,39 @@ function buildToolKey(toolName: string, callId: string, index: number) {
   return callId || `${toolName}-${index + 1}`;
 }
 
+// P1 扩展字段提取：从 SSE tool_call/tool_output payload 取章节号/字数/轮次等焦点信息（D6/D7）
+function numOrNull(value: unknown): number | null {
+  if (typeof value === "number") return value;
+  if (typeof value === "string" && value.trim() && !Number.isNaN(Number(value))) return Number(value);
+  return null;
+}
+
+function getTaskFocus(event: StreamEvent) {
+  const data = event.data;
+  return {
+    subagentType: typeof data.subagent_type === "string" ? data.subagent_type : undefined,
+    chapterIndex: numOrNull(data.chapter_index),
+    totalChapters: numOrNull(data.total_chapters),
+    iteration: numOrNull(data.iteration),
+  };
+}
+
+function getWordCountPatch(event: StreamEvent): { wordCount?: number; chapterIndex?: number } {
+  const data = event.data;
+  const patch: { wordCount?: number; chapterIndex?: number } = {};
+  const wc = numOrNull(data.word_count);
+  if (wc != null) patch.wordCount = wc;
+  const ci = numOrNull(data.chapter_index);
+  if (ci != null) patch.chapterIndex = ci;
+  return patch;
+}
+
 function upsertRunningTool(tools: ToolStatus[] | undefined, event: StreamEvent) {
   const toolName = getToolName(event);
   const callId = getToolCallId(event);
   const parentKey = getToolParentKey(event);
   const subagentName = getSubagentName(event);
+  const focus = getTaskFocus(event);
   const nextTools = [...(tools ?? [])];
   const lookupKey = callId;
 
@@ -114,6 +147,7 @@ function upsertRunningTool(tools: ToolStatus[] | undefined, event: StreamEvent) 
         ...nextTools[existingIndex],
         name: toolName,
         status: "running",
+        ...focus,
       };
       return nextTools;
     }
@@ -124,6 +158,7 @@ function upsertRunningTool(tools: ToolStatus[] | undefined, event: StreamEvent) 
       status: "running",
       parentKey,
       subagentName,
+      ...focus,
     });
     return nextTools;
   }
@@ -134,6 +169,7 @@ function upsertRunningTool(tools: ToolStatus[] | undefined, event: StreamEvent) 
     status: "running",
     parentKey,
     subagentName,
+    ...focus,
   });
   return nextTools;
 }
@@ -141,12 +177,14 @@ function upsertRunningTool(tools: ToolStatus[] | undefined, event: StreamEvent) 
 function markToolComplete(tools: ToolStatus[] | undefined, event: StreamEvent) {
   const toolName = getToolName(event);
   const eventCallId = getToolCallId(event);
+  const patch = getWordCountPatch(event);
   const nextTools = [...(tools ?? [])];
+  const markDone = (tool: ToolStatus): ToolStatus => ({ ...tool, status: "done", ...patch });
 
   if (eventCallId) {
     for (let index = 0; index < nextTools.length; index += 1) {
       if (nextTools[index].key === eventCallId && nextTools[index].status === "running") {
-        nextTools[index] = { ...nextTools[index], status: "done" };
+        nextTools[index] = markDone(nextTools[index]);
         return nextTools;
       }
     }
@@ -154,14 +192,14 @@ function markToolComplete(tools: ToolStatus[] | undefined, event: StreamEvent) {
 
   for (let index = nextTools.length - 1; index >= 0; index -= 1) {
     if (nextTools[index].name === toolName && nextTools[index].status === "running") {
-      nextTools[index] = { ...nextTools[index], status: "done" };
+      nextTools[index] = markDone(nextTools[index]);
       return nextTools;
     }
   }
 
   for (let index = nextTools.length - 1; index >= 0; index -= 1) {
     if (nextTools[index].name === toolName) {
-      nextTools[index] = { ...nextTools[index], status: "done" };
+      nextTools[index] = markDone(nextTools[index]);
       return nextTools;
     }
   }
@@ -170,6 +208,45 @@ function markToolComplete(tools: ToolStatus[] | undefined, event: StreamEvent) {
     key: buildToolKey(toolName, "", nextTools.length),
     name: toolName,
     status: "done",
+    ...patch,
+  });
+  return nextTools;
+}
+
+// S4：单工具失败（tool_error SSE）→ 标 failed。匹配逻辑与 markToolComplete 一致（call_id → name 回退）
+function markToolFailed(tools: ToolStatus[] | undefined, event: StreamEvent) {
+  const toolName = getToolName(event);
+  const eventCallId = getToolCallId(event);
+  const nextTools = [...(tools ?? [])];
+  const markFailed = (tool: ToolStatus): ToolStatus => ({ ...tool, status: "failed" });
+
+  if (eventCallId) {
+    for (let index = 0; index < nextTools.length; index += 1) {
+      if (nextTools[index].key === eventCallId && nextTools[index].status === "running") {
+        nextTools[index] = markFailed(nextTools[index]);
+        return nextTools;
+      }
+    }
+  }
+
+  for (let index = nextTools.length - 1; index >= 0; index -= 1) {
+    if (nextTools[index].name === toolName && nextTools[index].status === "running") {
+      nextTools[index] = markFailed(nextTools[index]);
+      return nextTools;
+    }
+  }
+
+  for (let index = nextTools.length - 1; index >= 0; index -= 1) {
+    if (nextTools[index].name === toolName) {
+      nextTools[index] = markFailed(nextTools[index]);
+      return nextTools;
+    }
+  }
+
+  nextTools.push({
+    key: buildToolKey(toolName, "", nextTools.length),
+    name: toolName,
+    status: "failed",
   });
   return nextTools;
 }
@@ -271,25 +348,23 @@ export default function Home() {
   const [detailOutlineChapters, setDetailOutlineChapters] = useState<DetailOutlineChapter[]>([]);
   const [detailOutlineLoading, setDetailOutlineLoading] = useState(false);
   const [activeDetailChapterFilename, setActiveDetailChapterFilename] = useState("");
-  const [novelMarkdown, setNovelMarkdown] = useState("");
-  const [novelSource, setNovelSource] = useState("");
-  const [novelChapterCount, setNovelChapterCount] = useState(0);
+  const [novelChapters, setNovelChapters] = useState<NovelChapter[]>([]);
+  const [activeNovelFilename, setActiveNovelFilename] = useState("");
   const [novelLoading, setNovelLoading] = useState(false);
   const [characters, setCharacters] = useState<CharacterMarkdownFile[]>([]);
   const [charactersLoading, setCharactersLoading] = useState(false);
   const [activeCharacterFilename, setActiveCharacterFilename] = useState("");
   const [worldviewMarkdown, setWorldviewMarkdown] = useState("");
   const [worldviewLoading, setWorldviewLoading] = useState(false);
-  const [volumeChapters, setVolumeChapters] = useState<VolumeChapter[]>([]);
-  const [activeVolumeFilename, setActiveVolumeFilename] = useState("");
   const [storylineMarkdown, setStorylineMarkdown] = useState("");
   const [storylineEntries, setStorylineEntries] = useState<StorylineEntry[]>([]);
   const [activeStorylineFilename, setActiveStorylineFilename] = useState("");
-  const [outlineTab, setOutlineTab] = useState<"outline" | "storyline" | "volume">("outline");
+  const [outlineTab, setOutlineTab] = useState<"outline" | "storyline">("outline");
   const [traceRuns, setTraceRuns] = useState<TraceRunSummary[]>([]);
   const [activeTraceId, setActiveTraceId] = useState("");
   const [liveTraceId, setLiveTraceId] = useState("");
   const [traceDetail, setTraceDetail] = useState<TraceDetail | null>(null);
+  const [historyDetails, setHistoryDetails] = useState<Map<string, TraceDetail>>(new Map());
   const [traceLoading, setTraceLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [creatingWorkspace, setCreatingWorkspace] = useState(false);
@@ -324,12 +399,13 @@ export default function Home() {
   }, [theme, themeReady]);
 
   // ── 首次加载：2 个请求完成全部初始化 ──
-  const bootstrappedRef = useRef(false);
-
+  // ⚠️ 不能用 ref 提前 return 来"保证只跑一次"。React StrictMode（Next.js dev 默认
+  // 开启）会对 mount 的 effect 先执行一遍 setup→cleanup→setup：第一次 setup 启动的
+  // 异步 bootstrap() 会被 cleanup 设置的 ignore 丢弃，而第二次 setup 又被 ref 拦掉
+  // 不重跑——结果 bootstrap 数据永远写不进 state，刷新后所有内容面板（大纲/人物/细纲/
+  // 世界观/正文）全部空白。正确做法：只用 ignore 防竞态，StrictMode 下第二次 setup
+  // 会重新发起请求并成功写入（dev 多一次请求，可接受）。
   useEffect(() => {
-    if (bootstrappedRef.current) return;
-    bootstrappedRef.current = true;
-
     let ignore = false;
 
     async function bootstrap() {
@@ -356,12 +432,6 @@ export default function Home() {
           setActiveStorylineFilename(data.storyline.entries[0]?.filename || "");
         }
         if (data.worldview) setWorldviewMarkdown(data.worldview.markdown);
-        if (data.volume) {
-          setVolumeChapters(data.volume.chapters);
-          setActiveVolumeFilename(
-            data.volume.chapters[0]?.filename || "",
-          );
-        }
         if (data.detail_outline) {
           setDetailOutlineChapters(data.detail_outline.chapters);
           setActiveDetailChapterFilename(
@@ -375,9 +445,8 @@ export default function Home() {
           );
         }
         if (data.novel) {
-          setNovelMarkdown(data.novel.markdown);
-          setNovelSource(data.novel.source);
-          setNovelChapterCount(data.novel.chapter_count);
+          setNovelChapters(data.novel.chapters);
+          setActiveNovelFilename(data.novel.chapters[0]?.filename || "");
         }
         setOutlineLoading(false);
         setDetailOutlineLoading(false);
@@ -461,17 +530,6 @@ export default function Home() {
         }
         if (bootData.worldview) setWorldviewMarkdown(bootData.worldview.markdown);
         else setWorldviewMarkdown("");
-        if (bootData.volume) {
-          setVolumeChapters(bootData.volume.chapters);
-          setActiveVolumeFilename(
-            bootData.volume.chapters.some((c) => c.filename === activeVolumeFilename)
-              ? activeVolumeFilename
-              : bootData.volume.chapters[0]?.filename || "",
-          );
-        } else {
-          setVolumeChapters([]);
-          setActiveVolumeFilename("");
-        }
         if (bootData.detail_outline) {
           setDetailOutlineChapters(bootData.detail_outline.chapters);
           setActiveDetailChapterFilename(
@@ -495,13 +553,13 @@ export default function Home() {
           setActiveCharacterFilename("");
         }
         if (bootData.novel) {
-          setNovelMarkdown(bootData.novel.markdown);
-          setNovelSource(bootData.novel.source);
-          setNovelChapterCount(bootData.novel.chapter_count);
+          setNovelChapters(bootData.novel.chapters);
+          setActiveNovelFilename((cur) =>
+            bootData.novel!.chapters.some((c) => c.filename === cur) ? cur : bootData.novel!.chapters[0]?.filename || "",
+          );
         } else {
-          setNovelMarkdown("");
-          setNovelSource("");
-          setNovelChapterCount(0);
+          setNovelChapters([]);
+          setActiveNovelFilename("");
         }
       } catch (err) {
         if (!ignore) {
@@ -537,6 +595,25 @@ export default function Home() {
   const activeThread = useMemo(
     () => threads.find((thread) => thread.thread_id === activeThreadId) ?? null,
     [activeThreadId, threads],
+  );
+
+  // D2: 当前 trace 的 stageFlow（从 traceDetail + 当前 assistant message 的 tools 派生）
+  const stageFlow = useMemo<StageFlow | null>(() => {
+    if (!traceDetail) return null;
+    const owner = messages.findLast((m) => m.role === "assistant" && m.traceId === traceDetail.run.trace_id);
+    return projectStageFlow(traceDetail, owner?.tools ?? []);
+  }, [traceDetail, messages]);
+
+  // 每条 message 对应的 stageFlow：当前 trace 命中用实时 stageFlow，历史 trace 用 historyDetails 派生
+  const stageFlows = useMemo<(StageFlow | null)[]>(
+    () =>
+      messages.map((m) => {
+        if (!m.traceId) return null;
+        if (m.traceId === traceDetail?.run.trace_id) return stageFlow;
+        const histDetail = historyDetails.get(m.traceId);
+        return histDetail ? projectStageFlow(histDetail, m.tools ?? []) : null;
+      }),
+    [messages, traceDetail, stageFlow, historyDetails],
   );
 
   const prevThreadIdRef = useRef(activeThreadId);
@@ -644,6 +721,33 @@ export default function Home() {
     };
   }, [activeThreadId, activeTraceId, liveTraceId]);
 
+  // P6: 历史回放 —— 加载本会话所有 trace 的 detail，供历史 message 派生 stageFlow（D3 顺序对应 via traceId）
+  // 用 traceId 列表作依赖键：event_count 高频变化不触发重跑，仅新 trace 加入时重载
+  const historyTraceKey = traceRuns.map((r) => r.trace_id).join(",");
+  useEffect(() => {
+    if (!activeThreadId || !historyTraceKey) {
+      setHistoryDetails(new Map());
+      return;
+    }
+    let ignore = false;
+    const ids = historyTraceKey.split(",").filter(Boolean);
+    async function loadHistoryDetails() {
+      const map = new Map<string, TraceDetail>();
+      for (const id of ids) {
+        try {
+          map.set(id, await fetchTraceDetail(activeThreadId, id));
+        } catch {
+          // 单个 trace 加载失败不阻塞其他
+        }
+      }
+      if (!ignore) setHistoryDetails(map);
+    }
+    loadHistoryDetails();
+    return () => {
+      ignore = true;
+    };
+  }, [activeThreadId, historyTraceKey]);
+
   const workspacePath = activeWorkspace?.workspace_path ?? activeThread?.workspace_path;
   const currentOutlineMarkdown = result?.thread_id === activeThreadId && result.markdown?.trim() ? result.markdown : outlineMarkdown;
 
@@ -681,16 +785,6 @@ export default function Home() {
       } catch {}
     });
 
-    es.addEventListener("volume", (e) => {
-      try {
-        const d = JSON.parse(e.data) as WorkspaceVolumeContent;
-        setVolumeChapters(d.chapters);
-        setActiveVolumeFilename((cur) =>
-          d.chapters.some((c) => c.filename === cur) ? cur : d.chapters[0]?.filename || "",
-        );
-      } catch {}
-    });
-
     es.addEventListener("detail_outline", (e) => {
       try {
         const d = JSON.parse(e.data) as WorkspaceDetailOutlineContent;
@@ -716,9 +810,10 @@ export default function Home() {
     es.addEventListener("novel", (e) => {
       try {
         const d = JSON.parse(e.data) as WorkspaceNovelContent;
-        setNovelMarkdown(d.markdown);
-        setNovelSource(d.source);
-        setNovelChapterCount(d.chapter_count);
+        setNovelChapters(d.chapters);
+        setActiveNovelFilename((cur) =>
+          d.chapters.some((c) => c.filename === cur) ? cur : d.chapters[0]?.filename || "",
+        );
         setNovelLoading(false);
       } catch {}
     });
@@ -746,15 +841,12 @@ export default function Home() {
       setStorylineEntries([]);
       setActiveStorylineFilename("");
       setWorldviewMarkdown("");
-      setVolumeChapters([]);
-      setActiveVolumeFilename("");
       setDetailOutlineChapters([]);
       setActiveDetailChapterFilename("");
       setCharacters([]);
       setActiveCharacterFilename("");
-      setNovelMarkdown("");
-      setNovelSource("");
-      setNovelChapterCount(0);
+      setNovelChapters([]);
+      setActiveNovelFilename("");
       setMessages([initialAssistantMessage]);
       skipNextBootstrap.current = true;
 
@@ -798,13 +890,10 @@ export default function Home() {
         setStorylineEntries([]);
         setActiveStorylineFilename("");
         setWorldviewMarkdown("");
-        setVolumeChapters([]);
-        setActiveVolumeFilename("");
         setDetailOutlineChapters([]);
         setActiveDetailChapterFilename("");
-        setNovelMarkdown("");
-        setNovelSource("");
-        setNovelChapterCount(0);
+        setNovelChapters([]);
+        setActiveNovelFilename("");
         setCharacters([]);
         setActiveCharacterFilename("");
         setResult(null);
@@ -965,11 +1054,33 @@ export default function Home() {
     abortControllerRef.current?.abort();
   }
 
+  // 决策9：重试 = 重发最后一条 user prompt（失败/停止后一键恢复）
+  function handleRetry() {
+    const lastUser = [...messages].reverse().find((m) => m.role === "user");
+    if (lastUser?.content) {
+      void performSubmit(lastUser.content);
+    }
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    // performSubmit 在 resume 失败时会 re-throw（供 InterviewOptions 解锁）；
+    // 表单路径无 InterviewOptions，吞掉避免 unhandled rejection（UI 已在内部处理）。
+    try {
+      await performSubmit(prompt);
+    } catch {
+      /* performSubmit 内部已处理 UI + toast */
+    }
+  }
 
-    const trimmedPrompt = prompt.trim();
+  async function performSubmit(promptText: string) {
+    const trimmedPrompt = promptText.trim();
     if (!trimmedPrompt || loading) return;
+    // HITL: 若上一条 assistant 处于 awaitingInput，本次提交是对 interrupt 的回答（resume）
+    const lastAssistant = [...messagesRef.current].reverse().find((m) => m.role === "assistant");
+    const isResume = !!lastAssistant?.awaitingInput;
+    // 点3：resume 时复用上一条 assistant 的 trace，把多次 HITL 缝合成同一条 trace
+    const resumeTraceId = isResume ? lastAssistant?.traceId ?? null : null;
     if (!activeWorkspaceId) {
       toast.error("请先选择或创建一个工作目录。");
       return;
@@ -977,8 +1088,20 @@ export default function Home() {
 
     setLoading(true);
     setResult(null);
-    setLiveTraceId("");
-    setTraceDetail(null);
+    if (resumeTraceId) {
+      // resume：激活 trace-1 的 live 追踪；保留其完整 detail（命中即用，否则用 traceRuns 骨架兜底）。
+      // 不清空——后续 trace_event（trace_id===trace-1）才能经 appendLiveTraceEvent 缝合进完整历史。
+      setLiveTraceId(resumeTraceId);
+      setTraceDetail((current) => {
+        if (current?.run.trace_id === resumeTraceId) return current;
+        const run = traceRuns.find((r) => r.trace_id === resumeTraceId);
+        return run ? { run, events: [], nodes: [], context: [], todos: [] } : current;
+      });
+    } else {
+      // 新 trace：清空，等待 run_start 重建
+      setLiveTraceId("");
+      setTraceDetail(null);
+    }
 
     if (activeThreadId) {
       threadMessagesRef.current.set(activeThreadId, messagesRef.current);
@@ -993,6 +1116,7 @@ export default function Home() {
         content: "正在执行...",
         contentFormat: "markdown",
         tools: [],
+        traceId: resumeTraceId ?? undefined, // resume 时继承 trace-1（复用，不再依赖后端 run_start）
       },
     ]);
     setPrompt("");
@@ -1029,10 +1153,11 @@ export default function Home() {
       const response = await fetch(`${API_BASE_URL}/api/screenplay/generate/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          thread_id: userMessageThreadId,
-          prompt: trimmedPrompt,
-        }),
+        body: JSON.stringify(
+          isResume
+            ? { thread_id: userMessageThreadId, resume: trimmedPrompt, trace_id: resumeTraceId ?? undefined }
+            : { thread_id: userMessageThreadId, prompt: trimmedPrompt },
+        ),
         signal: abortController.signal,
       });
 
@@ -1050,7 +1175,30 @@ export default function Home() {
       let finalData: ScreenplayResponse | null = null;
 
       while (true) {
-        const { done, value } = await reader.read();
+        // 心跳超时检测：让 read() 与定时器竞争。连接被静默掐断时 TCP 处于半关闭，
+        // read() 会无限阻塞，必须靠超时主动挣脱，否则前端永远卡在“运行中”。
+        let heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
+        const heartbeatTimeout = new Promise<never>((_, reject) => {
+          heartbeatTimer = setTimeout(() => reject(new Error("HEARTBEAT_TIMEOUT")), HEARTBEAT_TIMEOUT_MS);
+        });
+
+        let done = false;
+        let value: Uint8Array | undefined;
+        try {
+          const chunk = (await Promise.race([
+            reader.read(),
+            heartbeatTimeout,
+          ])) as ReadableStreamReadResult<Uint8Array>;
+          done = chunk.done;
+          value = chunk.value;
+        } catch {
+          // 超时触发：read() 仍在 pending，主动取消以释放底层连接，再上抛由 catch 兜底。
+          reader.cancel().catch(() => {});
+          throw new Error("HEARTBEAT_TIMEOUT");
+        } finally {
+          if (heartbeatTimer) clearTimeout(heartbeatTimer);
+        }
+
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
@@ -1075,6 +1223,12 @@ export default function Home() {
                 streamedText += String(event.data.content ?? "");
               } else if (event.type === "trace_event") {
                 const traceEvent = event.data as TraceLogEvent;
+                // D2: run_start 时把 trace_id 绑定到本次提交的 assistant message
+                if (traceEvent.type === "run_start") {
+                  setMessages((current) =>
+                    updateAssistantMessage(current, assistantIdx, (message) => ({ ...message, traceId: traceEvent.trace_id })),
+                  );
+                }
                 setTraceRuns((current) => {
                   if (traceEvent.type === "run_start") {
                     return upsertTraceRun(current, runFromTraceEvent(traceEvent));
@@ -1114,8 +1268,34 @@ export default function Home() {
                     tools: markToolComplete(message.tools, event),
                   })),
                 );
+              } else if (event.type === "tool_error") {
+                setMessages((current) =>
+                  updateAssistantMessage(current, assistantIdx, (message) => ({
+                    ...message,
+                    tools: markToolFailed(message.tools, event),
+                  })),
+                );
               } else if (event.type === "final") {
                 finalData = event.data as ScreenplayResponse;
+              } else if (event.type === "interrupt") {
+                const iv = event.data as {
+                  question?: string;
+                  options?: AskUserOption[] | null;
+                  multi_select?: boolean;
+                  source?: string;
+                };
+                setMessages((current) =>
+                  updateAssistantMessage(current, assistantIdx, (message) => ({
+                    ...message,
+                    content: iv.question || "等待你的输入",
+                    awaitingInput: {
+                      question: iv.question || "",
+                      options: iv.options ?? null,
+                      multi_select: iv.multi_select ?? false,
+                      source: iv.source,
+                    },
+                  })),
+                );
               }
             } catch {
               // SSE streams can include partial model/debug chunks that are not JSON payloads.
@@ -1134,15 +1314,7 @@ export default function Home() {
                 contentFormat: "markdown",
               };
             }
-
-            if (hasModelOutput) {
-              return {
-                ...message,
-                content: "模型正在思考并调用工具...",
-                contentFormat: "markdown",
-              };
-            }
-
+            // 工具/子代理阶段：过程反馈交给 StageFlowView（焦点文案+阶段进度），content 保持简洁占位
             return message;
           }),
         );
@@ -1163,6 +1335,7 @@ export default function Home() {
         setMessages((current) =>
           updateAssistantMessage(current, assistantIdx, (message) => ({
             ...message,
+            status: "completed",
             content:
               streamedText ||
               finalData?.markdown?.trim() ||
@@ -1177,21 +1350,45 @@ export default function Home() {
         setMessages((current) =>
           updateAssistantMessage(current, assistantIdx, (message) => ({
             ...message,
+            status: "stopped",
             content: message.content === "正在执行..." ? "已手动停止。" : `${message.content}\n\n已手动停止。`,
             contentFormat: "markdown",
           })),
         );
+        if (isResume) throw submitError; // 点2：resume 失败/中断 → 解锁 InterviewOptions
+        return;
+      }
+
+      if (submitError instanceof Error && submitError.message === "HEARTBEAT_TIMEOUT") {
+        const heartbeatMessage = `连接已断开（超过 ${HEARTBEAT_TIMEOUT_MS / 1000} 秒未收到数据），请重试。`;
+        setLiveTraceId("");
+        toast.error(heartbeatMessage);
+        setMessages((current) =>
+          updateAssistantMessage(current, assistantIdx, (message) => ({
+            ...message,
+            status: "failed",
+            content:
+              message.content === "正在执行..." ? `⚠️ ${heartbeatMessage}` : `${message.content}\n\n⚠️ ${heartbeatMessage}`,
+            contentFormat: "markdown",
+          })),
+        );
+        if (isResume) throw submitError; // 点2：resume 失败 → 解锁
         return;
       }
 
       toast.error(submitError instanceof Error ? submitError.message : "Unexpected request failure.");
-      setMessages((current) => [
-        ...current,
-        {
-          role: "assistant",
-          content: "请求失败了。检查后端是否启动后，可以在同一个会话里重试。",
-        },
-      ]);
+      setMessages((current) =>
+        updateAssistantMessage(current, assistantIdx, (message) => ({
+          ...message,
+          status: "failed",
+          content:
+            message.content === "正在执行..."
+              ? "请求失败了。检查后端是否启动后，可以在同一个会话里重试。"
+              : `${message.content}\n\n⚠️ 请求失败，可重试。`,
+          contentFormat: "markdown",
+        })),
+      );
+      if (isResume) throw submitError; // 点2：resume 失败 → 解锁
     } finally {
       if (abortControllerRef.current === abortController) {
         abortControllerRef.current = null;
@@ -1235,6 +1432,9 @@ export default function Home() {
             deleting={deleting}
             onPromptChange={setPrompt}
             onSubmit={handleSubmit}
+            onResumeSubmit={async (resumeText) => {
+              await performSubmit(resumeText);
+            }}
             onStop={handleStopGeneration}
             onToggleSessionMenu={() => setSessionMenuOpen((open) => !open)}
             onCloseSessionMenu={() => setSessionMenuOpen(false)}
@@ -1242,16 +1442,17 @@ export default function Home() {
             onSelectThread={handleSelectThread}
             onDeleteThread={handleDeleteThread}
             onOpenStyleModal={() => setStyleModalOpen(true)}
+            stageFlows={stageFlows}
+            onRetry={handleRetry}
           />
         ) : null}
 
         {activePanel === "novel" ? (
           <NovelPanel
-            workspacePath={workspacePath}
-            markdown={novelMarkdown}
+            chapters={novelChapters}
+            activeFilename={activeNovelFilename}
             loading={novelLoading}
-            source={novelSource}
-            chapterCount={novelChapterCount}
+            onSelectChapter={setActiveNovelFilename}
             exportUrl={activeWorkspaceId ? workspaceNovelPdfUrl(activeWorkspaceId) : undefined}
             wordExportUrl={activeWorkspaceId ? workspaceNovelWordUrl(activeWorkspaceId) : undefined}
           />

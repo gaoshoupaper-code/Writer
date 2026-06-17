@@ -2,8 +2,10 @@ import { KeyboardEvent, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ChatMessage, ThreadSummary } from "../../lib/types";
+import type { StageFlow } from "../../lib/stage";
+import { InterviewOptions } from "./InterviewOptions";
 import { SessionMenu } from "./SessionMenu";
-import { ToolTree } from "./ToolTree";
+import { StageFlowView } from "./StageFlowView";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 
@@ -20,6 +22,7 @@ type ChatPanelProps = {
   deleting: boolean;
   onPromptChange: (prompt: string) => void;
   onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
+  onResumeSubmit: (resume: string) => Promise<void>;
   onStop: () => void;
   onToggleSessionMenu: () => void;
   onCloseSessionMenu: () => void;
@@ -27,6 +30,8 @@ type ChatPanelProps = {
   onSelectThread: (threadId: string) => void;
   onDeleteThread: (threadId: string) => void;
   onOpenStyleModal: () => void;
+  stageFlows?: (StageFlow | null)[];
+  onRetry?: () => void;
 };
 
 export function ChatPanel({
@@ -42,6 +47,7 @@ export function ChatPanel({
   deleting,
   onPromptChange,
   onSubmit,
+  onResumeSubmit,
   onStop,
   onToggleSessionMenu,
   onCloseSessionMenu,
@@ -49,10 +55,19 @@ export function ChatPanel({
   onSelectThread,
   onDeleteThread,
   onOpenStyleModal,
+  stageFlows,
+  onRetry,
 }: ChatPanelProps) {
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const [expanded, setExpanded] = useState(false);
   const [canExpand, setCanExpand] = useState(false);
+
+  // HITL 选项化：最后一条 assistant 处于 awaitingInput 且带 options 时，禁用底部 composer
+  //（提交改走选项区「提交」按钮，避免与「自定义/补充」框职责混淆）
+  const lastMessage = messages[messages.length - 1];
+  const awaitingWithOptions =
+    lastMessage?.role === "assistant" && !!lastMessage?.awaitingInput?.options?.length;
 
   useEffect(() => {
     const input = inputRef.current;
@@ -65,6 +80,13 @@ export function ChatPanel({
     input.style.height = `${Math.min(input.scrollHeight, expanded ? expandedHeight : collapsedHeight)}px`;
     setCanExpand(input.scrollHeight > collapsedHeight + 1);
   }, [expanded, prompt]);
+
+  // 切换会话时把对话区滚到最底部，直接看到最新消息
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list) return;
+    list.scrollTop = list.scrollHeight;
+  }, [activeThreadId]);
 
   function handleInputKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
@@ -117,18 +139,27 @@ export function ChatPanel({
         </div>
       </div>
 
-      <div className="message-list">
+      <div className="message-list" ref={listRef}>
         {messages.map((message, index) => {
           const label = message.role === "assistant" ? "Agent" : "你";
           const isLastAssistant = message.role === "assistant" && index === messages.length - 1 && loading;
+          const flow = stageFlows?.[index];
 
           return (
             <article
               className={`message ${message.role} animate-in fade-in-0 slide-in-from-bottom-2 duration-300`}
+              data-status={message.status}
               key={`${message.role}-${index}`}
             >
               <span className="message-role">{label}</span>
-              {message.role === "assistant" && message.tools?.length ? <ToolTree tools={message.tools} /> : null}
+              {flow ? <StageFlowView flow={flow} defaultExpanded={index === messages.length - 1} /> : null}
+              {/* D5 兜底：无阶段卡片（非 task running）时，主 agent 工具的极简"正在处理…"；ask_user 不显示 */}
+              {message.role === "assistant" &&
+              flow &&
+              flow.stages.length === 0 &&
+              message.tools?.some((t) => t.status === "running" && t.name !== "ask_user") ? (
+                <div className="message-action-fallback">正在处理…</div>
+              ) : null}
               <div className="message-content">
                 {message.role === "assistant" && message.contentFormat === "markdown" ? (
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
@@ -136,6 +167,18 @@ export function ChatPanel({
                   <p>{message.content}</p>
                 )}
               </div>
+              {/* HITL 选项化：awaitingInput 带 options 时渲染选项 UI（选中+自定义内联+提交）*/}
+              {message.role === "assistant" && message.awaitingInput?.options?.length ? (
+                <InterviewOptions
+                  options={message.awaitingInput.options}
+                  multiSelect={!!message.awaitingInput.multi_select}
+                  onSubmit={onResumeSubmit}
+                  disabled={loading}
+                />
+              ) : null}
+              {message.role === "assistant" && (message.status === "failed" || message.status === "stopped") && !message.awaitingInput ? (
+                <button type="button" className="message-retry" onClick={() => onRetry?.()}>↻ 重试</button>
+              ) : null}
               {/* 最后一条 assistant 消息 + loading 态 → 显示 shimmer */}
               {isLastAssistant && !message.content ? (
                 <div className="grid gap-2 mt-2">
@@ -158,6 +201,8 @@ export function ChatPanel({
             rows={1}
             onChange={(event) => onPromptChange(event.target.value)}
             onKeyDown={handleInputKeyDown}
+            disabled={loading || awaitingWithOptions}
+            placeholder={awaitingWithOptions ? "请在上方选项区选择并提交" : undefined}
           />
           {canExpand ? (
             <button
@@ -185,7 +230,7 @@ export function ChatPanel({
           <Button
             className="send-button min-h-[46px] rounded-[14px] px-4 text-sm font-black bg-gradient-to-br from-[var(--coral)] to-[var(--gold)] shadow-lg hover:shadow-xl hover:-translate-y-px transition-all"
             type="submit"
-            disabled={loading}
+            disabled={loading || awaitingWithOptions}
           >
             {loading ? "生成中" : "发送"}
           </Button>

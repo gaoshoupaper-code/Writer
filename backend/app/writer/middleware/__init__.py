@@ -12,6 +12,7 @@
 #   ErrorRecoveryMiddleware         — 工具调用出错时自动重试，耗尽后注入恢复建议
 #   FilesystemPathGuardMiddleware   — 拦截非法文件写入路径，防止越权或路径穿越
 #   GoalMiddleware                  — 注册目标工具和状态 schema，拦截未达标的最终输出
+#   MetaReadOnlyMiddleware          — Meta Agent 专属只读守卫，拦截写文件并引导改用对应子代理
 #   TraceMiddleware                 — 记录模型调用和工具调用的开始/完成/错误事件
 #   TraceCallbackHandler            — LangChain 回调处理器，注册 run 层级的父子关系
 # ==============================================================================
@@ -21,6 +22,7 @@ from app.writer.middleware.artifact_validation_middleware import ArtifactValidat
 from app.writer.middleware.context_assembler_middleware import ContextAssemblerMiddleware
 from app.writer.middleware.error_recovery_middleware import ErrorRecoveryMiddleware
 from app.writer.middleware.goal_middleware import GoalMiddleware
+from app.writer.middleware.meta_readonly_middleware import MetaReadOnlyMiddleware
 from app.writer.middleware.path_guard_middleware import FilesystemPathGuardMiddleware
 from app.writer.middleware.trace_callback import TraceCallbackHandler
 from app.writer.middleware.trace_middleware import TraceMiddleware
@@ -33,6 +35,7 @@ __all__ = [
     "ErrorRecoveryMiddleware",
     "FilesystemPathGuardMiddleware",
     "GoalMiddleware",
+    "MetaReadOnlyMiddleware",
     "TraceCallbackHandler",
     "TraceMiddleware",
 ]

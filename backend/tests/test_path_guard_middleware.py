@@ -48,9 +48,6 @@ class NormalizeWorkspaceWritePathTest(unittest.TestCase):
             self.assertEqual(normalize_workspace_write_path("storyline/主线.md", workspace), "/storyline/主线.md")
             self.assertEqual(normalize_workspace_write_path("/storyline/主线.md", workspace), "/storyline/主线.md")
             self.assertEqual(normalize_workspace_write_path(r"storyline\主线.md", workspace), "/storyline/主线.md")
-            # volume
-            self.assertEqual(normalize_workspace_write_path("volume/第一卷.md", workspace), "/volume/第一卷.md")
-            self.assertEqual(normalize_workspace_write_path("/volume/第一卷.md", workspace), "/volume/第一卷.md")
 
     def test_accepts_workspace_absolute_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

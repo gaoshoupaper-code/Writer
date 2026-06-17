@@ -1,5 +1,6 @@
 import json
 import re
+import time
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -8,7 +9,7 @@ from urllib.parse import quote
 from watchfiles import awatch
 
 from docx import Document
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from reportlab.lib.pagesizes import A4
@@ -38,16 +39,27 @@ from app.schemas.screenplay import (
     WorkspaceCreateRequest,
     WorkspaceDetailOutlineContent,
     WorkspaceNovelChaptersContent,
-    WorkspaceNovelContent,
     WorkspaceOutlineContent,
     WorkspaceStorylineContent,
     WorkspaceStorylineGraphContent,
-    WorkspaceVolumeContent,
     WorkspaceWorldviewContent,
     WorkspaceSummary,
 )
 from app.schemas.checkpoint import CheckpointState
 from app.writer.trace import TraceDetail, TraceRunSummary
+
+
+_active_generations = 0
+
+
+def _log(event: str, **fields) -> None:
+    """诊断日志：结构化 JSON 到 stdout（flush 保证即时输出）。
+
+    为 Phase 1 根因诊断服务——定位 SSE 连接泄漏 / 请求挂起 / 锁竞争。
+    设计文档 §5 约定：轻量、零依赖、JSON 到 stdout。
+    """
+    record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "event": event, **fields}
+    print(json.dumps(record, ensure_ascii=False), flush=True)
 
 
 def _markdown_to_plain_text(markdown: str) -> str:
@@ -158,19 +170,33 @@ def _build_novel_pdf(markdown: str, title: str) -> bytes:
 
 async def _event_generator(payload: ScreenplayGenerateRequest, thread: ThreadSummary):
     """Async generator that yields SSE events from the agent execution."""
+    global _active_generations
+    _active_generations += 1
+    _log("sse_open", channel="generate", thread_id=payload.thread_id, active=_active_generations)
+    start = time.perf_counter()
     final_data = None
-    async for chunk in agent_service.generate_stream(payload, thread):
-        yield chunk
-        if chunk.startswith("event: final"):
-            for line in chunk.split("\n"):
-                if line.startswith("data: "):
-                    final_data = line[6:]
-                    break
-    if final_data:
-        import json
+    try:
+        async for chunk in agent_service.generate_stream(payload, thread):
+            yield chunk
+            if chunk.startswith("event: final"):
+                for line in chunk.split("\n"):
+                    if line.startswith("data: "):
+                        final_data = line[6:]
+                        break
+        if final_data:
+            import json
 
-        response = ScreenplayGenerateResponse.model_validate(json.loads(final_data))
-        thread_store.write_outline(thread, response)
+            response = ScreenplayGenerateResponse.model_validate(json.loads(final_data))
+            thread_store.write_outline(thread, response)
+        _log("sse_close", channel="generate", thread_id=payload.thread_id,
+             ms=int((time.perf_counter() - start) * 1000))
+    except BaseException as exc:
+        _log("sse_error", channel="generate", thread_id=payload.thread_id,
+             error=type(exc).__name__, ms=int((time.perf_counter() - start) * 1000))
+        raise
+    finally:
+        _active_generations -= 1
+        _log("sse_exit", channel="generate", thread_id=payload.thread_id, active=_active_generations)
 
 
 settings = get_settings()
@@ -218,6 +244,25 @@ app.add_middleware(
 app.include_router(style_router)
 
 
+@app.middleware("http")
+async def _log_http(request: Request, call_next):
+    """记录每个 HTTP 请求的耗时与状态码。
+
+    注意：对 SSE（StreamingResponse），Starlette 中间件的 ms ≈ 首字节时间，
+    非连接全程时长——后者由 _event_generator / _workspace_watch_generator
+    内部的 sse_close/sse_error 埋点覆盖。中间件主职是普通短请求（fetchInit 等）的耗时。
+    """
+    start = time.perf_counter()
+    status_code = 0
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        _log("http", method=request.method, path=request.url.path,
+             status=status_code, ms=int((time.perf_counter() - start) * 1000))
+
+
 @app.get("/health")
 def healthcheck() -> dict[str, str]:
     return {"status": "ok", "mode": settings.writer_agent_mode}
@@ -243,7 +288,6 @@ def bootstrap_workspace(workspace_id: str) -> WorkspaceBootstrapResponse:
         threads=data["threads"],
         outline=data["outline"],
         storyline=data["storyline"],
-        volume=data["volume"],
         detail_outline=data["detail_outline"],
         characters=data["characters"],
         novel=data["novel"],
@@ -298,14 +342,6 @@ def get_workspace_worldview(workspace_id: str) -> WorkspaceWorldviewContent:
     return content
 
 
-@app.get("/api/workspaces/{workspace_id}/volume", response_model=WorkspaceVolumeContent)
-def get_workspace_volume(workspace_id: str) -> WorkspaceVolumeContent:
-    content = thread_store.read_workspace_volume(workspace_id)
-    if content is None:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-    return content
-
-
 @app.get("/api/workspaces/{workspace_id}/storyline-graph", response_model=WorkspaceStorylineGraphContent)
 def get_workspace_storyline_graph(workspace_id: str) -> WorkspaceStorylineGraphContent:
     """故事线流程图（竖向泳道时间轴）。读取时按需生成兜底——图缺失/过期自动重生成。"""
@@ -323,9 +359,9 @@ def get_workspace_characters(workspace_id: str) -> WorkspaceCharacterContent:
     return content
 
 
-@app.get("/api/workspaces/{workspace_id}/novel", response_model=WorkspaceNovelContent)
-def get_workspace_novel(workspace_id: str) -> WorkspaceNovelContent:
-    content = thread_store.read_workspace_novel(workspace_id)
+@app.get("/api/workspaces/{workspace_id}/novel", response_model=WorkspaceNovelChaptersContent)
+def get_workspace_novel(workspace_id: str) -> WorkspaceNovelChaptersContent:
+    content = thread_store.read_workspace_novel_chapters(workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
@@ -353,8 +389,6 @@ def _classify_changes(changes, workspace_path: Path) -> set[str]:
             categories.add("storyline")
         elif top == "worldview.md":
             categories.add("worldview")
-        elif len(parts) > 1 and parts[0] == "volume":
-            categories.add("volume")
         elif len(parts) > 1 and parts[0] == "detail":
             categories.add("detail_outline")
         elif len(parts) > 1 and parts[0] == "character":
@@ -367,45 +401,50 @@ def _classify_changes(changes, workspace_path: Path) -> set[str]:
 
 
 async def _workspace_watch_generator(workspace_id: str, workspace_path: Path):
-    async for changes in awatch(
-        workspace_path,
-        watch_filter=lambda _change, path: Path(path).suffix == ".md",
-        debounce=400,
-        step=50,
-        recursive=True,
-        ignore_permission_denied=True,
-    ):
-        categories = _classify_changes(changes, workspace_path)
-        if not categories:
-            continue
-        if "outline" in categories:
-            content = thread_store.read_workspace_outline(workspace_id)
-            if content is not None:
-                yield _sse_event("outline", content.model_dump())
-        if "storyline" in categories:
-            content = thread_store.read_workspace_storyline(workspace_id)
-            if content is not None:
-                yield _sse_event("storyline", content.model_dump())
-        if "worldview" in categories:
-            content = thread_store.read_workspace_worldview(workspace_id)
-            if content is not None:
-                yield _sse_event("worldview", content.model_dump())
-        if "volume" in categories:
-            content = thread_store.read_workspace_volume(workspace_id)
-            if content is not None:
-                yield _sse_event("volume", content.model_dump())
-        if "detail_outline" in categories:
-            content = thread_store.read_workspace_detail_outline(workspace_id)
-            if content is not None:
-                yield _sse_event("detail_outline", content.model_dump())
-        if "characters" in categories:
-            content = thread_store.read_workspace_characters(workspace_id)
-            if content is not None:
-                yield _sse_event("characters", content.model_dump())
-        if "novel" in categories:
-            content = thread_store.read_workspace_novel(workspace_id)
-            if content is not None:
-                yield _sse_event("novel", content.model_dump())
+    _log("sse_open", channel="watch", workspace_id=workspace_id)
+    start = time.perf_counter()
+    try:
+        async for changes in awatch(
+            workspace_path,
+            watch_filter=lambda _change, path: Path(path).suffix == ".md",
+            debounce=400,
+            step=50,
+            recursive=True,
+            ignore_permission_denied=True,
+        ):
+            categories = _classify_changes(changes, workspace_path)
+            if not categories:
+                continue
+            if "outline" in categories:
+                content = thread_store.read_workspace_outline(workspace_id)
+                if content is not None:
+                    yield _sse_event("outline", content.model_dump())
+            if "storyline" in categories:
+                content = thread_store.read_workspace_storyline(workspace_id)
+                if content is not None:
+                    yield _sse_event("storyline", content.model_dump())
+            if "worldview" in categories:
+                content = thread_store.read_workspace_worldview(workspace_id)
+                if content is not None:
+                    yield _sse_event("worldview", content.model_dump())
+            if "detail_outline" in categories:
+                content = thread_store.read_workspace_detail_outline(workspace_id)
+                if content is not None:
+                    yield _sse_event("detail_outline", content.model_dump())
+            if "characters" in categories:
+                content = thread_store.read_workspace_characters(workspace_id)
+                if content is not None:
+                    yield _sse_event("characters", content.model_dump())
+            if "novel" in categories:
+                content = thread_store.read_workspace_novel_chapters(workspace_id)
+                if content is not None:
+                    yield _sse_event("novel", content.model_dump())
+        _log("sse_close", channel="watch", workspace_id=workspace_id,
+             ms=int((time.perf_counter() - start) * 1000))
+    except BaseException as exc:
+        _log("sse_error", channel="watch", workspace_id=workspace_id,
+             error=type(exc).__name__, ms=int((time.perf_counter() - start) * 1000))
+        raise
 
 
 @app.get("/api/workspaces/{workspace_id}/watch")

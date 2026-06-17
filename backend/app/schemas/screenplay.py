@@ -102,18 +102,6 @@ class WorkspaceWorldviewContent(BaseModel):
     markdown: str
 
 
-class VolumeChapter(BaseModel):
-    filename: str
-    title: str
-    markdown: str
-
-
-class WorkspaceVolumeContent(BaseModel):
-    workspace_id: str
-    chapters: list[VolumeChapter]
-    file_count: int = 0
-
-
 class DetailOutlineChapter(BaseModel):
     filename: str
     title: str
@@ -168,6 +156,8 @@ class ScreenplayGenerateRequest(BaseModel):
     tone: str | None = None
     audience: str | None = None
     thread_id: str
+    # resume 回传：复用活跃 trace，把一次提问的多次 HITL 缝合成同一条 trace（点3）
+    trace_id: str | None = None
 
     def primary_text(self) -> str:
         return self.prompt or self.content or self.text or self.premise or ""
@@ -207,8 +197,7 @@ class WorkspaceBootstrapResponse(BaseModel):
     threads: list[ThreadSummary]
     outline: WorkspaceOutlineContent | None = None
     storyline: WorkspaceStorylineContent | None = None
-    volume: WorkspaceVolumeContent | None = None
     detail_outline: WorkspaceDetailOutlineContent | None = None
     characters: WorkspaceCharacterContent | None = None
-    novel: WorkspaceNovelContent | None = None
+    novel: WorkspaceNovelChaptersContent | None = None
     worldview: WorkspaceWorldviewContent | None = None

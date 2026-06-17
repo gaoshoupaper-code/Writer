@@ -89,7 +89,7 @@ def build_detail_outline_deep_subagent(
     evaluation_spec = build_detail_outline_evaluator(
         workspace_root,
         middleware_factory("detail-outline-evaluation-subagent"),
-        context_file_paths=["outline.md", "character/*.md", "storyline.md", "storyline/*.md", "volume/*.md", "detail/*.md"],
+        context_file_paths=["outline.md", "character/*.md", "storyline.md", "storyline/*.md", "detail/*.md"],
     )
 
     # ---- 构建 evolution SubAgent dict ----
@@ -111,11 +111,11 @@ def build_detail_outline_deep_subagent(
     return build_deep_subagent(
         name="detail-outline",
         description=(
-            "适用：卷纲通过 evaluation 后，需要将卷纲拆解为逐章细纲时调用。"
-            "每次调用批量生成 3 章细纲文件（chapter-XX.md ~ chapter-XX+2.md），"
-            "内置 evolution 评估：3 章生成后统一评估质量，如果评估建议修订会自动修订（单次评估修订，仅 1 次）。"
-            "主代理控制批次推进节奏：每次指定起始章节编号。"
-            "委托时请说明本次要生成的起始章节编号和创作目标。"
+            "适用：storybuilding 产出 timeline.md 后，需要把事件编排进章节时调用。"
+            "每次处理 timeline 的下一批 5-8 个事件，自主决定分几章、每章几事件，"
+            "写入 detail/chapter-XX.md 并增量更新 detail/overview.md。"
+            "内置 evolution 评估：批次生成后统一评估质量，如建议修订则自动修订（单次，仅 1 次）。"
+            "委托时请说明创作目标（可选）。"
         ),
         model=model,
         system_prompt=system_prompt,
