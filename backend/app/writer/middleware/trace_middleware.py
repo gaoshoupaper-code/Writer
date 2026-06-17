@@ -35,6 +35,7 @@ from typing import Any
 
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
 from langgraph.config import get_config
+from langgraph.errors import GraphInterrupt
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel
 
@@ -74,8 +75,10 @@ class TraceMiddleware(AgentMiddleware):
         try:
             response = handler(request)
         except BaseException as exc:
-            # 发生异常时记录错误事件，然后向上抛出，不吞掉
-            self._record_model_error(request, started, exc)
+            # GraphInterrupt 是 HITL（ask_user）的正常控制流，不是错误——
+            # 直接放行，不记录 llm_error，避免监测面板误报。
+            if not isinstance(exc, GraphInterrupt):
+                self._record_model_error(request, started, exc)
             raise
         self._record_model_end(request, response, started)
         return response
@@ -91,7 +94,8 @@ class TraceMiddleware(AgentMiddleware):
         try:
             response = await handler(request)
         except BaseException as exc:
-            self._record_model_error(request, started, exc)
+            if not isinstance(exc, GraphInterrupt):
+                self._record_model_error(request, started, exc)
             raise
         self._record_model_end(request, response, started)
         return response
@@ -107,7 +111,10 @@ class TraceMiddleware(AgentMiddleware):
         try:
             response = handler(request)
         except BaseException as exc:
-            self._record_tool_error(request, started, exc)
+            # GraphInterrupt 是 HITL（ask_user）的正常控制流，不是工具错误——
+            # 直接放行，不记录 tool_error，避免监测面板误报。
+            if not isinstance(exc, GraphInterrupt):
+                self._record_tool_error(request, started, exc)
             raise
         self._record_tool_end(request, response, started)
         return response
@@ -119,7 +126,8 @@ class TraceMiddleware(AgentMiddleware):
         try:
             response = await handler(request)
         except BaseException as exc:
-            self._record_tool_error(request, started, exc)
+            if not isinstance(exc, GraphInterrupt):
+                self._record_tool_error(request, started, exc)
             raise
         self._record_tool_end(request, response, started)
         return response
