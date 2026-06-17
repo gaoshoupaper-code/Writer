@@ -1,7 +1,9 @@
+import asyncio
 import json
 import re
 import time
 import zipfile
+from contextlib import suppress
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
@@ -400,9 +402,33 @@ def _classify_changes(changes, workspace_path: Path) -> set[str]:
     return categories
 
 
-async def _workspace_watch_generator(workspace_id: str, workspace_path: Path):
+async def _workspace_watch_generator(workspace_id: str, workspace_path: Path, request: Request):
+    """监听 workspace 下 .md 文件变化并通过 SSE 推送面板更新。
+
+    连接生命周期（修复 CLOSE_WAIT 泄漏的关键）：
+      客户端断开时，Starlette 会向本 generator 注入 CancelledError，但 awatch 的
+      `async for` 是长阻塞 await——底层 watcher 线程要等 rust_timeout（Windows≈1s）
+      才唤醒，且完全依赖 CancelledError 能被正确注入到 anyio.to_thread.run_sync，
+      不可靠。泄漏的 watcher 协程长期占据事件循环，socket 永驻 CLOSE_WAIT，最终
+      拖垮后端（/health 超时、所有面板请求挂起）。
+
+      改用 watchfiles 官方推荐的 stop_event 退出路径：后台 task 轮询
+      request.is_disconnected()，一旦客户端断开立即 stop_event.set()，awatch 走
+      'stop' 分支 return，RustNotify context manager 干净释放句柄。finally 再兜底
+      set + cancel，覆盖 CancelledError/GeneratorExit/正常 return 全部路径。
+    """
     _log("sse_open", channel="watch", workspace_id=workspace_id)
     start = time.perf_counter()
+    stop_event = asyncio.Event()
+
+    async def _watch_disconnect():
+        while not stop_event.is_set():
+            if await request.is_disconnected():
+                stop_event.set()
+                return
+            await asyncio.sleep(0.5)
+
+    disconnect_task = asyncio.create_task(_watch_disconnect())
     try:
         async for changes in awatch(
             workspace_path,
@@ -411,7 +437,9 @@ async def _workspace_watch_generator(workspace_id: str, workspace_path: Path):
             step=50,
             recursive=True,
             ignore_permission_denied=True,
+            stop_event=stop_event,
         ):
+            # awatch 走 'stop' 路径时循环正常结束；否则处理变更
             categories = _classify_changes(changes, workspace_path)
             if not categories:
                 continue
@@ -445,10 +473,17 @@ async def _workspace_watch_generator(workspace_id: str, workspace_path: Path):
         _log("sse_error", channel="watch", workspace_id=workspace_id,
              error=type(exc).__name__, ms=int((time.perf_counter() - start) * 1000))
         raise
+    finally:
+        # 兜底：无论 awatch 因何结束，都确保 stop_event 被 set，watcher 线程立即唤醒退出
+        stop_event.set()
+        disconnect_task.cancel()
+        # 等待 disconnect_task 真正结束，避免它脱离 generator 生命周期后仍持有 request 引用
+        with suppress(BaseException):
+            await disconnect_task
 
 
 @app.get("/api/workspaces/{workspace_id}/watch")
-async def watch_workspace(workspace_id: str):
+async def watch_workspace(workspace_id: str, request: Request):
     workspace = thread_store.get_workspace(workspace_id)
     if workspace is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
@@ -456,7 +491,7 @@ async def watch_workspace(workspace_id: str):
     if not workspace_path.exists():
         raise HTTPException(status_code=404, detail="Workspace directory missing")
     return StreamingResponse(
-        _workspace_watch_generator(workspace_id, workspace_path),
+        _workspace_watch_generator(workspace_id, workspace_path, request),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

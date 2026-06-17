@@ -604,16 +604,28 @@ export default function Home() {
     return projectStageFlow(traceDetail, owner?.tools ?? []);
   }, [traceDetail, messages]);
 
-  // 每条 message 对应的 stageFlow：当前 trace 命中用实时 stageFlow，历史 trace 用 historyDetails 派生
+  // 每条 message 对应的 stageFlow：
+  // - 当前 trace 命中 → 用实时 stageFlow，但仅当本条是该 trace 的「活跃最后 assistant」时才实时；
+  //   否则（被后续 resume 取代的历史 HITL 消息，或纯历史回放）按 frozen 派生——
+  //   后端 interrupt run 永远 running，历史消息视角必须冻结，否则 StageFlowView 残留「进行中」（Bug B）。
+  // - 历史 trace → 用 historyDetails 派生（非 live，一律 frozen）。
   const stageFlows = useMemo<(StageFlow | null)[]>(
     () =>
       messages.map((m) => {
         if (!m.traceId) return null;
-        if (m.traceId === traceDetail?.run.trace_id) return stageFlow;
+        if (m.traceId === traceDetail?.run.trace_id) {
+          const liveOwner = messages.findLast(
+            (msg) => msg.role === "assistant" && msg.traceId === m.traceId,
+          );
+          const isActive = liveOwner === m && liveTraceId === m.traceId;
+          // 活跃最后 assistant：复用实时 stageFlow（避免重复派生）；否则按本条 tools frozen 派生。
+          if (isActive) return stageFlow;
+          return projectStageFlow(traceDetail, m.tools ?? [], true);
+        }
         const histDetail = historyDetails.get(m.traceId);
-        return histDetail ? projectStageFlow(histDetail, m.tools ?? []) : null;
+        return histDetail ? projectStageFlow(histDetail, m.tools ?? [], true) : null;
       }),
-    [messages, traceDetail, stageFlow, historyDetails],
+    [messages, traceDetail, stageFlow, historyDetails, liveTraceId],
   );
 
   const prevThreadIdRef = useRef(activeThreadId);
@@ -1140,6 +1152,9 @@ export default function Home() {
 
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
+    // reader 提到 try 外声明：abort/异常路径下才能在 finally 统一 cancel 释放底层连接，
+    // 避免 Stop/超时后 fetch 连接残留（后端 generator 收不到断开信号而泄漏）。
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 
     try {
       let userMessageThreadId = activeThreadId;
@@ -1182,8 +1197,11 @@ export default function Home() {
         throw new Error(`API returned ${response.status}`);
       }
 
-      const reader = response.body?.getReader();
+      reader = response.body?.getReader() ?? null;
       if (!reader) throw new Error("Response body is not readable");
+      // const 别名锁定非空引用：let reader 经 await/循环后 TS narrowing 丢失，
+      // 循环内用 activeReader（const）保证 read()/cancel() 不报 "possibly null"。
+      const activeReader = reader;
 
       const decoder = new TextDecoder();
       let buffer = "";
@@ -1203,14 +1221,14 @@ export default function Home() {
         let value: Uint8Array | undefined;
         try {
           const chunk = (await Promise.race([
-            reader.read(),
+            activeReader.read(),
             heartbeatTimeout,
           ])) as ReadableStreamReadResult<Uint8Array>;
           done = chunk.done;
           value = chunk.value;
         } catch {
           // 超时触发：read() 仍在 pending，主动取消以释放底层连接，再上抛由 catch 兜底。
-          reader.cancel().catch(() => {});
+          activeReader.cancel().catch(() => {});
           throw new Error("HEARTBEAT_TIMEOUT");
         } finally {
           if (heartbeatTimer) clearTimeout(heartbeatTimer);
@@ -1410,6 +1428,9 @@ export default function Home() {
       if (abortControllerRef.current === abortController) {
         abortControllerRef.current = null;
       }
+      // 统一释放底层连接：Stop/超时/异常/正常结束都会走到这里，
+      // 确保后端 generator 收到断开信号（与心跳超时分支的 reader.cancel() 一致）。
+      reader?.cancel().catch(() => {});
       setLoading(false);
     }
   }

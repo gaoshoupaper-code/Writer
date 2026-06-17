@@ -50,6 +50,8 @@ const STAGE_ORDER: StageType[] = ["storybuilding", "detail-outline", "writing", 
 
 // 空态：无 trace 或无节点
 const EMPTY_FLOW: StageFlow = { stages: [], currentStageId: null, totalDurationMs: null, status: "completed" };
+// Bug B：frozen 视角的空态——显式 completed，避免历史消息回退到 running。
+const EMPTY_FROZEN_FLOW: StageFlow = { stages: [], currentStageId: null, totalDurationMs: null, status: "completed" };
 
 /**
  * 从 traceDetail + message.tools 派生阶段流（D1/D2 纯派生）。
@@ -60,9 +62,15 @@ const EMPTY_FLOW: StageFlow = { stages: [], currentStageId: null, totalDurationM
  * - message.tools（SSE tool_call 扩展字段）→ 实时 subagentType / 章节号 / 字数（D6/D7）
  *
  * 历史回放（tools 空）：按 task 区间时序匹配 agent 节点推断 type，缺失降级为 "general"。
+ *
+ * frozen（Bug B 修复）：当此 message 已不是该 trace 的活跃（最后一条）assistant——典型场景是
+ * HITL resume 后，旧 interrupt 消息被新 assistant 取代，或切换到非 live 的历史 trace——
+ * 该视角已不活跃，派生出的 StageFlow 不应再显示「进行中」。后端 interrupt run 永远停留在
+ * running（resume 复用其 queue 的前提，不可强行 complete），故需在派生层把残留的 running
+ * 冻结为 completed，让历史消息阶段卡片显示「N/N 阶段完成」、focusText/脉动消失。
  */
-export function projectStageFlow(detail: TraceDetail | null, tools: ToolStatus[]): StageFlow {
-  if (!detail || detail.nodes.length === 0) return EMPTY_FLOW;
+export function projectStageFlow(detail: TraceDetail | null, tools: ToolStatus[], frozen = false): StageFlow {
+  if (!detail || detail.nodes.length === 0) return frozen ? EMPTY_FROZEN_FLOW : EMPTY_FLOW;
 
   const nodes = detail.nodes;
 
@@ -141,7 +149,37 @@ export function projectStageFlow(detail: TraceDetail | null, tools: ToolStatus[]
   const totalDurationMs = sumDuration(stages.map((s) => s.durationMs));
   const status = deriveFlowStatus(detail, stages);
 
+  // Bug B：frozen 视角下，该消息已不活跃——把残留的 running 一律冻结为 completed，
+  // 让历史消息阶段卡片显示「N/N 阶段完成」，focusText / 脉动 / 「正在处理…」兜底全部消失。
+  if (frozen) {
+    return freezeFlow(stages, currentStageId, totalDurationMs, status);
+  }
+
   return { stages, currentStageId, totalDurationMs, status };
+}
+
+/**
+ * 冻结 StageFlow：把 flow/stage/subStep 残留的 running 全部降级为 completed。
+ * 仅用于历史消息（非活跃 assistant）的派生——后端 interrupt run 永远 running，
+ * 但从这些消息的视角看，执行已经「翻篇」，不该再显示进行中。
+ */
+function freezeFlow(stages: Stage[], currentStageId: string | null, totalDurationMs: number | null, _status: StageFlow["status"]): StageFlow {
+  const frozenStages = stages.map((stage) => {
+    if (stage.status !== "running") return stage;
+    return {
+      ...stage,
+      status: "completed" as const,
+      subSteps: stage.subSteps.map((step) =>
+        step.status === "running" ? { ...step, status: "completed" as const } : step,
+      ),
+    };
+  });
+  return {
+    stages: frozenStages,
+    currentStageId: frozenStages[frozenStages.length - 1]?.id ?? currentStageId,
+    totalDurationMs,
+    status: "completed",
+  };
 }
 
 function buildStage(
