@@ -44,6 +44,7 @@ import {
 } from "../lib/api";
 import { appendLiveTraceEvent } from "../lib/trace";
 import { projectStageFlow } from "../lib/stage";
+import { usePanelPolling } from "../lib/usePanelPolling";
 import type { StageFlow } from "../lib/stage";
 import type {
   AskUserOption,
@@ -60,13 +61,7 @@ import type {
   TraceLogEvent,
   TraceRunSummary,
   StorylineEntry,
-  WorkspaceCharacterContent,
-  WorkspaceDetailOutlineContent,
-  WorkspaceNovelContent,
-  WorkspaceOutlineContent,
   WorkspacePanel,
-  WorkspaceStorylineContent,
-  WorkspaceWorldviewContent,
   WorkspaceSummary,
 } from "../lib/types";
 
@@ -367,6 +362,9 @@ export default function Home() {
   const [historyDetails, setHistoryDetails] = useState<Map<string, TraceDetail>>(new Map());
   const [traceLoading, setTraceLoading] = useState(false);
   const [loading, setLoading] = useState(false);
+  // 工作区 bootstrap（初次加载/切换）进行中标志：轮询 Hook 期间会跳过写 state，
+  // 让 bootstrap 作为权威源，避免切换工作区时的内容状态闪烁。
+  const [bootstrapping, setBootstrapping] = useState(false);
   const [creatingWorkspace, setCreatingWorkspace] = useState(false);
   const [creatingThread, setCreatingThread] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -410,6 +408,7 @@ export default function Home() {
 
     async function bootstrap() {
       try {
+        setBootstrapping(true);
         // 请求 1：workspaces + styles
         const { workspaces: ws, styles: st } = await fetchInit();
         if (ignore) return;
@@ -464,6 +463,7 @@ export default function Home() {
           setCharactersLoading(false);
           setNovelLoading(false);
           setWorldviewLoading(false);
+          setBootstrapping(false);
         }
       }
     }
@@ -500,6 +500,7 @@ export default function Home() {
     let ignore = false;
 
     async function loadWorkspace() {
+      setBootstrapping(true);
       setOutlineLoading(true);
       setDetailOutlineLoading(true);
       setCharactersLoading(true);
@@ -572,6 +573,7 @@ export default function Home() {
           setCharactersLoading(false);
           setNovelLoading(false);
           setWorldviewLoading(false);
+          setBootstrapping(false);
         }
       }
     }
@@ -751,77 +753,32 @@ export default function Home() {
   const workspacePath = activeWorkspace?.workspace_path ?? activeThread?.workspace_path;
   const currentOutlineMarkdown = result?.thread_id === activeThreadId && result.markdown?.trim() ? result.markdown : outlineMarkdown;
 
-  // Workspace file watcher: real-time panel updates via SSE
-  useEffect(() => {
-    if (!activeWorkspaceId) return;
-
-    const es = new EventSource(`${API_BASE_URL}/api/workspaces/${activeWorkspaceId}/watch`);
-
-    es.addEventListener("outline", (e) => {
-      try {
-        const d = JSON.parse(e.data) as WorkspaceOutlineContent;
-        setOutlineMarkdown(d.markdown);
-        setOutlineLoading(false);
-      } catch {}
-    });
-
-    es.addEventListener("storyline", (e) => {
-      try {
-        const d = JSON.parse(e.data) as WorkspaceStorylineContent;
-        setStorylineMarkdown(d.index_markdown);
-        setStorylineEntries(d.entries);
-        setActiveStorylineFilename((cur) =>
-          d.entries.some((entry) => entry.filename === cur) ? cur : d.entries[0]?.filename || "",
-        );
-        setOutlineLoading(false);
-      } catch {}
-    });
-
-    es.addEventListener("worldview", (e) => {
-      try {
-        const d = JSON.parse(e.data) as WorkspaceWorldviewContent;
-        setWorldviewMarkdown(d.markdown);
-        setWorldviewLoading(false);
-      } catch {}
-    });
-
-    es.addEventListener("detail_outline", (e) => {
-      try {
-        const d = JSON.parse(e.data) as WorkspaceDetailOutlineContent;
-        setDetailOutlineChapters(d.chapters);
-        setActiveDetailChapterFilename((cur) =>
-          d.chapters.some((c) => c.filename === cur) ? cur : d.chapters[0]?.filename || "",
-        );
-        setDetailOutlineLoading(false);
-      } catch {}
-    });
-
-    es.addEventListener("characters", (e) => {
-      try {
-        const d = JSON.parse(e.data) as WorkspaceCharacterContent;
-        setCharacters(d.characters);
-        setActiveCharacterFilename((cur) =>
-          d.characters.some((c) => c.filename === cur) ? cur : d.characters[0]?.filename || "",
-        );
-        setCharactersLoading(false);
-      } catch {}
-    });
-
-    es.addEventListener("novel", (e) => {
-      try {
-        const d = JSON.parse(e.data) as WorkspaceNovelContent;
-        setNovelChapters(d.chapters);
-        setActiveNovelFilename((cur) =>
-          d.chapters.some((c) => c.filename === cur) ? cur : d.chapters[0]?.filename || "",
-        );
-        setNovelLoading(false);
-      } catch {}
-    });
-
-    return () => {
-      es.close();
-    };
-  }, [activeWorkspaceId]);
+  // 内容面板实时刷新：生成中每 2s 轮询当前面板的 REST 接口（替代原 SSE/EventSource，
+  // 因 GET EventSource 在 Next.js dev rewrites 下不可靠，而 REST 走同代理已验证可用）。
+  usePanelPolling({
+    activeWorkspaceId,
+    activePanel,
+    loading,
+    bootstrapping,
+    setters: {
+      setNovelChapters,
+      setActiveNovelFilename,
+      setNovelLoading,
+      setStorylineMarkdown,
+      setStorylineEntries,
+      setActiveStorylineFilename,
+      setDetailOutlineChapters,
+      setActiveDetailChapterFilename,
+      setDetailOutlineLoading,
+      setCharacters,
+      setActiveCharacterFilename,
+      setCharactersLoading,
+      setWorldviewMarkdown,
+      setWorldviewLoading,
+      setOutlineMarkdown,
+      setOutlineLoading,
+    },
+  });
 
   async function handleCreateWorkspace() {
     const outlineName = newWorkspaceName.trim();
