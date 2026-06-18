@@ -75,6 +75,7 @@ before implementation rather than after mistakes.
 ## 云服务器
 111.228.4.165
 ssh    TCP    22
+git pull + 重启
 
 ## Coding & Interaction Style
 

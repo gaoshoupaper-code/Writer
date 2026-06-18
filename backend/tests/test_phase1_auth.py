@@ -117,11 +117,12 @@ class TestUserRepository:
         u = repo.create(username="eve", password="pw123456")
         assert not repo.has_api_key(u["user_id"])
 
-        repo.set_api_key(u["user_id"], "sk-abc", "https://api.example.com")
+        repo.set_api_key(u["user_id"], "sk-abc", "https://api.example.com", "gpt-4o")
         assert repo.has_api_key(u["user_id"])
-        key, url = repo.get_api_key_plain(u["user_id"])
+        key, url, model = repo.get_api_key_plain(u["user_id"])
         assert key == "sk-abc"
         assert url == "https://api.example.com"
+        assert model == "gpt-4o"
 
         repo.clear_api_key(u["user_id"])
         assert not repo.has_api_key(u["user_id"])

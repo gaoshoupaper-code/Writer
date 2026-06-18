@@ -96,10 +96,12 @@ class CharacterService:
         try:
             from app.db import get_database, UserRepository
             users = UserRepository(get_database())
-            key, base_url = users.get_api_key_plain(owner_id)
+            key, base_url, model = users.get_api_key_plain(owner_id)
             if key is None:
                 return build_writer_model(self.settings)
-            return build_writer_model(self.settings, api_key=key, base_url=base_url)
+            return build_writer_model(
+                self.settings, api_key=key, base_url=base_url, model_name_override=model,
+            )
         except Exception:
             return build_writer_model(self.settings)
 

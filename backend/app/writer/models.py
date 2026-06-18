@@ -23,14 +23,16 @@ def build_writer_model(
     *,
     api_key: str | None = None,
     base_url: str | None = None,
+    model_name_override: str | None = None,
 ) -> ChatOpenAI:
     """构建写作模型。
 
-    多用户隔离（D9）：普通用户调用时传入其解密后的 api_key + base_url，
-    覆盖 settings 里的全局 key（全局 key 现仅作管理员兜底）。
-    两个参数都为 None 时回退到 settings（保留旧行为）。
+    多用户隔离（D9）：普通用户调用时传入其解密后的 api_key + base_url + model，
+    覆盖 settings 里的全局值（全局值现仅作管理员兜底）。
+    所有参数为 None 时回退到 settings（保留旧行为）。
     """
-    provider, model_name = parse_writer_model(settings.writer_model)
+    effective_model = model_name_override if model_name_override else settings.writer_model
+    provider, model_name = parse_writer_model(effective_model)
     provider_options = {}
 
     if settings.writer_temperature is not None:
