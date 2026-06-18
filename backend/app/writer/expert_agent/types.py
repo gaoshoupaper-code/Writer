@@ -1,41 +1,18 @@
-"""expert_agent 共享类型与工具函数。"""
+"""expert_agent 共享类型与工具函数。
+
+SubAgentSpec / MiddlewareFactory 已迁入 platform.agent.runtime.types（PR-08，
+框架级类型）。本文件 re-export 供 writer 内部过渡期引用，PR-11 writer 降级时清理。
+apply_style_suffix 是写作专属工具，留在此处。
+"""
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import NotRequired, TypedDict
-
-from deepagents.middleware.filesystem import FilesystemPermission
-from langchain.agents.middleware.types import AgentMiddleware
+# 框架级类型：从 runtime re-export（transitional，PR-11 清理）
+from app.platform.agent.runtime import MiddlewareFactory, SubAgentSpec
 
 
 # ======================================================================
-# 共享类型
-# ======================================================================
-
-# 中间件工厂函数类型：根据代理名称生成中间件列表
-MiddlewareFactory = Callable[[str], list[AgentMiddleware]]
-
-
-class SubAgentSpec(TypedDict):
-    """可运行的子代理规格。
-
-    Fields:
-        name:            代理名称
-        system_prompt:   系统提示词
-        permissions:     文件系统权限列表
-        middleware:      额外中间件列表
-        response_format: 结构化输出格式（可选）
-    """
-    name: str
-    system_prompt: str
-    permissions: NotRequired[list[FilesystemPermission]]
-    middleware: NotRequired[list[AgentMiddleware]]
-    response_format: NotRequired[object]
-
-
-# ======================================================================
-# 共享工具函数
+# 写作专属工具函数
 # ======================================================================
 
 
@@ -49,3 +26,10 @@ def apply_style_suffix(system_prompt: str, style_suffix: str | None) -> str:
     if not style_suffix:
         return system_prompt
     return f"{system_prompt}\n\n{style_suffix}"
+
+
+__all__ = [
+    "MiddlewareFactory",
+    "SubAgentSpec",
+    "apply_style_suffix",
+]

@@ -9,9 +9,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from deepagents import CompiledSubAgent, create_deep_agent
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
+
+from app.platform.agent.runtime import CompiledSubAgent, create_deep_agent
 
 from app.platform.agent.middleware import ErrorRecoveryMiddleware, FilesystemPathGuardMiddleware
 from app.platform.tools import build_ask_user_tool

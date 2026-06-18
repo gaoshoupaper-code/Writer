@@ -6,8 +6,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from deepagents.middleware.filesystem import FilesystemPermission
 from langchain.agents.middleware.types import AgentMiddleware
+
+from app.platform.agent.runtime import FilesystemPermission
 
 from app.platform.agent.middleware import ContextAssemblerMiddleware
 from app.writer.expert_agent.types import SubAgentSpec

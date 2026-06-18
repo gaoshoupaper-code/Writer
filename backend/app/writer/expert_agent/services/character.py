@@ -14,9 +14,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from deepagents import create_deep_agent
-from deepagents.backends import FilesystemBackend
 from langchain.agents.middleware.types import AgentMiddleware
+
+from app.platform.agent.runtime import FilesystemBackend, create_deep_agent
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from app.platform.agent.middleware import FilesystemPathGuardMiddleware, TraceCallbackHandler, TraceMiddleware

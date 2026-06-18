@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from deepagents import CompiledSubAgent, SubAgent
-from deepagents.backends.protocol import BackendProtocol
-from deepagents.middleware.filesystem import FilesystemPermission
 from langchain.agents.middleware.types import AgentMiddleware
+
+from app.platform.agent.runtime import (
+    BackendProtocol,
+    CompiledSubAgent,
+    FilesystemPermission,
+    SubAgent,
+)
 from langchain_core.language_models import BaseChatModel
 
 from app.platform.agent.middleware import ContextAssemblerMiddleware

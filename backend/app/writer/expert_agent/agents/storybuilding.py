@@ -17,9 +17,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from deepagents import CompiledSubAgent, SubAgent
-from deepagents.middleware.filesystem import FilesystemPermission
 from langchain.agents.middleware.types import AgentMiddleware
+
+from app.platform.agent.runtime import (
+    CompiledSubAgent,
+    FilesystemPermission,
+    SubAgent,
+)
 
 from app.writer.expert_agent.factory import build_deep_subagent
 from app.writer.expert_agent.evaluators.storybuilding import build_storybuilding_evaluator

@@ -7,14 +7,19 @@ import re
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from deepagents import CompiledSubAgent, SubAgent, create_deep_agent
-from deepagents.backends import FilesystemBackend
-from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
 from langchain.agents.middleware.types import AgentMiddleware
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 
 from app.platform.agent.base_service import BaseAgentService
+from app.platform.agent.runtime import (
+    GENERAL_PURPOSE_SUBAGENT,
+    CompiledSubAgent,
+    FilesystemBackend,
+    SubAgent,
+    compose_skills_backend,
+    create_deep_agent,
+)
 from app.platform.streaming import ExtraTask, run_agent_stream
 from app.writer.expert_agent.agents.storybuilding import build_storybuilding_deep_subagent
 from app.writer.expert_agent.services.storyline_graph import generate_storyline_graph
@@ -22,7 +27,6 @@ from app.writer.expert_agent.agents.detail_outline import build_detail_outline_d
 from app.writer.models import build_writer_model
 from app.writer.expert_agent.agents.writing import build_writing_deep_subagent
 from app.writer.expert_agent.agents.interview import build_interview_deep_subagent
-from app.platform.agent._skills_backend import _compose_skills_backend
 from app.platform.agent.middleware import (
     ArtifactPrerequisite,
     ArtifactPrerequisiteMiddleware,
@@ -187,7 +191,7 @@ class MetaAgentService(BaseAgentService):
         detail_outline_style = self._resolve_style_for_subagent(workspace_id, "detail_outline_style") if workspace_id else None
         writing_style = self._resolve_style_for_subagent(workspace_id, "writing_style") if workspace_id else None
         backend = self._backend_for_workspace(workspace_path)
-        effective_backend, skill_sources = _compose_skills_backend(backend, self._meta_skill_paths())
+        effective_backend, skill_sources = compose_skills_backend(backend, self._meta_skill_paths())
         return create_deep_agent(
             model=model,
             tools=[],

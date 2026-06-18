@@ -1,64 +1,28 @@
-"""DeepAgent 子代理工厂模块。
+"""DeepAgent 子代理工厂模块（写作专属装配）。
 
 将各创作型子代理（outline / detail_outline / writing / character）构建为
 create_deep_agent 实例，内部注册 evolution SubAgent 进行评估。
 
-替代原 _build_compiled_pipeline_subagent 的 StateGraph 管道模式，
-改为让 DeepAgent 自主决策"生成 → 调用 evolution 评估 → 根据反馈修订"的流程。
+DeepAgents 框架符号（create_deep_agent / CompiledSubAgent / SubAgent /
+compose_skills_backend）从 platform.agent.runtime 统一 import（PR-08 隔离层）。
+本模块只保留写作专属的装配逻辑（evolution + RevisionLimit + ArtifactValidation）。
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from deepagents import CompiledSubAgent, SubAgent, create_deep_agent
-from deepagents.backends.filesystem import FilesystemBackend
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 
 from app.platform.agent.middleware import ArtifactValidationMiddleware
+from app.platform.agent.runtime import (
+    CompiledSubAgent,
+    SubAgent,
+    compose_skills_backend,
+    create_deep_agent,
+)
 from app.writer.expert_agent.middleware.revision_limit_middleware import RevisionLimitMiddleware
 
-
-def _compose_skills_backend(
-    backend: object,
-    skill_paths: list[str],
-) -> tuple[object, list[str]]:
-    """当 backend 是 virtual_mode FilesystemBackend 时，为 skills 创建路由。
-
-    FilesystemBackend(virtual_mode=True) 要求所有路径是相对于 root_dir 的虚拟路径，
-    无法解析 Windows 绝对路径。skills 目录是应用代码的一部分，不在 workspace 内。
-
-    解决方案：用 CompositeBackend 将 skills 前缀路由到独立的 FilesystemBackend，
-    workspace 操作走默认 backend，互不干扰。
-
-    Args:
-        backend:     原始 backend（通常是 virtual_mode FilesystemBackend）
-        skill_paths: skills 目录的绝对文件系统路径列表
-
-    Returns:
-        (effective_backend, virtual_skill_sources) 元组
-    """
-    is_virtual_fs = (
-        isinstance(backend, FilesystemBackend)
-        and getattr(backend, "virtual_mode", False)
-    )
-    # 非 virtual backend 可以直接用绝对路径，无需 CompositeBackend
-    if not is_virtual_fs:
-        return backend, skill_paths
-
-    from deepagents.backends.composite import CompositeBackend
-
-    routes: dict[str, FilesystemBackend] = {}
-    virtual_sources: list[str] = []
-
-    for i, skill_dir in enumerate(skill_paths):
-        prefix = f"/_skills_{i}/"
-        # virtual_mode=True 让 ls("/") 列出 skill_dir 内容
-        routes[prefix] = FilesystemBackend(root_dir=skill_dir, virtual_mode=True)
-        virtual_sources.append(prefix)
-
-    composite = CompositeBackend(default=backend, routes=routes)
-    return composite, virtual_sources
 
 
 def build_deep_subagent(
@@ -110,7 +74,7 @@ def build_deep_subagent(
     effective_backend = backend
     skill_sources: list[str] = []
     if skills:
-        effective_backend, skill_sources = _compose_skills_backend(backend, skills)
+        effective_backend, skill_sources = compose_skills_backend(backend, skills)
 
     # ---- 1. 组装子代理 middleware ----
     mw: list[AgentMiddleware] = list(subagent_middleware) if subagent_middleware else []

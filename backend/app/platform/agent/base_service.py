@@ -22,16 +22,17 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from deepagents.backends import FilesystemBackend
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from app.core.settings import Settings
+from app.platform.agent.runtime import FilesystemBackend
 from app.schemas.checkpoint import CheckpointMessage, CheckpointState, CheckpointToolCall
 
 
 class BaseAgentService:
     """领域无关的 agent 服务基类。
 
+    实现 ``AgentService`` 协议（get_thread_checkpoint / delete_thread_checkpoint）。
     提供 model/checkpointer 解析、workspace backend 构建、checkpoint 读写等
     通用能力。各 domain service 继承此类。
     """

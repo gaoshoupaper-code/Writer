@@ -14,8 +14,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-from deepagents import create_deep_agent
-from deepagents.backends import FilesystemBackend
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 
@@ -27,7 +25,6 @@ from app.domains.image.tools import (
     build_generate_images_tool,
     build_persist_skill_tool,
 )
-from app.platform.agent._skills_backend import _compose_skills_backend
 from app.platform.agent.base_service import BaseAgentService
 from app.platform.agent.middleware import (
     WRITING_WRITE_PATTERNS,
@@ -35,6 +32,11 @@ from app.platform.agent.middleware import (
     FilesystemPathGuardMiddleware,
     FileWriteSerializeMiddleware,
     TraceMiddleware,
+)
+from app.platform.agent.runtime import (
+    FilesystemBackend,
+    compose_skills_backend,
+    create_deep_agent,
 )
 from app.platform.tools import build_ask_user_tool
 
@@ -116,7 +118,7 @@ class ImageAgentService(BaseAgentService):
         if selected_skill_ids:
             from app.platform.skills.loader import resolve_owner_skills
             skill_paths.extend(resolve_owner_skills(owner_id, selected_skill_ids))
-        effective_backend, skill_sources = _compose_skills_backend(backend, skill_paths)
+        effective_backend, skill_sources = compose_skills_backend(backend, skill_paths)
 
         return create_deep_agent(
             model=model,
