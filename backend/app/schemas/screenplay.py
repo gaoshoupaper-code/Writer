@@ -6,12 +6,14 @@ from app.create_type.schemas import StyleSummary
 
 
 class WorkspaceCreateRequest(BaseModel):
-    outline_name: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    domain: str = Field(default="writing")
 
 
 class WorkspaceSummary(BaseModel):
     workspace_id: str
-    outline_name: str
+    title: str
+    domain: str = "writing"
     workspace_path: str
     created_at: str
     updated_at: str

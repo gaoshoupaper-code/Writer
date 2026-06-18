@@ -86,11 +86,11 @@ class ThreadStore:
         rows = self.workspaces.list_by_owner(owner_id)
         return [self._to_workspace_summary(r) for r in rows]
 
-    def create_workspace(self, owner_id: str, outline_name: str) -> WorkspaceSummary:
-        normalized = outline_name.strip()
+    def create_workspace(self, owner_id: str, title: str, domain: str = "writing") -> WorkspaceSummary:
+        normalized = title.strip()
         if not normalized:
-            raise ValueError("outline_name cannot be empty")
-        ws = self.workspaces.create(owner_id=owner_id, outline_name=normalized)
+            raise ValueError("title cannot be empty")
+        ws = self.workspaces.create(owner_id=owner_id, title=normalized, domain=domain)
         ws_path = self._ws_path(owner_id, ws["workspace_id"])
         ws_path.mkdir(parents=True, exist_ok=False)
         return self._to_workspace_summary({**ws, "workspace_path": str(ws_path)})
@@ -439,7 +439,8 @@ class ThreadStore:
     def _to_workspace_summary(self, ws: dict) -> WorkspaceSummary:
         return WorkspaceSummary(
             workspace_id=ws["workspace_id"],
-            outline_name=ws["outline_name"],
+            title=ws.get("title", ws.get("outline_name", "")),
+            domain=ws.get("domain", "writing"),
             workspace_path=ws.get("workspace_path", ""),
             created_at=ws["created_at"],
             updated_at=ws["updated_at"],

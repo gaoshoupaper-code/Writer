@@ -42,8 +42,10 @@ from langchain_core.messages import ToolMessage
 # 需要拦截的文件系统写入工具名称
 _FILESYSTEM_WRITE_TOOLS = {"write_file", "edit_file"}
 
-# 允许的写入路径正则白名单（虚拟路径格式，如 /outline.md）
-_ALLOWED_WRITE_PATHS = (
+# 允许的写入路径正则白名单（虚拟路径格式，如 /outline.md）。
+# 导出为 WRITING_WRITE_PATTERNS，供 writing domain 显式传入（DD6a 参数化）。
+# 历史别名 _ALLOWED_WRITE_PATHS 保留，兼容旧引用。
+WRITING_WRITE_PATTERNS = (
     re.compile(r"^/character/[^/]+\.md$"),     # 角色档案
     re.compile(r"^/outline\.md$"),              # 总纲（锚点）
     re.compile(r"^/storyline\.md$"),            # 线纲索引（故事核心+一览表）
@@ -56,6 +58,7 @@ _ALLOWED_WRITE_PATHS = (
     re.compile(r"^/detail/[^/]+\.md$"),         # 细纲
     re.compile(r"^/state_log\.md$"),            # 状态日志
 )
+_ALLOWED_WRITE_PATHS = WRITING_WRITE_PATTERNS  # 向后兼容别名
 
 # Windows 绝对路径正则（如 C:/path/to/file）
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"^[a-zA-Z]:/")
@@ -70,14 +73,23 @@ class FilesystemPathGuardMiddleware(AgentMiddleware):
     非法路径会被替换为 ToolMessage 错误响应，阻止实际写入操作。
     """
 
-    def __init__(self, workspace_path: Path, allowed_write_paths: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        workspace_path: Path,
+        allowed_write_paths: tuple[str, ...] = (),
+        allowed_patterns: tuple[re.Pattern[str], ...] | None = None,
+    ) -> None:
         """
         Args:
             workspace_path:      工作区根目录的绝对路径，用于解析 Windows 绝对路径
-            allowed_write_paths: 额外允许的写入路径列表（运行时动态扩展白名单）
+            allowed_write_paths: 额外允许的精确写入路径列表（运行时动态扩展白名单）
+            allowed_patterns:    允许的写入路径正则模式元组（DD6a 参数化）。
+                                 None 时用 WRITING_WRITE_PATTERNS（向后兼容写作默认）。
+                                 各 domain 传自己的模式：image 传 images/skills 白名单。
         """
         self.workspace_path = workspace_path.resolve()
         self.allowed_write_paths = set(allowed_write_paths)
+        self.allowed_patterns = allowed_patterns  # None → normalize 内回退写作默认
 
     # ------------------------------------------------------------------
     # 工具调用拦截（同步 / 异步）
@@ -125,6 +137,7 @@ class FilesystemPathGuardMiddleware(AgentMiddleware):
                 raw_path,
                 self.workspace_path,
                 self.allowed_write_paths,
+                allowed_patterns=self.allowed_patterns,
             )
         except ValueError as exc:
             # 路径不合法，返回错误消息
@@ -150,6 +163,8 @@ def normalize_workspace_write_path(
     raw_path: object,
     workspace_path: Path,
     allowed_write_paths: set[str] | None = None,
+    *,
+    allowed_patterns: tuple[re.Pattern[str], ...] | None = None,
 ) -> str:
     """校验并规范化工作区写入路径。
 
@@ -159,7 +174,10 @@ def normalize_workspace_write_path(
     Args:
         raw_path:             原始路径（可以是字符串、虚拟路径或 Windows 绝对路径）
         workspace_path:       工作区根目录（用于解析 Windows 绝对路径）
-        allowed_write_paths:  额外允许的写入路径集合
+        allowed_write_paths:  额外允许的写入路径集合（精确匹配）
+        allowed_patterns:     允许的写入路径正则模式元组（DD6a）。
+                              None 时用 WRITING_WRITE_PATTERNS（向后兼容写作默认）。
+                              传空元组 () 表示无正则白名单（仅精确匹配 allowed_write_paths）。
 
     Returns:
         规范化后的虚拟路径字符串
@@ -169,6 +187,8 @@ def normalize_workspace_write_path(
     """
     if allowed_write_paths is None:
         allowed_write_paths = set()
+    # None → 写作默认（向后兼容）；显式传空元组则无正则白名单
+    patterns = WRITING_WRITE_PATTERNS if allowed_patterns is None else allowed_patterns
 
     if not isinstance(raw_path, str) or not raw_path.strip():
         raise ValueError("file_path must be a non-empty string")
@@ -211,9 +231,9 @@ def normalize_workspace_write_path(
     if normalized in allowed_write_paths:
         return normalized
 
-    # 检查是否匹配预定义白名单
-    if not any(pattern.fullmatch(normalized) for pattern in _ALLOWED_WRITE_PATHS):
-        allowed = "/character/*.md, /outline.md, /storyline.md, /storyline/*.md, /worldview.md, /evaluation.md, /novel.md, /chapter/*.md, /review/*.md, /detail/*.md, /state_log.md"
+    # 检查是否匹配正则白名单（DD6a：patterns 可注入，默认写作白名单）
+    if not any(pattern.fullmatch(normalized) for pattern in patterns):
+        allowed = _describe_patterns(patterns)
         if allowed_write_paths:
             allowed = f"{allowed}, {', '.join(sorted(allowed_write_paths))}"
         raise ValueError(
@@ -221,6 +241,23 @@ def normalize_workspace_write_path(
             f"{normalized}. Allowed: {allowed}"
         )
     return normalized
+
+
+def _describe_patterns(patterns: tuple[re.Pattern[str], ...]) -> str:
+    """把正则白名单转成人可读的路径描述（错误消息用）。
+
+    从每个 pattern 的 source 提取路径骨架：去掉 ^ $ 和正则元组，保留路径形态。
+    退化策略：提取过复杂则用原始 source。
+    """
+    if not patterns:
+        return "(no pattern whitelist)"
+    parts: list[str] = []
+    for p in patterns:
+        src = p.pattern
+        # 粗提取：去掉锚点和常见正则元字符，保留路径直观形态
+        desc = src.replace("^", "").replace("$", "").replace(r"[^/]+", "*").replace(r"\.", ".")
+        parts.append(desc)
+    return ", ".join(parts)
 
 
 def _virtual_path_from_workspace_absolute(raw_path: str, workspace_path: Path) -> str:

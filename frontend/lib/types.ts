@@ -36,7 +36,8 @@ export type ThreadSummary = {
 
 export type WorkspaceSummary = {
   workspace_id: string;
-  outline_name: string;
+  title: string;
+  domain: string;
   workspace_path: string;
   created_at: string;
   updated_at: string;
@@ -303,11 +304,16 @@ export type ChatMessage = {
   // D2/P7: 本条消息的执行态（streaming=进行中 / completed / failed / stopped）
   status?: "streaming" | "completed" | "failed" | "stopped";
   // HITL: 子代理 ask_user 中断，等待用户回答（resume 提交后清除）
+  // DD4: kind 区分反馈类型（choice=访谈 / image_review=图像评审）
   awaitingInput?: {
+    kind?: string; // "choice" | "image_review"，缺省视为 choice（向后兼容）
     question: string;
     options?: AskUserOption[] | null;
     multi_select?: boolean;
     source?: string;
+    // image_review 透传（DD4）
+    round?: number;
+    versions?: unknown[];
   };
 };
 

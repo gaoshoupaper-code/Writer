@@ -51,11 +51,27 @@ CREATE TABLE IF NOT EXISTS users (
     -- API key：AES-256-GCM 密文（nonce||ciphertext+tag，urlsafe-base64）
     encrypted_api_key    TEXT,
     api_key_base_url     TEXT,
+    -- 当前激活的模型名（用户自填，如 glm-4.6 / deepseek-v3）
+    active_model         TEXT,
     -- 冻结标记：1 表示禁用，无法登录
     disabled             INTEGER NOT NULL DEFAULT 0,
     workspace_quota      INTEGER NOT NULL DEFAULT 5,
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS provider_configs (
+    config_id    TEXT PRIMARY KEY,
+    owner_id     TEXT NOT NULL REFERENCES users(user_id),
+    name         TEXT NOT NULL,
+    -- AES-256-GCM 加密的 API key
+    api_key_enc  TEXT NOT NULL,
+    base_url     TEXT,
+    model        TEXT NOT NULL,
+    -- 当前激活的配置：每用户只能有 1 条 is_active=1
+    is_active    INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL,
+    last_used_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS invite_codes (
@@ -79,7 +95,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS workspaces (
     workspace_id     TEXT PRIMARY KEY,
     owner_id         TEXT NOT NULL REFERENCES users(user_id),
-    outline_name     TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    domain           TEXT NOT NULL DEFAULT 'writing',
     active_style_id  TEXT,
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
@@ -105,6 +122,37 @@ CREATE TABLE IF NOT EXISTS styles (
     created_at            TEXT NOT NULL
 );
 
+-- 文生图产物元数据（DD7a：单表 images，字段内嵌评估数据）
+CREATE TABLE IF NOT EXISTS images (
+    image_id        TEXT PRIMARY KEY,
+    workspace_id    TEXT NOT NULL REFERENCES workspaces(workspace_id),
+    owner_id        TEXT NOT NULL REFERENCES users(user_id),
+    round           INTEGER NOT NULL,
+    version_id      TEXT NOT NULL,
+    sample_index    INTEGER NOT NULL,
+    direction       TEXT,
+    prompt          TEXT,
+    file_path       TEXT NOT NULL,
+    is_final        INTEGER NOT NULL DEFAULT 0,
+    agent_analysis  TEXT,
+    user_score      INTEGER,
+    user_note       TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+-- Skills 自进化系统元数据（DD7b：DB 存元数据，文件存 SKILL.md 正文）
+CREATE TABLE IF NOT EXISTS skills (
+    skill_id        TEXT PRIMARY KEY,
+    owner_id        TEXT NOT NULL REFERENCES users(user_id),
+    name            TEXT NOT NULL,
+    scene_tag       TEXT,
+    description     TEXT NOT NULL DEFAULT '',
+    revision_count  INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_workspaces_owner ON workspaces(owner_id);
 CREATE INDEX IF NOT EXISTS idx_threads_owner ON threads(owner_id);
 CREATE INDEX IF NOT EXISTS idx_threads_workspace ON threads(workspace_id);
@@ -112,6 +160,13 @@ CREATE INDEX IF NOT EXISTS idx_styles_owner ON styles(owner_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_invite_codes_created_by ON invite_codes(created_by);
+CREATE INDEX IF NOT EXISTS idx_provider_configs_owner ON provider_configs(owner_id);
+CREATE INDEX IF NOT EXISTS idx_images_workspace ON images(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_images_round ON images(workspace_id, round);
+CREATE INDEX IF NOT EXISTS idx_images_final ON images(workspace_id, is_final);
+CREATE INDEX IF NOT EXISTS idx_images_owner ON images(owner_id);
+CREATE INDEX IF NOT EXISTS idx_skills_owner ON skills(owner_id);
+CREATE INDEX IF NOT EXISTS idx_provider_configs_active ON provider_configs(owner_id, is_active);
 """
 
 
@@ -132,6 +187,31 @@ class Database:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """幂等迁移：为旧库补列/改列。
+
+        ``IF NOT EXISTS`` 在 SQLite 里不能用于 ``ALTER ADD COLUMN``，用
+        ``PRAGMA table_info`` 探测后再补。``RENAME COLUMN`` 同理先探测旧列名是否存在。
+
+        workspace 补列（DD2）：
+        - ``outline_name`` → ``title``：字段语义通用化（image workspace 非"大纲名"）
+        - ``domain``：能力域隔离（writing/image/...），存量默认 'writing'
+        """
+        cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(users)")}
+        if "active_model" not in cols:
+            self._conn.execute("ALTER TABLE users ADD COLUMN active_model TEXT")
+
+        ws_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(workspaces)")}
+        # outline_name → title（旧库才有 outline_name；全新库 _SCHEMA 直接是 title）
+        if "outline_name" in ws_cols and "title" not in ws_cols:
+            self._conn.execute("ALTER TABLE workspaces RENAME COLUMN outline_name TO title")
+        # domain 列（DD2）：存量默认 'writing'
+        if "domain" not in ws_cols:
+            self._conn.execute(
+                "ALTER TABLE workspaces ADD COLUMN domain TEXT NOT NULL DEFAULT 'writing'"
+            )
 
     # ── 事务上下文 ──────────────────────────────────────────
     def transaction(self):
@@ -241,34 +321,36 @@ class UserRepository:
                 (hash_password(password), _now(), user_id),
             )
 
-    # ── API key ──
-    def set_api_key(self, user_id: str, api_key: str, base_url: str | None) -> None:
+    # ── API key + model（users 表的 active 配置缓存，真实源是 provider_configs）──
+    def set_api_key(
+        self, user_id: str, api_key: str, base_url: str | None, model: str | None = None,
+    ) -> None:
         encrypted = encrypt_secret(api_key, self.db.master_key)
         with self.db.transaction() as conn:
             conn.execute(
                 "UPDATE users SET encrypted_api_key = ?, api_key_base_url = ?, "
-                "updated_at = ? WHERE user_id = ?",
-                (encrypted, base_url, _now(), user_id),
+                "active_model = COALESCE(?, active_model), updated_at = ? WHERE user_id = ?",
+                (encrypted, base_url, model, _now(), user_id),
             )
 
     def clear_api_key(self, user_id: str) -> None:
         with self.db.transaction() as conn:
             conn.execute(
                 "UPDATE users SET encrypted_api_key = NULL, api_key_base_url = NULL, "
-                "updated_at = ? WHERE user_id = ?",
+                "active_model = NULL, updated_at = ? WHERE user_id = ?",
                 (_now(), user_id),
             )
 
-    def get_api_key_plain(self, user_id: str) -> tuple[str | None, str | None]:
-        """返回 (解密后的 api_key, base_url)。无 key 返回 (None, None)。"""
+    def get_api_key_plain(self, user_id: str) -> tuple[str | None, str | None, str | None]:
+        """返回 (解密后的 api_key, base_url, model)。无 key 返回 (None, None, None)。"""
         row = self.db.conn.execute(
-            "SELECT encrypted_api_key, api_key_base_url FROM users WHERE user_id = ?",
+            "SELECT encrypted_api_key, api_key_base_url, active_model FROM users WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         if not row or not row["encrypted_api_key"]:
-            return None, None
+            return None, None, None
         plain = decrypt_secret(row["encrypted_api_key"], self.db.master_key)
-        return plain, row["api_key_base_url"]
+        return plain, row["api_key_base_url"], row["active_model"]
 
     def has_api_key(self, user_id: str) -> bool:
         row = self.db.conn.execute(
@@ -281,6 +363,143 @@ class UserRepository:
             "SELECT COUNT(*) AS c FROM workspaces WHERE owner_id = ?", (user_id,)
         ).fetchone()
         return int(row["c"]) if row else 0
+
+
+class ProviderConfigRepository:
+    """API 配置历史（每用户多条）。Key 加密存储，列表不暴露明文。
+
+    active 配置（is_active=1）会同步回 users 表，供 build_writer_model 使用。
+    """
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def list_by_owner(self, owner_id: str) -> list[dict]:
+        rows = self.db.conn.execute(
+            "SELECT config_id, owner_id, name, base_url, model, is_active, "
+            "created_at, last_used_at FROM provider_configs WHERE owner_id = ? "
+            "ORDER BY is_active DESC, last_used_at DESC NULLS LAST, created_at DESC",
+            (owner_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get(self, config_id: str, owner_id: str) -> dict | None:
+        row = self.db.conn.execute(
+            "SELECT * FROM provider_configs WHERE config_id = ? AND owner_id = ?",
+            (config_id, owner_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_active(self, owner_id: str) -> dict | None:
+        row = self.db.conn.execute(
+            "SELECT * FROM provider_configs WHERE owner_id = ? AND is_active = 1",
+            (owner_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def create(
+        self, *, owner_id: str, name: str, api_key: str,
+        base_url: str | None, model: str, activate: bool = True,
+    ) -> dict:
+        from uuid import uuid4
+        config_id = uuid4().hex
+        now = _now()
+        encrypted = encrypt_secret(api_key, self.db.master_key)
+        with self.db.transaction() as conn:
+            if activate:
+                conn.execute(
+                    "UPDATE provider_configs SET is_active = 0 WHERE owner_id = ?",
+                    (owner_id,),
+                )
+            conn.execute(
+                "INSERT INTO provider_configs (config_id, owner_id, name, api_key_enc, "
+                "base_url, model, is_active, created_at, last_used_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (config_id, owner_id, name, encrypted, base_url, model,
+                 1 if activate else 0, now, now if activate else None),
+            )
+        if activate:
+            self._sync_to_users(owner_id)
+        return self.get(config_id, owner_id)  # type: ignore[return-value]
+
+    def update(
+        self, config_id: str, owner_id: str, *,
+        name: str | None = None, api_key: str | None = None,
+        base_url: str | None = None, model: str | None = None,
+    ) -> dict | None:
+        sets, vals = [], []
+        if name is not None:
+            sets.append("name = ?"); vals.append(name)
+        if api_key is not None:
+            sets.append("api_key_enc = ?"); vals.append(encrypt_secret(api_key, self.db.master_key))
+        if base_url is not None:
+            sets.append("base_url = ?"); vals.append(base_url)
+        if model is not None:
+            sets.append("model = ?"); vals.append(model)
+        if not sets:
+            return self.get(config_id, owner_id)
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                f"UPDATE provider_configs SET {', '.join(sets)} "
+                "WHERE config_id = ? AND owner_id = ?",
+                (*vals, config_id, owner_id),
+            )
+            if cur.rowcount == 0:
+                return None
+        # 若改的是激活配置，同步到 users
+        active = self.get_active(owner_id)
+        if active and active["config_id"] == config_id:
+            self._sync_to_users(owner_id)
+        return self.get(config_id, owner_id)
+
+    def activate(self, config_id: str, owner_id: str) -> bool:
+        with self.db.transaction() as conn:
+            # 校验归属
+            row = conn.execute(
+                "SELECT 1 FROM provider_configs WHERE config_id = ? AND owner_id = ?",
+                (config_id, owner_id),
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute(
+                "UPDATE provider_configs SET is_active = 0 WHERE owner_id = ?",
+                (owner_id,),
+            )
+            conn.execute(
+                "UPDATE provider_configs SET is_active = 1, last_used_at = ? "
+                "WHERE config_id = ? AND owner_id = ?",
+                (_now(), config_id, owner_id),
+            )
+        self._sync_to_users(owner_id)
+        return True
+
+    def delete(self, config_id: str, owner_id: str) -> bool:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT is_active FROM provider_configs WHERE config_id = ? AND owner_id = ?",
+                (config_id, owner_id),
+            ).fetchone()
+            if not row:
+                return False
+            was_active = bool(row["is_active"])
+            conn.execute(
+                "DELETE FROM provider_configs WHERE config_id = ? AND owner_id = ?",
+                (config_id, owner_id),
+            )
+        if was_active:
+            # 删的是激活配置：清空 users 表的 active 缓存
+            UserRepository(self.db).clear_api_key(owner_id)
+        return True
+
+    def _sync_to_users(self, owner_id: str) -> None:
+        """把激活配置的 key/base_url/model 同步到 users 表（供 build_writer_model 读）。"""
+        active = self.get_active(owner_id)
+        users = UserRepository(self.db)
+        if active is None:
+            users.clear_api_key(owner_id)
+            return
+        plain = decrypt_secret(active["api_key_enc"], self.db.master_key)
+        users.set_api_key(owner_id, plain, active["base_url"], active["model"])
 
 
 class InviteCodeRepository:
@@ -406,15 +625,15 @@ class WorkspaceRepository:
         self.db = db
 
     def create(
-        self, *, owner_id: str, outline_name: str,
+        self, *, owner_id: str, title: str, domain: str = "writing",
     ) -> dict:
         workspace_id = uuid4().hex
         now = _now()
         with self.db.transaction() as conn:
             conn.execute(
-                "INSERT INTO workspaces (workspace_id, owner_id, outline_name, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (workspace_id, owner_id, outline_name, now, now),
+                "INSERT INTO workspaces (workspace_id, owner_id, title, domain, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (workspace_id, owner_id, title, domain, now, now),
             )
         return self.get(workspace_id, owner_id)  # type: ignore[return-value]
 
@@ -689,6 +908,196 @@ class StyleRepository:
             cur = conn.execute(
                 "DELETE FROM styles WHERE style_id = ? AND owner_id = ?",
                 (style_id, owner_id),
+            )
+            return cur.rowcount > 0
+
+
+class ImageRepository:
+    """文生图产物元数据访问层（DD7a）。所有读写带 owner_id。"""
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def create(
+        self, *, image_id: str, workspace_id: str, owner_id: str,
+        round: int, version_id: str, sample_index: int,
+        direction: str | None, prompt: str | None, file_path: str,
+    ) -> dict:
+        now = _now()
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO images (image_id, workspace_id, owner_id, round, version_id, "
+                "sample_index, direction, prompt, file_path, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (image_id, workspace_id, owner_id, round, version_id,
+                 sample_index, direction, prompt, file_path, now, now),
+            )
+        return self.get(image_id, owner_id)  # type: ignore[return-value]
+
+    def get(self, image_id: str, owner_id: str) -> dict | None:
+        row = self.db.conn.execute(
+            "SELECT * FROM images WHERE image_id = ? AND owner_id = ?",
+            (image_id, owner_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_any(self, image_id: str) -> dict | None:
+        """不过滤 owner（图片服务端点鉴权后用，已确认归属）。"""
+        row = self.db.conn.execute(
+            "SELECT * FROM images WHERE image_id = ?", (image_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_by_workspace(self, workspace_id: str, owner_id: str) -> list[dict]:
+        rows = self.db.conn.execute(
+            "SELECT * FROM images WHERE workspace_id = ? AND owner_id = ? ORDER BY round, version_id, sample_index",
+            (workspace_id, owner_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_by_round(self, workspace_id: str, owner_id: str, round: int) -> list[dict]:
+        rows = self.db.conn.execute(
+            "SELECT * FROM images WHERE workspace_id = ? AND owner_id = ? AND round = ? "
+            "ORDER BY version_id, sample_index",
+            (workspace_id, owner_id, round),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_final(self, workspace_id: str, owner_id: str) -> list[dict]:
+        rows = self.db.conn.execute(
+            "SELECT * FROM images WHERE workspace_id = ? AND owner_id = ? AND is_final = 1 "
+            "ORDER BY round, version_id, sample_index",
+            (workspace_id, owner_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_evaluation(
+        self, image_id: str, owner_id: str, *,
+        agent_analysis: str | None = None, user_score: int | None = None,
+        user_note: str | None = None,
+    ) -> dict | None:
+        sets, vals = [], []
+        if agent_analysis is not None:
+            sets.append("agent_analysis = ?"); vals.append(agent_analysis)
+        if user_score is not None:
+            sets.append("user_score = ?"); vals.append(user_score)
+        if user_note is not None:
+            sets.append("user_note = ?"); vals.append(user_note)
+        if not sets:
+            return self.get(image_id, owner_id)
+        sets.append("updated_at = ?"); vals.append(_now())
+        vals.extend([image_id, owner_id])
+        with self.db.transaction() as conn:
+            conn.execute(
+                f"UPDATE images SET {', '.join(sets)} WHERE image_id = ? AND owner_id = ?",
+                vals,
+            )
+        return self.get(image_id, owner_id)
+
+    def set_final(self, image_id: str, owner_id: str, is_final: bool) -> dict | None:
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE images SET is_final = ?, updated_at = ? WHERE image_id = ? AND owner_id = ?",
+                (1 if is_final else 0, _now(), image_id, owner_id),
+            )
+        return self.get(image_id, owner_id)
+
+    def delete_non_final(self, workspace_id: str, owner_id: str) -> int:
+        """删除某 workspace 的非定稿图（D11 废弃清理）。返回删除行数。"""
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "DELETE FROM images WHERE workspace_id = ? AND owner_id = ? AND is_final = 0",
+                (workspace_id, owner_id),
+            )
+            return cur.rowcount
+
+    def delete_by_workspace(self, workspace_id: str, owner_id: str) -> int:
+        """删除某 workspace 的所有图（D11 workspace 删除连带）。返回删除行数。"""
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "DELETE FROM images WHERE workspace_id = ? AND owner_id = ?",
+                (workspace_id, owner_id),
+            )
+            return cur.rowcount
+
+
+class SkillRepository:
+    """Skills 自进化系统元数据访问层（DD7b）。所有读写带 owner_id。
+
+    SKILL.md 正文存文件系统（skills/<owner>/<skill_id>/SKILL.md），
+    本表只存管理用元数据（name/scene_tag/description/revision_count）。
+    """
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def create(
+        self, *, owner_id: str, name: str, scene_tag: str | None = None,
+        description: str = "",
+    ) -> dict:
+        skill_id = uuid4().hex
+        now = _now()
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO skills (skill_id, owner_id, name, scene_tag, description, "
+                "revision_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+                (skill_id, owner_id, name, scene_tag, description, now, now),
+            )
+        return self.get(skill_id, owner_id)  # type: ignore[return-value]
+
+    def get(self, skill_id: str, owner_id: str) -> dict | None:
+        row = self.db.conn.execute(
+            "SELECT * FROM skills WHERE skill_id = ? AND owner_id = ?",
+            (skill_id, owner_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_by_owner(self, owner_id: str) -> list[dict]:
+        rows = self.db.conn.execute(
+            "SELECT * FROM skills WHERE owner_id = ? ORDER BY updated_at DESC",
+            (owner_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update(
+        self, skill_id: str, owner_id: str, *,
+        name: str | None = None, scene_tag: str | None = None,
+        description: str | None = None,
+    ) -> dict | None:
+        sets, vals = [], []
+        for k, v in [("name", name), ("scene_tag", scene_tag), ("description", description)]:
+            if v is not None:
+                sets.append(f"{k} = ?"); vals.append(v)
+        if not sets:
+            return self.get(skill_id, owner_id)
+        sets.append("updated_at = ?"); vals.append(_now())
+        vals.extend([skill_id, owner_id])
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                f"UPDATE skills SET {', '.join(sets)} WHERE skill_id = ? AND owner_id = ?",
+                vals,
+            )
+            if cur.rowcount == 0:
+                return None
+        return self.get(skill_id, owner_id)
+
+    def bump_revision(self, skill_id: str, owner_id: str) -> dict | None:
+        """进化次数 +1（D8 持久化 Skill 时调用）。"""
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE skills SET revision_count = revision_count + 1, updated_at = ? "
+                "WHERE skill_id = ? AND owner_id = ?",
+                (_now(), skill_id, owner_id),
+            )
+            if cur.rowcount == 0:
+                return None
+        return self.get(skill_id, owner_id)
+
+    def delete(self, skill_id: str, owner_id: str) -> bool:
+        with self.db.transaction() as conn:
+            cur = conn.execute(
+                "DELETE FROM skills WHERE skill_id = ? AND owner_id = ?",
+                (skill_id, owner_id),
             )
             return cur.rowcount > 0
 

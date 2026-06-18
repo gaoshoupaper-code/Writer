@@ -44,8 +44,8 @@ export function TopBar({
   onLogout,
 }: TopBarProps) {
   const activeWorkspace = workspaces.find((w) => w.workspace_id === activeWorkspaceId);
-  // 决策3：顶部「书名：」+ outline_name 静态标签（数据源=现有 outline_name）
-  const displayLabel = activeWorkspace?.outline_name ? `书名：${activeWorkspace.outline_name}` : "选择一个工作目录";
+  // 决策3：顶部「书名：」+ title 静态标签（数据源=workspace.title）
+  const displayLabel = activeWorkspace?.title ? `书名：${activeWorkspace.title}` : "选择一个工作目录";
 
   return (
     <header className="dashboard-topbar">
@@ -74,7 +74,9 @@ export function TopBar({
                     className={`flex items-center justify-between gap-2 ${workspace.workspace_id === activeWorkspaceId ? "bg-primary/5" : ""}`}
                     onClick={() => onWorkspaceChange(workspace.workspace_id)}
                   >
-                    <span className="truncate text-sm">{workspace.outline_name}</span>
+                    <span className="truncate text-sm">
+                      {workspace.domain === "image" ? "🎨 " : "✍️ "}{workspace.title}
+                    </span>
                     <button
                       className="session-option-delete"
                       type="button"
@@ -83,7 +85,7 @@ export function TopBar({
                         onDeleteWorkspace(workspace.workspace_id);
                       }}
                       disabled={deletingWorkspace || creatingWorkspace}
-                      aria-label={`删除 ${workspace.outline_name}`}
+                      aria-label={`删除 ${workspace.title}`}
                     >
                       删除
                     </button>

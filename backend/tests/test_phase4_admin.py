@@ -221,7 +221,7 @@ class TestAdminImpersonateRead:
         client.post("/api/auth/register", json={"code": codes[0], "username": "alice", "password": "pw123456"})
 
         # alice 创建作品并写 outline
-        ws = client.post("/api/workspaces", json={"outline_name": "AliceNovel"}).json()
+        ws = client.post("/api/workspaces", json={"title": "AliceNovel"}).json()
         # 直接写 outline.md（避免触发 LLM）
         from app.core.settings import get_settings
         settings = get_settings()
@@ -238,10 +238,10 @@ class TestAdminImpersonateRead:
         r = client.get(f"/api/admin/users/{me['user_id']}/workspaces")
         assert r.status_code == 200
         ws_list = r.json()
-        assert any(w["outline_name"] == "AliceNovel" for w in ws_list)
+        assert any(w["title"] == "AliceNovel" for w in ws_list)
 
         r = client.get(f"/api/admin/users/{me['user_id']}/workspaces/{ws['workspace_id']}/outline")
         assert r.status_code == 200
         data = r.json()
-        assert data["outline_name"] == "AliceNovel"
+        assert data["title"] == "AliceNovel"
         assert "Alice 的小说" in data["markdown"]

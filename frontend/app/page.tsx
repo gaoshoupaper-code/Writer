@@ -379,6 +379,7 @@ export default function Home() {
   const [authUser, setAuthUser] = useState<{ username: string; is_admin: boolean } | null>(null);
   const [hasApiKey, setHasApiKey] = useState(false);
   const [workspaceCreateOpen, setWorkspaceCreateOpen] = useState(false);
+  const [newWorkspaceDomain, setNewWorkspaceDomain] = useState<"writing" | "image">("writing");
   const [workspaceDeleteOpen, setWorkspaceDeleteOpen] = useState(false);
   const [pendingDeleteWorkspaceId, setPendingDeleteWorkspaceId] = useState("");
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
@@ -813,13 +814,13 @@ export default function Home() {
   });
 
   async function handleCreateWorkspace() {
-    const outlineName = newWorkspaceName.trim();
-    if (!outlineName || creatingWorkspace) return;
+    const title = newWorkspaceName.trim();
+    if (!title || creatingWorkspace) return;
 
     setCreatingWorkspace(true);
 
     try {
-      const workspace = await createWorkspaceRequest(outlineName);
+      const workspace = await createWorkspaceRequest(title, newWorkspaceDomain);
 
       // 新工作区一定是空的，直接设空值避免触发无意义的 bootstrap 请求
       setThreads([]);
@@ -842,6 +843,7 @@ export default function Home() {
       setWorkspaces((current) => [workspace, ...current]);
       setActiveWorkspaceId(workspace.workspace_id);
       setNewWorkspaceName("失忆编剧大纲");
+      setNewWorkspaceDomain("writing");
       setWorkspaceCreateOpen(false);
     } catch (createError) {
       toast.error(createError instanceof Error ? createError.message : "无法创建工作目录。");
@@ -1060,6 +1062,11 @@ export default function Home() {
     // performSubmit 在 resume 失败时会 re-throw（供 InterviewOptions 解锁）；
     // 表单路径无 InterviewOptions，吞掉避免 unhandled rejection（UI 已在内部处理）。
     try {
+      if (activeWorkspace?.domain === "image") {
+        await performImageStream({ prompt });
+        setPrompt("");
+        return;
+      }
       await performSubmit(prompt);
     } catch {
       /* performSubmit 内部已处理 UI + toast */
@@ -1290,20 +1297,32 @@ export default function Home() {
                 finalData = event.data as ScreenplayResponse;
               } else if (event.type === "interrupt") {
                 const iv = event.data as {
+                  kind?: string;
                   question?: string;
                   options?: AskUserOption[] | null;
                   multi_select?: boolean;
                   source?: string;
+                  // image_review（DD4）
+                  round?: number;
+                  versions?: unknown[];
                 };
+                const interruptKind = iv.kind ?? "choice";
                 setMessages((current) =>
                   updateAssistantMessage(current, assistantIdx, (message) => ({
                     ...message,
-                    content: iv.question || "等待你的输入",
+                    content:
+                      interruptKind === "image_review"
+                        ? `第 ${iv.round ?? "?"} 轮图像评审：3 版 6 图已生成，请打分`
+                        : iv.question || "等待你的输入",
                     awaitingInput: {
+                      kind: interruptKind,
                       question: iv.question || "",
                       options: iv.options ?? null,
                       multi_select: iv.multi_select ?? false,
                       source: iv.source,
+                      // image_review 透传完整 payload（DD4）
+                      round: iv.round,
+                      versions: iv.versions,
                     },
                   })),
                 );
@@ -1408,6 +1427,127 @@ export default function Home() {
     }
   }
 
+  /**
+   * image review 的 resume 处理（DD4 结构化反馈）。
+   * 发送结构化 resume 对象到 /api/image/generate/stream，消费 SSE 更新消息。
+   * 精简版：处理 interrupt（下一轮评审）+ final（收尾）+ error。
+   * 支持两种模式：首次提交（prompt）/ resume（结构化反馈对象）。
+   */
+  async function performImageStream(
+    opts: { prompt: string } | { resume: import("../lib/api").ImageReviewResume },
+  ) {
+    if (!activeThreadId || loading) return;
+    const isResume = "resume" in opts;
+    if (isResume) {
+      const lastAssistant = [...messagesRef.current].reverse().find((m) => m.role === "assistant");
+      if (!lastAssistant?.awaitingInput) return;
+      setMessages((current) => {
+        const idx = current.findIndex((m) => m === lastAssistant);
+        if (idx < 0) return current;
+        const next = [...current];
+        next[idx] = { ...lastAssistant, awaitingInput: undefined };
+        return next;
+      });
+    }
+    setLoading(true);
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+    if (!isResume) {
+      // 首次提交：追加 user 消息
+      setMessages((current) => [
+        ...current,
+        { role: "user", content: opts.prompt, contentFormat: "text" },
+      ]);
+    }
+    setMessages((current) => [
+      ...current,
+      { role: "assistant", content: isResume ? "正在优化..." : "正在生成...", contentFormat: "markdown", tools: [] },
+    ]);
+    try {
+      const body = isResume
+        ? { thread_id: activeThreadId, prompt: "", resume: opts.resume }
+        : { thread_id: activeThreadId, prompt: opts.prompt };
+      const response = await fetch(`${API_BASE_URL}/api/image/generate/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        credentials: "include",
+        signal: abortController.signal,
+      });
+      if (!response.ok || !response.body) throw new Error(`image stream failed: ${response.status}`);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let streamedText = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split("\n\n");
+        buffer = events.pop() ?? "";
+        for (const evt of events) {
+          const lines = evt.split("\n");
+          let eventType = "";
+          let eventData = "";
+          for (const line of lines) {
+            if (line.startsWith("event: ")) eventType = line.slice(7);
+            else if (line.startsWith("data: ")) eventData += line.slice(6);
+          }
+          if (!eventType) continue;
+          try {
+            const event = { type: eventType, data: JSON.parse(eventData) };
+            if (event.type === "model_stream") {
+              streamedText += (event.data as { content?: string }).content ?? "";
+              setMessages((current) =>
+                updateAssistantMessage(current, current.length - 1, (m) => ({
+                  ...m, content: streamedText, contentFormat: "markdown",
+                })),
+              );
+            } else if (event.type === "interrupt") {
+              const iv = event.data as {
+                kind?: string; round?: number; versions?: unknown[];
+                question?: string; options?: AskUserOption[] | null; multi_select?: boolean; source?: string;
+              };
+              const interruptKind = iv.kind ?? "choice";
+              setMessages((current) =>
+                updateAssistantMessage(current, current.length - 1, (m) => ({
+                  ...m,
+                  content: interruptKind === "image_review"
+                    ? `第 ${iv.round ?? "?"} 轮图像评审：请打分`
+                    : iv.question || "等待输入",
+                  awaitingInput: {
+                    kind: interruptKind, question: iv.question || "",
+                    options: iv.options ?? null, multi_select: iv.multi_select ?? false,
+                    source: iv.source, round: iv.round, versions: iv.versions,
+                  } as typeof m.awaitingInput,
+                })),
+              );
+              return;
+            } else if (event.type === "final") {
+              const data = event.data as { content?: string };
+              setMessages((current) =>
+                updateAssistantMessage(current, current.length - 1, (m) => ({
+                  ...m, content: data.content ?? "完成", contentFormat: "markdown",
+                })),
+              );
+              return;
+            } else if (event.type === "error") {
+              toast.error((event.data as { error?: string }).error ?? "image stream 出错");
+              return;
+            }
+          } catch {
+            // partial JSON
+          }
+        }
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "image stream 失败");
+    } finally {
+      if (abortControllerRef.current === abortController) abortControllerRef.current = null;
+      setLoading(false);
+    }
+  }
+
   // 未登录（或在跳转 /login 中）：不渲染主界面，避免闪烁 + 触发 401 雪崩
   if (!authChecked) {
     return null;
@@ -1461,6 +1601,14 @@ export default function Home() {
                 return;
               }
               await performSubmit(resumeText);
+            }}
+            onImageReviewSubmit={async (resume) => {
+              if (aiDisabled) {
+                toast.error("请先在设置页填写你的 API Key，才能使用 AI 生成。");
+                return;
+              }
+              // image review 的 resume 走 image generate stream 端点（结构化对象，DD4）
+              await performImageStream({ resume });
             }}
             onStop={handleStopGeneration}
             onToggleSessionMenu={() => setSessionMenuOpen((open) => !open)}
@@ -1542,9 +1690,9 @@ export default function Home() {
         <div className="modal-overlay" role="presentation">
           <section className="modal-content" role="dialog" aria-modal="true" aria-labelledby="workspace-create-title">
             <h2 className="modal-title" id="workspace-create-title">
-              新建剧本
+              新建工作目录
             </h2>
-            <p className="modal-description">输入新剧本名，创建后会直接切换到这个剧本。</p>
+            <p className="modal-description">选择类型并输入名称，创建后会直接切换。</p>
             <form
               className="workspace-create-form"
               onSubmit={(event) => {
@@ -1552,11 +1700,41 @@ export default function Home() {
                 handleCreateWorkspace();
               }}
             >
+              <div className="workspace-domain-select">
+                <label className={`domain-option${newWorkspaceDomain === "writing" ? " selected" : ""}`}>
+                  <input
+                    type="radio"
+                    name="workspace-domain"
+                    value="writing"
+                    checked={newWorkspaceDomain === "writing"}
+                    onChange={() => setNewWorkspaceDomain("writing")}
+                    disabled={creatingWorkspace}
+                  />
+                  <span className="domain-option-body">
+                    <strong>✍️ 写作</strong>
+                    <small>小说/剧本创作</small>
+                  </span>
+                </label>
+                <label className={`domain-option${newWorkspaceDomain === "image" ? " selected" : ""}`}>
+                  <input
+                    type="radio"
+                    name="workspace-domain"
+                    value="image"
+                    checked={newWorkspaceDomain === "image"}
+                    onChange={() => setNewWorkspaceDomain("image")}
+                    disabled={creatingWorkspace}
+                  />
+                  <span className="domain-option-body">
+                    <strong>🎨 文生图</strong>
+                    <small>图片生成与优化</small>
+                  </span>
+                </label>
+              </div>
               <input
                 className="thread-input workspace-create-input"
                 value={newWorkspaceName}
                 onChange={(event) => setNewWorkspaceName(event.target.value)}
-                placeholder="请输入新剧本名"
+                placeholder={newWorkspaceDomain === "image" ? "请输入图片主题名" : "请输入新剧本名"}
                 autoFocus
                 disabled={creatingWorkspace}
               />
@@ -1580,7 +1758,7 @@ export default function Home() {
 
       <ConfirmDialog
         open={workspaceDeleteOpen}
-        title={`删除工作目录「${workspaces.find((w) => w.workspace_id === pendingDeleteWorkspaceId)?.outline_name || ""}」？`}
+        title={`删除工作目录「${workspaces.find((w) => w.workspace_id === pendingDeleteWorkspaceId)?.title || ""}」？`}
         description="这会删除该工作目录以及目录下的所有创作会话。该操作不可撤销。"
         confirmLabel="删除工作目录"
         loading={deletingWorkspace}

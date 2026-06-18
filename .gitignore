@@ -14,6 +14,8 @@ backend/checkpoints.db*
 backend/checkpoints/
 backend/app.db
 backend/app.db-*
+backend/app.db.bak.*
+backend/skills/
 backup/
 pre-multiuser-backup-*
 forensics-*/

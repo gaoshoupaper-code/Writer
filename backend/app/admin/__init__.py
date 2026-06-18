@@ -42,6 +42,7 @@ class MyProfile(BaseModel):
     username: str
     has_api_key: bool
     base_url: str | None
+    active_model: str | None
     workspace_count: int
     workspace_quota: int
 
@@ -49,6 +50,7 @@ class MyProfile(BaseModel):
 class ApiKeyRequest(BaseModel):
     api_key: str = Field(min_length=1)
     base_url: str | None = None
+    model: str | None = Field(default=None, min_length=1)
 
 
 @me_router.get("", response_model=MyProfile)
@@ -61,6 +63,7 @@ def get_my_profile(user: CurrentUser = Depends(current_user)) -> MyProfile:
         username=row["username"],
         has_api_key=bool(row["encrypted_api_key"]),
         base_url=row["api_key_base_url"],
+        active_model=row.get("active_model"),
         workspace_count=users.workspace_count(user.user_id),
         workspace_quota=row["workspace_quota"],
     )
@@ -68,9 +71,101 @@ def get_my_profile(user: CurrentUser = Depends(current_user)) -> MyProfile:
 
 @me_router.put("/api-key")
 def set_my_api_key(payload: ApiKeyRequest, user: CurrentUser = Depends(current_user)) -> dict:
+    """简单设/改当前 key（兼容旧设置页）。完整配置管理走 /provider-configs。"""
     users = UserRepository(get_database())
-    users.set_api_key(user.user_id, payload.api_key, payload.base_url)
+    users.set_api_key(user.user_id, payload.api_key, payload.base_url, payload.model)
     return {"has_api_key": True}
+
+
+# ── Provider 配置历史（多条，可切换）──────────────────────
+
+class ProviderConfigSummary(BaseModel):
+    """列表项：不含 key 明文。"""
+    config_id: str
+    name: str
+    base_url: str | None
+    model: str
+    is_active: bool
+    created_at: str
+    last_used_at: str | None
+
+
+class ProviderConfigCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    api_key: str = Field(min_length=1)
+    base_url: str | None = None
+    model: str = Field(min_length=1, max_length=128)
+    activate: bool = True
+
+
+class ProviderConfigUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=64)
+    api_key: str | None = Field(default=None, min_length=1)
+    base_url: str | None = None
+    model: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+@me_router.get("/provider-configs", response_model=list[ProviderConfigSummary])
+def list_my_configs(user: CurrentUser = Depends(current_user)) -> list[ProviderConfigSummary]:
+    from app.db import ProviderConfigRepository
+    rows = ProviderConfigRepository(get_database()).list_by_owner(user.user_id)
+    return [ProviderConfigSummary(**r) for r in rows]
+
+
+@me_router.post("/provider-configs", response_model=ProviderConfigSummary)
+def create_my_config(
+    payload: ProviderConfigCreate, user: CurrentUser = Depends(current_user),
+) -> ProviderConfigSummary:
+    from app.db import ProviderConfigRepository
+    repo = ProviderConfigRepository(get_database())
+    row = repo.create(
+        owner_id=user.user_id, name=payload.name, api_key=payload.api_key,
+        base_url=payload.base_url, model=payload.model, activate=payload.activate,
+    )
+    # 去掉 api_key_enc 等内部字段，复用 Summary
+    return ProviderConfigSummary(
+        config_id=row["config_id"], name=row["name"], base_url=row["base_url"],
+        model=row["model"], is_active=bool(row["is_active"]),
+        created_at=row["created_at"], last_used_at=row["last_used_at"],
+    )
+
+
+@me_router.put("/provider-configs/{config_id}", response_model=ProviderConfigSummary)
+def update_my_config(
+    config_id: str, payload: ProviderConfigUpdate,
+    user: CurrentUser = Depends(current_user),
+) -> ProviderConfigSummary:
+    from app.db import ProviderConfigRepository
+    repo = ProviderConfigRepository(get_database())
+    row = repo.update(
+        config_id, user.user_id, name=payload.name, api_key=payload.api_key,
+        base_url=payload.base_url, model=payload.model,
+    )
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "配置不存在")
+    return ProviderConfigSummary(
+        config_id=row["config_id"], name=row["name"], base_url=row["base_url"],
+        model=row["model"], is_active=bool(row["is_active"]),
+        created_at=row["created_at"], last_used_at=row["last_used_at"],
+    )
+
+
+@me_router.post("/provider-configs/{config_id}/activate")
+def activate_my_config(config_id: str, user: CurrentUser = Depends(current_user)) -> dict:
+    from app.db import ProviderConfigRepository
+    ok = ProviderConfigRepository(get_database()).activate(config_id, user.user_id)
+    if not ok:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "配置不存在")
+    return {"status": "ok", "active": config_id}
+
+
+@me_router.delete("/provider-configs/{config_id}")
+def delete_my_config(config_id: str, user: CurrentUser = Depends(current_user)) -> dict:
+    from app.db import ProviderConfigRepository
+    ok = ProviderConfigRepository(get_database()).delete(config_id, user.user_id)
+    if not ok:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "配置不存在")
+    return {"status": "ok", "deleted": config_id}
 
 
 @me_router.delete("/api-key")
@@ -225,7 +320,8 @@ def reset_user_password_auto(
 
 class AdminWorkspaceSummary(BaseModel):
     workspace_id: str
-    outline_name: str
+    title: str
+    domain: str = "writing"
     created_at: str
     updated_at: str
 
@@ -243,7 +339,8 @@ def list_user_workspaces(
     return [
         AdminWorkspaceSummary(
             workspace_id=r["workspace_id"],
-            outline_name=r["outline_name"],
+            title=r.get("title", r.get("outline_name", "")),
+            domain=r.get("domain", "writing"),
             created_at=r["created_at"],
             updated_at=r["updated_at"],
         )
@@ -274,4 +371,4 @@ def read_user_workspace_outline(
             markdown = outline_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             markdown = outline_path.read_text(encoding="gb18030", errors="replace")
-    return {"workspace_id": workspace_id, "outline_name": ws["outline_name"], "markdown": markdown}
+    return {"workspace_id": workspace_id, "title": ws.get("title", ws.get("outline_name", "")), "markdown": markdown}

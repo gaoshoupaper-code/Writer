@@ -353,14 +353,14 @@ function UserWorkspacesView({ user, onBack }: { user: AdminUserSummary; onBack: 
                 className={`admin-ws-item ${activeWs?.workspace_id === w.workspace_id ? "active" : ""}`}
                 onClick={() => setActiveWs(w)}
               >
-                {w.outline_name}
+                {w.title}
               </button>
             ))}
           </aside>
           <div className="admin-ws-content">
             {activeWs ? (
               <>
-                <h3>{activeWs.outline_name} · 大纲</h3>
+                <h3>{activeWs.title} · 大纲</h3>
                 {outlineLoading ? <p className="auth-subtitle">加载中…</p> : (
                   <pre className="admin-outline">{outline || "（暂无大纲内容）"}</pre>
                 )}

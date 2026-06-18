@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import type { ChatMessage, ThreadSummary } from "../../lib/types";
 import type { StageFlow } from "../../lib/stage";
 import { InterviewOptions } from "./InterviewOptions";
+import { ImageReviewCard } from "./ImageReviewCard";
 import { SessionMenu } from "./SessionMenu";
 import { StageFlowView } from "./StageFlowView";
 import { Button } from "@/components/ui/button";
@@ -23,6 +24,7 @@ type ChatPanelProps = {
   onPromptChange: (prompt: string) => void;
   onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
   onResumeSubmit: (resume: string) => Promise<void>;
+  onImageReviewSubmit: (resume: import("../../lib/api").ImageReviewResume) => Promise<void>;
   onStop: () => void;
   onToggleSessionMenu: () => void;
   onCloseSessionMenu: () => void;
@@ -48,6 +50,7 @@ export function ChatPanel({
   onPromptChange,
   onSubmit,
   onResumeSubmit,
+  onImageReviewSubmit,
   onStop,
   onToggleSessionMenu,
   onCloseSessionMenu,
@@ -167,18 +170,27 @@ export function ChatPanel({
                   <p>{message.content}</p>
                 )}
               </div>
-              {/* HITL 选项化：仅【最后一条 assistant】且 awaitingInput 带 options 时渲染选项 UI。
-                  D3 防御约束：awaitingInput 应在 resume 响应后被清空，此 index 约束兜底，
-                  确保任何历史 HITL 消息（即使 awaitingInput 残留）都不再渲染可点击选项框。*/}
+              {/* HITL：按 awaitingInput.kind 路由渲染（DD4）。
+                  choice → InterviewOptions（写作访谈）
+                  image_review → ImageReviewCard（文生图评审）
+                  D3 防御：仅最后一条 assistant 渲染，历史 HITL 残留不渲染。*/}
               {message.role === "assistant" &&
               index === messages.length - 1 &&
-              message.awaitingInput?.options?.length ? (
-                <InterviewOptions
-                  options={message.awaitingInput.options}
-                  multiSelect={!!message.awaitingInput.multi_select}
-                  onSubmit={onResumeSubmit}
-                  disabled={loading}
-                />
+              message.awaitingInput ? (
+                message.awaitingInput.kind === "image_review" ? (
+                  <ImageReviewCard
+                    payload={message.awaitingInput as unknown as import("../../lib/api").ImageReviewInterrupt}
+                    onSubmit={onImageReviewSubmit}
+                    disabled={loading}
+                  />
+                ) : message.awaitingInput.options?.length ? (
+                  <InterviewOptions
+                    options={message.awaitingInput.options}
+                    multiSelect={!!message.awaitingInput.multi_select}
+                    onSubmit={onResumeSubmit}
+                    disabled={loading}
+                  />
+                ) : null
               ) : null}
               {message.role === "assistant" && (message.status === "failed" || message.status === "stopped") && !message.awaitingInput ? (
                 <button type="button" className="message-retry" onClick={() => onRetry?.()}>↻ 重试</button>

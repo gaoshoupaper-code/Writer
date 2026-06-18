@@ -16,6 +16,7 @@ from langchain.agents.middleware.types import AgentMiddleware
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 
+from app.platform.agent.base_service import BaseAgentService
 from app.writer.expert_agent.agents.storybuilding import build_storybuilding_deep_subagent
 from app.writer.expert_agent.services.storyline_graph import generate_storyline_graph
 from app.writer.expert_agent.agents.detail_outline import build_detail_outline_deep_subagent
@@ -52,53 +53,11 @@ META_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 SSE_HEARTBEAT_INTERVAL = 15
 
 
-class MetaAgentService:
+class MetaAgentService(BaseAgentService):
     def __init__(self, settings: Settings, workspace_root: Path, trace_recorder: TraceRecorder, style_store: CreateTypeStore, checkpointer: BaseCheckpointSaver) -> None:
-        self.settings = settings
-        self.workspace_root = workspace_root
-        self.trace_recorder = trace_recorder
+        # 复用 BaseAgentService 的通用初始化（settings/workspace_root/trace_recorder/checkpointer）
+        super().__init__(settings, workspace_root, trace_recorder, checkpointer)
         self.style_store = style_store
-        self.checkpointer = checkpointer
-
-    def _backend_for_workspace(self, workspace_path: Path) -> FilesystemBackend:
-        workspace_path.mkdir(parents=True, exist_ok=True)
-        return FilesystemBackend(root_dir=workspace_path, virtual_mode=True)
-
-    # ── 多用户隔离：解析当前用户的 model 与 checkpointer ──
-    def _resolve_model(self, owner_id: str | None):
-        """按 owner 解密其 API key 构建 model；无 owner 或无 key 回退全局 settings。"""
-        if not owner_id:
-            return build_writer_model(self.settings)
-        try:
-            from app.db import get_database, UserRepository
-            users = UserRepository(get_database())
-            key, base_url = users.get_api_key_plain(owner_id)
-            if key is None:
-                # 用户未填 key：回退全局（管理员兜底）或抛错由路由层拦
-                return build_writer_model(self.settings)
-            return build_writer_model(self.settings, api_key=key, base_url=base_url)
-        except Exception:
-            return build_writer_model(self.settings)
-
-    async def _resolve_checkpointer(self, owner_id: str | None):
-        """按 owner 取分库 saver；无 owner 回退全局（兼容/测试）。"""
-        if not owner_id:
-            return self.checkpointer
-        try:
-            from app.core.checkpoint_pool import get_checkpoint_pool
-            return await get_checkpoint_pool().get(owner_id)
-        except Exception:
-            return self.checkpointer
-
-    def _resolve_checkpointer_sync(self, owner_id: str | None):
-        """delete_thread_checkpoint 是同步调用，这里只能用全局 saver 兜底。
-
-        分库 saver 是异步惰性创建的，同步路径无法获取。删除 thread 的
-        checkpoint 用全局 saver 调 delete_thread——但分库下数据不在全局库，
-        故此处是空操作。真正的清理在 main.py 删除 workspace 时走 drop。
-        保留此方法仅为接口兼容。
-        """
-        return self.checkpointer
 
     def _middleware_for_workspace(self, workspace_path: Path, trace_id: str | None, agent_name: str) -> list[AgentMiddleware]:
         # GoalMiddleware 仅安装在 Meta Agent 层级（见 _agent_for_workspace），
@@ -261,12 +220,6 @@ class MetaAgentService:
             str(META_SKILLS_DIR / "auto-pipeline"),
             str(META_SKILLS_DIR / "interactive-gating"),
         ]
-
-    def delete_thread_checkpoint(self, thread_id: str, *, owner_id: str | None = None) -> None:
-        # 多用户：同步路径用全局 saver 兜底（分库 saver 是异步惰性创建的）。
-        # 真正的分库清理在 main.py 删除 workspace 时走 CheckpointPool.drop。
-        checkpointer = self._resolve_checkpointer_sync(owner_id)
-        checkpointer.delete_thread(thread_id)
 
     async def get_thread_checkpoint(self, thread_id: str, *, owner_id: str | None = None) -> CheckpointState:
         """读取 thread 的最新 checkpoint，规范化为 CheckpointState。"""

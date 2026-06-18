@@ -97,12 +97,70 @@ export type MyProfile = {
   username: string;
   has_api_key: boolean;
   base_url: string | null;
+  active_model: string | null;
   workspace_count: number;
   workspace_quota: number;
 };
 
 export async function fetchMyProfile() {
   return apiJson<MyProfile>(`${API_BASE_URL}/api/me`);
+}
+
+// ── Provider 配置历史（多条，可切换）──────────────────────
+
+export type ProviderConfig = {
+  config_id: string;
+  name: string;
+  base_url: string | null;
+  model: string;
+  is_active: boolean;
+  created_at: string;
+  last_used_at: string | null;
+};
+
+export type ProviderConfigInput = {
+  name: string;
+  api_key: string;
+  base_url: string | null;
+  model: string;
+  activate?: boolean;
+};
+
+export async function listProviderConfigs() {
+  return apiJson<ProviderConfig[]>(`${API_BASE_URL}/api/me/provider-configs`);
+}
+
+export async function createProviderConfig(payload: ProviderConfigInput) {
+  return apiJson<ProviderConfig>(`${API_BASE_URL}/api/me/provider-configs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateProviderConfig(
+  configId: string,
+  payload: Partial<Omit<ProviderConfigInput, "activate">>,
+) {
+  return apiJson<ProviderConfig>(`${API_BASE_URL}/api/me/provider-configs/${configId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function activateProviderConfig(configId: string) {
+  return apiJson<{ status: string; active: string }>(
+    `${API_BASE_URL}/api/me/provider-configs/${configId}/activate`,
+    { method: "POST" },
+  );
+}
+
+export async function deleteProviderConfig(configId: string) {
+  return apiJson<{ status: string; deleted: string }>(
+    `${API_BASE_URL}/api/me/provider-configs/${configId}`,
+    { method: "DELETE" },
+  );
 }
 
 // ── 管理后台（D6/D12/D14）──────────────────────────────────
@@ -129,7 +187,8 @@ export type AdminUserSummary = {
 
 export type AdminWorkspaceSummary = {
   workspace_id: string;
-  outline_name: string;
+  title: string;
+  domain: string;
   created_at: string;
   updated_at: string;
 };
@@ -182,7 +241,7 @@ export async function adminListUserWorkspaces(userId: string) {
 }
 
 export async function adminReadUserWorkspaceOutline(userId: string, workspaceId: string) {
-  return apiJson<{ workspace_id: string; outline_name: string; markdown: string }>(
+  return apiJson<{ workspace_id: string; title: string; markdown: string }>(
     `${API_BASE_URL}/api/admin/users/${userId}/workspaces/${workspaceId}/outline`,
   );
 }
@@ -204,14 +263,102 @@ export async function fetchWorkspaceBootstrap(workspaceId: string) {
   return parseJsonResponse<WorkspaceBootstrapResponse>(response);
 }
 
-export async function createWorkspace(outlineName: string) {
+export async function createWorkspace(title: string, domain: string = "writing") {
   const response = await apiFetch(`${API_BASE_URL}/api/workspaces`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ outline_name: outlineName }),
+    body: JSON.stringify({ title, domain }),
   });
 
   return parseJsonResponse<WorkspaceSummary>(response);
+}
+
+// ── 文生图（Phase 3/4）────────────────────────────────────
+
+/** 图片 URL（DD8b：按 image_id 取图，后端鉴权）。 */
+export function imageUrl(imageId: string): string {
+  return `${API_BASE_URL}/api/images/${imageId}`;
+}
+
+export type ImageVersion = {
+  version_id: string;
+  direction: string;
+  prompt: string;
+  images: { image_id: string; url: string }[];
+  agent_analysis: string;
+};
+
+export type ImageReviewInterrupt = {
+  kind: "image_review";
+  round: number;
+  versions: ImageVersion[];
+};
+
+export type ImageReviewResume = {
+  kind: "image_review";
+  round: number;
+  ratings: { version_id: string; score: number; note: string }[];
+  overall_direction: string;
+  action: "continue" | "stop";
+};
+
+// ── Skill 管理（D18）──────────────────────────────────────
+
+export type SkillSummary = {
+  skill_id: string;
+  name: string;
+  scene_tag: string | null;
+  description: string;
+  revision_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SkillDetail = SkillSummary & { content: string };
+
+export async function listSkills() {
+  return apiJson<SkillSummary[]>(`${API_BASE_URL}/api/skills`);
+}
+
+export async function readSkill(skillId: string) {
+  return apiJson<SkillDetail>(`${API_BASE_URL}/api/skills/${skillId}`);
+}
+
+export async function updateSkill(
+  skillId: string,
+  data: { name?: string; scene_tag?: string; description?: string },
+) {
+  return apiJson<SkillSummary>(`${API_BASE_URL}/api/skills/${skillId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export async function deleteSkill(skillId: string) {
+  return apiJson<{ status: string }>(`${API_BASE_URL}/api/skills/${skillId}`, {
+    method: "DELETE",
+  });
+}
+
+export async function mergeSkills(
+  skillId1: string,
+  skillId2: string,
+  newName: string,
+  newContent: string,
+  newSceneTag: string = "",
+) {
+  return apiJson<SkillSummary>(`${API_BASE_URL}/api/skills/merge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      skill_id_1: skillId1,
+      skill_id_2: skillId2,
+      new_name: newName,
+      new_content: newContent,
+      new_scene_tag: newSceneTag,
+    }),
+  });
 }
 
 export async function deleteWorkspace(workspaceId: string) {

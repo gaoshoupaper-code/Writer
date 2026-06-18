@@ -12,6 +12,7 @@ from docx import Document
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.pdfbase import pdfmetrics
@@ -47,6 +48,7 @@ from app.schemas.screenplay import (
 )
 from app.schemas.checkpoint import CheckpointState
 from app.writer.trace import TraceDetail, TraceRunSummary
+from app.writer.middleware.trace_callback import TraceCallbackHandler
 from app.auth import auth_router, current_user, CurrentUser
 from app.auth.bootstrap import bootstrap_admin
 from app.admin import me_router, admin_router
@@ -233,15 +235,21 @@ _checkpointer_cm = AsyncSqliteSaver.from_conn_string(str(_global_checkpoint_db_p
 
 agent_service: MetaAgentService | None = None
 character_service: CharacterService | None = None
+image_agent_service = None  # ImageAgentService 实例（Phase 3）
 
 
 async def _lifespan(application: FastAPI):
-    global agent_service, character_service
+    global agent_service, character_service, image_agent_service
     checkpointer = await _checkpointer_cm.__aenter__()
     if agent_service is None:
         agent_service = MetaAgentService(settings, workspace_root, trace_recorder, style_store, checkpointer)
     if character_service is None:
         character_service = CharacterService(settings, workspace_root, trace_recorder, checkpointer)
+    if image_agent_service is None:
+        from app.domains.image.agent import ImageAgentService
+        image_agent_service = ImageAgentService(settings, workspace_root, trace_recorder, checkpointer)
+        from app.domains.image.router import init_image_routes
+        init_image_routes(image_agent_service, thread_store)
     # 多用户：引导管理员账号（幂等）
     bootstrap_admin()
     # 启动 trace 写盘 drain 协程：append_event 不再同步写盘，改入内存缓冲，
@@ -272,6 +280,9 @@ app.include_router(style_router)
 app.include_router(auth_router)
 app.include_router(me_router)
 app.include_router(admin_router)
+# image domain 路由（Phase 3：图片服务端点 + Skill 管理）
+from app.domains.image.router import router as image_router
+app.include_router(image_router)
 
 
 @app.middleware("http")
@@ -342,7 +353,7 @@ def create_workspace(payload: WorkspaceCreateRequest, user: CurrentUser = Depend
             detail=f"作品数量已达上限（{quota} 部）",
         )
     try:
-        return thread_store.create_workspace(user.user_id, payload.outline_name)
+        return thread_store.create_workspace(user.user_id, payload.title, payload.domain)
     except FileExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
@@ -517,8 +528,8 @@ def export_workspace_novel_pdf(workspace_id: str, user: CurrentUser = Depends(cu
     if not content.markdown.strip():
         raise HTTPException(status_code=404, detail="Novel content not found")
 
-    filename = f"{workspace.outline_name or workspace_id}.pdf"
-    pdf = _build_novel_pdf(content.markdown, workspace.outline_name or "小说正文")
+    filename = f"{workspace.title or workspace_id}.pdf"
+    pdf = _build_novel_pdf(content.markdown, workspace.title or "小说正文")
     return Response(
         content=pdf,
         media_type="application/pdf",
@@ -538,7 +549,7 @@ def export_workspace_novel_word_zip(workspace_id: str, user: CurrentUser = Depen
     if not content.chapters:
         raise HTTPException(status_code=404, detail="Novel content not found")
 
-    filename_base = _safe_download_name(workspace.outline_name or workspace_id, workspace_id)
+    filename_base = _safe_download_name(workspace.title or workspace_id, workspace_id)
     archive = _build_novel_docx_zip(content)
     return Response(
         content=archive,
@@ -665,6 +676,138 @@ async def stream_screenplay(payload: ScreenplayGenerateRequest, user: CurrentUse
         raise HTTPException(status_code=404, detail="Thread not found")
     return StreamingResponse(
         _event_generator(payload, thread, owner_id=user.user_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+class ImageGenerateRequest(BaseModel):
+    """文生图生成请求。"""
+    thread_id: str
+    prompt: str  # 用户想生成的图片描述
+    trace_id: str | None = None
+    resume: dict | None = None  # HITL resume（结构化 image_review 反馈，DD4）
+    selected_skill_ids: list[str] | None = None  # D9 加载的私有 Skill
+
+
+async def _image_event_generator(payload: ImageGenerateRequest, thread, *, owner_id: str):
+    """文生图 SSE 流（复用 image_agent_service 的 agent + SSE 格式）。
+
+    image agent 走自己的 _build_agent，SSE 事件格式与写作一致（model_stream/
+    tool_call/tool_output/interrupt/final），前端按 interrupt 的 kind 路由渲染。
+    """
+    import asyncio
+    from langgraph.types import Command
+    model = image_agent_service._resolve_model(owner_id)
+    checkpointer = await image_agent_service._resolve_checkpointer(owner_id)
+    trace = trace_recorder.create_run(thread, "image.generate.stream")
+    yield _sse_event("status", {"status": "started", "trace_id": trace.trace_id})
+    trace_queue = trace_recorder.get_active_queue(trace.trace_id)
+    if trace_queue is None:
+        raise RuntimeError(f"Trace queue not created: {trace.trace_id}")
+
+    agent = image_agent_service._build_agent(
+        Path(thread.workspace_path), trace.trace_id, thread.workspace_id, owner_id,
+        model=model, checkpointer=checkpointer,
+        selected_skill_ids=payload.selected_skill_ids,
+    )
+    config = {
+        "configurable": {"thread_id": thread.thread_id},
+        "callbacks": [TraceCallbackHandler(trace_recorder, trace.trace_id)],
+        "recursion_limit": 200,
+    }
+    if payload.resume is not None:
+        agent_input = Command(resume=payload.resume)
+    else:
+        agent_input = {"messages": [{"role": "user", "content": payload.prompt}]}
+
+    heartbeat_task = asyncio.create_task(asyncio.sleep(15))
+    agent_events = agent.astream_events(agent_input, config=config, version="v2")
+    agent_task = asyncio.create_task(agent_events.__anext__())
+    full_result = None
+    try:
+        while True:
+            done, _ = await asyncio.wait(
+                {agent_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done:
+                heartbeat_task.result()
+                yield ": ping\n\n"
+                heartbeat_task = asyncio.create_task(asyncio.sleep(15))
+            if agent_task in done:
+                try:
+                    event = agent_task.result()
+                except StopAsyncIteration:
+                    break
+                agent_task = asyncio.create_task(agent_events.__anext__())
+                kind = event["event"]
+                data = event.get("data", {})
+                if kind == "on_chat_model_stream":
+                    chunk = data.get("chunk")
+                    content = getattr(chunk, "content", "") if chunk else ""
+                    if content:
+                        yield _sse_event("model_stream", {"content": content})
+                elif kind == "on_tool_end":
+                    yield _sse_event("tool_output", {
+                        "tool": event.get("name", ""),
+                        "output": str(data.get("output", ""))[:2000],
+                    })
+                elif kind == "on_tool_error":
+                    yield _sse_event("tool_error", {
+                        "tool": event.get("name", ""),
+                        "error": str(data.get("error") or data.get("output") or "")[:500],
+                    })
+                if kind == "on_chain_end" and event.get("name") == "LangGraph":
+                    full_result = data.get("output")
+        # HITL interrupt 检测（DD4）
+        state = await agent.aget_state(config)
+        pending = [t for t in state.tasks if t.interrupts]
+        if pending:
+            iv = pending[0].interrupts[0].value
+            payload_dict = iv if isinstance(iv, dict) else {"question": str(iv)}
+            # 确保 kind 字段存在（DD4：前端按 kind 路由）
+            if "kind" not in payload_dict:
+                payload_dict["kind"] = "choice"
+            payload_dict["thread_id"] = thread.thread_id
+            yield _sse_event("interrupt", payload_dict)
+            return
+        if full_result is not None:
+            content = ""
+            if isinstance(full_result, dict):
+                for msg in reversed(full_result.get("messages", [])):
+                    mc = getattr(msg, "content", None) or (msg.get("content") if isinstance(msg, dict) else None)
+                    if isinstance(mc, str) and mc:
+                        content = mc
+                        break
+            yield _sse_event("final", {"content": content, "thread_id": thread.thread_id})
+        trace_recorder.complete_run(thread, trace.trace_id)
+    except BaseException as exc:
+        trace_recorder.fail_run(thread, trace.trace_id, exc)
+        yield _sse_event("error", {"error": str(exc)[:500]})
+        raise
+    finally:
+        heartbeat_task.cancel()
+        agent_task.cancel()
+        with __import__("contextlib").suppress(BaseException):
+            await agent_events.aclose()
+
+
+@app.post("/api/image/generate/stream")
+async def stream_image(payload: ImageGenerateRequest, user: CurrentUser = Depends(current_user)):
+    """文生图 SSE 流（Phase 3.9）。
+
+    复用 image_agent_service 的 agent，SSE 事件与写作一致。
+    interrupt 事件按 kind 路由：choice=访谈式 / image_review=图像评审。
+    """
+    thread = thread_store.get_thread(user.user_id, payload.thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    return StreamingResponse(
+        _image_event_generator(payload, thread, owner_id=user.user_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
