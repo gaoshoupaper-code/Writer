@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import type { WorkspaceSummary } from "../../lib/types";
 import {
   DropdownMenu,
@@ -17,10 +18,14 @@ type TopBarProps = {
   creatingWorkspace: boolean;
   deletingWorkspace: boolean;
   theme: ThemeMode;
+  username: string;
+  isAdmin: boolean;
+  hasApiKey: boolean;
   onWorkspaceChange: (workspaceId: string) => void;
   onCreateWorkspace: () => void;
   onDeleteWorkspace: (workspaceId: string) => void;
   onThemeToggle: () => void;
+  onLogout: () => void;
 };
 
 export function TopBar({
@@ -29,10 +34,14 @@ export function TopBar({
   creatingWorkspace,
   deletingWorkspace,
   theme,
+  username,
+  isAdmin,
+  hasApiKey,
   onWorkspaceChange,
   onCreateWorkspace,
   onDeleteWorkspace,
   onThemeToggle,
+  onLogout,
 }: TopBarProps) {
   const activeWorkspace = workspaces.find((w) => w.workspace_id === activeWorkspaceId);
   // 决策3：顶部「书名：」+ outline_name 静态标签（数据源=现有 outline_name）
@@ -97,6 +106,37 @@ export function TopBar({
       </div>
 
       <div className="workspace-actions">
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button className="user-menu-trigger" type="button" aria-label="用户菜单">
+              <span className="user-menu-avatar">{(username || "?").slice(0, 1).toUpperCase()}</span>
+              <span className="user-menu-name">{username || "用户"}</span>
+              <span className="session-menu-caret">▾</span>
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-[220px]">
+            <div className="user-menu-header">
+              <strong>{username || "用户"}</strong>
+              <span className={`user-menu-keybadge ${hasApiKey ? "ok" : "missing"}`}>
+                {hasApiKey ? "Key 已配置" : "Key 未配置"}
+              </span>
+            </div>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem asChild>
+              <Link href="/settings">设置（API Key）</Link>
+            </DropdownMenuItem>
+            {isAdmin ? (
+              <DropdownMenuItem asChild>
+                <Link href="/admin">管理后台</Link>
+              </DropdownMenuItem>
+            ) : null}
+            <DropdownMenuSeparator />
+            <DropdownMenuItem className="text-red-600" onClick={onLogout}>
+              退出登录
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+
         <button
           className="theme-toggle"
           type="button"

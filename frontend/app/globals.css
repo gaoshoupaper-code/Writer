@@ -4614,3 +4614,457 @@ html[data-theme="dark"] .panel-heading {
 .message-retry:hover {
   background: rgba(95, 124, 255, 0.16);
 }
+
+/* ── 认证页（登录/注册/设置）────────────────────────────── */
+.auth-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: linear-gradient(135deg, var(--bg, #f7f8fc) 0%, #eef1f8 100%);
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 420px;
+  background: var(--surface, #ffffff);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 16px;
+  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.08);
+  padding: 32px 28px;
+}
+
+.auth-title {
+  margin: 0 0 4px;
+  font-size: 22px;
+  font-weight: 800;
+  text-align: center;
+}
+
+.auth-subtitle {
+  margin: 0 0 24px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-muted, #64748b);
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.auth-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.auth-input {
+  padding: 10px 12px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 10px;
+  font-size: 14px;
+  background: var(--surface, #fff);
+  color: var(--text, #0f172a);
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.auth-input:focus {
+  border-color: var(--blue, #5f7cff);
+}
+
+.auth-button {
+  margin-top: 6px;
+  padding: 11px 16px;
+  border: none;
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--teal, #2dd4bf), var(--blue, #5f7cff));
+  color: #fff;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 0.1s, box-shadow 0.15s;
+}
+
+.auth-button:hover:not(:disabled) {
+  box-shadow: 0 6px 16px rgba(95, 124, 255, 0.3);
+  transform: translateY(-1px);
+}
+
+.auth-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.auth-foot {
+  margin: 18px 0 0;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-muted, #64748b);
+}
+
+.auth-foot a {
+  color: var(--blue, #5f7cff);
+  text-decoration: none;
+  font-weight: 600;
+  margin-left: 4px;
+}
+
+.auth-hint {
+  margin: 12px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-muted, #94a3b8);
+  text-align: center;
+}
+
+.settings-quota {
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(95, 124, 255, 0.08);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--blue, #5f7cff);
+}
+
+.settings-key-status {
+  margin-bottom: 18px;
+  font-size: 13px;
+}
+
+.settings-key-ok {
+  color: #16a34a;
+}
+
+.settings-key-missing {
+  color: #dc2626;
+}
+
+html[data-theme="dark"] .auth-page {
+  background: linear-gradient(135deg, #0b1120 0%, #131a2e 100%);
+}
+
+html[data-theme="dark"] .auth-card {
+  background: #161e33;
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+html[data-theme="dark"] .auth-input {
+  background: #1c2540;
+  border-color: rgba(255, 255, 255, 0.12);
+  color: #e2e8f0;
+}
+
+/* ── TopBar 用户菜单 ─────────────────────────────────────── */
+.user-menu-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 999px;
+  background: var(--surface, #fff);
+  color: var(--text, #0f172a);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.user-menu-trigger:hover {
+  background: rgba(95, 124, 255, 0.06);
+}
+
+.user-menu-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--teal, #2dd4bf), var(--blue, #5f7cff));
+  color: #fff;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.user-menu-name {
+  max-width: 100px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-menu-header {
+  padding: 6px 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.user-menu-keybadge {
+  align-self: flex-start;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.user-menu-keybadge.ok {
+  background: rgba(22, 163, 74, 0.1);
+  color: #16a34a;
+}
+
+.user-menu-keybadge.missing {
+  background: rgba(220, 38, 38, 0.1);
+  color: #dc2626;
+}
+
+html[data-theme="dark"] .user-menu-trigger {
+  background: #1c2540;
+  border-color: rgba(255, 255, 255, 0.12);
+  color: #e2e8f0;
+}
+
+/* ── 管理后台 ─────────────────────────────────────────────── */
+.admin-card {
+  width: 100%;
+  max-width: 960px;
+  background: var(--surface, #fff);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 16px;
+  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.08);
+  padding: 28px;
+}
+
+.admin-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.admin-back {
+  font-size: 13px;
+  color: var(--blue, #5f7cff);
+  text-decoration: none;
+}
+
+.admin-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+  margin-bottom: 20px;
+}
+
+.admin-tab {
+  padding: 8px 16px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted, #64748b);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+
+.admin-tab.active {
+  color: var(--blue, #5f7cff);
+  border-bottom-color: var(--blue, #5f7cff);
+}
+
+.admin-section {
+  margin-top: 8px;
+}
+
+.admin-section h2 {
+  font-size: 16px;
+  margin: 0 0 12px;
+}
+
+.admin-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.admin-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.admin-table th,
+.admin-table td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.admin-table th {
+  font-weight: 700;
+  color: var(--text-muted, #64748b);
+  font-size: 12px;
+}
+
+.admin-table .row-disabled {
+  opacity: 0.5;
+}
+
+.admin-time {
+  color: var(--text-muted, #94a3b8);
+  font-size: 12px;
+}
+
+.admin-code {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  background: rgba(95, 124, 255, 0.08);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.admin-newcodes {
+  margin-bottom: 16px;
+  padding: 12px;
+  border-radius: 10px;
+  background: rgba(45, 212, 191, 0.1);
+  border: 1px solid rgba(45, 212, 191, 0.3);
+}
+
+.admin-newcodes strong {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.admin-code-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.admin-link {
+  background: none;
+  border: none;
+  color: var(--blue, #5f7cff);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 2px 6px;
+  margin-right: 4px;
+}
+
+.admin-link.danger {
+  color: #dc2626;
+}
+
+.admin-link:hover {
+  text-decoration: underline;
+}
+
+.admin-muted {
+  color: var(--text-muted, #94a3b8);
+}
+
+.badge-usable {
+  color: #16a34a;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.badge-used {
+  color: var(--text-muted, #64748b);
+  font-size: 12px;
+}
+
+.badge-revoked {
+  color: #dc2626;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.admin-ws-layout {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  gap: 16px;
+  margin-top: 8px;
+}
+
+.admin-ws-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-right: 1px solid rgba(0, 0, 0, 0.06);
+  padding-right: 12px;
+}
+
+.admin-ws-item {
+  padding: 8px 10px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text, #0f172a);
+}
+
+.admin-ws-item:hover {
+  background: rgba(95, 124, 255, 0.06);
+}
+
+.admin-ws-item.active {
+  background: rgba(95, 124, 255, 0.12);
+  font-weight: 600;
+}
+
+.admin-ws-content h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.admin-outline {
+  background: rgba(0, 0, 0, 0.03);
+  padding: 12px;
+  border-radius: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  max-height: 480px;
+  overflow: auto;
+  margin: 0;
+}
+
+html[data-theme="dark"] .admin-card {
+  background: #161e33;
+  border-color: rgba(255, 255, 255, 0.08);
+  color: #e2e8f0;
+}
+
+html[data-theme="dark"] .admin-tabs {
+  border-bottom-color: rgba(255, 255, 255, 0.1);
+}
+
+html[data-theme="dark"] .admin-table th,
+html[data-theme="dark"] .admin-table td {
+  border-bottom-color: rgba(255, 255, 255, 0.08);
+}
+
+html[data-theme="dark"] .admin-outline {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+
+

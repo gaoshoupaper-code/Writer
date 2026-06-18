@@ -64,6 +64,42 @@ class MetaAgentService:
         workspace_path.mkdir(parents=True, exist_ok=True)
         return FilesystemBackend(root_dir=workspace_path, virtual_mode=True)
 
+    # ── 多用户隔离：解析当前用户的 model 与 checkpointer ──
+    def _resolve_model(self, owner_id: str | None):
+        """按 owner 解密其 API key 构建 model；无 owner 或无 key 回退全局 settings。"""
+        if not owner_id:
+            return build_writer_model(self.settings)
+        try:
+            from app.db import get_database, UserRepository
+            users = UserRepository(get_database())
+            key, base_url = users.get_api_key_plain(owner_id)
+            if key is None:
+                # 用户未填 key：回退全局（管理员兜底）或抛错由路由层拦
+                return build_writer_model(self.settings)
+            return build_writer_model(self.settings, api_key=key, base_url=base_url)
+        except Exception:
+            return build_writer_model(self.settings)
+
+    async def _resolve_checkpointer(self, owner_id: str | None):
+        """按 owner 取分库 saver；无 owner 回退全局（兼容/测试）。"""
+        if not owner_id:
+            return self.checkpointer
+        try:
+            from app.core.checkpoint_pool import get_checkpoint_pool
+            return await get_checkpoint_pool().get(owner_id)
+        except Exception:
+            return self.checkpointer
+
+    def _resolve_checkpointer_sync(self, owner_id: str | None):
+        """delete_thread_checkpoint 是同步调用，这里只能用全局 saver 兜底。
+
+        分库 saver 是异步惰性创建的，同步路径无法获取。删除 thread 的
+        checkpoint 用全局 saver 调 delete_thread——但分库下数据不在全局库，
+        故此处是空操作。真正的清理在 main.py 删除 workspace 时走 drop。
+        保留此方法仅为接口兼容。
+        """
+        return self.checkpointer
+
     def _middleware_for_workspace(self, workspace_path: Path, trace_id: str | None, agent_name: str) -> list[AgentMiddleware]:
         # GoalMiddleware 仅安装在 Meta Agent 层级（见 _agent_for_workspace），
         # 子代理不需要——它们通过 evolution 评估循环和 ArtifactValidation 控制质量。
@@ -133,38 +169,38 @@ class MetaAgentService:
             return None
         return style.get("meta_style") or None
 
-    def _interview_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None) -> CompiledSubAgent:
+    def _interview_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, *, model=None) -> CompiledSubAgent:
         return build_interview_deep_subagent(
             workspace_path,
-            build_writer_model(self.settings),
+            model or build_writer_model(self.settings),
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_workspace(workspace_path, trace_id, agent_name),
         )
 
-    def _storybuilding_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
+    def _storybuilding_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None, *, model=None) -> CompiledSubAgent:
         return build_storybuilding_deep_subagent(
             workspace_path,
-            build_writer_model(self.settings),
+            model or build_writer_model(self.settings),
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_workspace(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
             context_file_paths=["demand.md"],
         )
 
-    def _detail_outline_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
+    def _detail_outline_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None, *, model=None) -> CompiledSubAgent:
         return build_detail_outline_deep_subagent(
             workspace_path,
-            build_writer_model(self.settings),
+            model or build_writer_model(self.settings),
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
             context_file_paths=["demand.md", "outline.md", "character/*.md", "worldview.md", "storyline.md", "storyline/*.md", "detail/overview.md", "detail/chapter-*.md"],
         )
 
-    def _writing_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None) -> CompiledSubAgent:
+    def _writing_subagent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, style_suffix: str | None = None, *, model=None) -> CompiledSubAgent:
         return build_writing_deep_subagent(
             workspace_path,
-            build_writer_model(self.settings),
+            model or build_writer_model(self.settings),
             self._backend_for_workspace(workspace_path),
             lambda agent_name: self._middleware_for_pipeline_subagent(workspace_path, trace_id, agent_name),
             style_suffix=style_suffix,
@@ -176,8 +212,13 @@ class MetaAgentService:
         spec["middleware"] = self._middleware_for_workspace(workspace_path, trace_id, "general-purpose-subagent")
         return spec
 
-    def _agent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, workspace_id: str | None = None):
-        model = build_writer_model(self.settings)
+    def _agent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, workspace_id: str | None = None, *, model=None, checkpointer=None):
+        # 多用户隔离（T2.4/T2.5）：model 用用户解密 key 构建，
+        # checkpointer 用用户的分库 saver。两者外部注入，缺省回退全局（管理员兜底）。
+        if model is None:
+            model = build_writer_model(self.settings)
+        if checkpointer is None:
+            checkpointer = self.checkpointer
         middleware: list[AgentMiddleware] = [
             GoalMiddleware(),
             ErrorRecoveryMiddleware(),
@@ -198,13 +239,13 @@ class MetaAgentService:
             system_prompt=self._load_system_prompt(meta_style),
             subagents=[
                 self._general_subagent_for_workspace(workspace_path, trace_id),
-                self._interview_subagent_for_workspace(workspace_path, trace_id),
-                self._storybuilding_subagent_for_workspace(workspace_path, trace_id, storybuilding_style),
-                self._detail_outline_subagent_for_workspace(workspace_path, trace_id, detail_outline_style),
-                self._writing_subagent_for_workspace(workspace_path, trace_id, writing_style),
+                self._interview_subagent_for_workspace(workspace_path, trace_id, model=model),
+                self._storybuilding_subagent_for_workspace(workspace_path, trace_id, storybuilding_style, model=model),
+                self._detail_outline_subagent_for_workspace(workspace_path, trace_id, detail_outline_style, model=model),
+                self._writing_subagent_for_workspace(workspace_path, trace_id, writing_style, model=model),
             ],
             backend=effective_backend,
-            checkpointer=self.checkpointer,
+            checkpointer=checkpointer,
             middleware=middleware,
             skills=skill_sources,
         )
@@ -221,13 +262,17 @@ class MetaAgentService:
             str(META_SKILLS_DIR / "interactive-gating"),
         ]
 
-    def delete_thread_checkpoint(self, thread_id: str) -> None:
-        self.checkpointer.delete_thread(thread_id)
+    def delete_thread_checkpoint(self, thread_id: str, *, owner_id: str | None = None) -> None:
+        # 多用户：同步路径用全局 saver 兜底（分库 saver 是异步惰性创建的）。
+        # 真正的分库清理在 main.py 删除 workspace 时走 CheckpointPool.drop。
+        checkpointer = self._resolve_checkpointer_sync(owner_id)
+        checkpointer.delete_thread(thread_id)
 
-    async def get_thread_checkpoint(self, thread_id: str) -> CheckpointState:
+    async def get_thread_checkpoint(self, thread_id: str, *, owner_id: str | None = None) -> CheckpointState:
         """读取 thread 的最新 checkpoint，规范化为 CheckpointState。"""
+        checkpointer = await self._resolve_checkpointer(owner_id)
         config = {"configurable": {"thread_id": thread_id}}
-        checkpoint = await self.checkpointer.aget(config)
+        checkpoint = await checkpointer.aget(config)
         if checkpoint is None:
             print(f"[checkpoint] thread_id={thread_id} → aget returned None (no checkpoint saved)")
             return CheckpointState(thread_id=thread_id, messages=[])
@@ -246,6 +291,8 @@ class MetaAgentService:
         self,
         payload: ScreenplayGenerateRequest,
         thread: ThreadSummary,
+        *,
+        owner_id: str | None = None,
     ) -> ScreenplayGenerateResponse:
         if self.settings.writer_agent_mode.lower() == "mock":
             return self._mock_response(payload, thread)
@@ -253,7 +300,11 @@ class MetaAgentService:
         trace = self.trace_recorder.create_run(thread, "screenplay.generate")
         try:
             prompt = self._build_user_prompt(payload, thread)
-            agent = self._agent_for_workspace(Path(thread.workspace_path), trace.trace_id, thread.workspace_id)
+            model = self._resolve_model(owner_id)
+            agent = self._agent_for_workspace(
+                Path(thread.workspace_path), trace.trace_id, thread.workspace_id,
+                model=model,
+            )
             result = agent.invoke(
                 {"messages": [{"role": "user", "content": prompt}]},
                 config={
@@ -272,12 +323,16 @@ class MetaAgentService:
             self.trace_recorder.fail_run(thread, trace.trace_id, exc)
             raise
 
-    async def generate_stream(self, payload: ScreenplayGenerateRequest, thread: ThreadSummary) -> AsyncIterator[str]:
+    async def generate_stream(self, payload: ScreenplayGenerateRequest, thread: ThreadSummary, *, owner_id: str | None = None) -> AsyncIterator[str]:
         """Stream agent execution events as SSE to the frontend."""
         if self.settings.writer_agent_mode.lower() == "mock":
             response = self._mock_response(payload, thread)
             yield _sse("final", response.model_dump())
             return
+
+        # 多用户：解析当前用户的 model 与分库 checkpointer
+        model = self._resolve_model(owner_id)
+        checkpointer = await self._resolve_checkpointer(owner_id)
 
         # HITL resume：带 resume + trace_id 时复用活跃 trace（不发 run_start），
         # 否则 create_run 新开。内存丢失（服务重启）时 resume_run 会降级 create_run（D2=A）。
@@ -296,7 +351,10 @@ class MetaAgentService:
         for trace_update in self._trace_updates(trace_queue):
             yield trace_update
 
-        agent = self._agent_for_workspace(Path(thread.workspace_path), trace.trace_id, thread.workspace_id)
+        agent = self._agent_for_workspace(
+            Path(thread.workspace_path), trace.trace_id, thread.workspace_id,
+            model=model, checkpointer=checkpointer,
+        )
 
         # resume 分支已在上方判定，据此构造 agent 输入
         if resume_value is not None:

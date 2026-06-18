@@ -26,6 +26,7 @@ import {
   deleteTrace as deleteTraceRequest,
   deleteWorkspace as deleteWorkspaceRequest,
   fetchInit,
+  fetchMeOrNull,
   fetchStyles as fetchStylesRequest,
   fetchThreadTraces,
   fetchThreads,
@@ -36,6 +37,7 @@ import {
   fetchWorkspaceNovel,
   fetchWorkspaceOutline,
   fetchWorkspaces,
+  logout as logoutRequest,
   optimizeStyle as optimizeStyleRequest,
   updateStyle as updateStyleRequest,
   updateThread as updateThreadRequest,
@@ -372,6 +374,10 @@ export default function Home() {
   const [deletingWorkspace, setDeletingWorkspace] = useState(false);
   const [theme, setTheme] = useState<ThemeMode>("light");
   const [themeReady, setThemeReady] = useState(false);
+  // 多用户：登录态 + 是否已填 API Key
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authUser, setAuthUser] = useState<{ username: string; is_admin: boolean } | null>(null);
+  const [hasApiKey, setHasApiKey] = useState(false);
   const [workspaceCreateOpen, setWorkspaceCreateOpen] = useState(false);
   const [workspaceDeleteOpen, setWorkspaceDeleteOpen] = useState(false);
   const [pendingDeleteWorkspaceId, setPendingDeleteWorkspaceId] = useState("");
@@ -395,6 +401,32 @@ export default function Home() {
       window.localStorage.setItem(themeStorageKey, theme);
     }
   }, [theme, themeReady]);
+
+  // ── 路由守卫：未登录跳 /login ──
+  useEffect(() => {
+    let ignore = false;
+    (async () => {
+      const me = await fetchMeOrNull();
+      if (ignore) return;
+      if (!me) {
+        window.location.href = "/login";
+        return;
+      }
+      setAuthUser({ username: me.username, is_admin: me.is_admin });
+      setHasApiKey(me.has_api_key);
+      setAuthChecked(true);
+    })();
+    return () => { ignore = true; };
+  }, []);
+
+  async function handleLogout() {
+    try {
+      await logoutRequest();
+    } catch {
+      /* ignore */
+    }
+    window.location.href = "/login";
+  }
 
   // ── 首次加载：2 个请求完成全部初始化 ──
   // ⚠️ 不能用 ref 提前 return 来"保证只跑一次"。React StrictMode（Next.js dev 默认
@@ -1021,6 +1053,10 @@ export default function Home() {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (aiDisabled) {
+      toast.error("请先在设置页填写你的 API Key，才能使用 AI 生成。");
+      return;
+    }
     // performSubmit 在 resume 失败时会 re-throw（供 InterviewOptions 解锁）；
     // 表单路径无 InterviewOptions，吞掉避免 unhandled rejection（UI 已在内部处理）。
     try {
@@ -1132,6 +1168,7 @@ export default function Home() {
             ? { thread_id: userMessageThreadId, resume: trimmedPrompt, trace_id: resumeTraceId ?? undefined }
             : { thread_id: userMessageThreadId, prompt: trimmedPrompt },
         ),
+        credentials: "include",
         signal: abortController.signal,
       });
 
@@ -1371,6 +1408,14 @@ export default function Home() {
     }
   }
 
+  // 未登录（或在跳转 /login 中）：不渲染主界面，避免闪烁 + 触发 401 雪崩
+  if (!authChecked) {
+    return null;
+  }
+
+  // 未填 API Key：禁用 AI 生成，提交时拦截并引导去设置页
+  const aiDisabled = !hasApiKey;
+
   return (
     <>
       <AppShell
@@ -1381,6 +1426,9 @@ export default function Home() {
             creatingWorkspace={creatingWorkspace}
             deletingWorkspace={deletingWorkspace}
             theme={theme}
+            username={authUser?.username ?? ""}
+            isAdmin={authUser?.is_admin ?? false}
+            hasApiKey={hasApiKey}
             onWorkspaceChange={setActiveWorkspaceId}
             onCreateWorkspace={() => setWorkspaceCreateOpen(true)}
             onDeleteWorkspace={(workspaceId: string) => {
@@ -1388,6 +1436,7 @@ export default function Home() {
               setWorkspaceDeleteOpen(true);
             }}
             onThemeToggle={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
+            onLogout={handleLogout}
           />
         }
         sidebar={<Sidebar activePanel={activePanel} onPanelChange={setActivePanel} />}
@@ -1407,6 +1456,10 @@ export default function Home() {
             onPromptChange={setPrompt}
             onSubmit={handleSubmit}
             onResumeSubmit={async (resumeText) => {
+              if (aiDisabled) {
+                toast.error("请先在设置页填写你的 API Key，才能使用 AI 生成。");
+                return;
+              }
               await performSubmit(resumeText);
             }}
             onStop={handleStopGeneration}

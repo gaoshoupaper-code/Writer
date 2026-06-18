@@ -71,9 +71,10 @@ class CharacterService:
             middleware.insert(1, TraceMiddleware(self.trace_recorder, trace_id, agent_name))
         return middleware
 
-    def _agent_for_workspace(self, workspace_path: Path, trace_id: str | None = None):
+    def _agent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, *, model=None):
         """为指定工作区构建完整的代理。"""
-        model = build_writer_model(self.settings)
+        if model is None:
+            model = build_writer_model(self.settings)
         middleware = self._middleware_for_workspace(workspace_path, trace_id, "character-service")
         return create_deep_agent(
             model=model,
@@ -88,10 +89,26 @@ class CharacterService:
         """删除指定线程的检查点数据。"""
         self.checkpointer.delete_thread(thread_id)
 
+    def _resolve_model(self, owner_id: str | None):
+        """按 owner 解密 API key 构建 model；无 owner/key 回退全局。"""
+        if not owner_id:
+            return build_writer_model(self.settings)
+        try:
+            from app.db import get_database, UserRepository
+            users = UserRepository(get_database())
+            key, base_url = users.get_api_key_plain(owner_id)
+            if key is None:
+                return build_writer_model(self.settings)
+            return build_writer_model(self.settings, api_key=key, base_url=base_url)
+        except Exception:
+            return build_writer_model(self.settings)
+
     def generate(
         self,
         payload: CharacterGenerateRequest,
         thread: ThreadSummary,
+        *,
+        owner_id: str | None = None,
     ) -> CharacterGenerateResponse:
         """执行角色生成。"""
         if self.settings.writer_agent_mode.lower() == "mock":
@@ -100,7 +117,8 @@ class CharacterService:
         trace = self.trace_recorder.create_run(thread, "character.generate")
         try:
             prompt = self._build_user_prompt(payload, thread)
-            agent = self._agent_for_workspace(Path(thread.workspace_path), trace.trace_id)
+            model = self._resolve_model(owner_id)
+            agent = self._agent_for_workspace(Path(thread.workspace_path), trace.trace_id, model=model)
             result = agent.invoke(
                 {"messages": [{"role": "user", "content": prompt}]},
                 config={

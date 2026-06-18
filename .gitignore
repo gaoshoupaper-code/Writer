@@ -11,6 +11,12 @@ backend/.env
 # 运行时数据
 backend/workspace/
 backend/checkpoints.db*
+backend/checkpoints/
+backend/app.db
+backend/app.db-*
+backup/
+pre-multiuser-backup-*
+forensics-*/
 
 # Node
 node_modules/

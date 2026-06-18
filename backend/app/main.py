@@ -9,7 +9,7 @@ from urllib.parse import quote
 from watchfiles import awatch
 
 from docx import Document
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from reportlab.lib.pagesizes import A4
@@ -47,6 +47,12 @@ from app.schemas.screenplay import (
 )
 from app.schemas.checkpoint import CheckpointState
 from app.writer.trace import TraceDetail, TraceRunSummary
+from app.auth import auth_router, current_user, CurrentUser
+from app.auth.bootstrap import bootstrap_admin
+from app.admin import me_router, admin_router
+from app.core.checkpoint_pool import CheckpointPool, init_checkpoint_pool, get_checkpoint_pool
+from app.core.security import load_master_key
+from app.db import Database, init_database, get_database, UserRepository
 
 
 _active_generations = 0
@@ -168,7 +174,7 @@ def _build_novel_pdf(markdown: str, title: str) -> bytes:
     return buffer.getvalue()
 
 
-async def _event_generator(payload: ScreenplayGenerateRequest, thread: ThreadSummary):
+async def _event_generator(payload: ScreenplayGenerateRequest, thread: ThreadSummary, *, owner_id: str | None = None):
     """Async generator that yields SSE events from the agent execution."""
     global _active_generations
     _active_generations += 1
@@ -176,7 +182,7 @@ async def _event_generator(payload: ScreenplayGenerateRequest, thread: ThreadSum
     start = time.perf_counter()
     final_data = None
     try:
-        async for chunk in agent_service.generate_stream(payload, thread):
+        async for chunk in agent_service.generate_stream(payload, thread, owner_id=owner_id):
             yield chunk
             if chunk.startswith("event: final"):
                 for line in chunk.split("\n"):
@@ -187,7 +193,8 @@ async def _event_generator(payload: ScreenplayGenerateRequest, thread: ThreadSum
             import json
 
             response = ScreenplayGenerateResponse.model_validate(json.loads(final_data))
-            thread_store.write_outline(thread, response)
+            # write_outline 需要 owner_id 来定位工作区路径（thread.workspace_path 已含）
+            thread_store.write_outline(owner_id or "", thread, response)
         _log("sse_close", channel="generate", thread_id=payload.thread_id,
              ms=int((time.perf_counter() - start) * 1000))
     except BaseException as exc:
@@ -200,17 +207,29 @@ async def _event_generator(payload: ScreenplayGenerateRequest, thread: ThreadSum
 
 
 settings = get_settings()
-workspace_root = Path(__file__).resolve().parents[1] / "workspace"
+workspace_root = Path(__file__).resolve().parents[1] / settings.workspace_root
 trace_recorder = TraceRecorder()
-thread_store = ThreadStore(workspace_root)
-style_store = CreateTypeStore(workspace_root, thread_store)
+
+# 多用户地基：元数据库 + checkpoint 分库池
+_master_key = load_master_key(settings.master_key)
+_database = Database(settings.db_path, _master_key)
+init_database(_database)
+
+_checkpoints_root = Path(__file__).resolve().parents[1] / "checkpoints"
+_checkpoint_pool = CheckpointPool(_checkpoints_root)
+init_checkpoint_pool(_checkpoint_pool)
+
+thread_store = ThreadStore(_database, workspace_root)
+style_store = CreateTypeStore(_database, thread_store.workspaces)
 style_optimizer = StyleOptimizer(settings)
 init_style_module(style_store, style_optimizer)
 
+# 全局 checkpointer：仅作管理员兜底与同步 delete_thread 路径用；
+# 普通用户走 CheckpointPool 分库（services 内部按 owner_id 解析）。
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-checkpoint_db_path = workspace_root.parent / "checkpoints.db"
-_checkpointer_cm = AsyncSqliteSaver.from_conn_string(str(checkpoint_db_path))
+_global_checkpoint_db_path = workspace_root.parent / "checkpoints.db"
+_checkpointer_cm = AsyncSqliteSaver.from_conn_string(str(_global_checkpoint_db_path))
 
 agent_service: MetaAgentService | None = None
 character_service: CharacterService | None = None
@@ -223,6 +242,8 @@ async def _lifespan(application: FastAPI):
         agent_service = MetaAgentService(settings, workspace_root, trace_recorder, style_store, checkpointer)
     if character_service is None:
         character_service = CharacterService(settings, workspace_root, trace_recorder, checkpointer)
+    # 多用户：引导管理员账号（幂等）
+    bootstrap_admin()
     # 启动 trace 写盘 drain 协程：append_event 不再同步写盘，改入内存缓冲，
     # 由此后台协程成批落盘（to_thread，不占事件循环）。
     trace_recorder.start_drain()
@@ -231,6 +252,7 @@ async def _lifespan(application: FastAPI):
     # 关闭 drain 并刷掉残余事件，保证进程退出前 trace 数据完整。
     await trace_recorder.aclose()
     await _checkpointer_cm.__aexit__(None, None, None)
+    await _checkpoint_pool.aclose_all()
 
 
 app = FastAPI(
@@ -247,6 +269,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(style_router)
+app.include_router(auth_router)
+app.include_router(me_router)
+app.include_router(admin_router)
 
 
 @app.middleware("http")
@@ -274,18 +299,18 @@ def healthcheck() -> dict[str, str]:
 
 
 @app.get("/api/init", response_model=InitResponse)
-def init_page() -> InitResponse:
-    """页面首次加载：一次返回 workspaces + styles，替代 2 个独立请求。"""
+def init_page(user: CurrentUser = Depends(current_user)) -> InitResponse:
+    """页面首次加载：一次返回当前用户的 workspaces + styles。"""
     return InitResponse(
-        workspaces=thread_store.list_workspaces(),
-        styles=style_store.list_styles(),
+        workspaces=thread_store.list_workspaces(user.user_id),
+        styles=style_store.list_styles(user.user_id),
     )
 
 
 @app.get("/api/workspaces/{workspace_id}/bootstrap", response_model=WorkspaceBootstrapResponse)
-def bootstrap_workspace(workspace_id: str) -> WorkspaceBootstrapResponse:
+def bootstrap_workspace(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceBootstrapResponse:
     """选中工作区后：一次返回 threads + 全部面板内容，替代 5 个独立请求。"""
-    data = thread_store.bootstrap_workspace(workspace_id)
+    data = thread_store.bootstrap_workspace(user.user_id, workspace_id)
     if data is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
@@ -301,14 +326,23 @@ def bootstrap_workspace(workspace_id: str) -> WorkspaceBootstrapResponse:
 
 
 @app.get("/api/workspaces", response_model=list[WorkspaceSummary])
-def list_workspaces() -> list[WorkspaceSummary]:
-    return thread_store.list_workspaces()
+def list_workspaces(user: CurrentUser = Depends(current_user)) -> list[WorkspaceSummary]:
+    return thread_store.list_workspaces(user.user_id)
 
 
 @app.post("/api/workspaces", response_model=WorkspaceSummary)
-def create_workspace(payload: WorkspaceCreateRequest) -> WorkspaceSummary:
+def create_workspace(payload: WorkspaceCreateRequest, user: CurrentUser = Depends(current_user)) -> WorkspaceSummary:
+    # 配额检查（T2.8）
+    users = UserRepository(get_database())
+    owner = users.get_by_id(user.user_id)
+    quota = owner["workspace_quota"] if owner else settings.default_workspace_quota
+    if users.workspace_count(user.user_id) >= quota:
+        raise HTTPException(
+            status_code=409,
+            detail=f"作品数量已达上限（{quota} 部）",
+        )
     try:
-        return thread_store.create_workspace(payload.outline_name)
+        return thread_store.create_workspace(user.user_id, payload.outline_name)
     except FileExistsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
@@ -316,57 +350,57 @@ def create_workspace(payload: WorkspaceCreateRequest) -> WorkspaceSummary:
 
 
 @app.get("/api/workspaces/{workspace_id}/outline", response_model=WorkspaceOutlineContent)
-def get_workspace_outline(workspace_id: str) -> WorkspaceOutlineContent:
-    content = thread_store.read_workspace_outline(workspace_id)
+def get_workspace_outline(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceOutlineContent:
+    content = thread_store.read_workspace_outline(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
 
 
 @app.get("/api/workspaces/{workspace_id}/storyline", response_model=WorkspaceStorylineContent)
-def get_workspace_storyline(workspace_id: str) -> WorkspaceStorylineContent:
-    content = thread_store.read_workspace_storyline(workspace_id)
+def get_workspace_storyline(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceStorylineContent:
+    content = thread_store.read_workspace_storyline(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
 
 
 @app.get("/api/workspaces/{workspace_id}/detail-outline", response_model=WorkspaceDetailOutlineContent)
-def get_workspace_detail_outline(workspace_id: str) -> WorkspaceDetailOutlineContent:
-    content = thread_store.read_workspace_detail_outline(workspace_id)
+def get_workspace_detail_outline(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceDetailOutlineContent:
+    content = thread_store.read_workspace_detail_outline(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
 
 
 @app.get("/api/workspaces/{workspace_id}/worldview", response_model=WorkspaceWorldviewContent)
-def get_workspace_worldview(workspace_id: str) -> WorkspaceWorldviewContent:
-    content = thread_store.read_workspace_worldview(workspace_id)
+def get_workspace_worldview(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceWorldviewContent:
+    content = thread_store.read_workspace_worldview(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
 
 
 @app.get("/api/workspaces/{workspace_id}/storyline-graph", response_model=WorkspaceStorylineGraphContent)
-def get_workspace_storyline_graph(workspace_id: str) -> WorkspaceStorylineGraphContent:
+def get_workspace_storyline_graph(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceStorylineGraphContent:
     """故事线流程图（竖向泳道时间轴）。读取时按需生成兜底——图缺失/过期自动重生成。"""
-    content = thread_store.read_workspace_storyline_graph(workspace_id)
+    content = thread_store.read_workspace_storyline_graph(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
 
 
 @app.get("/api/workspaces/{workspace_id}/characters", response_model=WorkspaceCharacterContent)
-def get_workspace_characters(workspace_id: str) -> WorkspaceCharacterContent:
-    content = thread_store.read_workspace_characters(workspace_id)
+def get_workspace_characters(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceCharacterContent:
+    content = thread_store.read_workspace_characters(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
 
 
 @app.get("/api/workspaces/{workspace_id}/novel", response_model=WorkspaceNovelChaptersContent)
-def get_workspace_novel(workspace_id: str) -> WorkspaceNovelChaptersContent:
-    content = thread_store.read_workspace_novel_chapters(workspace_id)
+def get_workspace_novel(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceNovelChaptersContent:
+    content = thread_store.read_workspace_novel_chapters(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
@@ -405,7 +439,7 @@ def _classify_changes(changes, workspace_path: Path) -> set[str]:
     return categories
 
 
-async def _workspace_watch_generator(workspace_id: str, workspace_path: Path):
+async def _workspace_watch_generator(owner_id: str, workspace_id: str, workspace_path: Path):
     _log("sse_open", channel="watch", workspace_id=workspace_id)
     start = time.perf_counter()
     try:
@@ -421,27 +455,27 @@ async def _workspace_watch_generator(workspace_id: str, workspace_path: Path):
             if not categories:
                 continue
             if "outline" in categories:
-                content = thread_store.read_workspace_outline(workspace_id)
+                content = thread_store.read_workspace_outline(owner_id, workspace_id)
                 if content is not None:
                     yield _sse_event("outline", content.model_dump())
             if "storyline" in categories:
-                content = thread_store.read_workspace_storyline(workspace_id)
+                content = thread_store.read_workspace_storyline(owner_id, workspace_id)
                 if content is not None:
                     yield _sse_event("storyline", content.model_dump())
             if "worldview" in categories:
-                content = thread_store.read_workspace_worldview(workspace_id)
+                content = thread_store.read_workspace_worldview(owner_id, workspace_id)
                 if content is not None:
                     yield _sse_event("worldview", content.model_dump())
             if "detail_outline" in categories:
-                content = thread_store.read_workspace_detail_outline(workspace_id)
+                content = thread_store.read_workspace_detail_outline(owner_id, workspace_id)
                 if content is not None:
                     yield _sse_event("detail_outline", content.model_dump())
             if "characters" in categories:
-                content = thread_store.read_workspace_characters(workspace_id)
+                content = thread_store.read_workspace_characters(owner_id, workspace_id)
                 if content is not None:
                     yield _sse_event("characters", content.model_dump())
             if "novel" in categories:
-                content = thread_store.read_workspace_novel_chapters(workspace_id)
+                content = thread_store.read_workspace_novel_chapters(owner_id, workspace_id)
                 if content is not None:
                     yield _sse_event("novel", content.model_dump())
         _log("sse_close", channel="watch", workspace_id=workspace_id,
@@ -453,15 +487,15 @@ async def _workspace_watch_generator(workspace_id: str, workspace_path: Path):
 
 
 @app.get("/api/workspaces/{workspace_id}/watch")
-async def watch_workspace(workspace_id: str):
-    workspace = thread_store.get_workspace(workspace_id)
+async def watch_workspace(workspace_id: str, user: CurrentUser = Depends(current_user)):
+    workspace = thread_store.get_workspace(user.user_id, workspace_id)
     if workspace is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     workspace_path = Path(workspace.workspace_path)
     if not workspace_path.exists():
         raise HTTPException(status_code=404, detail="Workspace directory missing")
     return StreamingResponse(
-        _workspace_watch_generator(workspace_id, workspace_path),
+        _workspace_watch_generator(user.user_id, workspace_id, workspace_path),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -472,12 +506,12 @@ async def watch_workspace(workspace_id: str):
 
 
 @app.get("/api/workspaces/{workspace_id}/novel/export.pdf")
-def export_workspace_novel_pdf(workspace_id: str) -> Response:
-    workspace = thread_store.get_workspace(workspace_id)
+def export_workspace_novel_pdf(workspace_id: str, user: CurrentUser = Depends(current_user)) -> Response:
+    workspace = thread_store.get_workspace(user.user_id, workspace_id)
     if workspace is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    content = thread_store.read_workspace_novel(workspace_id)
+    content = thread_store.read_workspace_novel(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     if not content.markdown.strip():
@@ -493,12 +527,12 @@ def export_workspace_novel_pdf(workspace_id: str) -> Response:
 
 
 @app.get("/api/workspaces/{workspace_id}/novel/export-word.zip")
-def export_workspace_novel_word_zip(workspace_id: str) -> Response:
-    workspace = thread_store.get_workspace(workspace_id)
+def export_workspace_novel_word_zip(workspace_id: str, user: CurrentUser = Depends(current_user)) -> Response:
+    workspace = thread_store.get_workspace(user.user_id, workspace_id)
     if workspace is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    content = thread_store.read_workspace_novel_chapters(workspace_id)
+    content = thread_store.read_workspace_novel_chapters(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     if not content.chapters:
@@ -514,28 +548,29 @@ def export_workspace_novel_word_zip(workspace_id: str) -> Response:
 
 
 @app.delete("/api/workspaces/{workspace_id}")
-def delete_workspace(workspace_id: str) -> dict[str, str | bool | list[str]]:
+async def delete_workspace(workspace_id: str, user: CurrentUser = Depends(current_user)) -> dict[str, str | bool | list[str]]:
     try:
-        deleted_thread_ids = thread_store.delete_workspace(workspace_id)
+        deleted_thread_ids = thread_store.delete_workspace(user.user_id, workspace_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     if deleted_thread_ids is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
+    # T2.9：清理 checkpoint（分库）+ trace
     for thread_id in deleted_thread_ids:
-        agent_service.delete_thread_checkpoint(thread_id)
+        agent_service.delete_thread_checkpoint(thread_id, owner_id=user.user_id)
         character_service.delete_thread_checkpoint(thread_id)
     return {"status": "ok", "deleted": workspace_id, "deleted_threads": deleted_thread_ids}
 
 
 @app.get("/api/threads", response_model=list[ThreadSummary])
-def list_threads(workspace_id: str | None = None) -> list[ThreadSummary]:
-    return thread_store.list_threads(workspace_id)
+def list_threads(workspace_id: str | None = None, user: CurrentUser = Depends(current_user)) -> list[ThreadSummary]:
+    return thread_store.list_threads(user.user_id, workspace_id)
 
 
 @app.post("/api/threads", response_model=ThreadSummary)
-def create_thread(payload: ThreadCreateRequest) -> ThreadSummary:
+def create_thread(payload: ThreadCreateRequest, user: CurrentUser = Depends(current_user)) -> ThreadSummary:
     try:
-        return thread_store.create_thread(payload.workspace_id, payload.session_name)
+        return thread_store.create_thread(user.user_id, payload.workspace_id, payload.session_name)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -543,9 +578,9 @@ def create_thread(payload: ThreadCreateRequest) -> ThreadSummary:
 
 
 @app.patch("/api/threads/{thread_id}", response_model=ThreadSummary)
-def update_thread(thread_id: str, payload: ThreadUpdateRequest) -> ThreadSummary:
+def update_thread(thread_id: str, payload: ThreadUpdateRequest, user: CurrentUser = Depends(current_user)) -> ThreadSummary:
     try:
-        thread = thread_store.update_thread_name(thread_id, payload.session_name)
+        thread = thread_store.update_thread_name(user.user_id, thread_id, payload.session_name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if thread is None:
@@ -554,8 +589,8 @@ def update_thread(thread_id: str, payload: ThreadUpdateRequest) -> ThreadSummary
 
 
 @app.delete("/api/threads/{thread_id}")
-def delete_thread(thread_id: str) -> dict[str, str | bool]:
-    thread = thread_store.get_thread(thread_id)
+def delete_thread(thread_id: str, user: CurrentUser = Depends(current_user)) -> dict[str, str | bool]:
+    thread = thread_store.get_thread(user.user_id, thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
     try:
@@ -563,41 +598,41 @@ def delete_thread(thread_id: str) -> dict[str, str | bool]:
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    deleted = thread_store.delete_thread(thread_id)
+    deleted = thread_store.delete_thread(user.user_id, thread_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Thread not found")
-    agent_service.delete_thread_checkpoint(thread_id)
+    agent_service.delete_thread_checkpoint(thread_id, owner_id=user.user_id)
     character_service.delete_thread_checkpoint(thread_id)
     return {"status": "ok", "deleted": thread_id}
 
 
 @app.get("/api/threads/{thread_id}/outline", response_model=WorkspaceOutlineContent)
-def get_thread_outline(thread_id: str) -> WorkspaceOutlineContent:
-    content = thread_store.read_thread_outline(thread_id)
+def get_thread_outline(thread_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceOutlineContent:
+    content = thread_store.read_thread_outline(user.user_id, thread_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Thread not found")
     return content
 
 
 @app.get("/api/threads/{thread_id}/checkpoint", response_model=CheckpointState)
-async def get_thread_checkpoint(thread_id: str) -> CheckpointState:
-    thread = thread_store.get_thread(thread_id)
+async def get_thread_checkpoint(thread_id: str, user: CurrentUser = Depends(current_user)) -> CheckpointState:
+    thread = thread_store.get_thread(user.user_id, thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
-    return await agent_service.get_thread_checkpoint(thread_id)
+    return await agent_service.get_thread_checkpoint(thread_id, owner_id=user.user_id)
 
 
 @app.get("/api/threads/{thread_id}/traces", response_model=list[TraceRunSummary])
-def list_thread_traces(thread_id: str) -> list[TraceRunSummary]:
-    thread = thread_store.get_thread(thread_id)
+def list_thread_traces(thread_id: str, user: CurrentUser = Depends(current_user)) -> list[TraceRunSummary]:
+    thread = thread_store.get_thread(user.user_id, thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
     return trace_recorder.list_runs(thread)
 
 
 @app.get("/api/threads/{thread_id}/traces/{trace_id}", response_model=TraceDetail)
-def get_thread_trace(thread_id: str, trace_id: str) -> TraceDetail:
-    thread = thread_store.get_thread(thread_id)
+def get_thread_trace(thread_id: str, trace_id: str, user: CurrentUser = Depends(current_user)) -> TraceDetail:
+    thread = thread_store.get_thread(user.user_id, thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
     try:
@@ -610,8 +645,8 @@ def get_thread_trace(thread_id: str, trace_id: str) -> TraceDetail:
 
 
 @app.delete("/api/threads/{thread_id}/traces/{trace_id}")
-def delete_thread_trace(thread_id: str, trace_id: str) -> dict[str, str]:
-    thread = thread_store.get_thread(thread_id)
+def delete_thread_trace(thread_id: str, trace_id: str, user: CurrentUser = Depends(current_user)) -> dict[str, str]:
+    thread = thread_store.get_thread(user.user_id, thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
     try:
@@ -624,12 +659,12 @@ def delete_thread_trace(thread_id: str, trace_id: str) -> dict[str, str]:
 
 
 @app.post("/api/screenplay/generate/stream")
-async def stream_screenplay(payload: ScreenplayGenerateRequest):
-    thread = thread_store.get_thread(payload.thread_id)
+async def stream_screenplay(payload: ScreenplayGenerateRequest, user: CurrentUser = Depends(current_user)):
+    thread = thread_store.get_thread(user.user_id, payload.thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
     return StreamingResponse(
-        _event_generator(payload, thread),
+        _event_generator(payload, thread, owner_id=user.user_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -640,10 +675,10 @@ async def stream_screenplay(payload: ScreenplayGenerateRequest):
 
 
 @app.post("/api/character/generate", response_model=CharacterGenerateResponse)
-def generate_character(payload: CharacterGenerateRequest) -> CharacterGenerateResponse:
-    thread = thread_store.get_thread(payload.thread_id)
+def generate_character(payload: CharacterGenerateRequest, user: CurrentUser = Depends(current_user)) -> CharacterGenerateResponse:
+    thread = thread_store.get_thread(user.user_id, payload.thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
-    response = character_service.generate(payload, thread)
-    thread_store.write_character(thread, response)
+    response = character_service.generate(payload, thread, owner_id=user.user_id)
+    thread_store.write_character(user.user_id, thread, response)
     return response

@@ -1,127 +1,73 @@
+"""风格存储（多用户改造版，D7：完全私有）。
+
+原实现：全局 styles.json + 通过 thread_store 写 workspaces.json 的 active_style_id。
+现实现：SQLite styles 表（带 owner_id）+ WorkspaceRepository.set_active_style。
+
+每个用户只看自己的风格，互不可见、互不影响。
+
+注：StyleSummary 来自 app.create_type.schemas（4 列风格字段版），不是 app.schemas.style。
+"""
+
 from __future__ import annotations
 
-import json
-from datetime import UTC, datetime
-from pathlib import Path
-from uuid import uuid4
-
 from app.create_type.schemas import StyleSummary
+from app.db import Database, StyleRepository, WorkspaceRepository
 
 
 class CreateTypeStore:
-    def __init__(self, workspace_root: Path, thread_store: ThreadStore) -> None:
-        self.workspace_root = workspace_root
-        self.thread_store = thread_store
-        self.styles_path = workspace_root / "styles.json"
-        self.workspace_root.mkdir(parents=True, exist_ok=True)
+    def __init__(self, db: Database, workspace_repo: WorkspaceRepository) -> None:
+        self.db = db
+        self.styles = StyleRepository(db)
+        self.workspaces = workspace_repo
 
-    def list_styles(self) -> list[StyleSummary]:
-        index = self._read_index()
-        return [StyleSummary(**style) for style in index.values()]
+    def list_styles(self, owner_id: str) -> list[StyleSummary]:
+        rows = self.styles.list_by_owner(owner_id)
+        return [self._to_summary(r) for r in rows]
 
-    def get_style(self, style_id: str) -> dict | None:
-        return self._read_index().get(style_id)
+    def get_style(self, owner_id: str, style_id: str) -> dict | None:
+        return self.styles.get(style_id, owner_id)
 
-    def create_style(self, name: str, meta_style: str = "", storybuilding_style: str = "", detail_outline_style: str = "", writing_style: str = "") -> StyleSummary:
-        now = self._now()
-        style_id = f"style-{uuid4().hex[:8]}"
-        style = {
-            "style_id": style_id,
-            "name": name.strip(),
-            "meta_style": meta_style.strip(),
-            "storybuilding_style": storybuilding_style.strip(),
-            "detail_outline_style": detail_outline_style.strip(),
-            "writing_style": writing_style.strip(),
-            "created_at": now,
-        }
+    def create_style(
+        self, owner_id: str, name: str, meta_style: str = "",
+        storybuilding_style: str = "", detail_outline_style: str = "",
+        writing_style: str = "",
+    ) -> StyleSummary:
+        row = self.styles.create(
+            owner_id=owner_id, name=name, meta_style=meta_style,
+            storybuilding_style=storybuilding_style,
+            detail_outline_style=detail_outline_style,
+            writing_style=writing_style,
+        )
+        return self._to_summary(row)
 
-        index = self._read_index()
-        index[style_id] = style
-        self._write_index(index)
-        return StyleSummary(**style)
+    def update_style(self, owner_id: str, style_id: str, **fields) -> StyleSummary | None:
+        row = self.styles.update(style_id, owner_id, **fields)
+        return self._to_summary(row) if row else None
 
-    def update_style(self, style_id: str, **fields) -> StyleSummary | None:
-        index = self._read_index()
-        if style_id not in index:
-            return None
-        style = index[style_id]
-        for key, value in fields.items():
-            if value is not None and key in style:
-                style[key] = value.strip() if isinstance(value, str) else value
-        index[style_id] = style
-        self._write_index(index)
-        return StyleSummary(**style)
+    def delete_style(self, owner_id: str, style_id: str) -> bool:
+        ok = self.styles.delete(style_id, owner_id)
+        if ok:
+            # 清理所有引用此风格的工作区 active_style_id
+            self.workspaces.clear_style_reference(style_id)
+        return ok
 
-    def delete_style(self, style_id: str) -> bool:
-        index = self._read_index()
-        if style_id not in index:
-            return False
+    def get_active_style_id(self, owner_id: str, workspace_id: str) -> str | None:
+        ws = self.workspaces.get(workspace_id, owner_id)
+        return ws.get("active_style_id") if ws else None
 
-        del index[style_id]
-        self._write_index(index)
+    def set_active_style_id(
+        self, owner_id: str, workspace_id: str, style_id: str | None,
+    ) -> bool:
+        return self.workspaces.set_active_style(workspace_id, owner_id, style_id)
 
-        self.thread_store.clear_workspace_style_reference(style_id)
-        return True
-
-    def get_active_style_id(self, workspace_id: str) -> str | None:
-        workspace = self.thread_store._read_workspace_index().get(workspace_id)
-        if workspace is None:
-            return None
-        return workspace.get("active_style_id")
-
-    def set_active_style_id(self, workspace_id: str, style_id: str | None) -> None:
-        workspaces = self.thread_store._read_workspace_index()
-        workspace = workspaces.get(workspace_id)
-        if workspace is None:
-            raise KeyError(f"Workspace not found: {workspace_id}")
-
-        if style_id is not None:
-            styles = self._read_index()
-            if style_id not in styles:
-                raise KeyError(f"Style not found: {style_id}")
-
-        workspace["active_style_id"] = style_id
-        workspaces[workspace_id] = workspace
-        self.thread_store._write_workspace_index(workspaces)
-
-    def _read_index(self) -> dict[str, dict]:
-        if not self.styles_path.exists():
-            return {}
-        with self.styles_path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            raise ValueError(f"Invalid styles index format: {self.styles_path}")
-
-        # Migrate old format (name + description) to new format
-        migrated = False
-        for style_id, style in data.items():
-            if "description" in style and "writing_style" not in style:
-                desc = style.pop("description", "")
-                style.setdefault("detail_outline_style", "")
-                style.setdefault("writing_style", desc)
-                migrated = True
-            if "meta_style" not in style:
-                style["meta_style"] = ""
-                migrated = True
-            # outline_style → storybuilding_style (agent architecture refactor)
-            if "outline_style" in style and "storybuilding_style" not in style:
-                style["storybuilding_style"] = style.pop("outline_style", "")
-                migrated = True
-            # character_style removed (merged into storybuilding agent)
-            if "character_style" in style:
-                del style["character_style"]
-                migrated = True
-        if migrated:
-            self._write_index(data)
-
-        return data
-
-    def _write_index(self, index: dict[str, dict]) -> None:
-        with self.styles_path.open("w", encoding="utf-8") as f:
-            json.dump(index, f, ensure_ascii=False, indent=2)
-
-    def _now(self) -> str:
-        return datetime.now(UTC).isoformat()
-
-
-from app.core.thread_store import ThreadStore  # noqa: E402
+    @staticmethod
+    def _to_summary(row: dict) -> StyleSummary:
+        return StyleSummary(
+            style_id=row["style_id"],
+            name=row["name"],
+            meta_style=row.get("meta_style", ""),
+            storybuilding_style=row.get("storybuilding_style", ""),
+            detail_outline_style=row.get("detail_outline_style", ""),
+            writing_style=row.get("writing_style", ""),
+            created_at=row.get("created_at", ""),
+        )

@@ -4,4 +4,5 @@
 
 git add .
 git commit -m "描述你改了什么"
-git push
+git push origin main   → 推到 GitHub(备份,慢)
+git push deploy main   → 推到服务器(部署,快,不走 GitHub)
