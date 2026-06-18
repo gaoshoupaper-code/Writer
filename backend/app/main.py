@@ -736,20 +736,19 @@ class ImageGenerateRequest(BaseModel):
 
 
 async def _image_event_generator(payload: ImageGenerateRequest, thread, *, owner_id: str):
-    """文生图 SSE 流（复用 image_agent_service 的 agent + SSE 格式）。
+    """文生图 SSE 流（PR-07b 切到 platform.streaming.run_agent_stream 骨架）。
 
     image agent 走自己的 _build_agent，SSE 事件格式与写作一致（model_stream/
-    tool_call/tool_output/interrupt/final），前端按 interrupt 的 kind 路由渲染。
+    tool_output/tool_error/interrupt/final），前端按 interrupt 的 kind 路由渲染。
+    心跳 + agent 事件循环 + interrupt 检测由 run_agent_stream 统一编排，
+    事件分发逻辑通过 sink 闭包注入（image 专属：简单分发，无 task 派发）。
     """
-    import asyncio
     from langgraph.types import Command
+    from app.platform.streaming import run_agent_stream, sse as _sse
     model = image_agent_service._resolve_model(owner_id)
     checkpointer = await image_agent_service._resolve_checkpointer(owner_id)
     trace = trace_recorder.create_run(thread, "image.generate.stream")
-    yield _sse_event("status", {"status": "started", "trace_id": trace.trace_id})
-    trace_queue = trace_recorder.get_active_queue(trace.trace_id)
-    if trace_queue is None:
-        raise RuntimeError(f"Trace queue not created: {trace.trace_id}")
+    yield _sse("status", {"status": "started", "trace_id": trace.trace_id})
 
     agent = image_agent_service._build_agent(
         Path(thread.workspace_path), trace.trace_id, thread.workspace_id, owner_id,
@@ -766,75 +765,63 @@ async def _image_event_generator(payload: ImageGenerateRequest, thread, *, owner
     else:
         agent_input = {"messages": [{"role": "user", "content": payload.prompt}]}
 
-    heartbeat_task = asyncio.create_task(asyncio.sleep(15))
-    agent_events = agent.astream_events(agent_input, config=config, version="v2")
-    agent_task = asyncio.create_task(agent_events.__anext__())
-    full_result = None
+    # image 事件分发 sink（领域专属，纯同步——image 无 task 派发/章节计数）
+    async def on_event(event: dict) -> list[str]:
+        frames: list[str] = []
+        kind = event["event"]
+        data = event.get("data", {})
+        if kind == "on_chat_model_stream":
+            chunk = data.get("chunk")
+            content = getattr(chunk, "content", "") if chunk else ""
+            if content:
+                frames.append(_sse("model_stream", {"content": content}))
+        elif kind == "on_tool_end":
+            frames.append(_sse("tool_output", {
+                "tool": event.get("name", ""),
+                "output": str(data.get("output", ""))[:2000],
+            }))
+        elif kind == "on_tool_error":
+            frames.append(_sse("tool_error", {
+                "tool": event.get("name", ""),
+                "error": str(data.get("error") or data.get("output") or "")[:500],
+            }))
+        return frames
+
+    class _ImageSink:
+        async def on_event(self_inner, event: dict) -> list[str]:
+            return await on_event(event)
+
+    sse_iter, result = run_agent_stream(agent, agent_input, config, sink=_ImageSink())
+
     try:
-        while True:
-            done, _ = await asyncio.wait(
-                {agent_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED,
-            )
-            if heartbeat_task in done:
-                heartbeat_task.result()
-                yield ": ping\n\n"
-                heartbeat_task = asyncio.create_task(asyncio.sleep(15))
-            if agent_task in done:
-                try:
-                    event = agent_task.result()
-                except StopAsyncIteration:
-                    break
-                agent_task = asyncio.create_task(agent_events.__anext__())
-                kind = event["event"]
-                data = event.get("data", {})
-                if kind == "on_chat_model_stream":
-                    chunk = data.get("chunk")
-                    content = getattr(chunk, "content", "") if chunk else ""
-                    if content:
-                        yield _sse_event("model_stream", {"content": content})
-                elif kind == "on_tool_end":
-                    yield _sse_event("tool_output", {
-                        "tool": event.get("name", ""),
-                        "output": str(data.get("output", ""))[:2000],
-                    })
-                elif kind == "on_tool_error":
-                    yield _sse_event("tool_error", {
-                        "tool": event.get("name", ""),
-                        "error": str(data.get("error") or data.get("output") or "")[:500],
-                    })
-                if kind == "on_chain_end" and event.get("name") == "LangGraph":
-                    full_result = data.get("output")
-        # HITL interrupt 检测（DD4）
-        state = await agent.aget_state(config)
-        pending = [t for t in state.tasks if t.interrupts]
-        if pending:
-            iv = pending[0].interrupts[0].value
+        async for frame in sse_iter:
+            yield frame
+
+        # HITL interrupt 检测（DD4）：前端按 kind 路由（choice=访谈 / image_review=评审）
+        if result.pending_interrupt is not None:
+            iv = result.pending_interrupt
             payload_dict = iv if isinstance(iv, dict) else {"question": str(iv)}
             # 确保 kind 字段存在（DD4：前端按 kind 路由）
             if "kind" not in payload_dict:
                 payload_dict["kind"] = "choice"
             payload_dict["thread_id"] = thread.thread_id
-            yield _sse_event("interrupt", payload_dict)
+            yield _sse("interrupt", payload_dict)
             return
-        if full_result is not None:
+
+        if result.full_result is not None:
             content = ""
-            if isinstance(full_result, dict):
-                for msg in reversed(full_result.get("messages", [])):
+            if isinstance(result.full_result, dict):
+                for msg in reversed(result.full_result.get("messages", [])):
                     mc = getattr(msg, "content", None) or (msg.get("content") if isinstance(msg, dict) else None)
                     if isinstance(mc, str) and mc:
                         content = mc
                         break
-            yield _sse_event("final", {"content": content, "thread_id": thread.thread_id})
+            yield _sse("final", {"content": content, "thread_id": thread.thread_id})
         trace_recorder.complete_run(thread, trace.trace_id)
     except BaseException as exc:
         trace_recorder.fail_run(thread, trace.trace_id, exc)
-        yield _sse_event("error", {"error": str(exc)[:500]})
+        yield _sse("error", {"error": str(exc)[:500]})
         raise
-    finally:
-        heartbeat_task.cancel()
-        agent_task.cancel()
-        with __import__("contextlib").suppress(BaseException):
-            await agent_events.aclose()
 
 
 @app.post("/api/image/generate/stream")

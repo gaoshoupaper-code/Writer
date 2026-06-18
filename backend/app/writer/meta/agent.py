@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import time
-from contextlib import suppress
 
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -17,6 +15,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 
 from app.platform.agent.base_service import BaseAgentService
+from app.platform.streaming import ExtraTask, run_agent_stream
 from app.writer.expert_agent.agents.storybuilding import build_storybuilding_deep_subagent
 from app.writer.expert_agent.services.storyline_graph import generate_storyline_graph
 from app.writer.expert_agent.agents.detail_outline import build_detail_outline_deep_subagent
@@ -47,9 +46,7 @@ from app.schemas.checkpoint import CheckpointMessage, CheckpointState, Checkpoin
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 META_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 
-# SSE 心跳间隔：Agent 思考/跑工具期间流是静默的，定期发注释行让 cloudflared /
-# Cloudflare 等中间代理不会因空闲超时掐断连接（免费版边缘约 100s）。
-SSE_HEARTBEAT_INTERVAL = 15
+# SSE 心跳间隔已收敛到 platform.streaming.DEFAULT_HEARTBEAT_INTERVAL（PR-07a）。
 
 
 class MetaAgentService(BaseAgentService):
@@ -276,7 +273,12 @@ class MetaAgentService(BaseAgentService):
             raise
 
     async def generate_stream(self, payload: ScreenplayGenerateRequest, thread: ThreadSummary, *, owner_id: str | None = None) -> AsyncIterator[str]:
-        """Stream agent execution events as SSE to the frontend."""
+        """Stream agent execution events as SSE to the frontend.
+
+        SSE 编排骨架（心跳 + astream_events 循环 + interrupt 检测）由
+        ``platform.streaming.run_agent_stream`` 提供，事件分发逻辑通过
+        闭包 sink 注入（领域专属：model_output/tool_call/task 派发/章节计数）。
+        """
         if self.settings.writer_agent_mode.lower() == "mock":
             response = self._mock_response(payload, thread)
             yield _sse("final", response.model_dump())
@@ -323,163 +325,148 @@ class MetaAgentService(BaseAgentService):
         # 子代理调用计数：按 subagent_type 累计，用于 storybuilding 轮次与 writing 章节号推断降级（D6）
         subagent_call_counts: dict[str, int] = {}
 
-        trace_pump = asyncio.create_task(_next_trace_update(trace_queue))
-        agent_events = agent.astream_events(
-            agent_input,
-            config=config,
-            version="v2",
-        )
-        agent_task = asyncio.create_task(agent_events.__anext__())
-        heartbeat_task = asyncio.create_task(asyncio.sleep(SSE_HEARTBEAT_INTERVAL))
+        # ── 事件分发 sink（领域专属，闭包捕获 thread/active_tasks/计数器）─────
+        async def on_event(event: dict) -> list[str]:
+            frames: list[str] = []
+            kind = event["event"]
+            name = event.get("name", "")
+            data = event.get("data", {})
 
-        full_result = None
-        try:
-            while True:
-                done, _ = await asyncio.wait(
-                    {agent_task, trace_pump, heartbeat_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
+            if kind == "on_chat_model_end":
+                output = data.get("output")
+                tool_calls = _extract_tool_calls(output)
+                text = _extract_model_text(output)
+                evt_data = {"text": text}
+                if tool_calls:
+                    evt_data["tool_calls"] = tool_calls
+                frames.append(_sse("model_output", evt_data))
 
-                if trace_pump in done:
-                    trace_update = trace_pump.result()
-                    if trace_update:
-                        yield trace_update
-                    trace_pump = asyncio.create_task(_next_trace_update(trace_queue))
-
-                if heartbeat_task in done:
-                    # SSE 注释行：浏览器忽略，但保持字节流动，避免 cloudflared/Cloudflare
-                    # 在 Agent 静默期（思考/跑工具）因空闲超时掐断连接。
-                    heartbeat_task.result()
-                    yield ": ping\n\n"
-                    heartbeat_task = asyncio.create_task(asyncio.sleep(SSE_HEARTBEAT_INTERVAL))
-
-                if agent_task in done:
-                    try:
-                        event = agent_task.result()
-                    except StopAsyncIteration:
-                        break
-                    agent_task = asyncio.create_task(agent_events.__anext__())
-
-                    kind = event["event"]
-                    name = event.get("name", "")
-                    data = event.get("data", {})
-
-                    if kind == "on_chat_model_end":
-                        output = data.get("output")
-                        tool_calls = _extract_tool_calls(output)
-                        text = _extract_model_text(output)
-                        evt_data = {"text": text}
-                        if tool_calls:
-                            evt_data["tool_calls"] = tool_calls
-                        yield _sse("model_output", evt_data)
-
-                    elif kind == "on_chain_start" and name == "tools":
-                        tool_inputs = data.get("input", [])
-                        parent_task_id, subagent_name = _current_parent_task(active_tasks)
-                        for tc in tool_inputs:
-                            if isinstance(tc, dict):
-                                tool_name = tc.get("name", "unknown")
-                                call_id = tc.get("id", "")
-                                call_payload: dict[str, Any] = {
-                                    "tool": tool_name,
-                                    "input": tc.get("args", {}),
-                                    "call_id": call_id,
-                                    "parent_task_id": parent_task_id,
-                                    "subagent_name": subagent_name,
-                                }
-                                # task 工具：派发焦点信息（D6/D7）—— 章节号、总章数、轮次
-                                if tool_name == "task":
-                                    args = tc.get("args", {}) or {}
-                                    sub = _extract_subagent_name(args)
-                                    description = str(args.get("description", "") or "")
-                                    subagent_call_counts[sub] = subagent_call_counts.get(sub, 0) + 1
-                                    call_ordinal = subagent_call_counts[sub]
-                                    chapter_index = _extract_chapter_index(description)
-                                    total_chapters = await asyncio.to_thread(
-                                        _count_total_chapters, Path(thread.workspace_path)
-                                    )
-                                    # writing 章节号降级：正则失败时按 writing 调用序推断（D6）
-                                    if sub == "writing" and chapter_index is None:
-                                        chapter_index = call_ordinal
-                                    if call_id:
-                                        active_tasks[call_id] = {
-                                            "name": sub,
-                                            "chapter_index": chapter_index,
-                                            "total_chapters": total_chapters,
-                                            "iteration": call_ordinal,
-                                        }
-                                    call_payload["subagent_type"] = sub
-                                    call_payload["chapter_index"] = chapter_index
-                                    call_payload["total_chapters"] = total_chapters
-                                    call_payload["iteration"] = call_ordinal
-                                yield _sse("tool_call", call_payload)
-
-                    elif kind == "on_tool_end":
-                        output_payload: dict[str, Any] = {
-                            "tool": name,
-                            "output": str(data.get("output", ""))[:2000],
-                            "call_id": _extract_tool_call_id(data),
+            elif kind == "on_chain_start" and name == "tools":
+                tool_inputs = data.get("input", [])
+                parent_task_id, subagent_name = _current_parent_task(active_tasks)
+                for tc in tool_inputs:
+                    if isinstance(tc, dict):
+                        tool_name = tc.get("name", "unknown")
+                        call_id = tc.get("id", "")
+                        call_payload: dict[str, Any] = {
+                            "tool": tool_name,
+                            "input": tc.get("args", {}),
+                            "call_id": call_id,
+                            "parent_task_id": parent_task_id,
+                            "subagent_name": subagent_name,
                         }
-                        if name == "task":
-                            call_id = _extract_tool_call_id(data)
-                            if call_id and call_id in active_tasks:
-                                task_meta = active_tasks.pop(call_id)
-                                finished_subagent = task_meta.get("name")
-                                # storybuilding 完成后派生流程图：确定性、纯后端。
-                                # 失败已被模块内部 try/except 吞掉，这里只读不抛，绝不阻断 SSE 流。
-                                if finished_subagent == "storybuilding":
-                                    await asyncio.to_thread(
-                                        generate_storyline_graph, Path(thread.workspace_path)
-                                    )
-                                # writing 写完章节后实时算字数（D7），随 tool_output 推给前端
-                                if finished_subagent == "writing":
-                                    chapter_index = task_meta.get("chapter_index")
-                                    if chapter_index:
-                                        word_count = await asyncio.to_thread(
-                                            _count_chapter_words,
-                                            Path(thread.workspace_path),
-                                            chapter_index,
-                                        )
-                                        if word_count is not None:
-                                            output_payload["word_count"] = word_count
-                                            output_payload["chapter_index"] = chapter_index
-                        yield _sse("tool_output", output_payload)
+                        # task 工具：派发焦点信息（D6/D7）—— 章节号、总章数、轮次
+                        if tool_name == "task":
+                            args = tc.get("args", {}) or {}
+                            sub = _extract_subagent_name(args)
+                            description = str(args.get("description", "") or "")
+                            subagent_call_counts[sub] = subagent_call_counts.get(sub, 0) + 1
+                            call_ordinal = subagent_call_counts[sub]
+                            chapter_index = _extract_chapter_index(description)
+                            total_chapters = await asyncio.to_thread(
+                                _count_total_chapters, Path(thread.workspace_path)
+                            )
+                            # writing 章节号降级：正则失败时按 writing 调用序推断（D6）
+                            if sub == "writing" and chapter_index is None:
+                                chapter_index = call_ordinal
+                            if call_id:
+                                active_tasks[call_id] = {
+                                    "name": sub,
+                                    "chapter_index": chapter_index,
+                                    "total_chapters": total_chapters,
+                                    "iteration": call_ordinal,
+                                }
+                            call_payload["subagent_type"] = sub
+                            call_payload["chapter_index"] = chapter_index
+                            call_payload["total_chapters"] = total_chapters
+                            call_payload["iteration"] = call_ordinal
+                        frames.append(_sse("tool_call", call_payload))
 
-                    elif kind == "on_tool_error":
-                        # 单工具失败：推 tool_error SSE，前端据此标红/重试中（点1 S4）
-                        # data.error 在部分版本缺失，output 常是异常对象，兜底取
-                        err = data.get("error") or data.get("output") or ""
-                        yield _sse("tool_error", {
-                            "tool": name,
-                            "call_id": _extract_tool_call_id(data),
-                            "error": str(err)[:500],
-                        })
+            elif kind == "on_tool_end":
+                output_payload: dict[str, Any] = {
+                    "tool": name,
+                    "output": str(data.get("output", ""))[:2000],
+                    "call_id": _extract_tool_call_id(data),
+                }
+                if name == "task":
+                    call_id = _extract_tool_call_id(data)
+                    if call_id and call_id in active_tasks:
+                        task_meta = active_tasks.pop(call_id)
+                        finished_subagent = task_meta.get("name")
+                        # storybuilding 完成后派生流程图：确定性、纯后端。
+                        # 失败已被模块内部 try/except 吞掉，这里只读不抛，绝不阻断 SSE 流。
+                        if finished_subagent == "storybuilding":
+                            await asyncio.to_thread(
+                                generate_storyline_graph, Path(thread.workspace_path)
+                            )
+                        # writing 写完章节后实时算字数（D7），随 tool_output 推给前端
+                        if finished_subagent == "writing":
+                            chapter_index = task_meta.get("chapter_index")
+                            if chapter_index:
+                                word_count = await asyncio.to_thread(
+                                    _count_chapter_words,
+                                    Path(thread.workspace_path),
+                                    chapter_index,
+                                )
+                                if word_count is not None:
+                                    output_payload["word_count"] = word_count
+                                    output_payload["chapter_index"] = chapter_index
+                frames.append(_sse("tool_output", output_payload))
 
-                    elif kind == "on_chat_model_stream":
-                        chunk = data.get("chunk")
-                        if hasattr(chunk, "content"):
-                            content = chunk.content
-                        elif isinstance(chunk, dict):
-                            content = chunk.get("content", "")
-                        else:
-                            content = ""
-                        if content:
-                            yield _sse("model_stream", {"content": content})
+            elif kind == "on_tool_error":
+                # 单工具失败：推 tool_error SSE，前端据此标红/重试中（点1 S4）
+                # data.error 在部分版本缺失，output 常是异常对象，兜底取
+                err = data.get("error") or data.get("output") or ""
+                frames.append(_sse("tool_error", {
+                    "tool": name,
+                    "call_id": _extract_tool_call_id(data),
+                    "error": str(err)[:500],
+                }))
 
-                    if kind == "on_chain_end" and name == "LangGraph":
-                        full_result = data.get("output")
+            elif kind == "on_chat_model_stream":
+                chunk = data.get("chunk")
+                if hasattr(chunk, "content"):
+                    content = chunk.content
+                elif isinstance(chunk, dict):
+                    content = chunk.get("content", "")
+                else:
+                    content = ""
+                if content:
+                    frames.append(_sse("model_stream", {"content": content}))
 
-                for trace_update in self._trace_updates(trace_queue):
-                    yield trace_update
+            return frames
 
-            # HITL：流结束后检查是否因子代理 ask_user 的 interrupt 暂停。
-            # 必须用 aget_state：checkpointer 是 AsyncSqliteSaver，同步 get_state 在
-            # async（主线程 event loop）上下文会抛 InvalidStateError——同步调用仅允许
-            # 跨线程（如 FastAPI 同步端点的线程池），主线程必须走 async 接口。
-            state = await agent.aget_state(config)
-            pending = [t for t in state.tasks if t.interrupts]
-            if pending:
-                iv = pending[0].interrupts[0].value
+        # ── trace_pump 作为额外并发任务（与 agent 事件/心跳公平竞争 asyncio.wait）──
+        def _on_trace_done(finished: asyncio.Task) -> tuple[asyncio.Task | None, list[str]]:
+            update = finished.result()
+            return asyncio.create_task(_next_trace_update(trace_queue)), [update] if update else []
+
+        trace_extra = ExtraTask(
+            task=asyncio.create_task(_next_trace_update(trace_queue)),
+            on_done=_on_trace_done,
+        )
+
+        # 闭包 sink：领域专属事件分发（适配 EventSink 协议，on_event 是协程）
+        class _WritingSink:
+            async def on_event(self_inner, event: dict) -> list[str]:
+                return await on_event(event)
+
+        sse_iter, result = run_agent_stream(
+            agent, agent_input, config,
+            sink=_WritingSink(),
+            extra_tasks=[trace_extra],
+        )
+
+        try:
+            async for frame in sse_iter:
+                yield frame
+
+            # ── 流结束：trace drain + interrupt 检测 + final ──────────────────────
+            for trace_update in self._trace_updates(trace_queue):
+                yield trace_update
+
+            if result.pending_interrupt is not None:
+                iv = result.pending_interrupt
                 interrupt_payload: dict[str, Any] = {
                     "thread_id": thread.thread_id,
                     "source": "interview",
@@ -491,9 +478,9 @@ class MetaAgentService(BaseAgentService):
                 yield _sse("interrupt", interrupt_payload)
                 return
 
-            if full_result is None:
+            if result.full_result is None:
                 raise ValueError("Agent stream ended without a LangGraph final output.")
-            content = self._extract_text(full_result)
+            content = self._extract_text(result.full_result)
             response = self._response_from_workspace_artifacts(payload, content, thread)
             self.trace_recorder.complete_run(thread, trace.trace_id)
             for trace_update in self._trace_updates(trace_queue):
@@ -511,12 +498,6 @@ class MetaAgentService(BaseAgentService):
             for trace_update in self._trace_updates(trace_queue):
                 yield trace_update
             raise
-        finally:
-            heartbeat_task.cancel()
-            trace_pump.cancel()
-            agent_task.cancel()
-            with suppress(BaseException):
-                await agent_events.aclose()
 
     def _trace_updates(self, trace_queue) -> list[str]:
         trace_events = _drain_trace_queue(trace_queue)
