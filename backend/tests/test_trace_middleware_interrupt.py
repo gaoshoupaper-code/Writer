@@ -12,8 +12,8 @@ from unittest.mock import MagicMock
 from langgraph.errors import GraphInterrupt
 
 from app.schemas.screenplay import ThreadSummary
-from app.writer.middleware.trace_middleware import TraceMiddleware
-from app.writer.trace.recorder import TraceRecorder
+from app.platform.agent.middleware import TraceMiddleware
+from app.platform.trace.recorder import TraceRecorder
 
 
 def _make_thread(workspace: Path) -> ThreadSummary:

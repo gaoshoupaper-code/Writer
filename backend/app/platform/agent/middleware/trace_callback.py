@@ -24,7 +24,7 @@ from uuid import UUID
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 
-from app.writer.trace import TraceRecorder
+from app.platform.trace import TraceRecorder
 
 
 class TraceCallbackHandler(BaseCallbackHandler):

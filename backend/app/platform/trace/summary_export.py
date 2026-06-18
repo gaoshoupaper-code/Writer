@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from app.writer.trace.schemas import TraceDetail, TraceNode
+from app.platform.trace.schemas import TraceDetail, TraceNode
 
 
 def export_trace_summary(detail: TraceDetail, output_path: Path) -> None:

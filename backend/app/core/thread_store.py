@@ -37,18 +37,14 @@ from app.schemas.screenplay import (
     WorkspaceNovelChaptersContent,
     WorkspaceNovelContent,
     WorkspaceOutlineContent,
-    StorylineGraphEvent,
-    StorylineGraphStoryline,
     WorkspaceStorylineContent,
     WorkspaceStorylineGraphContent,
     WorkspaceWorldviewContent,
     WorkspaceSummary,
 )
-from app.writer.expert_agent.services.storyline_graph import (
-    build_storyline_graph_data,
-    generate_storyline_graph,
-    is_stale,
-)
+# 注意：storyline_graph 的「按需生成」逻辑已上移到 API 层（main.py:get_workspace_storyline_graph），
+# thread_store 只保留「读」职责——避免 core（基础设施层）反向依赖 writer（业务层）。
+# storyline_graph 的解析数据由调用方生成后传入 build_storyline_graph_content。
 
 
 def _read_text(path: Path) -> str:
@@ -191,18 +187,20 @@ class ThreadStore:
         )
 
     def read_workspace_storyline_graph(self, owner_id: str, workspace_id: str) -> WorkspaceStorylineGraphContent | None:
+        """读取 storyline_graph.md（派生产物）。
+
+        注意：只读不生成。「按需生成」兜底逻辑已上移到 API 层
+        （main.py:get_workspace_storyline_graph），避免 core 反向依赖 writer。
+        结构化数据（events/storylines）也由 API 层解析后填充——本方法只返回 markdown 文本，
+        events/storylines 字段保持默认空（前端优先用 markdown 渲染）。
+        """
         try:
             ws_path = self._require_ws_path(owner_id, workspace_id)
         except KeyError:
             return None
-        if is_stale(ws_path):
-            generate_storyline_graph(ws_path)
-        data = build_storyline_graph_data(ws_path)
         graph_path = ws_path / "storyline_graph.md"
         return WorkspaceStorylineGraphContent(
             workspace_id=workspace_id,
-            events=[StorylineGraphEvent(**e) for e in data.get("events", [])],
-            storylines=[StorylineGraphStoryline(**s) for s in data.get("storylines", [])],
             markdown=_read_text(graph_path) if graph_path.exists() else "",
         )
 

@@ -1,0 +1,8 @@
+# 分层依赖 baseline
+# 每行格式：RULE|importer|imported_module
+# 存量违规登记在此 = 允许；后续 PR 消除一条就删一行，最终此文件应为空。
+# 用 `python scripts/check_layering.py --update` 重新生成。
+#
+# 阶段 B 闭合（PR-06）：image→writer / core→writer 反向依赖全部切断，baseline 归零。
+# 后续阶段的违规会在此重新累积（如 PR-11 writer 降级时的过渡 import），逐 PR 消除。
+

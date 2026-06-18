@@ -6,10 +6,10 @@ from pathlib import Path
 
 from langchain_core.messages import AIMessage
 
-from app.writer.middleware.trace_middleware import _usage_payload
-from app.writer.trace.projector import TraceProjector
-from app.writer.trace.recorder import TraceRecorder
-from app.writer.trace.schemas import TraceLogEvent, TraceRunSummary
+from app.platform.agent.middleware.trace_middleware import _usage_payload
+from app.platform.trace.projector import TraceProjector
+from app.platform.trace.recorder import TraceRecorder
+from app.platform.trace.schemas import TraceLogEvent, TraceRunSummary
 from app.schemas.screenplay import ThreadSummary
 
 

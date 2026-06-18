@@ -13,8 +13,8 @@ from deepagents import CompiledSubAgent, create_deep_agent
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 
-from app.writer.middleware import ErrorRecoveryMiddleware, FilesystemPathGuardMiddleware
-from app.writer.tools.ask_user import build_ask_user_tool
+from app.platform.agent.middleware import ErrorRecoveryMiddleware, FilesystemPathGuardMiddleware
+from app.platform.tools import build_ask_user_tool
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "interview_system.md"
 

@@ -39,7 +39,7 @@ from langgraph.errors import GraphInterrupt
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel
 
-from app.writer.trace import TraceRecorder
+from app.platform.trace import TraceRecorder
 
 
 class TraceMiddleware(AgentMiddleware):

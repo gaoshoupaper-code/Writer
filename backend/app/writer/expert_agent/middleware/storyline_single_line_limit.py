@@ -27,7 +27,7 @@ from typing import Any
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages import ToolMessage
 
-from app.writer.middleware.path_guard_middleware import normalize_workspace_write_path
+from app.platform.agent.middleware.path_guard_middleware import normalize_workspace_write_path
 
 # 故事线详情文件虚拟路径：/storyline/S{XX}-<名>.md。只认 S{XX} 开头的故事线文件——
 # 同目录的 timeline.md（全局时间线表，并非故事线）因此不被计入（见需求基准 D3/D4）。

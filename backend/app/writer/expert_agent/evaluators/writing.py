@@ -9,7 +9,7 @@ from pathlib import Path
 from deepagents.middleware.filesystem import FilesystemPermission
 from langchain.agents.middleware.types import AgentMiddleware
 
-from app.writer.middleware.context_assembler_middleware import ContextAssemblerMiddleware
+from app.platform.agent.middleware import ContextAssemblerMiddleware
 from app.writer.expert_agent.types import SubAgentSpec
 
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "writing_evaluation.md"

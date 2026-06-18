@@ -19,13 +19,13 @@ from deepagents.backends import FilesystemBackend
 from langchain.agents.middleware.types import AgentMiddleware
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
-from app.writer.middleware import FilesystemPathGuardMiddleware, TraceCallbackHandler, TraceMiddleware
+from app.platform.agent.middleware import FilesystemPathGuardMiddleware, TraceCallbackHandler, TraceMiddleware
 from app.writer.models import build_writer_model
 
 # 独立于 agents/character.py 的 prompt 路径（该 agent 已被 storybuilding 替代）
 _CHARACTER_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "character_system.md"
 from app.core.settings import Settings
-from app.writer.trace import TraceRecorder
+from app.platform.trace import TraceRecorder
 from app.schemas.character import (
     CharacterGenerateRequest,
     CharacterGenerateResponse,

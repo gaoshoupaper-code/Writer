@@ -8,7 +8,7 @@ from typing import Any, TypeVar
 
 T = TypeVar("T")
 
-from app.writer.trace.schemas import (
+from app.platform.trace.schemas import (
     TraceContextRange,
     TraceContextSegment,
     TraceLogEvent,
@@ -18,7 +18,7 @@ from app.writer.trace.schemas import (
     TraceTodoItem,
     TraceTodoSnapshot,
 )
-from app.writer.trace.chain_summary import (
+from app.platform.trace.chain_summary import (
     agent_summary,
     build_tool_summary,
     error_summary,
@@ -846,7 +846,7 @@ def _detect_skill(event: TraceLogEvent) -> str | None:
     if event.tool_name not in {"read_file", "read"}:
         return None
     # 从 output 中提取路径，检查是否以 SKILL.md 结尾
-    from app.writer.trace.chain_summary import _extract_path
+    from app.platform.trace.chain_summary import _extract_path
 
     path = _extract_path(event.tool_output)
     if not path or not path.rstrip("/").endswith("SKILL.md"):

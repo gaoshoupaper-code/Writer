@@ -1,13 +1,13 @@
-# ==============================================================================
-# writer.trace 过渡门面（PR-05）
-#
-# trace 子系统实体已迁入 app.platform.trace（领域无关，writing/image 都用）。
-# 本文件 re-export 保持旧 import 路径 app.writer.trace 可用，PR-11 writer 降级时清理。
-#
-# transitional re-export —— PR-11 writer 降级时清理
-# ==============================================================================
+"""platform.trace —— 领域无关的 trace 子系统（PR-05 迁入）。
 
-from app.platform.trace import (  # noqa: F401
+trace 是通用基础设施（writing/image 都用），从 writer/trace 物理迁入此目录。
+包含：recorder / projector / chain_summary / schemas / summary_export。
+
+writer/trace/__init__.py 保留 re-export 门面供旧代码过渡，PR-11 writer 降级时清理。
+"""
+
+from app.platform.trace.recorder import TraceRecorder, TraceRunHandle
+from app.platform.trace.schemas import (
     TraceAgentRole,
     TraceContextKind,
     TraceContextRange,
@@ -17,8 +17,6 @@ from app.platform.trace import (  # noqa: F401
     TraceLogEvent,
     TraceNode,
     TraceNodeKind,
-    TraceRecorder,
-    TraceRunHandle,
     TraceRunSummary,
     TraceStatus,
     TraceTodoItem,

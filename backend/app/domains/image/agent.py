@@ -27,11 +27,16 @@ from app.domains.image.tools import (
     build_generate_images_tool,
     build_persist_skill_tool,
 )
+from app.platform.agent._skills_backend import _compose_skills_backend
 from app.platform.agent.base_service import BaseAgentService
-from app.writer.expert_agent.factory import _compose_skills_backend
-from app.writer.middleware import ErrorRecoveryMiddleware, FilesystemPathGuardMiddleware
-from app.writer.middleware.path_guard_middleware import WRITING_WRITE_PATTERNS
-from app.writer.tools.ask_user import build_ask_user_tool
+from app.platform.agent.middleware import (
+    WRITING_WRITE_PATTERNS,
+    ErrorRecoveryMiddleware,
+    FilesystemPathGuardMiddleware,
+    FileWriteSerializeMiddleware,
+    TraceMiddleware,
+)
+from app.platform.tools import build_ask_user_tool
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
@@ -97,8 +102,6 @@ class ImageAgentService(BaseAgentService):
         ]
 
         # middleware：platform 通用 + image 白名单（DD6a）
-        from app.writer.middleware import TraceMiddleware
-        from app.writer.expert_agent.middleware import FileWriteSerializeMiddleware
         middleware = [
             ErrorRecoveryMiddleware(),
             FilesystemPathGuardMiddleware(workspace_path, allowed_patterns=IMAGE_WRITE_PATTERNS),

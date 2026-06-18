@@ -14,9 +14,9 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from app.schemas.screenplay import ThreadSummary
-from app.writer.trace.projector import TraceProjector
-from app.writer.trace.schemas import TraceDetail, TraceLogEvent, TraceRunSummary
-from app.writer.trace.summary_export import export_trace_summary
+from app.platform.trace.projector import TraceProjector
+from app.platform.trace.schemas import TraceDetail, TraceLogEvent, TraceRunSummary
+from app.platform.trace.summary_export import export_trace_summary
 
 # ── 写盘解耦参数 ──────────────────────────────────────────────
 # 根因：append_event 原来在事件循环线程上同步 open("a")+write，单次生成会写

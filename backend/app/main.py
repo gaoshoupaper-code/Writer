@@ -26,12 +26,14 @@ from app.create_type.store import CreateTypeStore
 from app.create_type.optimizer import StyleOptimizer
 from app.create_type.router import init_style_module, router as style_router
 from app.core.thread_store import ThreadStore
-from app.writer.trace import TraceRecorder
+from app.platform.trace import TraceRecorder
 from app.schemas.character import CharacterGenerateRequest, CharacterGenerateResponse
 from app.schemas.screenplay import (
     InitResponse,
     ScreenplayGenerateRequest,
     ScreenplayGenerateResponse,
+    StorylineGraphEvent,
+    StorylineGraphStoryline,
     ThreadCreateRequest,
     ThreadSummary,
     ThreadUpdateRequest,
@@ -47,8 +49,8 @@ from app.schemas.screenplay import (
     WorkspaceSummary,
 )
 from app.schemas.checkpoint import CheckpointState
-from app.writer.trace import TraceDetail, TraceRunSummary
-from app.writer.middleware.trace_callback import TraceCallbackHandler
+from app.platform.trace import TraceDetail, TraceRunSummary
+from app.platform.agent.middleware import TraceCallbackHandler
 from app.auth import auth_router, current_user, CurrentUser
 from app.auth.bootstrap import bootstrap_admin
 from app.admin import me_router, admin_router
@@ -394,10 +396,49 @@ def get_workspace_worldview(workspace_id: str, user: CurrentUser = Depends(curre
 
 @app.get("/api/workspaces/{workspace_id}/storyline-graph", response_model=WorkspaceStorylineGraphContent)
 def get_workspace_storyline_graph(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceStorylineGraphContent:
-    """故事线流程图（竖向泳道时间轴）。读取时按需生成兜底——图缺失/过期自动重生成。"""
+    """故事线流程图（竖向泳道时间轴）。读取时按需生成兜底——图缺失/过期自动重生成。
+
+    生成逻辑在 API 层（而非 thread_store）：避免 core（基础设施层）反向依赖 writer。
+    thread_store 只负责读 markdown，结构化数据（events/storylines/t_map）在此解析填充。
+    """
     content = thread_store.read_workspace_storyline_graph(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
+
+    # 按需生成兜底：图缺失/过期 → 重生成（storyline_graph 是派生视图，幂等安全）
+    from app.writer.expert_agent.services.storyline_graph import (
+        build_storyline_graph_data,
+        generate_storyline_graph,
+        is_stale,
+    )
+    workspace = thread_store.get_workspace(user.user_id, workspace_id)
+    if workspace is not None:
+        ws_path = Path(workspace.workspace_path)
+        stale = is_stale(ws_path)
+        if stale:
+            generate_storyline_graph(ws_path)
+            content = thread_store.read_workspace_storyline_graph(user.user_id, workspace_id)
+            if content is None:
+                raise HTTPException(status_code=404, detail="Workspace not found")
+            content.stale = True
+        # 填充结构化数据（reactflow 自定义布局用）
+        data = build_storyline_graph_data(ws_path)
+        if data is not None:
+            content.storylines = [
+                StorylineGraphStoryline(
+                    id=sl.id, name=sl.name, type=sl.type, status=sl.status,
+                    direction=sl.direction, key_events=sl.key_events,
+                ) for sl in data.storylines
+            ]
+            content.events = {
+                eid: StorylineGraphEvent(
+                    id=ev.id, name=ev.name, type=ev.type,
+                    storylines=list(ev.storylines), group=ev.group, doc_order=ev.doc_order,
+                ) for eid, ev in data.events.items()
+            }
+            content.t_map = dict(data.t_map)
+            content.storyline_count = len(data.storylines)
+            content.event_count = len(data.events)
     return content
 
 

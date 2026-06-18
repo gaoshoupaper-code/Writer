@@ -7,6 +7,24 @@ Minimal runnable skeleton for a screenplay generation agent.
 - `backend/`: FastAPI API with a DeepAgents-powered screenplay service
 - `frontend/`: Next.js writing workspace for collecting inputs and displaying output
 
+### 分层依赖铁律（重构护栏）
+
+后端正按"平台层 + 领域层 + 基础设施层"三分层重构。6 条铁律由 `scripts/check_layering.py` 机器校验：
+
+1. `platform/` 不得 import `domains/` 或 `infrastructure/`
+2. `domains/X/` 不得 import `domains/Y/`（domain 间禁止互依）
+3. `domains/` 只能 import `platform/` + `infrastructure/`（过渡期含 `db`/`schemas`/`core`/`auth`/`admin`）
+4. `infrastructure/` 不得 import `platform/` 或 `domains/`
+5. `core/` 不得 import `writer/`（PR-03 切断）
+6. `domains/image` 不得 import `writer/`（PR-02 切断）
+
+```powershell
+python scripts/check_layering.py          # baseline 模式：只拦新增违规
+python scripts/check_layering.py --strict # 严格模式：存量违规也 fail（重构完成后用）
+```
+
+存量违规登记在 `backend/layering_baseline.txt`（当前 6 条：1 条 core→writer + 5 条 image→writer）。每消除一条就从 baseline 删一行，或重跑 `python scripts/check_layering.py --update`。CI（`.github/workflows/layering.yml`）在 PR 时自动跑此检查。
+
 ## Why this shape
 
 This first version optimizes for a fast feedback loop.

@@ -23,21 +23,20 @@ from app.writer.expert_agent.agents.detail_outline import build_detail_outline_d
 from app.writer.models import build_writer_model
 from app.writer.expert_agent.agents.writing import build_writing_deep_subagent
 from app.writer.expert_agent.agents.interview import build_interview_deep_subagent
-from app.writer.expert_agent.factory import _compose_skills_backend
-from app.writer.expert_agent.middleware.file_write_serialize import FileWriteSerializeMiddleware
-from app.writer.middleware import (
+from app.platform.agent._skills_backend import _compose_skills_backend
+from app.platform.agent.middleware import (
     ArtifactPrerequisite,
     ArtifactPrerequisiteMiddleware,
     ErrorRecoveryMiddleware,
     FilesystemPathGuardMiddleware,
-    GoalMiddleware,
-    MetaReadOnlyMiddleware,
+    FileWriteSerializeMiddleware,
     TraceCallbackHandler,
     TraceMiddleware,
 )
+from app.writer.middleware import GoalMiddleware, MetaReadOnlyMiddleware
 from app.core.settings import Settings
 from app.create_type.store import CreateTypeStore
-from app.writer.trace import TraceRecorder
+from app.platform.trace import TraceRecorder
 from app.schemas.screenplay import (
     ScreenplayGenerateRequest,
     ScreenplayGenerateResponse,

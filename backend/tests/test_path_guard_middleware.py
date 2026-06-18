@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.writer.middleware.path_guard_middleware import normalize_workspace_write_path
+from app.platform.agent.middleware.path_guard_middleware import normalize_workspace_write_path
 
 
 class NormalizeWorkspaceWritePathTest(unittest.TestCase):

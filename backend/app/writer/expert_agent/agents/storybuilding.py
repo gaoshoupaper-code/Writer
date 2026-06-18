@@ -27,7 +27,7 @@ from app.writer.expert_agent.types import apply_style_suffix
 from app.writer.expert_agent.middleware.storyline_single_line_limit import (
     StorylineSingleLineLimitMiddleware,
 )
-from app.writer.middleware.context_assembler_middleware import ContextAssemblerMiddleware
+from app.platform.agent.middleware import ContextAssemblerMiddleware
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "storybuilding_system.md"
 SKILLS_PATH_BASE = Path(__file__).resolve().parent.parent / "skills"

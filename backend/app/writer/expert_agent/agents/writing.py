@@ -10,7 +10,7 @@ from deepagents.middleware.filesystem import FilesystemPermission
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 
-from app.writer.middleware.context_assembler_middleware import ContextAssemblerMiddleware
+from app.platform.agent.middleware import ContextAssemblerMiddleware
 from app.writer.expert_agent.factory import build_deep_subagent
 from app.writer.expert_agent.evaluators.writing import build_writing_evaluator
 from app.writer.expert_agent.types import MiddlewareFactory, SubAgentSpec, apply_style_suffix

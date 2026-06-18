@@ -1,31 +1,30 @@
 # ==============================================================================
-# 中间件模块（middleware）
+# writer.middleware 过渡门面（PR-04）
 #
-# 本模块集中导出所有代理中间件，供上层 meta_agent 和各子代理按需组装。
+# 通用中间件实体已迁入 app.platform.agent.middleware（8 个）。
+# 本文件保留 re-export 供 writer 内部 + 旧代码过渡期引用，避免大批 import 改动集中在此 PR。
+# 阶段 B 闭合（PR-06）或 PR-11 writer 降级时删除。
 #
-# 中间件在 DeepAgents 框架中以洋葱模型包裹代理的核心执行流程：
-#   用户请求 → [外层中间件] → [内层中间件] → 模型调用 / 工具调用 → 逐层返回
+# 仍在 writer 下的写作专属中间件（GoalMiddleware / MetaReadOnlyMiddleware）保留实体导出。
 #
-# 各中间件职责一览：
-#   ArtifactPrerequisiteMiddleware  — 子代理执行前校验前置产物文件是否存在且非空
-#   ContextAssemblerMiddleware      — 通用上下文组装：由主代理配置文件路径，新阶段时读取并注入
-#   ErrorRecoveryMiddleware         — 工具调用出错时自动重试，耗尽后注入恢复建议
-#   FilesystemPathGuardMiddleware   — 拦截非法文件写入路径，防止越权或路径穿越
-#   GoalMiddleware                  — 注册目标工具和状态 schema，拦截未达标的最终输出
-#   MetaReadOnlyMiddleware          — Meta Agent 专属只读守卫，拦截写文件并引导改用对应子代理
-#   TraceMiddleware                 — 记录模型调用和工具调用的开始/完成/错误事件
-#   TraceCallbackHandler            — LangChain 回调处理器，注册 run 层级的父子关系
+# transitional re-export —— PR-11 writer 降级时清理
 # ==============================================================================
 
-from app.writer.middleware.artifact_prerequisite_middleware import ArtifactPrerequisite, ArtifactPrerequisiteMiddleware
-from app.writer.middleware.artifact_validation_middleware import ArtifactValidationMiddleware
-from app.writer.middleware.context_assembler_middleware import ContextAssemblerMiddleware
-from app.writer.middleware.error_recovery_middleware import ErrorRecoveryMiddleware
+# 写作专属（实体留在此处，PR-11 随 writer 迁入 domains/writing/middleware）
 from app.writer.middleware.goal_middleware import GoalMiddleware
 from app.writer.middleware.meta_readonly_middleware import MetaReadOnlyMiddleware
-from app.writer.middleware.path_guard_middleware import FilesystemPathGuardMiddleware
-from app.writer.middleware.trace_callback import TraceCallbackHandler
-from app.writer.middleware.trace_middleware import TraceMiddleware
+
+# 通用件（实体已迁 platform，re-export 保持旧 import 路径可用）
+from app.platform.agent.middleware import (
+    ArtifactPrerequisite,
+    ArtifactPrerequisiteMiddleware,
+    ArtifactValidationMiddleware,
+    ContextAssemblerMiddleware,
+    ErrorRecoveryMiddleware,
+    FilesystemPathGuardMiddleware,
+    TraceCallbackHandler,
+    TraceMiddleware,
+)
 
 __all__ = [
     "ArtifactPrerequisite",
