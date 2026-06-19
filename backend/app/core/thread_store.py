@@ -1,19 +1,12 @@
-"""工作区与线程存储（多用户改造版）。
+"""工作区与线程元数据存储（多用户改造版，PR-09 拆分后）。
 
-原实现：全局 JSON 索引（workspaces.json/threads.json）+ workspace/<作品名>/。
-现实现：SQLite 元数据（WorkspaceRepository/ThreadRepository）+ workspace/<owner_id>/<workspace_id>/。
-
-职责：
-- 元数据 CRUD（委派给 Repository，带 owner_id）
-- owner 限定的工作区路径解析
-- 工作区文件读写（outline/storyline/detail/character/novel/worldview）
-
-文件读写逻辑保持原样；唯一变化是路径来源从 JSON 索引改为 owner 限定的目录。
+职责单一化：只管元数据 CRUD（SQLite）+ owner 限定路径解析。
+产物文件读写（outline/storyline/detail/novel/character/worldview）已迁到
+``WritingArtifactStore``（thread_store.artifacts）。
 """
 
 from __future__ import annotations
 
-import re
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,35 +17,10 @@ from app.db import (
     WorkspaceRepository,
     workspace_dir,
 )
-from app.schemas.character import CharacterGenerateResponse
 from app.schemas.screenplay import (
-    CharacterMarkdownFile,
-    DetailOutlineChapter,
-    ScreenplayGenerateResponse,
-    StorylineEntry,
     ThreadSummary,
-    WorkspaceCharacterContent,
-    WorkspaceDetailOutlineContent,
-    WorkspaceNovelChapter,
-    WorkspaceNovelChaptersContent,
-    WorkspaceNovelContent,
-    WorkspaceOutlineContent,
-    WorkspaceStorylineContent,
-    WorkspaceStorylineGraphContent,
-    WorkspaceWorldviewContent,
     WorkspaceSummary,
 )
-# 注意：storyline_graph 的「按需生成」逻辑已上移到 API 层（main.py:get_workspace_storyline_graph），
-# thread_store 只保留「读」职责——避免 core（基础设施层）反向依赖 writer（业务层）。
-# storyline_graph 的解析数据由调用方生成后传入 build_storyline_graph_content。
-
-
-def _read_text(path: Path) -> str:
-    """读取文件文本，UTF-8 失败时回退 GB18030（GBK 超集，兼容中文 Windows）。"""
-    try:
-        return path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return path.read_text(encoding="gb18030", errors="replace")
 
 
 def _now() -> str:
@@ -68,6 +36,9 @@ class ThreadStore:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.workspaces = WorkspaceRepository(db)
         self.threads = ThreadRepository(db)
+        # 产物存储：共享 workspace_root + threads repo（write 需要 touch 时间戳）
+        from app.core.artifact_store import WritingArtifactStore
+        self.artifacts = WritingArtifactStore(workspace_root, self.threads)
 
     # ── 路径解析（owner 维度）────────────────────────────────
     def _ws_path(self, owner_id: str, workspace_id: str) -> Path:
@@ -148,140 +119,11 @@ class ThreadStore:
             return None
         return self._to_thread_summary(row, owner_id)
 
-    # ── 工作区文件读取 ───────────────────────────────────────
-    def _require_ws_path(self, owner_id: str, workspace_id: str) -> Path:
-        ws = self.workspaces.get(workspace_id, owner_id)
-        if ws is None:
-            raise KeyError(workspace_id)
-        ws_path = self._ws_path(owner_id, workspace_id)
-        if not ws_path.exists():
-            raise FileNotFoundError(f"Workspace directory missing: {ws_path}")
-        return ws_path
+    # ── bootstrap（元数据 + 产物聚合，产物部分委托 artifacts）──
+        """一次返回 workspace 元数据 + 全部产物。
 
-    def read_workspace_outline(self, owner_id: str, workspace_id: str) -> WorkspaceOutlineContent | None:
-        try:
-            ws_path = self._require_ws_path(owner_id, workspace_id)
-        except KeyError:
-            return None
-        artifact = ws_path / "outline.md"
-        markdown = _read_text(artifact) if artifact.exists() else ""
-        return WorkspaceOutlineContent(workspace_id=workspace_id, markdown=markdown)
-
-    def read_workspace_storyline(self, owner_id: str, workspace_id: str) -> WorkspaceStorylineContent | None:
-        try:
-            ws_path = self._require_ws_path(owner_id, workspace_id)
-        except KeyError:
-            return None
-        index_path = ws_path / "storyline.md"
-        index_markdown = _read_text(index_path) if index_path.exists() else ""
-        entries: list[StorylineEntry] = []
-        storyline_dir = ws_path / "storyline"
-        if storyline_dir.exists():
-            for ap in sorted(storyline_dir.glob("*.md"), key=lambda p: p.name):
-                content = _read_text(ap).strip()
-                if content:
-                    entries.append(StorylineEntry(filename=ap.name, title=ap.stem, markdown=content))
-        return WorkspaceStorylineContent(
-            workspace_id=workspace_id, index_markdown=index_markdown,
-            entries=entries, file_count=len(entries),
-        )
-
-    def read_workspace_storyline_graph(self, owner_id: str, workspace_id: str) -> WorkspaceStorylineGraphContent | None:
-        """读取 storyline_graph.md（派生产物）。
-
-        注意：只读不生成。「按需生成」兜底逻辑已上移到 API 层
-        （main.py:get_workspace_storyline_graph），避免 core 反向依赖 writer。
-        结构化数据（events/storylines）也由 API 层解析后填充——本方法只返回 markdown 文本，
-        events/storylines 字段保持默认空（前端优先用 markdown 渲染）。
+        元数据（workspace + threads）由本类查询，产物读取委托给 artifacts。
         """
-        try:
-            ws_path = self._require_ws_path(owner_id, workspace_id)
-        except KeyError:
-            return None
-        graph_path = ws_path / "storyline_graph.md"
-        return WorkspaceStorylineGraphContent(
-            workspace_id=workspace_id,
-            markdown=_read_text(graph_path) if graph_path.exists() else "",
-        )
-
-    def read_workspace_worldview(self, owner_id: str, workspace_id: str) -> WorkspaceWorldviewContent | None:
-        try:
-            ws_path = self._require_ws_path(owner_id, workspace_id)
-        except KeyError:
-            return None
-        wp = ws_path / "worldview.md"
-        return WorkspaceWorldviewContent(
-            workspace_id=workspace_id,
-            markdown=_read_text(wp) if wp.exists() else "",
-        )
-
-    def read_workspace_detail_outline(self, owner_id: str, workspace_id: str) -> WorkspaceDetailOutlineContent | None:
-        try:
-            ws_path = self._require_ws_path(owner_id, workspace_id)
-        except KeyError:
-            return None
-        detail_dir = ws_path / "detail"
-        chapters: list[DetailOutlineChapter] = []
-        if detail_dir.exists():
-            for ap in sorted(detail_dir.glob("*.md"), key=lambda p: (p.name != "overview.md", p.name)):
-                if ap.name == "evaluation.md":
-                    continue
-                content = _read_text(ap).strip()
-                if content:
-                    chapters.append(DetailOutlineChapter(
-                        filename=ap.name, title=self._detail_outline_title(ap.name), markdown=content,
-                    ))
-        return WorkspaceDetailOutlineContent(workspace_id=workspace_id, chapters=chapters, file_count=len(chapters))
-
-    def read_thread_outline(self, owner_id: str, thread_id: str) -> WorkspaceOutlineContent | None:
-        thread = self.threads.get(thread_id, owner_id)
-        if thread is None:
-            return None
-        return self.read_workspace_outline(owner_id, thread["workspace_id"])
-
-    def read_workspace_novel(self, owner_id: str, workspace_id: str) -> WorkspaceNovelContent | None:
-        try:
-            ws_path = self._require_ws_path(owner_id, workspace_id)
-        except KeyError:
-            return None
-        novel_path = ws_path / "novel.md"
-        markdown = _read_text(novel_path) if novel_path.exists() else ""
-        return WorkspaceNovelContent(workspace_id=workspace_id, markdown=markdown)
-
-    def read_workspace_novel_chapters(self, owner_id: str, workspace_id: str) -> WorkspaceNovelChaptersContent | None:
-        try:
-            ws_path = self._require_ws_path(owner_id, workspace_id)
-        except KeyError:
-            return None
-        chapter_files = self._workspace_chapter_files(ws_path)
-        chapters: list[WorkspaceNovelChapter] = []
-        for path in chapter_files:
-            md = _read_text(path)
-            chapters.append(WorkspaceNovelChapter(
-                filename=path.name, title=self._markdown_title(md) or path.stem, markdown=md,
-            ))
-        novel_md_path = ws_path / "novel.md"
-        if novel_md_path.exists():
-            md = _read_text(novel_md_path)
-            chapters = [WorkspaceNovelChapter(
-                filename="novel.md", title=self._markdown_title(md) or "正文", markdown=md,
-            )] + chapters
-        return WorkspaceNovelChaptersContent(workspace_id=workspace_id, chapters=chapters, file_count=len(chapters))
-
-    def read_workspace_characters(self, owner_id: str, workspace_id: str) -> WorkspaceCharacterContent | None:
-        try:
-            ws_path = self._require_ws_path(owner_id, workspace_id)
-        except KeyError:
-            return None
-        character_dir = ws_path / "character"
-        characters: list[CharacterMarkdownFile] = []
-        if character_dir.exists():
-            for ap in sorted(character_dir.glob("*.md"), key=lambda p: p.stem):
-                characters.append(CharacterMarkdownFile(filename=ap.name, name=ap.stem, markdown=_read_text(ap)))
-        return WorkspaceCharacterContent(workspace_id=workspace_id, characters=characters)
-
-    def bootstrap_workspace(self, owner_id: str, workspace_id: str) -> dict | None:
-        """一次读取 index 文件，批量返回 bootstrap 所需的全部数据。"""
         ws = self.workspaces.get(workspace_id, owner_id)
         if ws is None:
             return None
@@ -289,151 +131,19 @@ class ThreadStore:
         if not ws_path.exists():
             raise FileNotFoundError(f"Workspace directory missing: {ws_path}")
 
-        thread_summaries = [
-            self._to_thread_summary(t, owner_id)
-            for t in self.threads.list_by_workspace(workspace_id, owner_id)
-        ]
+        thread_rows = self.threads.list_by_workspace(workspace_id, owner_id)
+        thread_summaries = [self._to_thread_summary(t, owner_id) for t in thread_rows]
 
-        artifact_path = ws_path / "outline.md"
-        outline = WorkspaceOutlineContent(
-            workspace_id=workspace_id,
-            markdown=_read_text(artifact_path) if artifact_path.exists() else "",
+        artifact_data = self.artifacts.bootstrap_workspace(
+            owner_id, workspace_id,
+            ws_exists=True, threads_rows=thread_rows, thread_summaries=thread_summaries,
         )
-
-        storyline_index_path = ws_path / "storyline.md"
-        storyline_entries: list[StorylineEntry] = []
-        storyline_dir = ws_path / "storyline"
-        if storyline_dir.exists():
-            for ap in sorted(storyline_dir.glob("*.md"), key=lambda p: p.name):
-                content = _read_text(ap).strip()
-                if content:
-                    storyline_entries.append(StorylineEntry(filename=ap.name, title=ap.stem, markdown=content))
-        storyline = WorkspaceStorylineContent(
-            workspace_id=workspace_id,
-            index_markdown=_read_text(storyline_index_path) if storyline_index_path.exists() else "",
-            entries=storyline_entries, file_count=len(storyline_entries),
-        )
-
-        worldview_path = ws_path / "worldview.md"
-        worldview = WorkspaceWorldviewContent(
-            workspace_id=workspace_id,
-            markdown=_read_text(worldview_path) if worldview_path.exists() else "",
-        )
-
-        detail_dir = ws_path / "detail"
-        detail_chapters: list[DetailOutlineChapter] = []
-        if detail_dir.exists():
-            for ap in sorted(detail_dir.glob("*.md"), key=lambda p: (p.name != "overview.md", p.name)):
-                if ap.name == "evaluation.md":
-                    continue
-                content = _read_text(ap).strip()
-                if content:
-                    detail_chapters.append(DetailOutlineChapter(
-                        filename=ap.name, title=self._detail_outline_title(ap.name), markdown=content,
-                    ))
-        detail_outline = WorkspaceDetailOutlineContent(
-            workspace_id=workspace_id, chapters=detail_chapters, file_count=len(detail_chapters),
-        )
-
-        character_dir = ws_path / "character"
-        characters: list[CharacterMarkdownFile] = []
-        if character_dir.exists():
-            for ap in sorted(character_dir.glob("*.md"), key=lambda p: p.stem):
-                characters.append(CharacterMarkdownFile(filename=ap.name, name=ap.stem, markdown=_read_text(ap)))
-        character_content = WorkspaceCharacterContent(workspace_id=workspace_id, characters=characters)
-
-        novel = self.read_workspace_novel_chapters(owner_id, workspace_id)
-
-        return {
-            "workspace": ws,
-            "threads": sorted(thread_summaries, key=lambda t: t.updated_at, reverse=True),
-            "outline": outline,
-            "storyline": storyline,
-            "detail_outline": detail_outline,
-            "characters": character_content,
-            "worldview": worldview,
-            "novel": novel,
-        }
-
-    # ── 工作区文件写入 ───────────────────────────────────────
-    def write_outline(
-        self, owner_id: str, thread: ThreadSummary, response: ScreenplayGenerateResponse,
-    ) -> None:
-        ws_path = Path(thread.workspace_path)
-        if not ws_path.exists():
-            raise FileNotFoundError(f"Workspace directory missing: {ws_path}")
-        artifact_path = ws_path / "outline.md"
-        markdown = response.markdown.strip() or self._fallback_outline_markdown(response)
-        artifact_path.write_text(f"{markdown}\n", encoding="utf-8")
-        evaluation_markdown = response.evaluation_markdown.strip()
-        if evaluation_markdown:
-            (ws_path / "evaluation.md").write_text(f"{evaluation_markdown}\n", encoding="utf-8")
-        self.threads.touch(thread.thread_id, owner_id)
-
-    def write_character(
-        self, owner_id: str, thread: ThreadSummary, response: CharacterGenerateResponse,
-    ) -> None:
-        ws_path = Path(thread.workspace_path)
-        if not ws_path.exists():
-            raise FileNotFoundError(f"Workspace directory missing: {ws_path}")
-        artifact_dir = ws_path / "character"
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        artifact_path = artifact_dir / f"{response.name}.md"
-        markdown = response.markdown.strip() or self._fallback_character_markdown(response)
-        artifact_path.write_text(f"{markdown}\n", encoding="utf-8")
-        self.threads.touch(thread.thread_id, owner_id)
+        return {"workspace": ws, **artifact_data}
 
     def clear_workspace_style_reference(self, style_id: str) -> None:
         self.workspaces.clear_style_reference(style_id)
 
     # ── 辅助 ────────────────────────────────────────────────
-    def _detail_outline_title(self, filename: str) -> str:
-        if filename == "overview.md":
-            return "总览"
-        match = re.match(r"chapter-(\d+)\.md$", filename)
-        if match:
-            return f"第{int(match.group(1))}章"
-        return Path(filename).stem
-
-    def _workspace_chapter_files(self, ws_path: Path) -> list[Path]:
-        chapter_dir = ws_path / "chapter"
-        if not chapter_dir.exists():
-            return []
-        return sorted(
-            (p for p in chapter_dir.glob("*.md") if p.is_file() and _read_text(p).strip()),
-            key=lambda p: p.name,
-        )
-
-    def _markdown_title(self, markdown: str) -> str:
-        for line in markdown.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("#"):
-                return stripped.lstrip("#").strip()
-            if stripped:
-                return stripped
-        return ""
-
-    def _fallback_character_markdown(self, response: CharacterGenerateResponse) -> str:
-        return (
-            f"# {response.name}\n\n"
-            f"## 角色身份\n\n{response.identity}\n\n"
-            f"## 外貌特征\n\n{response.appearance}\n\n"
-            f"## 性格与内心\n\n{response.personality}\n\n"
-            f"## 关系网络\n\n{response.relationships}\n\n"
-            f"## 目前状态\n\n{response.current_state}\n"
-        )
-
-    def _fallback_outline_markdown(self, response: ScreenplayGenerateResponse) -> str:
-        beat_lines = "\n".join(
-            f"{i}. {beat}" for i, beat in enumerate(response.beats, start=1)
-        )
-        return (
-            f"# {response.title}\n\n"
-            f"## 一句话梗概\n\n{response.logline}\n\n"
-            f"## 短梗概\n\n{response.synopsis}\n\n"
-            f"## 五个关键剧情节点\n\n{beat_lines}"
-        )
-
     def _to_workspace_summary(self, ws: dict) -> WorkspaceSummary:
         return WorkspaceSummary(
             workspace_id=ws["workspace_id"],

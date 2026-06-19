@@ -34,10 +34,14 @@ class AgentService(Protocol):
         """读取 thread 的最新 checkpoint，规范化为 CheckpointState。"""
         ...
 
-    def delete_thread_checkpoint(
+    async def delete_thread_checkpoint(
         self, thread_id: str, *, owner_id: str | None = None,
     ) -> None:
-        """删除 thread 的 checkpoint（多用户隔离：按 owner 清理分库）。"""
+        """删除 thread 的 checkpoint（多用户隔离：按 owner 清理分库 saver）。
+
+        async：分库 saver 是异步惰性创建，必须用 async 接口才能取到 owner 对应的
+        per-user .db 并真正清理（PR-10 修复：原同步实现删不到分库 checkpoint）。
+        """
         ...
 
 

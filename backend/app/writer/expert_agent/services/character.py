@@ -85,8 +85,12 @@ class CharacterService:
             middleware=middleware,
         )
 
-    def delete_thread_checkpoint(self, thread_id: str) -> None:
-        """删除指定线程的检查点数据。"""
+    async def delete_thread_checkpoint(self, thread_id: str) -> None:
+        """删除指定线程的检查点数据（PR-10 改 async 保持 AgentService 协议一致）。
+
+        character 不分库（用全局 saver），但仍走 async 接口与写作/image 一致。
+        PR-12 补齐继承 BaseAgentService 后此方法可删除（由基类提供）。
+        """
         self.checkpointer.delete_thread(thread_id)
 
     def _resolve_model(self, owner_id: str | None):

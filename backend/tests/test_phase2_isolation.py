@@ -221,6 +221,35 @@ class TestCheckpointPool:
 
         asyncio.run(run())
 
+    def test_delete_thread_checkpoint_uses_per_user_db(self, tmp_path):
+        """PR-10 回归测试：delete_thread_checkpoint 必须用分库 saver 真正清理。
+
+        缺口重现：原同步实现调 _resolve_checkpointer_sync（全局 saver），
+        分库数据不在全局库，删除是空操作——checkpoint 残留。
+        修复后：async delete_thread_checkpoint 走 _resolve_checkpointer 取分库 saver。
+        """
+        import asyncio
+        from langgraph.checkpoint.base import empty_checkpoint
+        from app.core.checkpoint_pool import CheckpointPool, init_checkpoint_pool, get_checkpoint_pool
+
+        pool = CheckpointPool(tmp_path / "checkpoints")
+        init_checkpoint_pool(pool)
+
+        async def run():
+            # user_a 的分库写入一条 checkpoint
+            saver = await pool.get("user_a")
+            cfg = {"configurable": {"thread_id": "t1", "checkpoint_ns": ""}}
+            await saver.aput(cfg, empty_checkpoint(), {}, [])
+            # 确认存在
+            assert await saver.aget(cfg) is not None
+
+            # 用修复后的逻辑删除（模拟 BaseAgentService.delete_thread_checkpoint）
+            await saver.adelete_thread("t1")
+            assert await saver.aget(cfg) is None, "checkpoint 应被真正清理，而非残留"
+            await pool.aclose_all()
+
+        asyncio.run(run())
+
 
 # ── workspace_id 改 uuid（不再用作品名）────────────────────
 

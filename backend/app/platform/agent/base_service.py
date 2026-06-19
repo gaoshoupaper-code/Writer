@@ -102,17 +102,22 @@ class BaseAgentService:
     def _resolve_checkpointer_sync(self, owner_id: str | None):
         """同步路径的 checkpointer（只能用全局兜底，分库 saver 是异步惰性创建）。
 
-        delete_thread_checkpoint 是同步调用，分库下数据不在全局库，故此处是空操作。
-        真正的清理在 main.py 删除 workspace 时走 drop。保留接口兼容。
+        仅用于无法 await 的同步上下文。分库数据的可靠删除请用 delete_thread_checkpoint
+        （async，PR-10 修复：原来同步调全局 saver 删不到分库 checkpoint）。
         """
         return self.checkpointer
 
     # ── checkpoint 读写 ──────────────────────────────────────
 
-    def delete_thread_checkpoint(self, thread_id: str, *, owner_id: str | None = None) -> None:
-        """删除 thread 的 checkpoint（同步，用全局 saver 兜底）。"""
-        checkpointer = self._resolve_checkpointer_sync(owner_id)
-        checkpointer.delete_thread(thread_id)
+    async def delete_thread_checkpoint(self, thread_id: str, *, owner_id: str | None = None) -> None:
+        """删除 thread 的 checkpoint（PR-10 修复：改为 async，用分库 saver）。
+
+        原同步实现调 _resolve_checkpointer_sync 返回全局 saver，分库（per-user .db）
+        数据不在全局库，删除是空操作——导致 delete_thread 后 checkpoint 残留。
+        现改为 async，走 _resolve_checkpointer 取到 owner 对应的分库 saver，真正清理。
+        """
+        checkpointer = await self._resolve_checkpointer(owner_id)
+        await checkpointer.adelete_thread(thread_id)
 
     async def get_thread_checkpoint(self, thread_id: str, *, owner_id: str | None = None) -> CheckpointState:
         """读取 thread 的最新 checkpoint，规范化为 CheckpointState。"""
