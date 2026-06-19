@@ -5,12 +5,12 @@
 
 每个用户只看自己的风格，互不可见、互不影响。
 
-注：StyleSummary 来自 app.create_type.schemas（4 列风格字段版），不是 app.schemas.style。
+注：StyleSummary 来自 app.domains.writing.styling.schemas（4 列风格字段版），不是 app.schemas.style。
 """
 
 from __future__ import annotations
 
-from app.create_type.schemas import StyleSummary
+from app.domains.writing.styling.schemas import StyleSummary
 from app.platform.core.db import Database, StyleRepository, WorkspaceRepository
 
 

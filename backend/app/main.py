@@ -13,10 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.admin import admin_router, me_router
 from app.auth import CurrentUser, auth_router, current_user
 from app.auth.bootstrap import bootstrap_admin
-from app.create_type.optimizer import StyleOptimizer
-from app.create_type.router import init_style_module
-from app.create_type.router import router as style_router
-from app.create_type.store import CreateTypeStore
+from app.domains.writing.styling.optimizer import StyleOptimizer
+from app.domains.writing.styling.router import init_style_module
+from app.domains.writing.styling.router import router as style_router
+from app.domains.writing.styling.store import CreateTypeStore
 from app.domains.writing.expert_agent.services.character import CharacterService
 from app.domains.writing.meta import MetaAgentService
 from app.platform.agent.middleware import TraceCallbackHandler  # noqa: F401 — image router 用

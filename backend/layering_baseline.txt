@@ -3,10 +3,6 @@
 # 存量违规登记在此 = 允许；后续 PR 消除一条就删一行，最终此文件应为空。
 # 用 `python scripts/check_layering.py --update` 重新生成。
 #
-# PR-12 后剩余 2 条预先存在的跨域依赖：
-# - R2 image→writing.models：image 复用写作模型构建（DeepSeek 配置），
-#   待 image 独立模型配置后消除
-# - R3 writing/meta→create_type.store：待 create_type 归类为 domain 或下沉
+# 重构完成（阶段 A-G）：全部 6 条铁律违规清零，baseline 为空。
+# strict 模式可用：python scripts/check_layering.py --strict
 
-R2|domains/image/agent.py|app.domains.writing.models
-R3|domains/writing/meta/agent.py|app.create_type.store

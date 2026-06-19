@@ -38,7 +38,7 @@ from app.platform.agent.middleware import (
 )
 from app.domains.writing.middleware import GoalMiddleware, MetaReadOnlyMiddleware
 from app.platform.core.settings import Settings
-from app.create_type.store import CreateTypeStore
+from app.domains.writing.styling.store import CreateTypeStore
 from app.platform.trace import TraceRecorder
 from app.schemas.screenplay import (
     ScreenplayGenerateRequest,

@@ -69,16 +69,16 @@ class ImageAgentService(BaseAgentService):
     def _load_system_prompt(self) -> str:
         return (PROMPTS_DIR / "system.md").read_text(encoding="utf-8").strip()
 
-    # ── 模型构建（PR-12：从基类下沉，image 当前复用写作模型配置）─────
+    # ── 模型构建（PR-14 解耦：image 独立模型构建，不再依赖 writing）─────
     def _build_model_default(self):
-        """image agent 的默认模型（当前复用写作模型配置）。"""
-        from app.domains.writing.models import build_writer_model
-        return build_writer_model(self.settings)
+        """image agent 的默认模型（用本 domain 的 build_image_model）。"""
+        from app.domains.image.models import build_image_model
+        return build_image_model(self.settings)
 
     def _build_model_with_key(self, key: str, base_url: str | None, model_name: str | None):
         """按 owner 的 key 构建 image 模型（多用户隔离 D9）。"""
-        from app.domains.writing.models import build_writer_model
-        return build_writer_model(
+        from app.domains.image.models import build_image_model
+        return build_image_model(
             self.settings, api_key=key, base_url=base_url, model_name_override=model_name,
         )
 

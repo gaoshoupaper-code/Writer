@@ -54,13 +54,10 @@ def test_baseline_mode_passes(linter):
     assert rc == 0, "baseline 模式下不应有新增违规"
 
 
-def test_strict_mode_fails_on_known_transitions(linter):
-    """strict 模式：PR-11 后有 2 条已知过渡违规，应 exit 1。
-
-    PR-12 修 R1（build_writer_model 下沉）后剩 1 条；create_type 归类后清零。
-    """
+def test_strict_mode_passes_when_clean(linter):
+    """strict 模式：重构完成后全部违规清零，baseline 空，应 exit 0。"""
     rc = linter.main(["--strict"])
-    assert rc == 1, "strict 模式下应因存量过渡违规 fail"
+    assert rc == 0, "重构完成后 strict 模式应通过（无违规）"
 
 
 def test_linter_detects_new_violation(linter, tmp_path, monkeypatch):
@@ -118,12 +115,6 @@ def test_baseline_file_exists_and_tracks_transitions():
         line for line in content.splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    # PR-12 修 R1（build_writer_model 下沉）后剩 2 条：
-    # - R2 image→writing.models（image 复用写作模型）
-    # - R3 writing/meta→create_type.store
-    assert len(violation_lines) == 2, f"PR-12 后 baseline 应有 2 条，实际 {len(violation_lines)}：{violation_lines}"
-    assert any("image/agent.py|app.domains.writing.models" in l for l in violation_lines)
-    assert any("meta/agent.py|app.create_type.store" in l for l in violation_lines)
-    # R1 应已消除（build_writer_model 下沉到子类钩子）
-    assert not any("base_service.py|app.domains.writing.models" in l for l in violation_lines), \
-        "R1（platform→writing.models）应在 PR-12 消除"
+    # 重构完成（阶段 A-G）：全部 6 条铁律违规清零，baseline 为空
+    assert violation_lines == [], \
+        f"重构完成后 baseline 应为空，实际含：{violation_lines}"

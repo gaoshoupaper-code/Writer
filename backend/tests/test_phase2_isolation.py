@@ -12,7 +12,7 @@ import pytest
 
 from app.platform.core.security import generate_master_key, load_master_key
 from app.platform.state.thread_store import ThreadStore
-from app.create_type.store import CreateTypeStore
+from app.domains.writing.styling.store import CreateTypeStore
 from app.platform.core.db import (
     Database,
     StyleRepository,

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from app.platform.state.thread_store import ThreadStore
-    from app.create_type.store import CreateTypeStore
+    from app.domains.writing.styling.store import CreateTypeStore
     from app.platform.trace import TraceRecorder
     from app.domains.writing.meta import MetaAgentService
     from app.domains.writing.expert_agent.services.character import CharacterService

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 
-from app.create_type.optimizer import StyleOptimizer, VALID_STYLE_TYPES
-from app.create_type.schemas import (
+from app.domains.writing.styling.optimizer import StyleOptimizer, VALID_STYLE_TYPES
+from app.domains.writing.styling.schemas import (
     StyleCreateRequest,
     StyleOptimizeRequest,
     StyleOptimizeResponse,
@@ -9,7 +9,7 @@ from app.create_type.schemas import (
     StyleUpdateRequest,
     WorkspaceStyleRequest,
 )
-from app.create_type.store import CreateTypeStore
+from app.domains.writing.styling.store import CreateTypeStore
 from app.schemas.screenplay import WorkspaceSummary
 
 router = APIRouter(prefix="/api", tags=["styles"])

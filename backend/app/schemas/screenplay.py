@@ -2,7 +2,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.create_type.schemas import StyleSummary
+from app.domains.writing.styling.schemas import StyleSummary
 
 
 class WorkspaceCreateRequest(BaseModel):
