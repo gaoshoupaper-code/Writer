@@ -18,8 +18,8 @@ class Settings(BaseSettings):
     # 生成方式：python -c "import secrets; print(secrets.token_hex(32))"
     master_key: str
 
-    # 元数据库路径（相对 backend 根，或绝对路径）。默认 backend/app.db
-    db_path: str = "app.db"
+    # 元数据库路径（相对 backend 根，或绝对路径）。默认 backend/app.platform.core.db
+    db_path: str = "app.platform.core.db"
 
     # 工作区根目录（默认 backend/workspace，内部按 user_id 分桶）
     workspace_root: str = "workspace"

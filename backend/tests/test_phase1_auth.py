@@ -18,7 +18,7 @@ from app.platform.core.security import (
     load_master_key,
     verify_password,
 )
-from app.db import (
+from app.platform.core.db import (
     Database,
     InviteCodeRepository,
     SessionRepository,
@@ -228,7 +228,7 @@ class TestSessions:
 class TestAdminBootstrap:
     def test_creates_admin_when_none(self, db, monkeypatch, tmp_path):
         # 初始化 db 单例
-        from app.db import init_database
+        from app.platform.core.db import init_database
         init_database(db)
 
         # 伪造 settings
@@ -249,7 +249,7 @@ class TestAdminBootstrap:
         assert result["admin_invite_code"]
 
     def test_idempotent_when_admin_exists(self, db, monkeypatch):
-        from app.db import init_database
+        from app.platform.core.db import init_database
         init_database(db)
         UserRepository(db).create(
             username="existing", password="pw123456", is_admin=True,

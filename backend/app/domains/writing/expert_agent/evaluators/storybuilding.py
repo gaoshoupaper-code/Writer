@@ -9,9 +9,7 @@ from pathlib import Path
 
 from langchain.agents.middleware.types import AgentMiddleware
 
-from app.platform.agent.runtime import FilesystemPermission
-
-from app.domains.writing.expert_agent.types import SubAgentSpec
+from app.platform.agent.runtime import FilesystemPermission, SubAgentSpec
 
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "storybuilding_evaluation.md"
 

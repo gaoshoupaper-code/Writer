@@ -18,7 +18,7 @@ from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app.platform.core.settings import get_settings
-from app.db import (
+from app.platform.core.db import (
     InviteCodeRepository,
     SessionRepository,
     UserRepository,

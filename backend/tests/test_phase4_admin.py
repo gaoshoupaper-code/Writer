@@ -25,7 +25,7 @@ def app_env(tmp_path, monkeypatch):
     backend_dir = Path(__file__).resolve().parents[1]
     workspace = tmp_path / "workspace"
     checkpoints = tmp_path / "checkpoints"
-    db_path = tmp_path / "app.db"
+    db_path = tmp_path / "app.platform.core.db"
 
     monkeypatch.setenv("MASTER_KEY", secrets.token_hex(32))
     monkeypatch.setenv("DB_PATH", str(db_path))
@@ -47,7 +47,7 @@ def app_env(tmp_path, monkeypatch):
     import app.platform.core.settings as settings_mod
     settings_mod.get_settings.cache_clear()
     # 重置单例
-    import app.db as db_mod
+    import app.platform.core.db as db_mod
     db_mod._database = None
     import app.platform.core.checkpoint_pool as pool_mod
     pool_mod._pool = None

@@ -11,7 +11,7 @@ import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
-from app.db import (
+from app.platform.core.db import (
     Database,
     ThreadRepository,
     WorkspaceRepository,

@@ -67,7 +67,7 @@ class BaseAgentService:
         if not owner_id:
             return self._build_model_default()
         try:
-            from app.db import get_database, UserRepository
+            from app.platform.core.db import get_database, UserRepository
             users = UserRepository(get_database())
             key, base_url, model = users.get_api_key_plain(owner_id)
             if key is None:

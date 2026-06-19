@@ -21,21 +21,140 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.auth import CurrentUser, current_user
-from app.db import SkillRepository, get_database
+from app.platform.agent.middleware import TraceCallbackHandler
+from app.platform.core.db import SkillRepository, get_database
 from app.platform.skills.loader import skills_root
 
 router = APIRouter()
 
-# image_service 和 thread_store 由 main.py 注入（lifespan 后 set 到模块全局）
+# image_service / thread_store / trace_recorder 由 main.py 注入（lifespan 后 set 到模块全局）
 _image_service = None
 _thread_store = None
+_trace_recorder = None
 
 
-def init_image_routes(image_service, thread_store) -> None:
-    """main.py 启动时注入 service 实例。"""
-    global _image_service, _thread_store
+def init_image_routes(image_service, thread_store, trace_recorder) -> None:
+    """main.py 启动时注入 service 实例（PR-14 增加 trace_recorder）。"""
+    global _image_service, _thread_store, _trace_recorder
     _image_service = image_service
     _thread_store = thread_store
+    _trace_recorder = trace_recorder
+
+
+# ── 文生图 SSE 流（PR-14 从 main.py 迁入）─────────────────
+
+class ImageGenerateRequest(BaseModel):
+    """文生图生成请求。"""
+    thread_id: str
+    prompt: str  # 用户想生成的图片描述
+    trace_id: str | None = None
+    resume: dict | None = None  # HITL resume（结构化 image_review 反馈，DD4）
+    selected_skill_ids: list[str] | None = None  # D9 加载的私有 Skill
+
+
+async def _image_event_generator(payload: ImageGenerateRequest, thread, *, owner_id: str):
+    """文生图 SSE 流（platform.streaming.run_agent_stream 骨架）。
+
+    image agent 走自己的 _build_agent，SSE 事件格式与写作一致（model_stream/
+    tool_output/tool_error/interrupt/final），前端按 interrupt 的 kind 路由渲染。
+    """
+    from langgraph.types import Command
+    from app.platform.streaming import run_agent_stream, sse as _sse
+    trace_recorder = _trace_recorder
+    model = _image_service._resolve_model(owner_id)
+    checkpointer = await _image_service._resolve_checkpointer(owner_id)
+    trace = trace_recorder.create_run(thread, "image.generate.stream")
+    yield _sse("status", {"status": "started", "trace_id": trace.trace_id})
+
+    agent = _image_service._build_agent(
+        Path(thread.workspace_path), trace.trace_id, thread.workspace_id, owner_id,
+        model=model, checkpointer=checkpointer,
+        selected_skill_ids=payload.selected_skill_ids,
+    )
+    config = {
+        "configurable": {"thread_id": thread.thread_id},
+        "callbacks": [TraceCallbackHandler(trace_recorder, trace.trace_id)],
+        "recursion_limit": 200,
+    }
+    if payload.resume is not None:
+        agent_input = Command(resume=payload.resume)
+    else:
+        agent_input = {"messages": [{"role": "user", "content": payload.prompt}]}
+
+    async def on_event(event: dict) -> list[str]:
+        frames: list[str] = []
+        kind = event["event"]
+        data = event.get("data", {})
+        if kind == "on_chat_model_stream":
+            chunk = data.get("chunk")
+            content = getattr(chunk, "content", "") if chunk else ""
+            if content:
+                frames.append(_sse("model_stream", {"content": content}))
+        elif kind == "on_tool_end":
+            frames.append(_sse("tool_output", {
+                "tool": event.get("name", ""),
+                "output": str(data.get("output", ""))[:2000],
+            }))
+        elif kind == "on_tool_error":
+            frames.append(_sse("tool_error", {
+                "tool": event.get("name", ""),
+                "error": str(data.get("error") or data.get("output") or "")[:500],
+            }))
+        return frames
+
+    class _ImageSink:
+        async def on_event(self_inner, event: dict) -> list[str]:
+            return await on_event(event)
+
+    sse_iter, result = run_agent_stream(agent, agent_input, config, sink=_ImageSink())
+
+    try:
+        async for frame in sse_iter:
+            yield frame
+
+        if result.pending_interrupt is not None:
+            iv = result.pending_interrupt
+            payload_dict = iv if isinstance(iv, dict) else {"question": str(iv)}
+            if "kind" not in payload_dict:
+                payload_dict["kind"] = "choice"
+            payload_dict["thread_id"] = thread.thread_id
+            yield _sse("interrupt", payload_dict)
+            return
+
+        if result.full_result is not None:
+            content = ""
+            if isinstance(result.full_result, dict):
+                for msg in reversed(result.full_result.get("messages", [])):
+                    mc = getattr(msg, "content", None) or (msg.get("content") if isinstance(msg, dict) else None)
+                    if isinstance(mc, str) and mc:
+                        content = mc
+                        break
+            yield _sse("final", {"content": content, "thread_id": thread.thread_id})
+        trace_recorder.complete_run(thread, trace.trace_id)
+    except BaseException as exc:
+        trace_recorder.fail_run(thread, trace.trace_id, exc)
+        yield _sse("error", {"error": str(exc)[:500]})
+        raise
+
+
+@router.post("/api/image/generate/stream")
+async def stream_image(payload: ImageGenerateRequest, user: CurrentUser = Depends(current_user)):
+    """文生图 SSE 流。
+
+    interrupt 事件按 kind 路由：choice=访谈式 / image_review=图像评审。
+    """
+    thread = _thread_store.get_thread(user.user_id, payload.thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    return StreamingResponse(
+        _image_event_generator(payload, thread, owner_id=user.user_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ── 图片服务端点（DD8b）───────────────────────────────────
@@ -47,7 +166,7 @@ def serve_image(image_id: str, user: CurrentUser = Depends(current_user)) -> Res
 
     鉴权：current_user + owner_id 校验（只能访问自己的图）。
     """
-    from app.db import ImageRepository
+    from app.platform.core.db import ImageRepository
     repo = ImageRepository(get_database())
     meta = repo.get(image_id, user.user_id)
     if meta is None:

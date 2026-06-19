@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from app.platform.core.security import generate_master_key, load_master_key
-from app.db import (
+from app.platform.core.db import (
     Database,
     ImageRepository,
     SkillRepository,
@@ -36,7 +36,7 @@ from app.platform.skills.loader import resolve_owner_skills
 
 @pytest.fixture()
 def db(tmp_path) -> Database:
-    d = Database(tmp_path / "app.db", load_master_key(generate_master_key()))
+    d = Database(tmp_path / "app.platform.core.db", load_master_key(generate_master_key()))
     init_database(d)
     return d
 

@@ -8,10 +8,9 @@ from pathlib import Path
 
 from langchain.agents.middleware.types import AgentMiddleware
 
-from app.platform.agent.runtime import FilesystemPermission
+from app.platform.agent.runtime import FilesystemPermission, SubAgentSpec
 
 from app.platform.agent.middleware import ContextAssemblerMiddleware
-from app.domains.writing.expert_agent.types import SubAgentSpec
 
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "writing_evaluation.md"
 

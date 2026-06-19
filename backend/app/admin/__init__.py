@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 from app.auth import CurrentUser, current_user, require_admin
 from app.platform.core.settings import get_settings
-from app.db import (
+from app.platform.core.db import (
     InviteCodeRepository,
     UserRepository,
     WorkspaceRepository,
@@ -107,7 +107,7 @@ class ProviderConfigUpdate(BaseModel):
 
 @me_router.get("/provider-configs", response_model=list[ProviderConfigSummary])
 def list_my_configs(user: CurrentUser = Depends(current_user)) -> list[ProviderConfigSummary]:
-    from app.db import ProviderConfigRepository
+    from app.platform.core.db import ProviderConfigRepository
     rows = ProviderConfigRepository(get_database()).list_by_owner(user.user_id)
     return [ProviderConfigSummary(**r) for r in rows]
 
@@ -116,7 +116,7 @@ def list_my_configs(user: CurrentUser = Depends(current_user)) -> list[ProviderC
 def create_my_config(
     payload: ProviderConfigCreate, user: CurrentUser = Depends(current_user),
 ) -> ProviderConfigSummary:
-    from app.db import ProviderConfigRepository
+    from app.platform.core.db import ProviderConfigRepository
     repo = ProviderConfigRepository(get_database())
     row = repo.create(
         owner_id=user.user_id, name=payload.name, api_key=payload.api_key,
@@ -135,7 +135,7 @@ def update_my_config(
     config_id: str, payload: ProviderConfigUpdate,
     user: CurrentUser = Depends(current_user),
 ) -> ProviderConfigSummary:
-    from app.db import ProviderConfigRepository
+    from app.platform.core.db import ProviderConfigRepository
     repo = ProviderConfigRepository(get_database())
     row = repo.update(
         config_id, user.user_id, name=payload.name, api_key=payload.api_key,
@@ -152,7 +152,7 @@ def update_my_config(
 
 @me_router.post("/provider-configs/{config_id}/activate")
 def activate_my_config(config_id: str, user: CurrentUser = Depends(current_user)) -> dict:
-    from app.db import ProviderConfigRepository
+    from app.platform.core.db import ProviderConfigRepository
     ok = ProviderConfigRepository(get_database()).activate(config_id, user.user_id)
     if not ok:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "配置不存在")
@@ -161,7 +161,7 @@ def activate_my_config(config_id: str, user: CurrentUser = Depends(current_user)
 
 @me_router.delete("/provider-configs/{config_id}")
 def delete_my_config(config_id: str, user: CurrentUser = Depends(current_user)) -> dict:
-    from app.db import ProviderConfigRepository
+    from app.platform.core.db import ProviderConfigRepository
     ok = ProviderConfigRepository(get_database()).delete(config_id, user.user_id)
     if not ok:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "配置不存在")
@@ -356,7 +356,7 @@ def read_user_workspace_outline(
 ) -> dict:
     """管理员代访问：读取某用户作品的 outline（只读）。"""
     from app.platform.state.thread_store import ThreadStore
-    from app.db import workspace_dir
+    from app.platform.core.db import workspace_dir
     from pathlib import Path
 
     ws = WorkspaceRepository(get_database()).get(workspace_id, user_id)

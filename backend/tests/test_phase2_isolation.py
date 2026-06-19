@@ -13,7 +13,7 @@ import pytest
 from app.platform.core.security import generate_master_key, load_master_key
 from app.platform.state.thread_store import ThreadStore
 from app.create_type.store import CreateTypeStore
-from app.db import (
+from app.platform.core.db import (
     Database,
     StyleRepository,
     UserRepository,
@@ -26,7 +26,7 @@ from app.db import (
 
 @pytest.fixture()
 def db(tmp_path) -> Database:
-    d = Database(tmp_path / "app.db", load_master_key(generate_master_key()))
+    d = Database(tmp_path / "app.platform.core.db", load_master_key(generate_master_key()))
     init_database(d)  # 供 ThreadStore 内部 get_database 路径用
     return d
 

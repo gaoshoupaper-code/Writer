@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 from app.platform.core.security import generate_master_key, load_master_key
-from app.db import (
+from app.platform.core.db import (
     Database,
     ProviderConfigRepository,
     UserRepository,
@@ -18,7 +18,7 @@ from app.db import (
 
 @pytest.fixture()
 def db(tmp_path):
-    d = Database(tmp_path / "app.db", load_master_key(generate_master_key()))
+    d = Database(tmp_path / "app.platform.core.db", load_master_key(generate_master_key()))
     init_database(d)
     return d
 

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from app.platform.core.settings import Settings
-from app.db import Database, ImageRepository, get_database
+from app.platform.core.db import Database, ImageRepository, get_database
 from app.domains.image.providers.bytedance import BytedanceImageProvider, BytedanceVisionProvider
 from app.platform.providers.image_generation import ImageGenerationProvider
 from app.platform.providers.image_understanding import ImageUnderstandingProvider
@@ -80,7 +80,7 @@ def _owner_credentials(owner_id: str | None) -> tuple[str | None, str | None]:
     if not owner_id:
         return None, None
     try:
-        from app.db import UserRepository
+        from app.platform.core.db import UserRepository
         users = UserRepository(get_database())
         key, base_url, _model = users.get_api_key_plain(owner_id)
         return key, base_url

@@ -10,14 +10,16 @@ from app.platform.agent.runtime import (
     BackendProtocol,
     CompiledSubAgent,
     FilesystemPermission,
+    MiddlewareFactory,
     SubAgent,
+    SubAgentSpec,
 )
 from langchain_core.language_models import BaseChatModel
 
 from app.platform.agent.middleware import ContextAssemblerMiddleware
 from app.domains.writing.expert_agent.factory import build_deep_subagent
 from app.domains.writing.expert_agent.evaluators.writing import build_writing_evaluator
-from app.domains.writing.expert_agent.types import MiddlewareFactory, SubAgentSpec, apply_style_suffix
+from app.domains.writing.expert_agent.types import apply_style_suffix
 
 # 写作子代理的系统提示词文件路径
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "writing_system.md"

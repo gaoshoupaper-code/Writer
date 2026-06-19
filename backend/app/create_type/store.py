@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from app.create_type.schemas import StyleSummary
-from app.db import Database, StyleRepository, WorkspaceRepository
+from app.platform.core.db import Database, StyleRepository, WorkspaceRepository
 
 
 class CreateTypeStore:

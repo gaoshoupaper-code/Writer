@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from app.db import ThreadRepository, workspace_dir
+from app.platform.core.db import ThreadRepository, workspace_dir
 from app.schemas.character import CharacterGenerateResponse
 from app.schemas.screenplay import (
     CharacterMarkdownFile,

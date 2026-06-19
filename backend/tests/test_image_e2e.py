@@ -24,7 +24,7 @@ from uuid import uuid4
 import pytest
 
 from app.platform.core.security import generate_master_key, load_master_key
-from app.db import (
+from app.platform.core.db import (
     Database,
     ImageRepository,
     SkillRepository,
@@ -45,7 +45,7 @@ from app.domains.image.tools import (
 @pytest.fixture()
 def e2e_env(tmp_path):
     """端到端测试环境：db + user + image workspace + store。"""
-    db = Database(tmp_path / "app.db", load_master_key(generate_master_key()))
+    db = Database(tmp_path / "app.platform.core.db", load_master_key(generate_master_key()))
     init_database(db)
     users = UserRepository(db)
     u = users.create(username="e2e", password="pw123456")

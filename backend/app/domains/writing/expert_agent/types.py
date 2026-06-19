@@ -1,18 +1,10 @@
-"""domains.writing.expert_agent 共享类型与工具函数。
+"""domains.writing.expert_agent 共享工具函数。
 
-SubAgentSpec / MiddlewareFactory 从 platform.agent.runtime re-export（框架级类型，
-PR-08 迁入 runtime）。apply_style_suffix 是写作专属工具。
+框架级类型（SubAgentSpec / MiddlewareFactory）已直接从 platform.agent.runtime import，
+不再经此文件 re-export。本文件只保留写作专属的 apply_style_suffix。
 """
 
 from __future__ import annotations
-
-# 框架级类型：从 runtime re-export（transitional，PR-11 清理）
-from app.platform.agent.runtime import MiddlewareFactory, SubAgentSpec
-
-
-# ======================================================================
-# 写作专属工具函数
-# ======================================================================
 
 
 def apply_style_suffix(system_prompt: str, style_suffix: str | None) -> str:
@@ -27,8 +19,4 @@ def apply_style_suffix(system_prompt: str, style_suffix: str | None) -> str:
     return f"{system_prompt}\n\n{style_suffix}"
 
 
-__all__ = [
-    "MiddlewareFactory",
-    "SubAgentSpec",
-    "apply_style_suffix",
-]
+__all__ = ["apply_style_suffix"]

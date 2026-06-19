@@ -4,7 +4,7 @@ from pathlib import Path
 
 from app.platform.core.security import generate_master_key, load_master_key
 from app.platform.state.thread_store import ThreadStore
-from app.db import Database, UserRepository, init_database
+from app.platform.core.db import Database, UserRepository, init_database
 
 
 class ThreadStoreTest(unittest.TestCase):
@@ -16,7 +16,7 @@ class ThreadStoreTest(unittest.TestCase):
 
     def test_create_workspace_is_owner_scoped_with_uuid(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            db = Database(Path(tmpdir) / "app.db", load_master_key(generate_master_key()))
+            db = Database(Path(tmpdir) / "app.platform.core.db", load_master_key(generate_master_key()))
             init_database(db)
             store = ThreadStore(db, Path(tmpdir) / "workspace")
             owner = UserRepository(db).create(username="owner", password="pw123456")

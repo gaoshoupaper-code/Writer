@@ -18,7 +18,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 
 from app.platform.core.settings import Settings
-from app.db import get_database
+from app.platform.core.db import get_database
 from app.domains.image.store import ImageArtifactStore
 from app.domains.image.tools import (
     build_analyze_image_tool,

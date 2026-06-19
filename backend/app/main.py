@@ -56,7 +56,7 @@ from app.auth.bootstrap import bootstrap_admin
 from app.admin import me_router, admin_router
 from app.platform.core.checkpoint_pool import CheckpointPool, init_checkpoint_pool, get_checkpoint_pool
 from app.platform.core.security import load_master_key
-from app.db import Database, init_database, get_database, UserRepository
+from app.platform.core.db import Database, init_database, get_database, UserRepository
 
 
 _active_generations = 0
@@ -179,35 +179,10 @@ def _build_novel_pdf(markdown: str, title: str) -> bytes:
 
 
 async def _event_generator(payload: ScreenplayGenerateRequest, thread: ThreadSummary, *, owner_id: str | None = None):
-    """Async generator that yields SSE events from the agent execution."""
-    global _active_generations
-    _active_generations += 1
-    _log("sse_open", channel="generate", thread_id=payload.thread_id, active=_active_generations)
-    start = time.perf_counter()
-    final_data = None
-    try:
-        async for chunk in agent_service.generate_stream(payload, thread, owner_id=owner_id):
-            yield chunk
-            if chunk.startswith("event: final"):
-                for line in chunk.split("\n"):
-                    if line.startswith("data: "):
-                        final_data = line[6:]
-                        break
-        if final_data:
-            import json
-
-            response = ScreenplayGenerateResponse.model_validate(json.loads(final_data))
-            # write_outline 需要 owner_id 来定位工作区路径（thread.workspace_path 已含）
-            thread_store.artifacts.write_outline(owner_id or "", thread, response)
-        _log("sse_close", channel="generate", thread_id=payload.thread_id,
-             ms=int((time.perf_counter() - start) * 1000))
-    except BaseException as exc:
-        _log("sse_error", channel="generate", thread_id=payload.thread_id,
-             error=type(exc).__name__, ms=int((time.perf_counter() - start) * 1000))
-        raise
-    finally:
-        _active_generations -= 1
-        _log("sse_exit", channel="generate", thread_id=payload.thread_id, active=_active_generations)
+    """SSE 生成器已迁到 routers/screenplay.py（PR-14）。保留此 shim 供过渡期调用。"""
+    from app.routers.screenplay import _event_generator as _gen
+    async for chunk in _gen(payload, thread, owner_id=owner_id):
+        yield chunk
 
 
 settings = get_settings()
@@ -251,7 +226,14 @@ async def _lifespan(application: FastAPI):
         from app.domains.image.agent import ImageAgentService
         image_agent_service = ImageAgentService(settings, workspace_root, trace_recorder, checkpointer)
         from app.domains.image.router import init_image_routes
-        init_image_routes(image_agent_service, thread_store)
+        init_image_routes(image_agent_service, thread_store, trace_recorder)
+    # PR-14：注入 router 共享 context（screenplay/character router 通过 get_*() 访问）
+    from app.routers.context import init_router_context
+    init_router_context(
+        thread_store=thread_store, style_store=style_store, trace_recorder=trace_recorder,
+        agent_service=agent_service, character_service=character_service,
+        image_agent_service=image_agent_service, style_optimizer=style_optimizer,
+    )
     # 多用户：引导管理员账号（幂等）
     bootstrap_admin()
     # 启动 trace 写盘 drain 协程：append_event 不再同步写盘，改入内存缓冲，
@@ -285,6 +267,11 @@ app.include_router(admin_router)
 # image domain 路由（Phase 3：图片服务端点 + Skill 管理）
 from app.domains.image.router import router as image_router
 app.include_router(image_router)
+# PR-14：生成端点 router（从 main.py 抽出，路径前缀 /api）
+from app.routers.screenplay import router as screenplay_router
+from app.routers.character import router as character_router
+app.include_router(screenplay_router, prefix="/api")
+app.include_router(character_router, prefix="/api")
 
 
 @app.middleware("http")
@@ -710,146 +697,12 @@ def delete_thread_trace(thread_id: str, trace_id: str, user: CurrentUser = Depen
     return {"status": "ok", "deleted": trace_id}
 
 
-@app.post("/api/screenplay/generate/stream")
-async def stream_screenplay(payload: ScreenplayGenerateRequest, user: CurrentUser = Depends(current_user)):
-    thread = thread_store.get_thread(user.user_id, payload.thread_id)
-    if thread is None:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    return StreamingResponse(
-        _event_generator(payload, thread, owner_id=user.user_id),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
 class ImageGenerateRequest(BaseModel):
-    """文生图生成请求。"""
+    """文生图生成请求（已迁到 domains/image/router.py，此 shim 供 main 内部引用）。"""
     thread_id: str
-    prompt: str  # 用户想生成的图片描述
+    prompt: str
     trace_id: str | None = None
-    resume: dict | None = None  # HITL resume（结构化 image_review 反馈，DD4）
-    selected_skill_ids: list[str] | None = None  # D9 加载的私有 Skill
+    resume: dict | None = None
+    selected_skill_ids: list[str] | None = None
 
 
-async def _image_event_generator(payload: ImageGenerateRequest, thread, *, owner_id: str):
-    """文生图 SSE 流（PR-07b 切到 platform.streaming.run_agent_stream 骨架）。
-
-    image agent 走自己的 _build_agent，SSE 事件格式与写作一致（model_stream/
-    tool_output/tool_error/interrupt/final），前端按 interrupt 的 kind 路由渲染。
-    心跳 + agent 事件循环 + interrupt 检测由 run_agent_stream 统一编排，
-    事件分发逻辑通过 sink 闭包注入（image 专属：简单分发，无 task 派发）。
-    """
-    from langgraph.types import Command
-    from app.platform.streaming import run_agent_stream, sse as _sse
-    model = image_agent_service._resolve_model(owner_id)
-    checkpointer = await image_agent_service._resolve_checkpointer(owner_id)
-    trace = trace_recorder.create_run(thread, "image.generate.stream")
-    yield _sse("status", {"status": "started", "trace_id": trace.trace_id})
-
-    agent = image_agent_service._build_agent(
-        Path(thread.workspace_path), trace.trace_id, thread.workspace_id, owner_id,
-        model=model, checkpointer=checkpointer,
-        selected_skill_ids=payload.selected_skill_ids,
-    )
-    config = {
-        "configurable": {"thread_id": thread.thread_id},
-        "callbacks": [TraceCallbackHandler(trace_recorder, trace.trace_id)],
-        "recursion_limit": 200,
-    }
-    if payload.resume is not None:
-        agent_input = Command(resume=payload.resume)
-    else:
-        agent_input = {"messages": [{"role": "user", "content": payload.prompt}]}
-
-    # image 事件分发 sink（领域专属，纯同步——image 无 task 派发/章节计数）
-    async def on_event(event: dict) -> list[str]:
-        frames: list[str] = []
-        kind = event["event"]
-        data = event.get("data", {})
-        if kind == "on_chat_model_stream":
-            chunk = data.get("chunk")
-            content = getattr(chunk, "content", "") if chunk else ""
-            if content:
-                frames.append(_sse("model_stream", {"content": content}))
-        elif kind == "on_tool_end":
-            frames.append(_sse("tool_output", {
-                "tool": event.get("name", ""),
-                "output": str(data.get("output", ""))[:2000],
-            }))
-        elif kind == "on_tool_error":
-            frames.append(_sse("tool_error", {
-                "tool": event.get("name", ""),
-                "error": str(data.get("error") or data.get("output") or "")[:500],
-            }))
-        return frames
-
-    class _ImageSink:
-        async def on_event(self_inner, event: dict) -> list[str]:
-            return await on_event(event)
-
-    sse_iter, result = run_agent_stream(agent, agent_input, config, sink=_ImageSink())
-
-    try:
-        async for frame in sse_iter:
-            yield frame
-
-        # HITL interrupt 检测（DD4）：前端按 kind 路由（choice=访谈 / image_review=评审）
-        if result.pending_interrupt is not None:
-            iv = result.pending_interrupt
-            payload_dict = iv if isinstance(iv, dict) else {"question": str(iv)}
-            # 确保 kind 字段存在（DD4：前端按 kind 路由）
-            if "kind" not in payload_dict:
-                payload_dict["kind"] = "choice"
-            payload_dict["thread_id"] = thread.thread_id
-            yield _sse("interrupt", payload_dict)
-            return
-
-        if result.full_result is not None:
-            content = ""
-            if isinstance(result.full_result, dict):
-                for msg in reversed(result.full_result.get("messages", [])):
-                    mc = getattr(msg, "content", None) or (msg.get("content") if isinstance(msg, dict) else None)
-                    if isinstance(mc, str) and mc:
-                        content = mc
-                        break
-            yield _sse("final", {"content": content, "thread_id": thread.thread_id})
-        trace_recorder.complete_run(thread, trace.trace_id)
-    except BaseException as exc:
-        trace_recorder.fail_run(thread, trace.trace_id, exc)
-        yield _sse("error", {"error": str(exc)[:500]})
-        raise
-
-
-@app.post("/api/image/generate/stream")
-async def stream_image(payload: ImageGenerateRequest, user: CurrentUser = Depends(current_user)):
-    """文生图 SSE 流（Phase 3.9）。
-
-    复用 image_agent_service 的 agent，SSE 事件与写作一致。
-    interrupt 事件按 kind 路由：choice=访谈式 / image_review=图像评审。
-    """
-    thread = thread_store.get_thread(user.user_id, payload.thread_id)
-    if thread is None:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    return StreamingResponse(
-        _image_event_generator(payload, thread, owner_id=user.user_id),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-@app.post("/api/character/generate", response_model=CharacterGenerateResponse)
-def generate_character(payload: CharacterGenerateRequest, user: CurrentUser = Depends(current_user)) -> CharacterGenerateResponse:
-    thread = thread_store.get_thread(user.user_id, payload.thread_id)
-    if thread is None:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    response = character_service.generate(payload, thread, owner_id=user.user_id)
-    thread_store.artifacts.write_character(user.user_id, thread, response)
-    return response

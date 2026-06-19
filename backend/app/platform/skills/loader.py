@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.db import SkillRepository, get_database
+from app.platform.core.db import SkillRepository, get_database
 
 
 def skills_root() -> Path:

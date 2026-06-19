@@ -18,7 +18,7 @@ from typing import Any
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
-from app.db import SkillRepository, get_database
+from app.platform.core.db import SkillRepository, get_database
 from app.domains.image.store import ImageArtifactStore, resolve_image_provider, resolve_vision_provider
 from app.platform.core.settings import Settings
 

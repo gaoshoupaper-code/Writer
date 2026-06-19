@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from app.db import (
+from app.platform.core.db import (
     Database,
     InviteCodeRepository,
     UserRepository,
