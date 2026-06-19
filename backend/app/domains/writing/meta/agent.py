@@ -21,12 +21,12 @@ from app.platform.agent.runtime import (
     create_deep_agent,
 )
 from app.platform.streaming import ExtraTask, run_agent_stream
-from app.writer.expert_agent.agents.storybuilding import build_storybuilding_deep_subagent
-from app.writer.expert_agent.services.storyline_graph import generate_storyline_graph
-from app.writer.expert_agent.agents.detail_outline import build_detail_outline_deep_subagent
-from app.writer.models import build_writer_model
-from app.writer.expert_agent.agents.writing import build_writing_deep_subagent
-from app.writer.expert_agent.agents.interview import build_interview_deep_subagent
+from app.domains.writing.expert_agent.agents.storybuilding import build_storybuilding_deep_subagent
+from app.domains.writing.expert_agent.services.storyline_graph import generate_storyline_graph
+from app.domains.writing.expert_agent.agents.detail_outline import build_detail_outline_deep_subagent
+from app.domains.writing.models import build_writer_model
+from app.domains.writing.expert_agent.agents.writing import build_writing_deep_subagent
+from app.domains.writing.expert_agent.agents.interview import build_interview_deep_subagent
 from app.platform.agent.middleware import (
     ArtifactPrerequisite,
     ArtifactPrerequisiteMiddleware,
@@ -36,8 +36,8 @@ from app.platform.agent.middleware import (
     TraceCallbackHandler,
     TraceMiddleware,
 )
-from app.writer.middleware import GoalMiddleware, MetaReadOnlyMiddleware
-from app.core.settings import Settings
+from app.domains.writing.middleware import GoalMiddleware, MetaReadOnlyMiddleware
+from app.platform.core.settings import Settings
 from app.create_type.store import CreateTypeStore
 from app.platform.trace import TraceRecorder
 from app.schemas.screenplay import (
@@ -99,6 +99,17 @@ class MetaAgentService(BaseAgentService):
                 ArtifactPrerequisite("detail outline", workspace_path / "detail", markdown_directory=True),
             ]
         return []
+
+    # ── 模型构建（PR-12：从基类下沉，消除 platform→domains 反向依赖）─────
+    def _build_model_default(self):
+        """写作领域的默认模型（无 owner/key 时）。"""
+        return build_writer_model(self.settings)
+
+    def _build_model_with_key(self, key: str, base_url: str | None, model_name: str | None):
+        """按 owner 的 key 构建写作模型（多用户隔离 D9）。"""
+        return build_writer_model(
+            self.settings, api_key=key, base_url=base_url, model_name_override=model_name,
+        )
 
     def _resolve_style_for_subagent(self, workspace_id: str, style_key: str) -> str | None:
         """从激活风格中提取指定子代理对应的风格文本（SUFFIX）。

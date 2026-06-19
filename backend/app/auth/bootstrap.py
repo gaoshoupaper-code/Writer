@@ -17,7 +17,7 @@ from app.db import (
     UserRepository,
     get_database,
 )
-from app.core.settings import get_settings
+from app.platform.core.settings import get_settings
 
 
 def bootstrap_admin() -> dict | None:

@@ -16,15 +16,14 @@ from pathlib import Path
 
 from langchain.agents.middleware.types import AgentMiddleware
 
-from app.platform.agent.runtime import FilesystemBackend, create_deep_agent
-from langgraph.checkpoint.base import BaseCheckpointSaver
-
+from app.platform.agent.base_service import BaseAgentService
 from app.platform.agent.middleware import FilesystemPathGuardMiddleware, TraceCallbackHandler, TraceMiddleware
-from app.writer.models import build_writer_model
+from app.platform.agent.runtime import FilesystemBackend, create_deep_agent
+from app.domains.writing.models import build_writer_model
 
 # 独立于 agents/character.py 的 prompt 路径（该 agent 已被 storybuilding 替代）
 _CHARACTER_PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "character_system.md"
-from app.core.settings import Settings
+from app.platform.core.settings import Settings
 from app.platform.trace import TraceRecorder
 from app.schemas.character import (
     CharacterGenerateRequest,
@@ -33,48 +32,38 @@ from app.schemas.character import (
 from app.schemas.screenplay import ThreadSummary
 
 
-class CharacterService:
-    """角色生成服务。
+class CharacterService(BaseAgentService):
+    """角色生成服务（PR-12 继承 BaseAgentService，消除重复的 model/checkpointer 逻辑）。
 
-    封装了角色生成的完整生命周期：
-    1. 从配置构建模型和后端
-    2. 组装中间件（路径守卫、追踪等）
-    3. 构建用户提示词
-    4. 调用代理生成角色
-    5. 验证工作区文件并返回结果
-
-    支持 live 模式（真实代理调用）和 mock 模式（模拟返回，用于测试）。
+    封装角色生成的完整生命周期：构建代理 → 生成 → 验证工作区文件。
+    通用能力（model 解析/checkpoint 读写/workspace backend）由基类提供。
     """
 
     def __init__(self, settings: Settings, workspace_root: Path, trace_recorder: TraceRecorder, checkpointer: BaseCheckpointSaver) -> None:
-        """
-        Args:
-            settings:       应用配置（包含模型、模式等设置）
-            workspace_root: 工作区根目录
-            trace_recorder: 追踪记录器
-            checkpointer:   检查点存储器（由外部注入，支持持久化）
-        """
-        self.settings = settings
-        self.workspace_root = workspace_root
-        self.trace_recorder = trace_recorder
-        self.checkpointer = checkpointer
+        super().__init__(settings, workspace_root, trace_recorder, checkpointer)
 
-    def _backend_for_workspace(self, workspace_path: Path) -> FilesystemBackend:
-        """为指定工作区创建文件系统后端。"""
-        workspace_path.mkdir(parents=True, exist_ok=True)
-        return FilesystemBackend(root_dir=workspace_path, virtual_mode=True)
+    # ── 模型构建（PR-12：从基类下沉，消除 platform→domains 反向依赖）─────
+    def _build_model_default(self):
+        """角色生成复用写作模型配置。"""
+        return build_writer_model(self.settings)
+
+    def _build_model_with_key(self, key: str, base_url: str | None, model_name: str | None):
+        """按 owner 的 key 构建模型（多用户隔离 D9）。"""
+        return build_writer_model(
+            self.settings, api_key=key, base_url=base_url, model_name_override=model_name,
+        )
 
     def _middleware_for_workspace(self, workspace_path: Path, trace_id: str | None, agent_name: str) -> list[AgentMiddleware]:
-        """为指定工作区组装中间件列表。"""
+        """角色服务的中间件（路径守卫 + trace）。"""
         middleware: list[AgentMiddleware] = [FilesystemPathGuardMiddleware(workspace_path)]
         if trace_id:
             middleware.insert(1, TraceMiddleware(self.trace_recorder, trace_id, agent_name))
         return middleware
 
     def _agent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, *, model=None):
-        """为指定工作区构建完整的代理。"""
+        """为指定工作区构建角色生成代理。"""
         if model is None:
-            model = build_writer_model(self.settings)
+            model = self._resolve_model(None)
         middleware = self._middleware_for_workspace(workspace_path, trace_id, "character-service")
         return create_deep_agent(
             model=model,
@@ -84,30 +73,6 @@ class CharacterService:
             checkpointer=self.checkpointer,
             middleware=middleware,
         )
-
-    async def delete_thread_checkpoint(self, thread_id: str) -> None:
-        """删除指定线程的检查点数据（PR-10 改 async 保持 AgentService 协议一致）。
-
-        character 不分库（用全局 saver），但仍走 async 接口与写作/image 一致。
-        PR-12 补齐继承 BaseAgentService 后此方法可删除（由基类提供）。
-        """
-        self.checkpointer.delete_thread(thread_id)
-
-    def _resolve_model(self, owner_id: str | None):
-        """按 owner 解密 API key 构建 model；无 owner/key 回退全局。"""
-        if not owner_id:
-            return build_writer_model(self.settings)
-        try:
-            from app.db import get_database, UserRepository
-            users = UserRepository(get_database())
-            key, base_url, model = users.get_api_key_plain(owner_id)
-            if key is None:
-                return build_writer_model(self.settings)
-            return build_writer_model(
-                self.settings, api_key=key, base_url=base_url, model_name_override=model,
-            )
-        except Exception:
-            return build_writer_model(self.settings)
 
     def generate(
         self,

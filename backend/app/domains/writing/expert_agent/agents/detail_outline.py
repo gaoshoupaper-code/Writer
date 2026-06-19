@@ -14,9 +14,9 @@ from app.platform.agent.runtime import (
     FilesystemPermission,
     SubAgent,
 )
-from app.writer.expert_agent.factory import build_deep_subagent
-from app.writer.expert_agent.evaluators.detail_outline import build_detail_outline_evaluator
-from app.writer.expert_agent.types import MiddlewareFactory, SubAgentSpec, apply_style_suffix
+from app.domains.writing.expert_agent.factory import build_deep_subagent
+from app.domains.writing.expert_agent.evaluators.detail_outline import build_detail_outline_evaluator
+from app.domains.writing.expert_agent.types import MiddlewareFactory, SubAgentSpec, apply_style_suffix
 
 # 细纲子代理的系统提示词文件路径
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "detail_outline_system.md"

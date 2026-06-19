@@ -1,8 +1,7 @@
-"""expert_agent 共享类型与工具函数。
+"""domains.writing.expert_agent 共享类型与工具函数。
 
-SubAgentSpec / MiddlewareFactory 已迁入 platform.agent.runtime.types（PR-08，
-框架级类型）。本文件 re-export 供 writer 内部过渡期引用，PR-11 writer 降级时清理。
-apply_style_suffix 是写作专属工具，留在此处。
+SubAgentSpec / MiddlewareFactory 从 platform.agent.runtime re-export（框架级类型，
+PR-08 迁入 runtime）。apply_style_suffix 是写作专属工具。
 """
 
 from __future__ import annotations

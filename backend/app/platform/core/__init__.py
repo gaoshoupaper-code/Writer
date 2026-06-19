@@ -1,6 +1,5 @@
-"""platform.core 子包：通用件（从各处收敛）。
+"""platform.core —— 通用基础设施（PR-13 从 core/ 迁入）。
 
-Phase 1 阶段：db / checkpoint_pool / settings / security / trace 仍在原位置
-（app/db、app/core、app/writer/trace），物理迁移在 Phase 2 随写作迁移一并完成。
-本包预留位置，迁移后内容从此处导出。
+跨领域通用件：settings / security / checkpoint_pool。
+状态层（thread_store / artifact_store / style_store）在 platform/state。
 """

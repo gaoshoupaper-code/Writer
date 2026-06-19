@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 from app.db import SkillRepository, get_database
 from app.domains.image.store import ImageArtifactStore, resolve_image_provider, resolve_vision_provider
-from app.core.settings import Settings
+from app.platform.core.settings import Settings
 
 
 # ════════════════════════════════════════════════════════════

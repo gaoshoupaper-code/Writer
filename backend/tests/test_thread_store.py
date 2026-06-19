@@ -2,8 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.core.security import generate_master_key, load_master_key
-from app.core.thread_store import ThreadStore
+from app.platform.core.security import generate_master_key, load_master_key
+from app.platform.state.thread_store import ThreadStore
 from app.db import Database, UserRepository, init_database
 
 

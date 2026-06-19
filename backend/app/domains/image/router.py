@@ -53,7 +53,7 @@ def serve_image(image_id: str, user: CurrentUser = Depends(current_user)) -> Res
     if meta is None:
         raise HTTPException(status_code=404, detail="Image not found")
     # 定位物理文件：workspace/<owner>/<ws_id>/<file_path>
-    from app.core.settings import get_settings
+    from app.platform.core.settings import get_settings
     settings = get_settings()
     ws_root = Path(settings.workspace_root)
     physical = ws_root / user.user_id / meta["workspace_id"] / meta["file_path"].lstrip("/")

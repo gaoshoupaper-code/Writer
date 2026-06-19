@@ -19,13 +19,13 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
 
-from app.writer.expert_agent.services.character import CharacterService
-from app.writer.meta import MetaAgentService
-from app.core.settings import get_settings
+from app.domains.writing.expert_agent.services.character import CharacterService
+from app.domains.writing.meta import MetaAgentService
+from app.platform.core.settings import get_settings
 from app.create_type.store import CreateTypeStore
 from app.create_type.optimizer import StyleOptimizer
 from app.create_type.router import init_style_module, router as style_router
-from app.core.thread_store import ThreadStore
+from app.platform.state.thread_store import ThreadStore
 from app.platform.trace import TraceRecorder
 from app.schemas.character import CharacterGenerateRequest, CharacterGenerateResponse
 from app.schemas.screenplay import (
@@ -54,8 +54,8 @@ from app.platform.agent.middleware import TraceCallbackHandler
 from app.auth import auth_router, current_user, CurrentUser
 from app.auth.bootstrap import bootstrap_admin
 from app.admin import me_router, admin_router
-from app.core.checkpoint_pool import CheckpointPool, init_checkpoint_pool, get_checkpoint_pool
-from app.core.security import load_master_key
+from app.platform.core.checkpoint_pool import CheckpointPool, init_checkpoint_pool, get_checkpoint_pool
+from app.platform.core.security import load_master_key
 from app.db import Database, init_database, get_database, UserRepository
 
 
@@ -406,7 +406,7 @@ def get_workspace_storyline_graph(workspace_id: str, user: CurrentUser = Depends
         raise HTTPException(status_code=404, detail="Workspace not found")
 
     # 按需生成兜底：图缺失/过期 → 重生成（storyline_graph 是派生视图，幂等安全）
-    from app.writer.expert_agent.services.storyline_graph import (
+    from app.domains.writing.expert_agent.services.storyline_graph import (
         build_storyline_graph_data,
         generate_storyline_graph,
         is_stale,

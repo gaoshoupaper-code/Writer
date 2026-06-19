@@ -80,7 +80,7 @@ def delete_style(style_id: str) -> dict[str, str | bool]:
 @router.put("/workspaces/{workspace_id}/style", response_model=WorkspaceSummary)
 def set_workspace_style(workspace_id: str, payload: WorkspaceStyleRequest) -> WorkspaceSummary:
     store = _require_store()
-    from app.core.thread_store import ThreadStore
+    from app.platform.state.thread_store import ThreadStore
 
     workspace = store.thread_store.get_workspace(workspace_id)
     if workspace is None:

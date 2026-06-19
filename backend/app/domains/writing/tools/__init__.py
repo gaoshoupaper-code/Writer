@@ -1,4 +1,4 @@
-from app.writer.tools.goal import (
+from app.domains.writing.tools.goal import (
     RECORD_GOAL_COMPLETION_TOOL_DESCRIPTION,
     SET_GOAL_TOOL_DESCRIPTION,
     GoalState,

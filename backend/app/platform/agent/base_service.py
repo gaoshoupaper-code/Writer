@@ -24,7 +24,7 @@ from typing import Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
-from app.core.settings import Settings
+from app.platform.core.settings import Settings
 from app.platform.agent.runtime import FilesystemBackend
 from app.schemas.checkpoint import CheckpointMessage, CheckpointState, CheckpointToolCall
 
@@ -78,15 +78,19 @@ class BaseAgentService:
             return self._build_model_default()
 
     def _build_model_default(self):
-        """无 owner/key 时构建 model（默认走写作 model）。子类可覆盖。"""
-        from app.writer.models import build_writer_model
-        return build_writer_model(self.settings)
+        """无 owner/key 时构建 model。子类必须覆盖（提供各自领域的默认模型）。
+
+        PR-12 修复 R1：原默认实现硬编码 build_writer_model（domains.writing），
+        导致 platform→domains 反向依赖。现改为抽象，由子类注入领域模型。
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} 必须覆盖 _build_model_default（提供领域默认模型）"
+        )
 
     def _build_model_with_key(self, key: str, base_url: str | None, model_name: str | None):
-        """按 owner 的 key 构建 model。子类可覆盖（如视觉模型）。"""
-        from app.writer.models import build_writer_model
-        return build_writer_model(
-            self.settings, api_key=key, base_url=base_url, model_name_override=model_name,
+        """按 owner 的 key 构建 model。子类必须覆盖（提供各自领域的模型构建）。"""
+        raise NotImplementedError(
+            f"{type(self).__name__} 必须覆盖 _build_model_with_key（提供领域模型构建）"
         )
 
     async def _resolve_checkpointer(self, owner_id: str | None):
@@ -94,7 +98,7 @@ class BaseAgentService:
         if not owner_id:
             return self.checkpointer
         try:
-            from app.core.checkpoint_pool import get_checkpoint_pool
+            from app.platform.core.checkpoint_pool import get_checkpoint_pool
             return await get_checkpoint_pool().get(owner_id)
         except Exception:
             return self.checkpointer

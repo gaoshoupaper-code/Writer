@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from app.core.security import (
+from app.platform.core.security import (
     decrypt_secret,
     encrypt_secret,
     hash_password,

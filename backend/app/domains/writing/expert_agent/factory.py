@@ -21,7 +21,7 @@ from app.platform.agent.runtime import (
     compose_skills_backend,
     create_deep_agent,
 )
-from app.writer.expert_agent.middleware.revision_limit_middleware import RevisionLimitMiddleware
+from app.domains.writing.expert_agent.middleware.revision_limit_middleware import RevisionLimitMiddleware
 
 
 

@@ -21,7 +21,7 @@ from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
 from langgraph.runtime import Runtime
 from typing_extensions import override
 
-from app.writer.tools import (
+from app.domains.writing.tools import (
     RECORD_GOAL_COMPLETION_TOOL_DESCRIPTION,
     SET_GOAL_TOOL_DESCRIPTION,
     GoalState,

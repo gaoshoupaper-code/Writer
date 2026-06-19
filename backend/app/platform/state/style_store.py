@@ -87,4 +87,4 @@ class StyleStore:
         return datetime.now(UTC).isoformat()
 
 
-from app.core.thread_store import ThreadStore  # noqa: E402
+from app.platform.state.thread_store import ThreadStore  # noqa: E402

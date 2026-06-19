@@ -54,10 +54,13 @@ def test_baseline_mode_passes(linter):
     assert rc == 0, "baseline 模式下不应有新增违规"
 
 
-def test_strict_mode_passes_when_no_violations(linter):
-    """strict 模式：阶段 B 闭合后无存量违规，应 exit 0。"""
+def test_strict_mode_fails_on_known_transitions(linter):
+    """strict 模式：PR-11 后有 2 条已知过渡违规，应 exit 1。
+
+    PR-12 修 R1（build_writer_model 下沉）后剩 1 条；create_type 归类后清零。
+    """
     rc = linter.main(["--strict"])
-    assert rc == 0, "阶段 B 闭合后 strict 模式应通过（无违规）"
+    assert rc == 1, "strict 模式下应因存量过渡违规 fail"
 
 
 def test_linter_detects_new_violation(linter, tmp_path, monkeypatch):
@@ -106,15 +109,21 @@ def test_same_domain_internal_import_not_flagged(linter, tmp_path, monkeypatch):
         f"同 domain 内部引用不应被误判，实际检出：{result.violations}"
 
 
-def test_baseline_file_exists_and_empty_after_stage_b():
-    """baseline 文件应存在；阶段 B 闭合后应无存量违规（空 baseline）。"""
+def test_baseline_file_exists_and_tracks_transitions():
+    """baseline 文件应存在；PR-12 后剩 2 条预先存在的跨域依赖。"""
     baseline = Path(__file__).resolve().parents[1] / "layering_baseline.txt"
     assert baseline.exists(), "backend/layering_baseline.txt 应存在"
     content = baseline.read_text(encoding="utf-8")
-    # 阶段 B 闭合（PR-06）：image→writer / core→writer 已切断，baseline 应无违规行
     violation_lines = [
         line for line in content.splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    assert violation_lines == [], \
-        f"阶段 B 闭合后 baseline 应为空，实际含：{violation_lines}"
+    # PR-12 修 R1（build_writer_model 下沉）后剩 2 条：
+    # - R2 image→writing.models（image 复用写作模型）
+    # - R3 writing/meta→create_type.store
+    assert len(violation_lines) == 2, f"PR-12 后 baseline 应有 2 条，实际 {len(violation_lines)}：{violation_lines}"
+    assert any("image/agent.py|app.domains.writing.models" in l for l in violation_lines)
+    assert any("meta/agent.py|app.create_type.store" in l for l in violation_lines)
+    # R1 应已消除（build_writer_model 下沉到子类钩子）
+    assert not any("base_service.py|app.domains.writing.models" in l for l in violation_lines), \
+        "R1（platform→writing.models）应在 PR-12 消除"

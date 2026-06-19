@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from app.core.security import generate_master_key, load_master_key
+from app.platform.core.security import generate_master_key, load_master_key
 from app.db import (
     Database,
     ImageRepository,
@@ -208,7 +208,7 @@ class TestSkillLoader:
 class TestToolBuilders:
     def test_build_generate_images_tool(self, db, image_workspace):
         owner_id, ws_id, ws_path = image_workspace
-        from app.core.settings import get_settings
+        from app.platform.core.settings import get_settings
         store = ImageArtifactStore(db)
         tool = build_generate_images_tool(
             store, get_settings(), ws_path, ws_id, owner_id,

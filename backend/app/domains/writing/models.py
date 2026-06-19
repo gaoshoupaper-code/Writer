@@ -1,7 +1,7 @@
 from langchain_openai import ChatOpenAI
 
-from app.core.settings import Settings
-from app.writer.deepseek_thinking import DeepSeekThinkingChatModel
+from app.platform.core.settings import Settings
+from app.domains.writing.deepseek_thinking import DeepSeekThinkingChatModel
 
 DEEPSEEK_PROVIDER = "deepseek"
 

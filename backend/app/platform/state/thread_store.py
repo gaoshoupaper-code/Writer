@@ -37,7 +37,7 @@ class ThreadStore:
         self.workspaces = WorkspaceRepository(db)
         self.threads = ThreadRepository(db)
         # 产物存储：共享 workspace_root + threads repo（write 需要 touch 时间戳）
-        from app.core.artifact_store import WritingArtifactStore
+        from app.platform.state.artifact_store import WritingArtifactStore
         self.artifacts = WritingArtifactStore(workspace_root, self.threads)
 
     # ── 路径解析（owner 维度）────────────────────────────────

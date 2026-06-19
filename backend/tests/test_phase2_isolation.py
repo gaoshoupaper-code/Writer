@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from app.core.security import generate_master_key, load_master_key
-from app.core.thread_store import ThreadStore
+from app.platform.core.security import generate_master_key, load_master_key
+from app.platform.state.thread_store import ThreadStore
 from app.create_type.store import CreateTypeStore
 from app.db import (
     Database,
@@ -188,7 +188,7 @@ class TestDeleteCleanup:
 class TestCheckpointPool:
     def test_per_user_db_isolation(self, tmp_path):
         import asyncio
-        from app.core.checkpoint_pool import CheckpointPool, init_checkpoint_pool, get_checkpoint_pool
+        from app.platform.core.checkpoint_pool import CheckpointPool, init_checkpoint_pool, get_checkpoint_pool
 
         pool = CheckpointPool(tmp_path / "checkpoints")
         init_checkpoint_pool(pool)
@@ -209,7 +209,7 @@ class TestCheckpointPool:
 
     def test_drop_user_removes_db(self, tmp_path):
         import asyncio
-        from app.core.checkpoint_pool import CheckpointPool
+        from app.platform.core.checkpoint_pool import CheckpointPool
 
         pool = CheckpointPool(tmp_path / "checkpoints")
 
@@ -230,7 +230,7 @@ class TestCheckpointPool:
         """
         import asyncio
         from langgraph.checkpoint.base import empty_checkpoint
-        from app.core.checkpoint_pool import CheckpointPool, init_checkpoint_pool, get_checkpoint_pool
+        from app.platform.core.checkpoint_pool import CheckpointPool, init_checkpoint_pool, get_checkpoint_pool
 
         pool = CheckpointPool(tmp_path / "checkpoints")
         init_checkpoint_pool(pool)

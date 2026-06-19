@@ -25,10 +25,10 @@ from app.platform.agent.runtime import (
     SubAgent,
 )
 
-from app.writer.expert_agent.factory import build_deep_subagent
-from app.writer.expert_agent.evaluators.storybuilding import build_storybuilding_evaluator
-from app.writer.expert_agent.types import apply_style_suffix
-from app.writer.expert_agent.middleware.storyline_single_line_limit import (
+from app.domains.writing.expert_agent.factory import build_deep_subagent
+from app.domains.writing.expert_agent.evaluators.storybuilding import build_storybuilding_evaluator
+from app.domains.writing.expert_agent.types import apply_style_suffix
+from app.domains.writing.expert_agent.middleware.storyline_single_line_limit import (
     StorylineSingleLineLimitMiddleware,
 )
 from app.platform.agent.middleware import ContextAssemblerMiddleware

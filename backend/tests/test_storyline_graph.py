@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from app.writer.expert_agent.services.storyline_graph import (
+from app.domains.writing.expert_agent.services.storyline_graph import (
     build_storyline_graph_data,
     generate_storyline_graph,
     is_stale,

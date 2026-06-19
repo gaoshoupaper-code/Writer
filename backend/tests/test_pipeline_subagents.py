@@ -12,7 +12,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
 
-from app.writer.expert_agent.middleware.revision_limit_middleware import RevisionLimitMiddleware
+from app.domains.writing.expert_agent.middleware.revision_limit_middleware import RevisionLimitMiddleware
 from app.platform.agent.middleware import ArtifactValidationMiddleware
 
 
