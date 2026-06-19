@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.core.security import generate_master_key, load_master_key
+from app.platform.core.security import generate_master_key, load_master_key
 from app.db import (
     Database,
     ProviderConfigRepository,

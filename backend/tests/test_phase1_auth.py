@@ -10,7 +10,7 @@ import secrets
 
 import pytest
 
-from app.core.security import (
+from app.platform.core.security import (
     decrypt_secret,
     encrypt_secret,
     generate_master_key,
@@ -232,7 +232,7 @@ class TestAdminBootstrap:
         init_database(db)
 
         # 伪造 settings
-        import app.core.settings as settings_mod
+        import app.platform.core.settings as settings_mod
 
         class FakeSettings:
             admin_username = "rootadmin"
@@ -255,7 +255,7 @@ class TestAdminBootstrap:
             username="existing", password="pw123456", is_admin=True,
         )
 
-        import app.core.settings as settings_mod
+        import app.platform.core.settings as settings_mod
 
         class FakeSettings:
             admin_username = "rootadmin"

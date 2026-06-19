@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from app.core.settings import Settings
-from app.writer.models import build_writer_model
+from app.platform.core.settings import Settings
+from app.domains.writing.models import build_writer_model
 
 STYLE_OPTIMIZER_PROMPTS: dict[str, str] = {
     "meta_style": (

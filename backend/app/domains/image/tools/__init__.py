@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 from app.db import SkillRepository, get_database
 from app.domains.image.store import ImageArtifactStore, resolve_image_provider, resolve_vision_provider
-from app.core.settings import Settings
+from app.platform.core.settings import Settings
 
 
 # ════════════════════════════════════════════════════════════
@@ -173,13 +173,12 @@ def build_analyze_image_tool(
 # ════════════════════════════════════════════════════════════
 
 
-SKILLS_ROOT_NAME = "skills"  # backend/skills/<owner>/<skill_id>/SKILL.md（DD7b）
+SKILLS_ROOT_NAME = "skills"  # backend/skills/<owner>/<skill_id>/SKILL.md（DD7b，保留常量供文档参考）
 
 
-def skills_root() -> Path:
-    """Skills 自进化系统的根目录（与 workspace 平级，DD7b）。"""
-    # backend/skills/（相对 backend 包根的上一级）
-    return Path(__file__).resolve().parents[3] / SKILLS_ROOT_NAME
+# skills_root 统一从 platform 导出（消除与 platform/skills/loader.py 的重复定义，
+# PR-02 合并：原本 image/tools 与 platform/skills/loader 各自定义了一份）。
+from app.platform.skills.loader import skills_root
 
 
 class PersistSkillInput(BaseModel):

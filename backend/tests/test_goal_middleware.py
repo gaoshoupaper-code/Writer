@@ -7,8 +7,8 @@ from langchain.agents.factory import _resolve_schemas
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain.tools import ToolRuntime
 
-from app.writer.middleware.goal_middleware import GoalMiddleware
-from app.writer.tools.goal import GoalState, aset_goal, set_goal
+from app.domains.writing.middleware.goal_middleware import GoalMiddleware
+from app.domains.writing.tools.goal import GoalState, aset_goal, set_goal
 
 
 class GoalMiddlewareTest(unittest.TestCase):

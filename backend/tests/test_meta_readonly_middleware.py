@@ -7,7 +7,7 @@ from typing import Any
 
 from langchain_core.messages import ToolMessage
 
-from app.writer.middleware.meta_readonly_middleware import (
+from app.domains.writing.middleware.meta_readonly_middleware import (
     MetaReadOnlyMiddleware,
     _resolve_subagent,
 )

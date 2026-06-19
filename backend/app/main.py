@@ -19,19 +19,21 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
 
-from app.writer.expert_agent.services.character import CharacterService
-from app.writer.meta import MetaAgentService
-from app.core.settings import get_settings
+from app.domains.writing.expert_agent.services.character import CharacterService
+from app.domains.writing.meta import MetaAgentService
+from app.platform.core.settings import get_settings
 from app.create_type.store import CreateTypeStore
 from app.create_type.optimizer import StyleOptimizer
 from app.create_type.router import init_style_module, router as style_router
-from app.core.thread_store import ThreadStore
-from app.writer.trace import TraceRecorder
+from app.platform.state.thread_store import ThreadStore
+from app.platform.trace import TraceRecorder
 from app.schemas.character import CharacterGenerateRequest, CharacterGenerateResponse
 from app.schemas.screenplay import (
     InitResponse,
     ScreenplayGenerateRequest,
     ScreenplayGenerateResponse,
+    StorylineGraphEvent,
+    StorylineGraphStoryline,
     ThreadCreateRequest,
     ThreadSummary,
     ThreadUpdateRequest,
@@ -47,13 +49,13 @@ from app.schemas.screenplay import (
     WorkspaceSummary,
 )
 from app.schemas.checkpoint import CheckpointState
-from app.writer.trace import TraceDetail, TraceRunSummary
-from app.writer.middleware.trace_callback import TraceCallbackHandler
+from app.platform.trace import TraceDetail, TraceRunSummary
+from app.platform.agent.middleware import TraceCallbackHandler
 from app.auth import auth_router, current_user, CurrentUser
 from app.auth.bootstrap import bootstrap_admin
 from app.admin import me_router, admin_router
-from app.core.checkpoint_pool import CheckpointPool, init_checkpoint_pool, get_checkpoint_pool
-from app.core.security import load_master_key
+from app.platform.core.checkpoint_pool import CheckpointPool, init_checkpoint_pool, get_checkpoint_pool
+from app.platform.core.security import load_master_key
 from app.db import Database, init_database, get_database, UserRepository
 
 
@@ -196,7 +198,7 @@ async def _event_generator(payload: ScreenplayGenerateRequest, thread: ThreadSum
 
             response = ScreenplayGenerateResponse.model_validate(json.loads(final_data))
             # write_outline 需要 owner_id 来定位工作区路径（thread.workspace_path 已含）
-            thread_store.write_outline(owner_id or "", thread, response)
+            thread_store.artifacts.write_outline(owner_id or "", thread, response)
         _log("sse_close", channel="generate", thread_id=payload.thread_id,
              ms=int((time.perf_counter() - start) * 1000))
     except BaseException as exc:
@@ -362,7 +364,7 @@ def create_workspace(payload: WorkspaceCreateRequest, user: CurrentUser = Depend
 
 @app.get("/api/workspaces/{workspace_id}/outline", response_model=WorkspaceOutlineContent)
 def get_workspace_outline(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceOutlineContent:
-    content = thread_store.read_workspace_outline(user.user_id, workspace_id)
+    content = thread_store.artifacts.read_workspace_outline(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
@@ -370,7 +372,7 @@ def get_workspace_outline(workspace_id: str, user: CurrentUser = Depends(current
 
 @app.get("/api/workspaces/{workspace_id}/storyline", response_model=WorkspaceStorylineContent)
 def get_workspace_storyline(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceStorylineContent:
-    content = thread_store.read_workspace_storyline(user.user_id, workspace_id)
+    content = thread_store.artifacts.read_workspace_storyline(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
@@ -378,7 +380,7 @@ def get_workspace_storyline(workspace_id: str, user: CurrentUser = Depends(curre
 
 @app.get("/api/workspaces/{workspace_id}/detail-outline", response_model=WorkspaceDetailOutlineContent)
 def get_workspace_detail_outline(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceDetailOutlineContent:
-    content = thread_store.read_workspace_detail_outline(user.user_id, workspace_id)
+    content = thread_store.artifacts.read_workspace_detail_outline(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
@@ -386,7 +388,7 @@ def get_workspace_detail_outline(workspace_id: str, user: CurrentUser = Depends(
 
 @app.get("/api/workspaces/{workspace_id}/worldview", response_model=WorkspaceWorldviewContent)
 def get_workspace_worldview(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceWorldviewContent:
-    content = thread_store.read_workspace_worldview(user.user_id, workspace_id)
+    content = thread_store.artifacts.read_workspace_worldview(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
@@ -394,16 +396,55 @@ def get_workspace_worldview(workspace_id: str, user: CurrentUser = Depends(curre
 
 @app.get("/api/workspaces/{workspace_id}/storyline-graph", response_model=WorkspaceStorylineGraphContent)
 def get_workspace_storyline_graph(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceStorylineGraphContent:
-    """故事线流程图（竖向泳道时间轴）。读取时按需生成兜底——图缺失/过期自动重生成。"""
-    content = thread_store.read_workspace_storyline_graph(user.user_id, workspace_id)
+    """故事线流程图（竖向泳道时间轴）。读取时按需生成兜底——图缺失/过期自动重生成。
+
+    生成逻辑在 API 层（而非 thread_store）：避免 core（基础设施层）反向依赖 writer。
+    thread_store 只负责读 markdown，结构化数据（events/storylines/t_map）在此解析填充。
+    """
+    content = thread_store.artifacts.read_workspace_storyline_graph(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
+
+    # 按需生成兜底：图缺失/过期 → 重生成（storyline_graph 是派生视图，幂等安全）
+    from app.domains.writing.expert_agent.services.storyline_graph import (
+        build_storyline_graph_data,
+        generate_storyline_graph,
+        is_stale,
+    )
+    workspace = thread_store.get_workspace(user.user_id, workspace_id)
+    if workspace is not None:
+        ws_path = Path(workspace.workspace_path)
+        stale = is_stale(ws_path)
+        if stale:
+            generate_storyline_graph(ws_path)
+            content = thread_store.artifacts.read_workspace_storyline_graph(user.user_id, workspace_id)
+            if content is None:
+                raise HTTPException(status_code=404, detail="Workspace not found")
+            content.stale = True
+        # 填充结构化数据（reactflow 自定义布局用）
+        data = build_storyline_graph_data(ws_path)
+        if data is not None:
+            content.storylines = [
+                StorylineGraphStoryline(
+                    id=sl.id, name=sl.name, type=sl.type, status=sl.status,
+                    direction=sl.direction, key_events=sl.key_events,
+                ) for sl in data.storylines
+            ]
+            content.events = {
+                eid: StorylineGraphEvent(
+                    id=ev.id, name=ev.name, type=ev.type,
+                    storylines=list(ev.storylines), group=ev.group, doc_order=ev.doc_order,
+                ) for eid, ev in data.events.items()
+            }
+            content.t_map = dict(data.t_map)
+            content.storyline_count = len(data.storylines)
+            content.event_count = len(data.events)
     return content
 
 
 @app.get("/api/workspaces/{workspace_id}/characters", response_model=WorkspaceCharacterContent)
 def get_workspace_characters(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceCharacterContent:
-    content = thread_store.read_workspace_characters(user.user_id, workspace_id)
+    content = thread_store.artifacts.read_workspace_characters(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
@@ -411,7 +452,7 @@ def get_workspace_characters(workspace_id: str, user: CurrentUser = Depends(curr
 
 @app.get("/api/workspaces/{workspace_id}/novel", response_model=WorkspaceNovelChaptersContent)
 def get_workspace_novel(workspace_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceNovelChaptersContent:
-    content = thread_store.read_workspace_novel_chapters(user.user_id, workspace_id)
+    content = thread_store.artifacts.read_workspace_novel_chapters(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return content
@@ -466,27 +507,27 @@ async def _workspace_watch_generator(owner_id: str, workspace_id: str, workspace
             if not categories:
                 continue
             if "outline" in categories:
-                content = thread_store.read_workspace_outline(owner_id, workspace_id)
+                content = thread_store.artifacts.read_workspace_outline(owner_id, workspace_id)
                 if content is not None:
                     yield _sse_event("outline", content.model_dump())
             if "storyline" in categories:
-                content = thread_store.read_workspace_storyline(owner_id, workspace_id)
+                content = thread_store.artifacts.read_workspace_storyline(owner_id, workspace_id)
                 if content is not None:
                     yield _sse_event("storyline", content.model_dump())
             if "worldview" in categories:
-                content = thread_store.read_workspace_worldview(owner_id, workspace_id)
+                content = thread_store.artifacts.read_workspace_worldview(owner_id, workspace_id)
                 if content is not None:
                     yield _sse_event("worldview", content.model_dump())
             if "detail_outline" in categories:
-                content = thread_store.read_workspace_detail_outline(owner_id, workspace_id)
+                content = thread_store.artifacts.read_workspace_detail_outline(owner_id, workspace_id)
                 if content is not None:
                     yield _sse_event("detail_outline", content.model_dump())
             if "characters" in categories:
-                content = thread_store.read_workspace_characters(owner_id, workspace_id)
+                content = thread_store.artifacts.read_workspace_characters(owner_id, workspace_id)
                 if content is not None:
                     yield _sse_event("characters", content.model_dump())
             if "novel" in categories:
-                content = thread_store.read_workspace_novel_chapters(owner_id, workspace_id)
+                content = thread_store.artifacts.read_workspace_novel_chapters(owner_id, workspace_id)
                 if content is not None:
                     yield _sse_event("novel", content.model_dump())
         _log("sse_close", channel="watch", workspace_id=workspace_id,
@@ -522,7 +563,7 @@ def export_workspace_novel_pdf(workspace_id: str, user: CurrentUser = Depends(cu
     if workspace is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    content = thread_store.read_workspace_novel(user.user_id, workspace_id)
+    content = thread_store.artifacts.read_workspace_novel(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     if not content.markdown.strip():
@@ -543,7 +584,7 @@ def export_workspace_novel_word_zip(workspace_id: str, user: CurrentUser = Depen
     if workspace is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    content = thread_store.read_workspace_novel_chapters(user.user_id, workspace_id)
+    content = thread_store.artifacts.read_workspace_novel_chapters(user.user_id, workspace_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     if not content.chapters:
@@ -568,8 +609,8 @@ async def delete_workspace(workspace_id: str, user: CurrentUser = Depends(curren
         raise HTTPException(status_code=404, detail="Workspace not found")
     # T2.9：清理 checkpoint（分库）+ trace
     for thread_id in deleted_thread_ids:
-        agent_service.delete_thread_checkpoint(thread_id, owner_id=user.user_id)
-        character_service.delete_thread_checkpoint(thread_id)
+        await agent_service.delete_thread_checkpoint(thread_id, owner_id=user.user_id)
+        await character_service.delete_thread_checkpoint(thread_id)
     return {"status": "ok", "deleted": workspace_id, "deleted_threads": deleted_thread_ids}
 
 
@@ -600,7 +641,7 @@ def update_thread(thread_id: str, payload: ThreadUpdateRequest, user: CurrentUse
 
 
 @app.delete("/api/threads/{thread_id}")
-def delete_thread(thread_id: str, user: CurrentUser = Depends(current_user)) -> dict[str, str | bool]:
+async def delete_thread(thread_id: str, user: CurrentUser = Depends(current_user)) -> dict[str, str | bool]:
     thread = thread_store.get_thread(user.user_id, thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
@@ -612,14 +653,14 @@ def delete_thread(thread_id: str, user: CurrentUser = Depends(current_user)) -> 
     deleted = thread_store.delete_thread(user.user_id, thread_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Thread not found")
-    agent_service.delete_thread_checkpoint(thread_id, owner_id=user.user_id)
-    character_service.delete_thread_checkpoint(thread_id)
+    await agent_service.delete_thread_checkpoint(thread_id, owner_id=user.user_id)
+    await character_service.delete_thread_checkpoint(thread_id)
     return {"status": "ok", "deleted": thread_id}
 
 
 @app.get("/api/threads/{thread_id}/outline", response_model=WorkspaceOutlineContent)
 def get_thread_outline(thread_id: str, user: CurrentUser = Depends(current_user)) -> WorkspaceOutlineContent:
-    content = thread_store.read_thread_outline(user.user_id, thread_id)
+    content = thread_store.artifacts.read_thread_outline(user.user_id, thread_id)
     if content is None:
         raise HTTPException(status_code=404, detail="Thread not found")
     return content
@@ -695,20 +736,19 @@ class ImageGenerateRequest(BaseModel):
 
 
 async def _image_event_generator(payload: ImageGenerateRequest, thread, *, owner_id: str):
-    """文生图 SSE 流（复用 image_agent_service 的 agent + SSE 格式）。
+    """文生图 SSE 流（PR-07b 切到 platform.streaming.run_agent_stream 骨架）。
 
     image agent 走自己的 _build_agent，SSE 事件格式与写作一致（model_stream/
-    tool_call/tool_output/interrupt/final），前端按 interrupt 的 kind 路由渲染。
+    tool_output/tool_error/interrupt/final），前端按 interrupt 的 kind 路由渲染。
+    心跳 + agent 事件循环 + interrupt 检测由 run_agent_stream 统一编排，
+    事件分发逻辑通过 sink 闭包注入（image 专属：简单分发，无 task 派发）。
     """
-    import asyncio
     from langgraph.types import Command
+    from app.platform.streaming import run_agent_stream, sse as _sse
     model = image_agent_service._resolve_model(owner_id)
     checkpointer = await image_agent_service._resolve_checkpointer(owner_id)
     trace = trace_recorder.create_run(thread, "image.generate.stream")
-    yield _sse_event("status", {"status": "started", "trace_id": trace.trace_id})
-    trace_queue = trace_recorder.get_active_queue(trace.trace_id)
-    if trace_queue is None:
-        raise RuntimeError(f"Trace queue not created: {trace.trace_id}")
+    yield _sse("status", {"status": "started", "trace_id": trace.trace_id})
 
     agent = image_agent_service._build_agent(
         Path(thread.workspace_path), trace.trace_id, thread.workspace_id, owner_id,
@@ -725,75 +765,63 @@ async def _image_event_generator(payload: ImageGenerateRequest, thread, *, owner
     else:
         agent_input = {"messages": [{"role": "user", "content": payload.prompt}]}
 
-    heartbeat_task = asyncio.create_task(asyncio.sleep(15))
-    agent_events = agent.astream_events(agent_input, config=config, version="v2")
-    agent_task = asyncio.create_task(agent_events.__anext__())
-    full_result = None
+    # image 事件分发 sink（领域专属，纯同步——image 无 task 派发/章节计数）
+    async def on_event(event: dict) -> list[str]:
+        frames: list[str] = []
+        kind = event["event"]
+        data = event.get("data", {})
+        if kind == "on_chat_model_stream":
+            chunk = data.get("chunk")
+            content = getattr(chunk, "content", "") if chunk else ""
+            if content:
+                frames.append(_sse("model_stream", {"content": content}))
+        elif kind == "on_tool_end":
+            frames.append(_sse("tool_output", {
+                "tool": event.get("name", ""),
+                "output": str(data.get("output", ""))[:2000],
+            }))
+        elif kind == "on_tool_error":
+            frames.append(_sse("tool_error", {
+                "tool": event.get("name", ""),
+                "error": str(data.get("error") or data.get("output") or "")[:500],
+            }))
+        return frames
+
+    class _ImageSink:
+        async def on_event(self_inner, event: dict) -> list[str]:
+            return await on_event(event)
+
+    sse_iter, result = run_agent_stream(agent, agent_input, config, sink=_ImageSink())
+
     try:
-        while True:
-            done, _ = await asyncio.wait(
-                {agent_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED,
-            )
-            if heartbeat_task in done:
-                heartbeat_task.result()
-                yield ": ping\n\n"
-                heartbeat_task = asyncio.create_task(asyncio.sleep(15))
-            if agent_task in done:
-                try:
-                    event = agent_task.result()
-                except StopAsyncIteration:
-                    break
-                agent_task = asyncio.create_task(agent_events.__anext__())
-                kind = event["event"]
-                data = event.get("data", {})
-                if kind == "on_chat_model_stream":
-                    chunk = data.get("chunk")
-                    content = getattr(chunk, "content", "") if chunk else ""
-                    if content:
-                        yield _sse_event("model_stream", {"content": content})
-                elif kind == "on_tool_end":
-                    yield _sse_event("tool_output", {
-                        "tool": event.get("name", ""),
-                        "output": str(data.get("output", ""))[:2000],
-                    })
-                elif kind == "on_tool_error":
-                    yield _sse_event("tool_error", {
-                        "tool": event.get("name", ""),
-                        "error": str(data.get("error") or data.get("output") or "")[:500],
-                    })
-                if kind == "on_chain_end" and event.get("name") == "LangGraph":
-                    full_result = data.get("output")
-        # HITL interrupt 检测（DD4）
-        state = await agent.aget_state(config)
-        pending = [t for t in state.tasks if t.interrupts]
-        if pending:
-            iv = pending[0].interrupts[0].value
+        async for frame in sse_iter:
+            yield frame
+
+        # HITL interrupt 检测（DD4）：前端按 kind 路由（choice=访谈 / image_review=评审）
+        if result.pending_interrupt is not None:
+            iv = result.pending_interrupt
             payload_dict = iv if isinstance(iv, dict) else {"question": str(iv)}
             # 确保 kind 字段存在（DD4：前端按 kind 路由）
             if "kind" not in payload_dict:
                 payload_dict["kind"] = "choice"
             payload_dict["thread_id"] = thread.thread_id
-            yield _sse_event("interrupt", payload_dict)
+            yield _sse("interrupt", payload_dict)
             return
-        if full_result is not None:
+
+        if result.full_result is not None:
             content = ""
-            if isinstance(full_result, dict):
-                for msg in reversed(full_result.get("messages", [])):
+            if isinstance(result.full_result, dict):
+                for msg in reversed(result.full_result.get("messages", [])):
                     mc = getattr(msg, "content", None) or (msg.get("content") if isinstance(msg, dict) else None)
                     if isinstance(mc, str) and mc:
                         content = mc
                         break
-            yield _sse_event("final", {"content": content, "thread_id": thread.thread_id})
+            yield _sse("final", {"content": content, "thread_id": thread.thread_id})
         trace_recorder.complete_run(thread, trace.trace_id)
     except BaseException as exc:
         trace_recorder.fail_run(thread, trace.trace_id, exc)
-        yield _sse_event("error", {"error": str(exc)[:500]})
+        yield _sse("error", {"error": str(exc)[:500]})
         raise
-    finally:
-        heartbeat_task.cancel()
-        agent_task.cancel()
-        with __import__("contextlib").suppress(BaseException):
-            await agent_events.aclose()
 
 
 @app.post("/api/image/generate/stream")
@@ -823,5 +851,5 @@ def generate_character(payload: CharacterGenerateRequest, user: CurrentUser = De
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
     response = character_service.generate(payload, thread, owner_id=user.user_id)
-    thread_store.write_character(user.user_id, thread, response)
+    thread_store.artifacts.write_character(user.user_id, thread, response)
     return response

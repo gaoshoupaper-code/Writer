@@ -1,0 +1,31 @@
+# 分层依赖 linter（PR-01 · 阶段 A）
+#
+# 在 PR 与 push 时校验 backend/app/ 的分层依赖，拦截新增违规。
+# 当前为 baseline 模式：backend/layering_baseline.txt 内的存量违规允许，
+# 新增违规 fail。每消除一条存量违规，记得从 baseline 删除对应行
+# （或重跑 `python scripts/check_layering.py --update`）。
+#
+# 本地复现：
+#   python scripts/check_layering.py
+name: layering
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'backend/app/**'
+      - 'backend/layering_baseline.txt'
+      - 'scripts/check_layering.py'
+      - '.github/workflows/layering.yml'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run layering linter
+        run: python scripts/check_layering.py

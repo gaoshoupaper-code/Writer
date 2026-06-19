@@ -22,7 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.auth import CurrentUser, current_user, require_admin
-from app.core.settings import get_settings
+from app.platform.core.settings import get_settings
 from app.db import (
     InviteCodeRepository,
     UserRepository,
@@ -355,7 +355,7 @@ def read_user_workspace_outline(
     admin: CurrentUser = Depends(require_admin),
 ) -> dict:
     """管理员代访问：读取某用户作品的 outline（只读）。"""
-    from app.core.thread_store import ThreadStore
+    from app.platform.state.thread_store import ThreadStore
     from app.db import workspace_dir
     from pathlib import Path
 

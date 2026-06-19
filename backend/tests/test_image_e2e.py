@@ -23,7 +23,7 @@ from uuid import uuid4
 
 import pytest
 
-from app.core.security import generate_master_key, load_master_key
+from app.platform.core.security import generate_master_key, load_master_key
 from app.db import (
     Database,
     ImageRepository,
@@ -32,7 +32,7 @@ from app.db import (
     WorkspaceRepository,
     init_database,
 )
-from app.core.settings import Settings
+from app.platform.core.settings import Settings
 from app.domains.image.providers.bytedance import BytedanceImageProvider, BytedanceVisionProvider
 from app.domains.image.store import ImageArtifactStore
 from app.domains.image.tools import (

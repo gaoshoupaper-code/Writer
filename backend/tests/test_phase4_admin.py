@@ -44,12 +44,12 @@ def app_env(tmp_path, monkeypatch):
 
     # 清除 settings 缓存 + 已加载模块，确保用新 env 重建
     import importlib
-    import app.core.settings as settings_mod
+    import app.platform.core.settings as settings_mod
     settings_mod.get_settings.cache_clear()
     # 重置单例
     import app.db as db_mod
     db_mod._database = None
-    import app.core.checkpoint_pool as pool_mod
+    import app.platform.core.checkpoint_pool as pool_mod
     pool_mod._pool = None
 
     from app.main import app  # noqa: F811 — 重新导入拿新实例
@@ -223,7 +223,7 @@ class TestAdminImpersonateRead:
         # alice 创建作品并写 outline
         ws = client.post("/api/workspaces", json={"title": "AliceNovel"}).json()
         # 直接写 outline.md（避免触发 LLM）
-        from app.core.settings import get_settings
+        from app.platform.core.settings import get_settings
         settings = get_settings()
         outline_path = Path(settings.workspace_root) / ws["workspace_id"][:0]  # 占位
         # 用正确路径：workspace/<owner_id>/<workspace_id>/outline.md

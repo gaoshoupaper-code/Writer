@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from app.core.settings import Settings
+from app.platform.core.settings import Settings
 from app.db import Database, ImageRepository, get_database
 from app.domains.image.providers.bytedance import BytedanceImageProvider, BytedanceVisionProvider
 from app.platform.providers.image_generation import ImageGenerationProvider

@@ -14,12 +14,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from deepagents import create_deep_agent
-from deepagents.backends import FilesystemBackend
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 
-from app.core.settings import Settings
+from app.platform.core.settings import Settings
 from app.db import get_database
 from app.domains.image.store import ImageArtifactStore
 from app.domains.image.tools import (
@@ -28,10 +26,19 @@ from app.domains.image.tools import (
     build_persist_skill_tool,
 )
 from app.platform.agent.base_service import BaseAgentService
-from app.writer.expert_agent.factory import _compose_skills_backend
-from app.writer.middleware import ErrorRecoveryMiddleware, FilesystemPathGuardMiddleware
-from app.writer.middleware.path_guard_middleware import WRITING_WRITE_PATTERNS
-from app.writer.tools.ask_user import build_ask_user_tool
+from app.platform.agent.middleware import (
+    WRITING_WRITE_PATTERNS,
+    ErrorRecoveryMiddleware,
+    FilesystemPathGuardMiddleware,
+    FileWriteSerializeMiddleware,
+    TraceMiddleware,
+)
+from app.platform.agent.runtime import (
+    FilesystemBackend,
+    compose_skills_backend,
+    create_deep_agent,
+)
+from app.platform.tools import build_ask_user_tool
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
@@ -61,6 +68,19 @@ class ImageAgentService(BaseAgentService):
 
     def _load_system_prompt(self) -> str:
         return (PROMPTS_DIR / "system.md").read_text(encoding="utf-8").strip()
+
+    # ── 模型构建（PR-12：从基类下沉，image 当前复用写作模型配置）─────
+    def _build_model_default(self):
+        """image agent 的默认模型（当前复用写作模型配置）。"""
+        from app.domains.writing.models import build_writer_model
+        return build_writer_model(self.settings)
+
+    def _build_model_with_key(self, key: str, base_url: str | None, model_name: str | None):
+        """按 owner 的 key 构建 image 模型（多用户隔离 D9）。"""
+        from app.domains.writing.models import build_writer_model
+        return build_writer_model(
+            self.settings, api_key=key, base_url=base_url, model_name_override=model_name,
+        )
 
     def _build_agent(
         self,
@@ -97,8 +117,6 @@ class ImageAgentService(BaseAgentService):
         ]
 
         # middleware：platform 通用 + image 白名单（DD6a）
-        from app.writer.middleware import TraceMiddleware
-        from app.writer.expert_agent.middleware import FileWriteSerializeMiddleware
         middleware = [
             ErrorRecoveryMiddleware(),
             FilesystemPathGuardMiddleware(workspace_path, allowed_patterns=IMAGE_WRITE_PATTERNS),
@@ -113,7 +131,7 @@ class ImageAgentService(BaseAgentService):
         if selected_skill_ids:
             from app.platform.skills.loader import resolve_owner_skills
             skill_paths.extend(resolve_owner_skills(owner_id, selected_skill_ids))
-        effective_backend, skill_sources = _compose_skills_backend(backend, skill_paths)
+        effective_backend, skill_sources = compose_skills_backend(backend, skill_paths)
 
         return create_deep_agent(
             model=model,

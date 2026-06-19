@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from langchain_core.messages import ToolMessage
 
-from app.writer.expert_agent.middleware.revision_limit_middleware import RevisionLimitMiddleware
+from app.domains.writing.expert_agent.middleware.revision_limit_middleware import RevisionLimitMiddleware
 
 
 def _request(

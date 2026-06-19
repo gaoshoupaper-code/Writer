@@ -22,16 +22,17 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from deepagents.backends import FilesystemBackend
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
-from app.core.settings import Settings
+from app.platform.core.settings import Settings
+from app.platform.agent.runtime import FilesystemBackend
 from app.schemas.checkpoint import CheckpointMessage, CheckpointState, CheckpointToolCall
 
 
 class BaseAgentService:
     """领域无关的 agent 服务基类。
 
+    实现 ``AgentService`` 协议（get_thread_checkpoint / delete_thread_checkpoint）。
     提供 model/checkpointer 解析、workspace backend 构建、checkpoint 读写等
     通用能力。各 domain service 继承此类。
     """
@@ -77,15 +78,19 @@ class BaseAgentService:
             return self._build_model_default()
 
     def _build_model_default(self):
-        """无 owner/key 时构建 model（默认走写作 model）。子类可覆盖。"""
-        from app.writer.models import build_writer_model
-        return build_writer_model(self.settings)
+        """无 owner/key 时构建 model。子类必须覆盖（提供各自领域的默认模型）。
+
+        PR-12 修复 R1：原默认实现硬编码 build_writer_model（domains.writing），
+        导致 platform→domains 反向依赖。现改为抽象，由子类注入领域模型。
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} 必须覆盖 _build_model_default（提供领域默认模型）"
+        )
 
     def _build_model_with_key(self, key: str, base_url: str | None, model_name: str | None):
-        """按 owner 的 key 构建 model。子类可覆盖（如视觉模型）。"""
-        from app.writer.models import build_writer_model
-        return build_writer_model(
-            self.settings, api_key=key, base_url=base_url, model_name_override=model_name,
+        """按 owner 的 key 构建 model。子类必须覆盖（提供各自领域的模型构建）。"""
+        raise NotImplementedError(
+            f"{type(self).__name__} 必须覆盖 _build_model_with_key（提供领域模型构建）"
         )
 
     async def _resolve_checkpointer(self, owner_id: str | None):
@@ -93,7 +98,7 @@ class BaseAgentService:
         if not owner_id:
             return self.checkpointer
         try:
-            from app.core.checkpoint_pool import get_checkpoint_pool
+            from app.platform.core.checkpoint_pool import get_checkpoint_pool
             return await get_checkpoint_pool().get(owner_id)
         except Exception:
             return self.checkpointer
@@ -101,17 +106,22 @@ class BaseAgentService:
     def _resolve_checkpointer_sync(self, owner_id: str | None):
         """同步路径的 checkpointer（只能用全局兜底，分库 saver 是异步惰性创建）。
 
-        delete_thread_checkpoint 是同步调用，分库下数据不在全局库，故此处是空操作。
-        真正的清理在 main.py 删除 workspace 时走 drop。保留接口兼容。
+        仅用于无法 await 的同步上下文。分库数据的可靠删除请用 delete_thread_checkpoint
+        （async，PR-10 修复：原来同步调全局 saver 删不到分库 checkpoint）。
         """
         return self.checkpointer
 
     # ── checkpoint 读写 ──────────────────────────────────────
 
-    def delete_thread_checkpoint(self, thread_id: str, *, owner_id: str | None = None) -> None:
-        """删除 thread 的 checkpoint（同步，用全局 saver 兜底）。"""
-        checkpointer = self._resolve_checkpointer_sync(owner_id)
-        checkpointer.delete_thread(thread_id)
+    async def delete_thread_checkpoint(self, thread_id: str, *, owner_id: str | None = None) -> None:
+        """删除 thread 的 checkpoint（PR-10 修复：改为 async，用分库 saver）。
+
+        原同步实现调 _resolve_checkpointer_sync 返回全局 saver，分库（per-user .db）
+        数据不在全局库，删除是空操作——导致 delete_thread 后 checkpoint 残留。
+        现改为 async，走 _resolve_checkpointer 取到 owner 对应的分库 saver，真正清理。
+        """
+        checkpointer = await self._resolve_checkpointer(owner_id)
+        await checkpointer.adelete_thread(thread_id)
 
     async def get_thread_checkpoint(self, thread_id: str, *, owner_id: str | None = None) -> CheckpointState:
         """读取 thread 的最新 checkpoint，规范化为 CheckpointState。"""

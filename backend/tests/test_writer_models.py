@@ -3,8 +3,8 @@ from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage, AIMessageChunk
 
-from app.writer.deepseek_thinking import DeepSeekThinkingChatModel, ReasoningSidecarStore
-from app.writer.models import build_writer_model, parse_writer_model
+from app.domains.writing.deepseek_thinking import DeepSeekThinkingChatModel, ReasoningSidecarStore
+from app.domains.writing.models import build_writer_model, parse_writer_model
 
 
 class WriterModelTest(unittest.TestCase):
