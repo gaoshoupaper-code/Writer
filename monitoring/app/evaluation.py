@@ -68,10 +68,29 @@ def evaluate_trace(trace_id: str) -> dict[str, Any] | None:
             "UPDATE evaluation_runs SET status='done', finished_at=? WHERE trace_id=?",
             (datetime.now(UTC).isoformat(), trace_id),
         )
+
+        # 6. 自动连锁（Phase 2）：badcase → 诊断 → 生成候选 prompt
+        # 失败不阻塞评估主流程（候选可经 API 手动重试）
+        candidates: list[dict[str, Any]] = []
+        if badcase["is_badcase"]:
+            try:
+                from app.diagnosis import diagnose_badcase
+                from app.optimizer import optimize_candidate
+                diagnosed = diagnose_badcase(trace_id, badcase)
+                for cand in diagnosed:
+                    if "id" in cand:
+                        optimized = optimize_candidate(cand["id"])
+                        if optimized:
+                            cand["optimized"] = optimized
+                        candidates.append(cand)
+            except Exception:
+                logger.exception("自动连锁诊断/优化失败 %s", trace_id)
+
         return {
             "content": content_result,
             "subagent": subagent_results,
             "badcase": badcase,
+            "candidates": candidates,
         }
     except Exception as exc:
         logger.exception("evaluate_trace 失败 %s", trace_id)

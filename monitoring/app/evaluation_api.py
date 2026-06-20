@@ -136,3 +136,61 @@ def evaluation_overview() -> dict[str, Any]:
         "badcase_count": len(badcase_traces),
         "dimension_averages": avg,
     }
+
+
+# ── Phase 2：诊断与候选 ──
+
+
+@router.get("/candidates")
+def list_candidates(status: str | None = None) -> list[dict[str, Any]]:
+    """列改进候选（improvement_candidates）。
+
+    query param status 可选过滤（pending/optimized/ab_testing/approved/rejected）。
+    """
+    from app.diagnosis import list_candidates as _list
+    return _list(status)
+
+
+@router.get("/candidates/{candidate_id}")
+def get_candidate(candidate_id: int) -> dict[str, Any]:
+    """查单个候选详情（含诊断结论 + 候选 prompt 版本内容）。"""
+    cand = db.query_one("SELECT * FROM improvement_candidates WHERE id=?", (candidate_id,))
+    if cand is None:
+        raise HTTPException(status_code=404, detail="候选不存在")
+    result = dict(cand)
+    # 附带候选版本内容（若有）
+    if cand["candidate_version_id"]:
+        import app.prompts_repo as repo
+        ver = db.query_one(
+            "SELECT * FROM prompt_versions WHERE id=?", (cand["candidate_version_id"],)
+        )
+        if ver:
+            result["candidate_version"] = {
+                "version": ver["version"], "content": ver["content"],
+                "commit_message": ver["commit_message"],
+            }
+    return result
+
+
+@router.post("/candidates/{candidate_id}/optimize")
+def trigger_optimize(candidate_id: int) -> dict[str, Any]:
+    """手动（重新）生成某候选的改进版 prompt（忽略幂等会重生成）。
+
+    自动连锁已在评估时生成过；此端点用于重试/手动触发。
+    """
+    from app.llm import judge_enabled
+    if not judge_enabled():
+        raise HTTPException(status_code=400, detail="LLM 未配置")
+    cand = db.query_one("SELECT * FROM improvement_candidates WHERE id=?", (candidate_id,))
+    if cand is None:
+        raise HTTPException(status_code=404, detail="候选不存在")
+    # 重置已生成的版本，强制重新优化
+    db.execute(
+        "UPDATE improvement_candidates SET candidate_version_id=NULL, status='pending' WHERE id=?",
+        (candidate_id,),
+    )
+    from app.optimizer import optimize_candidate
+    result = optimize_candidate(candidate_id)
+    if result is None:
+        raise HTTPException(status_code=500, detail="优化失败，见日志")
+    return {"candidate_id": candidate_id, "result": result}
