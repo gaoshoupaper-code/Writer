@@ -175,6 +175,85 @@ def active_page(request: Request) -> HTMLResponse:
     )
 
 
+@router.get("/evaluation", response_class=HTMLResponse)
+def evaluation_page(request: Request) -> HTMLResponse:
+    """双层评估页（Phase 1 T1.7）：大盘 + 维度均分 + 评估记录列表。"""
+    from app.rubrics import xianxia as rubric
+
+    # 大盘
+    total = db.query_one("SELECT count(*) AS c FROM evaluation_runs WHERE status='done'")
+    badcase_rows = db.query_all(
+        """SELECT DISTINCT trace_id FROM evaluation_scores
+           WHERE (layer='content' AND score < ?) OR (layer='subagent' AND score < ?)""",
+        (rubric.CONTENT_BADCASE_THRESHOLD, rubric.SUBAGENT_BADCASE_THRESHOLD),
+    )
+    # 各维度均分
+    dim_avg = db.query_all(
+        """SELECT layer, target, metric, AVG(score) AS avg_score
+           FROM evaluation_scores GROUP BY layer, target, metric ORDER BY layer, target"""
+    )
+    content_avg_rows = [d for d in dim_avg if d["layer"] == "content"]
+    subagent_avg_rows = [d for d in dim_avg if d["layer"] == "subagent"]
+    content_avg = (sum(d["avg_score"] for d in content_avg_rows) / len(content_avg_rows)) if content_avg_rows else 0
+    subagent_avg = (sum(d["avg_score"] for d in subagent_avg_rows) / len(subagent_avg_rows)) if subagent_avg_rows else 0
+
+    # 已评估 trace 列表（每 trace 的双层均分 + badcase 维度数）
+    evaluated = db.query_all(
+        f"""SELECT er.trace_id, er.status AS eval_status, er.finished_at AS evaluated_at,
+            (SELECT AVG(score) FROM evaluation_scores WHERE trace_id=er.trace_id AND layer='content') AS content_avg,
+            (SELECT AVG(score) FROM evaluation_scores WHERE trace_id=er.trace_id AND layer='subagent') AS subagent_avg,
+            (SELECT count(*) FROM evaluation_scores WHERE trace_id=er.trace_id
+             AND ((layer='content' AND score < {rubric.CONTENT_BADCASE_THRESHOLD})
+               OR (layer='subagent' AND score < {rubric.SUBAGENT_BADCASE_THRESHOLD}))) AS badcase_count
+            FROM evaluation_runs er WHERE er.status='done'
+            ORDER BY er.finished_at DESC LIMIT 100"""
+    )
+    return templates.TemplateResponse(
+        request, "evaluation.html",
+        {
+            "active": "evaluation",
+            "overview": {
+                "evaluated_count": total["c"] if total else 0,
+                "badcase_count": len(badcase_rows),
+            },
+            "dimension_averages": dim_avg,
+            "content_avg": content_avg,
+            "subagent_avg": subagent_avg,
+            "content_threshold": rubric.CONTENT_BADCASE_THRESHOLD,
+            "subagent_threshold": rubric.SUBAGENT_BADCASE_THRESHOLD,
+            "evaluated_traces": evaluated,
+        },
+    )
+
+
+@router.get("/evaluation/{trace_id}", response_class=HTMLResponse)
+def evaluation_detail_page(request: Request, trace_id: str) -> HTMLResponse:
+    """单 trace 双层评估详情页：双层分数明细 + badcase + 交付物概要。"""
+    from app.rubrics import xianxia as rubric
+    from app.eval_extractor import summarize_deliveries
+
+    run = db.query_one("SELECT * FROM runs WHERE trace_id = ?", (trace_id,))
+    if run is None:
+        return templates.TemplateResponse(request, "empty.html", {"active": "evaluation", "message": "Trace 不存在"})
+
+    eval_run = db.query_one("SELECT * FROM evaluation_runs WHERE trace_id = ?", (trace_id,))
+    scores = db.query_all(
+        "SELECT layer, target, metric, score, evidence, scored_at "
+        "FROM evaluation_scores WHERE trace_id = ? ORDER BY layer, target",
+        (trace_id,),
+    )
+    return templates.TemplateResponse(
+        request, "evaluation_detail.html",
+        {
+            "active": "evaluation", "run": run, "eval_run": eval_run,
+            "scores": scores, "deliveries": summarize_deliveries(trace_id),
+            "content_threshold": rubric.CONTENT_BADCASE_THRESHOLD,
+            "subagent_threshold": rubric.SUBAGENT_BADCASE_THRESHOLD,
+            "judge_enabled": _judge_enabled(),
+        },
+    )
+
+
 def _judge_enabled() -> bool:
     try:
         from app.llm import judge_enabled

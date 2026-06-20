@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -180,6 +181,75 @@ def init_db() -> None:
                 UNIQUE(prompt_id, version)
             );
             CREATE INDEX IF NOT EXISTS idx_prompt_versions_pid ON prompt_versions(prompt_id);
+
+            -- Phase 1 双层评估：评估分数（内容维度 + subagent 维度）
+            CREATE TABLE IF NOT EXISTS evaluation_scores (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id      TEXT NOT NULL REFERENCES runs(trace_id) ON DELETE CASCADE,
+                layer         TEXT NOT NULL,           -- content / subagent
+                target        TEXT NOT NULL,           -- content 时='novel'; subagent 时=agent_name
+                metric        TEXT NOT NULL,           -- 维度名
+                score         REAL NOT NULL,           -- 0~1
+                evidence      TEXT,                    -- judge 打分依据
+                scored_at     TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_eval_scores_trace ON evaluation_scores(trace_id);
+            CREATE INDEX IF NOT EXISTS idx_eval_scores_layer ON evaluation_scores(layer);
+
+            -- Phase 1 双层评估：评估任务记录（防重复评、可追溯）
+            CREATE TABLE IF NOT EXISTS evaluation_runs (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id      TEXT NOT NULL,
+                status        TEXT NOT NULL,           -- pending / done / error
+                error         TEXT,
+                started_at    TEXT NOT NULL,
+                finished_at   TEXT,
+                UNIQUE(trace_id)                       -- 同一 trace 只评一次（重评需删记录）
+            );
+
+            -- Phase 1 T1.6：subagent → prompt 归因映射（配置表）
+            CREATE TABLE IF NOT EXISTS agent_prompt_map (
+                agent_name    TEXT NOT NULL,           -- interview/storybuilding/detail-outline/writing
+                prompt_name   TEXT NOT NULL,           -- 对应 prompts 表的 name
+                role          TEXT NOT NULL DEFAULT 'primary',  -- primary / evaluation
+                PRIMARY KEY (agent_name, prompt_name)
+            );
+
+            -- Phase 2/3：badcase 诊断候选 + A/B 实验（先建表，Phase 2/3 填充）
+            CREATE TABLE IF NOT EXISTS improvement_candidates (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id          TEXT NOT NULL,
+                layer             TEXT NOT NULL,
+                target            TEXT NOT NULL,
+                prompt_name       TEXT,                -- 归因到的 prompt
+                diagnosis         TEXT,                -- 诊断结论
+                candidate_version_id INTEGER,          -- 生成的候选 prompt 版本
+                status            TEXT NOT NULL DEFAULT 'pending',  -- pending/ab_testing/approved/rejected
+                created_at        TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ab_experiments (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                candidate_id      INTEGER,
+                prompt_name       TEXT NOT NULL,
+                production_version INTEGER,
+                candidate_version  INTEGER,
+                test_set_id       INTEGER,
+                production_scores_json TEXT,
+                candidate_scores_json  TEXT,
+                verdict           TEXT,                -- win / lose / tie
+                status            TEXT NOT NULL DEFAULT 'running',
+                created_at        TEXT NOT NULL
+            );
+
+            -- Phase 3：A/B 回放测试集
+            CREATE TABLE IF NOT EXISTS replay_test_sets (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                name          TEXT NOT NULL UNIQUE,
+                description   TEXT,
+                prompts_json  TEXT NOT NULL,           -- [{request, expected_category}]
+                created_at    TEXT NOT NULL
+            );
             """
         )
         conn.commit()
@@ -190,6 +260,8 @@ def init_db() -> None:
         _migrate_runs_owner_user_id(conn)
         # Phase 4 幂等迁移：prompt 版本管理表（T9 langfuse 式）
         _migrate_prompt_tables(conn)
+        # Phase 1：初始化归因映射（幂等，仅空表时填充）
+        _seed_agent_prompt_map(conn)
 
 
 # 第二期候选规则字段（manual 规则默认 approved 直接生效）
@@ -238,6 +310,34 @@ def _migrate_prompt_tables(conn: sqlite3.Connection) -> None:
     # prompts/prompt_versions 表已由 executescript 创建（IF NOT EXISTS）。
     # 此处无需额外操作，保留为扩展点。
     return
+
+
+# Phase 1 T1.6：subagent → prompt 归因映射初始数据（已核实确切 prompt 名）
+# 依据：backend/app/domains/writing/expert_agent/agents/*.py + evaluators/*.py 的 load_prompt
+_AGENT_PROMPT_SEED = [
+    ("interview", "interview_system", "primary"),
+    ("storybuilding", "storybuilding_system", "primary"),
+    ("storybuilding", "storybuilding_evaluation", "evaluation"),
+    ("detail-outline", "detail_outline_system", "primary"),
+    ("detail-outline", "detail_outline_evaluation", "evaluation"),
+    ("writing", "writing_system", "primary"),
+    ("writing", "writing_evaluation", "evaluation"),
+]
+
+
+def _seed_agent_prompt_map(conn: sqlite3.Connection) -> None:
+    """初始化归因映射（幂等：仅表为空时填充，避免覆盖用户修改）。"""
+    existing = conn.execute("SELECT count(*) AS c FROM agent_prompt_map").fetchone()
+    if existing and existing[0] > 0:
+        return
+    now = datetime.now(UTC).isoformat()
+    with _lock:
+        conn.executemany(
+            """INSERT OR IGNORE INTO agent_prompt_map (agent_name, prompt_name, role)
+               VALUES (?, ?, ?)""",
+            [(a, p, r) for a, p, r in _AGENT_PROMPT_SEED],
+        )
+        conn.commit()
 
 
 def execute(sql: str, params: tuple[Any, ...] | list[Any] = ()) -> sqlite3.Cursor:
