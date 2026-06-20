@@ -40,3 +40,13 @@ Thumbs.db
 # 本地临时/调试文件（不提交，保留本地）
 backend/diag.log
 backend/spike_*.py
+
+# 第三方/部署产物（独立部署，不入主仓库）
+langfuse/
+
+# monitoring 服务：只入源码，不入运行产物
+monitoring/.env
+monitoring/*.db
+monitoring/*.db.bak
+monitoring/start.log
+monitoring/.pytest_cache/
