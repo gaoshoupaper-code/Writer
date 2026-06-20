@@ -9,6 +9,7 @@ TraceEventType = Literal[
     "run_start",
     "run_end",
     "run_error",
+    "run_meta",
     "llm_start",
     "llm_end",
     "llm_error",
@@ -77,6 +78,9 @@ class TraceLogEvent(BaseModel):
     context_anchor_id: str | None = None
     input_context_range: TraceContextRange | None = None
     output_context_anchor_id: str | None = None
+    # 增量存储锚点（Phase 1 T1）：recorder 为每条事件分配的稳定 anchor_id。
+    # 写进 jsonl 永久稳定，monitoring 摄入时直接读用，重建时顺着 anchor 链回溯。
+    output_anchor_id: str | None = None
     error: str | None = None
     skill_name: str | None = None
 

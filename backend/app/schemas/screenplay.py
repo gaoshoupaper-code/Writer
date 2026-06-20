@@ -37,6 +37,10 @@ class ThreadSummary(BaseModel):
     workspace_path: str
     created_at: str
     updated_at: str
+    # 归属用户 ID（Phase 2 D2/D20）：trace 链路需要 user_id 做按用户隔离。
+    # 可选（T18）：现有构造点和测试不传此字段，默认 "unknown"。
+    # thread_store._to_thread_summary 已有 owner_id 在手，会注入真实值。
+    user_id: str = "unknown"
 
 
 class WorkspaceOutlineContent(BaseModel):

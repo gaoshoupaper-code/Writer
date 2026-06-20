@@ -14,6 +14,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from app.schemas.screenplay import ThreadSummary
+from app.platform.trace.increment import IncrementState, compute_increment
 from app.platform.trace.projector import TraceProjector
 from app.platform.trace.schemas import TraceDetail, TraceLogEvent, TraceRunSummary
 from app.platform.trace.summary_export import export_trace_summary
@@ -27,6 +28,10 @@ from app.platform.trace.summary_export import export_trace_summary
 # trace 结束（complete_run/fail_run）时同步 flush 该 trace 残余事件保证完整。
 _DRAIN_INTERVAL = 0.5  # 后台 drain 协程每 0.5s 成批写一次
 _FLUSH_BATCH_MAX = 200  # 单批最多写多少行（避免一批太大又阻塞线程池 worker）
+
+# 监测服务通知：monitoring_notify_url 配置后，trace 结束时 POST 通知它摄入。
+# 用懒 import + 短超时，任何失败都静默降级（monitoring 兜底扫描会补漏通知的 trace）。
+_MONITORING_NOTIFY_TIMEOUT = 2.0
 
 
 @dataclass
@@ -47,6 +52,15 @@ class TraceRecorder:
         self._run_names: dict[str, str] = {}
         self._run_metadata: dict[str, dict[str, Any]] = {}
         self._projector = TraceProjector()
+        # 增量存储状态（Phase 1 T1/T4/T5/T6）：每个活跃 trace 一个 IncrementState，
+        # 维护"已见消息"索引用于计算 LLM input 的增量范围。
+        # 跨重启丢失（T6 降级）：丢失后该 trace 退化为全量存储，不报错。
+        self._increment_states: dict[str, IncrementState] = {}
+        # T15 活跃大盘：记录活跃 trace 的 endpoint（轻量，不读文件）。
+        self._run_endpoints: dict[str, str] = {}
+        # anchor 计数器：为每条事件分配稳定 anchor_id（T1）。
+        # 格式 anchor-{trace_seq}-{global_counter}，写进 jsonl 后永久稳定。
+        self._anchor_counter: int = 0
         # 写盘解耦：append_event 只 append 进此缓冲区，后台 drain 协程成批落盘。
         # deque + Lock 而非 asyncio.Queue：append_event 的调用者含同步回调
         # (TraceCallbackHandler run_inline=True)，不能 await，必须跨线程安全。
@@ -54,7 +68,7 @@ class TraceRecorder:
         self._pending_lock = RLock()
         self._drain_task: asyncio.Task[None] | None = None
 
-    def create_run(self, thread: ThreadSummary, endpoint: str) -> TraceRunHandle:
+    def create_run(self, thread: ThreadSummary, endpoint: str, run_purpose: str = "user_generation") -> TraceRunHandle:
         trace_id = f"trace-{uuid4().hex}"
         started_at = datetime.now(UTC)
         run_path = self._trace_path(thread, trace_id, started_at)
@@ -65,6 +79,8 @@ class TraceRecorder:
         self._queues[trace_id] = asyncio.Queue()
         self._started_monotonic[trace_id] = time.perf_counter()
         self._run_paths[trace_id] = run_path
+        self._increment_states[trace_id] = IncrementState()
+        self._run_endpoints[trace_id] = endpoint
 
         summary = TraceRunSummary(
             trace_id=trace_id,
@@ -90,6 +106,12 @@ class TraceRecorder:
                     "thread_id": thread.thread_id,
                     "workspace_id": thread.workspace_id,
                     "session_name": thread.session_name,
+                    # 归属键（D2/D20）：trace 自带 user_id，monitoring 摄入时提取。
+                    "user_id": thread.user_id,
+                    # 防自指断路预留（D12 约束）：区分用户生成 vs 优化执行。
+                    # 后期优化闭环只处理 user_generation，optimization 的 trace
+                    # 摄入但不进优化池（等价 langfuse env 标记断路）。
+                    "run_purpose": run_purpose,
                 },
             },
         )
@@ -152,6 +174,24 @@ class TraceRecorder:
             self._sequences[trace_id] = sequence
 
             event_type = str(values["type"])
+
+            # ── 增量存储（Phase 1 T1/T4/T5/T8）──
+            # 为每条事件分配稳定 anchor_id（T1），写进 jsonl 永久稳定。
+            # 对 llm_start 计算 input 增量：与前次公共前缀引用为 range，
+            # input 只存新增尾部；range 为空 = 全量（T8）。
+            self._anchor_counter += 1
+            output_anchor_id = f"anchor-{trace_id}-{sequence}-{self._anchor_counter}"
+
+            input_value = values.get("input")
+            input_context_range = values.get("input_context_range")
+            if event_type == "llm_start" and input_value is not None:
+                inc_state = self._increment_states.get(trace_id)
+                if inc_state is not None:
+                    result = compute_increment(inc_state, input_value, output_anchor_id)
+                    input_value = result.input_to_store
+                    input_context_range = result.input_context_range
+                # inc_state 为 None（跨重启降级 T6）→ 不增量，input 保持全量。
+
             event = TraceLogEvent(
                 trace_id=trace_id,
                 event_id=str(values.get("event_id") or f"{trace_id}-{sequence}"),
@@ -167,7 +207,7 @@ class TraceRecorder:
                 agent_name=self._optional_str(values.get("agent_name")),
                 node_name=self._optional_str(values.get("node_name")),
                 model_name=self._optional_str(values.get("model_name")),
-                input=values.get("input"),
+                input=input_value,
                 output=_sanitize_tool_call_inputs(values.get("output")),
                 usage=values.get("usage"),
                 tool_calls=_tool_calls_payload(values.get("tool_calls")),
@@ -175,6 +215,8 @@ class TraceRecorder:
                 tool_name=self._optional_str(values.get("tool_name")),
                 tool_args=None,
                 tool_output=_sanitize_tool_call_inputs(values.get("tool_output")),
+                output_anchor_id=output_anchor_id,
+                input_context_range=input_context_range,
                 error=self._optional_str(values.get("error")),
             )
 
@@ -370,6 +412,34 @@ class TraceRecorder:
     def get_active_queue(self, trace_id: str) -> asyncio.Queue[TraceLogEvent] | None:
         return self._queues.get(trace_id)
 
+    def list_active_runs(self) -> list[dict[str, Any]]:
+        """列出当前活跃 trace（T15 活跃大盘，只读、轻量）。
+
+        返回内存中正在运行的 trace 摘要，供 monitoring 轮询展示活跃大盘。
+        不读文件、不持久化，纯内存读取。
+        """
+        import time
+
+        now = time.perf_counter()
+        result: list[dict[str, Any]] = []
+        for trace_id, started in self._started_monotonic.items():
+            result.append({
+                "trace_id": trace_id,
+                "endpoint": self._run_endpoints.get(trace_id, ""),
+                "duration_ms": int((now - started) * 1000),
+                "event_count": self._sequences.get(trace_id, 0),
+            })
+        return result
+
+    def set_prompt_version(self, trace_id: str, prompt_name: str, version: int) -> None:
+        """记录本次 trace 使用的 prompt 版本（T13：版本进 trace）。
+
+        agent 构建 prompt 后调用，版本号写入 run 级 metadata，供后期 badcase
+        回放对照"旧版本失败 vs 新版本成功"。第一期只记录主控 prompt。
+        """
+        meta = self._run_metadata.setdefault(trace_id, {})
+        meta.setdefault("prompt_versions", {})[prompt_name] = version
+
     def _read_run_detail(self, thread: ThreadSummary, trace_id: str) -> TraceDetail | None:
         run_data = self._read_run_index(thread).get(trace_id)
         if run_data is None:
@@ -415,6 +485,22 @@ class TraceRecorder:
         # trace 结束：先把该 trace 残余事件同步落盘，再更新 index/导出摘要/清理内存。
         # 此时该 trace 已停止产生事件，同步 flush 开销可接受且保证数据完整。
         self.flush_sync(trace_id)
+
+        # T13：把本次 trace 使用的 prompt 版本记录为 run_meta 事件（持久化到 jsonl，
+        # 供 monitoring 摄入 + 后期 badcase 回放对照）。在 cleanup 前读 _run_metadata。
+        prompt_versions = (self._run_metadata.get(trace_id) or {}).get("prompt_versions")
+        if prompt_versions:
+            self.append_event(
+                trace_id,
+                {
+                    "type": "run_meta",
+                    "status": status,
+                    "source": "system",
+                    "input": {"prompt_versions": prompt_versions},
+                },
+            )
+            self.flush_sync(trace_id)  # 确保 run_meta 事件落盘
+
         runs = self._read_run_index(thread)
         run = runs.get(trace_id)
         if run is None:
@@ -431,6 +517,10 @@ class TraceRecorder:
         self._export_summary(thread, trace_id, run)
 
         self._cleanup_run_state(trace_id)
+
+        # 所有 trace 收尾完成后，通知监测服务摄入。
+        # 放最后：即使通知失败也不影响 trace 正常结束（monitoring 兜底扫描补漏）。
+        _notify_monitoring(thread, trace_id, status, run)
 
     def _export_summary(
         self,
@@ -485,6 +575,8 @@ class TraceRecorder:
         self._run_paths.pop(trace_id, None)
         self._locks.pop(trace_id, None)
         self._sequences.pop(trace_id, None)
+        self._increment_states.pop(trace_id, None)
+        self._run_endpoints.pop(trace_id, None)
 
     def _read_run_index(self, thread: ThreadSummary) -> dict[str, dict[str, Any]]:
         index_path = self._index_path(thread)
@@ -581,3 +673,39 @@ def _tool_call_summary(call: Any) -> dict[str, Any]:
         if value not in (None, ""):
             summary[str(key)] = value
     return summary or {"name": "unknown"}
+
+
+def _notify_monitoring(
+    thread: "ThreadSummary",
+    trace_id: str,
+    status: str,
+    run: dict[str, Any],
+) -> None:
+    """trace 结束后通知监测服务摄入。
+
+    纯副作用、彻底降级：monitoring_notify_url 为空 → 不通知；
+    任何异常（网络/httpx 未装/超时/连接拒绝）→ 静默吞掉。
+    monitoring 靠兜底扫描补漏通知的 trace，故单次通知丢失不影响最终一致性。
+    """
+    try:
+        from app.platform.core.settings import get_settings
+
+        url = get_settings().monitoring_notify_url
+        if not url:
+            return  # 未配置监测服务，不通知
+        import httpx
+
+        httpx.post(
+            url,
+            json={
+                "trace_id": trace_id,
+                "workspace_path": thread.workspace_path,
+                "thread_id": thread.thread_id,
+                "trace_path": run.get("path", ""),
+                "status": status,
+            },
+            timeout=_MONITORING_NOTIFY_TIMEOUT,
+        )
+    except Exception:
+        # 通知是派生数据，不可拖垮 trace 收尾主流程
+        pass

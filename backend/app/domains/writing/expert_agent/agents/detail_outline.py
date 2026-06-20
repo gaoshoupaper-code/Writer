@@ -8,6 +8,7 @@ from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 
 from app.platform.agent.middleware import ContextAssemblerMiddleware
+from app.platform.prompt import load_prompt
 from app.platform.agent.runtime import (
     BackendProtocol,
     CompiledSubAgent,
@@ -42,7 +43,9 @@ def build_detail_outline_subagent(
     Returns:
         子代理规格字典
     """
-    system_prompt = apply_style_suffix(PROMPT_PATH.read_text(encoding="utf-8").strip(), style_suffix)
+    system_prompt = apply_style_suffix(
+        load_prompt("detail_outline_system").content.strip(), style_suffix
+    )
     permissions = [
         FilesystemPermission(operations=["read"], paths=["/**"], mode="allow"),
         FilesystemPermission(operations=["write"], paths=["/detail/**"], mode="allow"),

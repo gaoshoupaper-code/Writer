@@ -34,6 +34,18 @@ class Settings(BaseSettings):
     # 默认作品配额（每用户作品数量上限）
     default_workspace_quota: int = 5
 
+    # 监测服务完成通知端点（trace 结束后 POST 通知 monitoring 摄入）。
+    # 留空则不通知（monitoring 靠兜底扫描补）。
+    monitoring_notify_url: str = ""
+
+    # monitoring 服务基址（Phase 5 T10）：后端 prompt loader 从 monitoring 拉 prompt。
+    # 形如 http://localhost:7789。留空则 loader 降级为读本地 .md 文件（兼容）。
+    monitoring_url: str = ""
+
+    # prompt loader 本地缓存目录（Phase 5 T10）：从 monitoring 拉的 prompt 缓存到此，
+    # monitoring 不可用时降级读缓存。默认 backend/.prompt_cache。
+    prompt_cache_dir: str = ".prompt_cache"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

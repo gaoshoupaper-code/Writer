@@ -173,4 +173,5 @@ class ThreadStore:
             workspace_path=str(ws_path),
             created_at=thread["created_at"],
             updated_at=thread["updated_at"],
+            user_id=owner_id,
         )

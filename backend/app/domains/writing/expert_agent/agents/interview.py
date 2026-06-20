@@ -15,6 +15,7 @@ from langchain_core.language_models import BaseChatModel
 from app.platform.agent.runtime import CompiledSubAgent, create_deep_agent
 
 from app.platform.agent.middleware import ErrorRecoveryMiddleware, FilesystemPathGuardMiddleware
+from app.platform.prompt import load_prompt
 from app.platform.tools import build_ask_user_tool
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "interview_system.md"
@@ -34,7 +35,7 @@ def build_interview_deep_subagent(
         backend:            DeepAgents 后端（文件系统）
         middleware_factory: 中间件工厂（按 agent_name 生成通用中间件：ErrorRecovery/Trace/PathGuard）
     """
-    system_prompt = PROMPT_PATH.read_text(encoding="utf-8").strip()
+    system_prompt = load_prompt("interview_system").content.strip()
 
     # ErrorRecovery 会把 ask_user 的 interrupt() 当工具错误重试耗尽，破坏 HITL，须移除；
     # PathGuard 换成下方 demand.md 限定（只允许写 demand.md）。

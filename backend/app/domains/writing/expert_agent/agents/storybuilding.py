@@ -32,6 +32,7 @@ from app.domains.writing.expert_agent.middleware.storyline_single_line_limit imp
     StorylineSingleLineLimitMiddleware,
 )
 from app.platform.agent.middleware import ContextAssemblerMiddleware
+from app.platform.prompt import load_prompt
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "storybuilding_system.md"
 SKILLS_PATH_BASE = Path(__file__).resolve().parent.parent / "skills"
@@ -55,7 +56,7 @@ def build_storybuilding_subagent(
         故事构建子代理规格字典
     """
     system_prompt = apply_style_suffix(
-        PROMPT_PATH.read_text(encoding="utf-8").strip(),
+        load_prompt("storybuilding_system").content.strip(),
         style_suffix,
     )
 

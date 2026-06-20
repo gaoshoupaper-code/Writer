@@ -152,8 +152,10 @@ app.include_router(character_router, prefix="/api")
 # PR-14：workspaces/threads 端点（从 main.py 抽出）
 from app.routers.workspaces import router as workspaces_router
 from app.routers.threads import router as threads_router
+from app.routers.internal import router as internal_router
 app.include_router(workspaces_router, prefix="/api")
 app.include_router(threads_router, prefix="/api")
+app.include_router(internal_router)  # /internal 前缀已在 router 内定义，供 monitoring 轮询
 
 
 @app.middleware("http")

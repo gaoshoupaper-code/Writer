@@ -111,30 +111,31 @@ class MetaAgentService(BaseAgentService):
             self.settings, api_key=key, base_url=base_url, model_name_override=model_name,
         )
 
-    def _resolve_style_for_subagent(self, workspace_id: str, style_key: str) -> str | None:
+    def _resolve_style_for_subagent(self, workspace_id: str, style_key: str, owner_id: str | None = None) -> str | None:
         """从激活风格中提取指定子代理对应的风格文本（SUFFIX）。
 
         Args:
             workspace_id: 工作区 ID
             style_key:    风格字段名（storybuilding_style / detail_outline_style / writing_style）
+            owner_id:     所有者 ID（多用户隔离，None 回退管理员兜底）
 
         Returns:
             风格 SUFFIX 文本，无激活风格或该字段为空时返回 None
         """
-        style_id = self.style_store.get_active_style_id(workspace_id)
+        style_id = self.style_store.get_active_style_id(owner_id or "", workspace_id)
         if not style_id:
             return None
-        style = self.style_store.get_style(style_id)
+        style = self.style_store.get_style(owner_id or "", style_id)
         if not style:
             return None
         text = style.get(style_key, "")
         return text.strip() if text else None
 
-    def _resolve_meta_style(self, workspace_id: str) -> str | None:
-        style_id = self.style_store.get_active_style_id(workspace_id)
+    def _resolve_meta_style(self, workspace_id: str, owner_id: str | None = None) -> str | None:
+        style_id = self.style_store.get_active_style_id(owner_id or "", workspace_id)
         if not style_id:
             return None
-        style = self.style_store.get_style(style_id)
+        style = self.style_store.get_style(owner_id or "", style_id)
         if not style:
             return None
         return style.get("meta_style") or None
@@ -182,7 +183,7 @@ class MetaAgentService(BaseAgentService):
         spec["middleware"] = self._middleware_for_workspace(workspace_path, trace_id, "general-purpose-subagent")
         return spec
 
-    def _agent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, workspace_id: str | None = None, *, model=None, checkpointer=None):
+    def _agent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, workspace_id: str | None = None, *, model=None, checkpointer=None, owner_id: str | None = None):
         # 多用户隔离（T2.4/T2.5）：model 用用户解密 key 构建，
         # checkpointer 用用户的分库 saver。两者外部注入，缺省回退全局（管理员兜底）。
         if model is None:
@@ -196,11 +197,11 @@ class MetaAgentService(BaseAgentService):
         ]
         if trace_id:
             middleware.insert(1, TraceMiddleware(self.trace_recorder, trace_id, "meta-agent"))
-        meta_style = self._resolve_meta_style(workspace_id) if workspace_id else None
+        meta_style = self._resolve_meta_style(workspace_id, owner_id) if workspace_id else None
         # 每个子代理只注入对应的风格到 SUFFIX 槽位
-        storybuilding_style = self._resolve_style_for_subagent(workspace_id, "storybuilding_style") if workspace_id else None
-        detail_outline_style = self._resolve_style_for_subagent(workspace_id, "detail_outline_style") if workspace_id else None
-        writing_style = self._resolve_style_for_subagent(workspace_id, "writing_style") if workspace_id else None
+        storybuilding_style = self._resolve_style_for_subagent(workspace_id, "storybuilding_style", owner_id) if workspace_id else None
+        detail_outline_style = self._resolve_style_for_subagent(workspace_id, "detail_outline_style", owner_id) if workspace_id else None
+        writing_style = self._resolve_style_for_subagent(workspace_id, "writing_style", owner_id) if workspace_id else None
         backend = self._backend_for_workspace(workspace_path)
         effective_backend, skill_sources = compose_skills_backend(backend, self._meta_skill_paths())
         return create_deep_agent(
@@ -221,7 +222,15 @@ class MetaAgentService(BaseAgentService):
         )
 
     def _load_system_prompt(self, meta_style: str | None = None) -> str:
-        prompt = (PROMPTS_DIR / "system.md").read_text(encoding="utf-8").strip()
+        # Phase 5 T9/T13：统一 loader 从 monitoring 拉 prompt（含版本）。
+        # monitoring 不可用时降级读缓存。loader 返回的 PromptContent 含版本号，
+        # 供 trace 记录（T13）。
+        from app.platform.prompt import load_prompt
+
+        prompt_content = load_prompt("meta_system")
+        # 暴露版本给 trace（T13：prompt 版本写进 trace）
+        self._current_prompt_version = prompt_content.version
+        prompt = prompt_content.content
         if meta_style:
             prompt = f"{prompt}\n\n---\n【主控风格】\n{meta_style}\n---"
         return prompt
@@ -267,8 +276,13 @@ class MetaAgentService(BaseAgentService):
             model = self._resolve_model(owner_id)
             agent = self._agent_for_workspace(
                 Path(thread.workspace_path), trace.trace_id, thread.workspace_id,
-                model=model,
+                model=model, owner_id=owner_id,
             )
+            # T13：记录主控 prompt 版本到 trace（供后期 badcase 回放对照）。
+            if hasattr(self, "_current_prompt_version"):
+                self.trace_recorder.set_prompt_version(
+                    trace.trace_id, "meta_system", self._current_prompt_version
+                )
             result = agent.invoke(
                 {"messages": [{"role": "user", "content": prompt}]},
                 config={
@@ -322,7 +336,7 @@ class MetaAgentService(BaseAgentService):
 
         agent = self._agent_for_workspace(
             Path(thread.workspace_path), trace.trace_id, thread.workspace_id,
-            model=model, checkpointer=checkpointer,
+            model=model, checkpointer=checkpointer, owner_id=owner_id,
         )
 
         # resume 分支已在上方判定，据此构造 agent 输入
@@ -466,7 +480,7 @@ class MetaAgentService(BaseAgentService):
             async def on_event(self_inner, event: dict) -> list[str]:
                 return await on_event(event)
 
-        sse_iter, result = run_agent_stream(
+        sse_iter, result = await run_agent_stream(
             agent, agent_input, config,
             sink=_WritingSink(),
             extra_tasks=[trace_extra],

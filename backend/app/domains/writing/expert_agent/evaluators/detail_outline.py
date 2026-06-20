@@ -11,6 +11,7 @@ from langchain.agents.middleware.types import AgentMiddleware
 from app.platform.agent.runtime import FilesystemPermission, SubAgentSpec
 
 from app.platform.agent.middleware import ContextAssemblerMiddleware
+from app.platform.prompt import load_prompt
 
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "detail_outline_evaluation.md"
 
@@ -26,7 +27,7 @@ def build_detail_outline_evaluator(
     context_file_paths: list[str] | None = None,
 ) -> SubAgentSpec:
     """构建细纲评估子代理规格。"""
-    system_prompt = _PROMPT_PATH.read_text(encoding="utf-8").strip()
+    system_prompt = load_prompt("detail_outline_evaluation").content.strip()
 
     permissions: list[FilesystemPermission] = [
         FilesystemPermission(operations=["read"], paths=["/**"], mode="allow"),

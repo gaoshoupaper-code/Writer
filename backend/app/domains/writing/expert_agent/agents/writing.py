@@ -17,6 +17,7 @@ from app.platform.agent.runtime import (
 from langchain_core.language_models import BaseChatModel
 
 from app.platform.agent.middleware import ContextAssemblerMiddleware
+from app.platform.prompt import load_prompt
 from app.domains.writing.expert_agent.factory import build_deep_subagent
 from app.domains.writing.expert_agent.evaluators.writing import build_writing_evaluator
 from app.domains.writing.expert_agent.types import apply_style_suffix
@@ -40,7 +41,9 @@ def build_writing_subagent(middleware: list[AgentMiddleware] | None = None, styl
     Returns:
         子代理规格字典
     """
-    system_prompt = apply_style_suffix(PROMPT_PATH.read_text(encoding="utf-8").strip(), style_suffix)
+    system_prompt = apply_style_suffix(
+        load_prompt("writing_system").content.strip(), style_suffix
+    )
     permissions = [
         FilesystemPermission(
             operations=["read"],

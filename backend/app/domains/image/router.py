@@ -106,7 +106,7 @@ async def _image_event_generator(payload: ImageGenerateRequest, thread, *, owner
         async def on_event(self_inner, event: dict) -> list[str]:
             return await on_event(event)
 
-    sse_iter, result = run_agent_stream(agent, agent_input, config, sink=_ImageSink())
+    sse_iter, result = await run_agent_stream(agent, agent_input, config, sink=_ImageSink())
 
     try:
         async for frame in sse_iter:

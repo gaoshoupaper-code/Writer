@@ -10,6 +10,7 @@ from pathlib import Path
 from langchain.agents.middleware.types import AgentMiddleware
 
 from app.platform.agent.runtime import FilesystemPermission, SubAgentSpec
+from app.platform.prompt import load_prompt
 
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "storybuilding_evaluation.md"
 
@@ -35,7 +36,7 @@ def build_storybuilding_evaluator(
     Returns:
         评估子代理规格字典
     """
-    system_prompt = _PROMPT_PATH.read_text(encoding="utf-8").strip()
+    system_prompt = load_prompt("storybuilding_evaluation").content.strip()
 
     permissions: list[FilesystemPermission] = [
         FilesystemPermission(operations=["read"], paths=["/**"], mode="allow"),
