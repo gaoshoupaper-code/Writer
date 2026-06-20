@@ -301,12 +301,15 @@ class MetaAgentService(BaseAgentService):
             self.trace_recorder.fail_run(thread, trace.trace_id, exc)
             raise
 
-    async def generate_stream(self, payload: ScreenplayGenerateRequest, thread: ThreadSummary, *, owner_id: str | None = None) -> AsyncIterator[str]:
+    async def generate_stream(self, payload: ScreenplayGenerateRequest, thread: ThreadSummary, *, owner_id: str | None = None, run_purpose: str = "user_generation") -> AsyncIterator[str]:
         """Stream agent execution events as SSE to the frontend.
 
         SSE 编排骨架（心跳 + astream_events 循环 + interrupt 检测）由
         ``platform.streaming.run_agent_stream`` 提供，事件分发逻辑通过
         闭包 sink 注入（领域专属：model_output/tool_call/task 派发/章节计数）。
+
+        run_purpose（Phase 3 T3.1）：A/B 回放传 "optimization"，写进 trace 的
+        run_start.input，供监测层防自指断路（optimization trace 不进优化池）。
         """
         if self.settings.writer_agent_mode.lower() == "mock":
             response = self._mock_response(payload, thread)
@@ -324,7 +327,7 @@ class MetaAgentService(BaseAgentService):
         if resume_value is not None and trace_id_in:
             trace, is_new = self.trace_recorder.resume_run(thread, trace_id_in)
         else:
-            trace = self.trace_recorder.create_run(thread, "screenplay.generate.stream")
+            trace = self.trace_recorder.create_run(thread, "screenplay.generate.stream", run_purpose=run_purpose)
             is_new = True
         if is_new:
             yield _sse("status", {"status": "started", "trace_id": trace.trace_id})

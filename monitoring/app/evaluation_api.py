@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 
 import app.db as db
 
@@ -194,3 +194,123 @@ def trigger_optimize(candidate_id: int) -> dict[str, Any]:
     if result is None:
         raise HTTPException(status_code=500, detail="优化失败，见日志")
     return {"candidate_id": candidate_id, "result": result}
+
+
+# ── Phase 3：A/B 实验与批准上线 ──
+
+
+@router.post("/candidates/{candidate_id}/experiment")
+def trigger_experiment(
+    candidate_id: int, test_set_id: int | None = None, background_tasks: BackgroundTasks = None,
+) -> dict[str, Any]:
+    """触发某候选的 A/B 实验（后台异步跑，立即返回 experiment_id）。
+
+    实验跑完（生成+评估+对比，可能数十分钟）后查 GET /experiments/{id} 看结果。
+    """
+    cand = db.query_one("SELECT * FROM improvement_candidates WHERE id=?", (candidate_id,))
+    if cand is None:
+        raise HTTPException(status_code=404, detail="候选不存在")
+    if cand["candidate_version_id"] is None:
+        raise HTTPException(status_code=400, detail="候选无改进版本，先 POST /optimize")
+
+    # 先建实验记录拿 id，再后台跑（让调用方立即拿到 id 可轮询）
+    from app.experiment import run_experiment
+    if background_tasks is not None:
+        background_tasks.add_task(run_experiment, candidate_id, test_set_id)
+        return {"status": "started", "candidate_id": candidate_id, "test_set_id": test_set_id}
+    # 无 background_tasks（直接调用）：同步跑（仅供测试）
+    result = run_experiment(candidate_id, test_set_id)
+    return {"status": "done", "result": result}
+
+
+@router.get("/experiments")
+def list_experiments(status: str | None = None) -> list[dict[str, Any]]:
+    """列 A/B 实验记录。"""
+    from app.experiment import list_experiments as _list
+    return _list(status)
+
+
+@router.get("/experiments/{experiment_id}")
+def get_experiment(experiment_id: int) -> dict[str, Any]:
+    """查单个实验详情。"""
+    row = db.query_one("SELECT * FROM ab_experiments WHERE id=?", (experiment_id,))
+    if row is None:
+        raise HTTPException(status_code=404, detail="实验不存在")
+    import json as _json
+    item = dict(row)
+    if row["production_scores_json"]:
+        item["production"] = _json.loads(row["production_scores_json"])
+    if row["candidate_scores_json"]:
+        item["candidate"] = _json.loads(row["candidate_scores_json"])
+    return item
+
+
+@router.post("/experiments/{experiment_id}/approve")
+def approve_experiment(experiment_id: int) -> dict[str, Any]:
+    """批准实验上线：candidate 版本升 production label（原 production 降 staging）。
+
+    仅 verdict=win 的实验可批准。批准后：
+      - candidate 版本 → production label
+      - 原 production 版本 → staging label（保留可回滚）
+      - improvement_candidates.status → approved
+    """
+    import app.prompts_repo as repo
+
+    exp = db.query_one("SELECT * FROM ab_experiments WHERE id=?", (experiment_id,))
+    if exp is None:
+        raise HTTPException(status_code=404, detail="实验不存在")
+    if exp["verdict"] != "win":
+        raise HTTPException(status_code=400, detail=f"仅 win 实验可批准，当前 verdict={exp['verdict']}")
+
+    # 找 candidate 版本（通过 improvement_candidates）
+    cand = db.query_one(
+        "SELECT candidate_version_id, prompt_name FROM improvement_candidates WHERE id=?",
+        (exp["candidate_id"],),
+    )
+    if cand is None or cand["candidate_version_id"] is None:
+        raise HTTPException(status_code=400, detail="候选版本缺失")
+
+    prompt = repo.get_prompt_by_name(cand["prompt_name"])
+    if prompt is None:
+        raise HTTPException(status_code=400, detail="prompt 线不存在")
+
+    # candidate 版本升 production（label 互斥自动把原 production 移走）
+    repo.set_labels(cand["candidate_version_id"], [repo.PRODUCTION_LABEL, repo.LATEST_LABEL])
+    # 原 production 降 staging：找当前非 candidate 的最高版本，打 staging
+    versions = repo.list_versions(prompt["id"])
+    for v in versions:
+        labels = [s.strip() for s in (v["labels"] or "").split(",") if s.strip()]
+        if v["id"] != cand["candidate_version_id"] and repo.PRODUCTION_LABEL not in labels:
+            # 给历史版本打 staging（标记可回滚）
+            if "staging" not in labels:
+                repo.set_labels(v["id"], labels + ["staging"])
+            break
+
+    # 更新候选状态
+    db.execute(
+        "UPDATE improvement_candidates SET status='approved' WHERE id=?",
+        (cand["id"] if cand else 0,),
+    )
+    db.execute(
+        "UPDATE ab_experiments SET status='approved' WHERE id=?", (experiment_id,)
+    )
+    return {
+        "status": "approved", "experiment_id": experiment_id,
+        "prompt_name": cand["prompt_name"],
+        "message": f"candidate 已升 production，原 production 降 staging（可回滚）",
+    }
+
+
+@router.get("/replay-testsets")
+def list_replay_testsets() -> list[dict[str, Any]]:
+    """列回放测试集。"""
+    from app.replay import list_test_sets
+    return list_test_sets()
+
+
+@router.post("/replay-testsets/seed-default")
+def seed_default_testset() -> dict[str, Any]:
+    """初始化默认玄幻测试集（幂等）。"""
+    from app.replay import ensure_default_test_set
+    result = ensure_default_test_set()
+    return {"status": "ok", "test_set": result}

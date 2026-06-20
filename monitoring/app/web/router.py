@@ -232,6 +232,7 @@ def evaluation_detail_page(request: Request, trace_id: str) -> HTMLResponse:
     from app.rubrics import xianxia as rubric
     from app.eval_extractor import summarize_deliveries
 
+
     run = db.query_one("SELECT * FROM runs WHERE trace_id = ?", (trace_id,))
     if run is None:
         return templates.TemplateResponse(request, "empty.html", {"active": "evaluation", "message": "Trace 不存在"})
@@ -250,6 +251,24 @@ def evaluation_detail_page(request: Request, trace_id: str) -> HTMLResponse:
             "content_threshold": rubric.CONTENT_BADCASE_THRESHOLD,
             "subagent_threshold": rubric.SUBAGENT_BADCASE_THRESHOLD,
             "judge_enabled": _judge_enabled(),
+        },
+    )
+
+
+@router.get("/experiments", response_class=HTMLResponse)
+def experiments_page(request: Request) -> HTMLResponse:
+    """A/B 实验页（Phase 3 T3.5）：候选列表 + 实验结果 + 测试集。"""
+    from app.diagnosis import list_candidates
+    from app.experiment import list_experiments
+    from app.replay import list_test_sets
+
+    return templates.TemplateResponse(
+        request, "experiments.html",
+        {
+            "active": "experiments",
+            "candidates": list_candidates(),
+            "experiments": list_experiments(),
+            "testsets": list_test_sets(),
         },
     )
 
