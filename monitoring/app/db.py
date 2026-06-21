@@ -250,6 +250,21 @@ def init_db() -> None:
                 prompts_json  TEXT NOT NULL,           -- [{request, expected_category}]
                 created_at    TEXT NOT NULL
             );
+
+            -- Phase 0 T0.1：judge 方差校准结果（定 A/B seed 数 N 的科学依据）
+            CREATE TABLE IF NOT EXISTS judge_calibration (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                layer         TEXT NOT NULL,           -- content / subagent
+                target        TEXT NOT NULL,           -- content 时='novel'; subagent 时=agent_name
+                metric        TEXT NOT NULL,           -- 维度名
+                sample_count  INTEGER NOT NULL,        -- M（校准跑了几次）
+                scores_json   TEXT NOT NULL,           -- [s1, s2, ...] 原始分数
+                mean          REAL NOT NULL,
+                std           REAL NOT NULL,           -- 标准差 σ
+                recommended_n INTEGER NOT NULL,        -- 据此 σ 推荐的 seed 数
+                calibrated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_judge_cal_dim ON judge_calibration(layer, target, metric);
             """
         )
         conn.commit()

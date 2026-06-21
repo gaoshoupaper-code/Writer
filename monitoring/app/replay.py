@@ -152,3 +152,103 @@ def ensure_default_test_set() -> dict[str, Any]:
         name="default-xianxia", prompts=default_prompts,
         description="内置默认玄幻回放测试集（3 条典型套路场景）",
     )
+
+
+# ── 多文风多题材测试集（Phase 0 T0.2，D21 + S3）──
+# 目的：A/B 验证 + D10 契约测试的输入。关键不是「量」，是「覆盖差异化的文风/
+# 节奏/题材」，这样才能暴露进化出的 middleware「改坏文艺向/慢节奏」这类误伤
+# （测试集分布外的低概率高危，D10 要防的）。
+#
+# 4 类 × 3 条 = 12 条：
+#   - 爽文（爽点密集/升级/打脸）：进化正目标，应高分
+#   - 文艺向（重情感/意境/慢热，反对爽点密集）：误伤高发区，应保住
+#   - 慢节奏（铺垫厚重/世界观优先/不赶进度）：误伤高发区，应保住
+#   - 都市/现实（非玄幻，验证跨题材）：泛化验证
+
+
+_MULTISTYLE_PROMPTS = [
+    # ── 爽文类（进化正目标）──
+    {
+        "request": "写一部玄幻爽文：主角穿越成废柴少爷，觉醒上古血脉金手指，一路打脸家族敌人。要求爽点密集，每章有反转或打脸，升级节奏快。",
+        "genre": "玄幻-爽文",
+        "style_profile": "dense_payoff",
+    },
+    {
+        "request": "系统流玄幻：主角绑定签到系统，每日签到获神级奖励。强调装逼打脸和逆袭快感，章末留追读钩子。",
+        "genre": "玄幻-爽文",
+        "style_profile": "dense_payoff",
+    },
+    {
+        "request": "无敌流修仙：主角开局即无敌，重点写各方势力的震惊和主角的从容装逼。爽点在于碾压和反差。",
+        "genre": "玄幻-爽文",
+        "style_profile": "dense_payoff",
+    },
+    # ── 文艺向（误伤高发区：进化出的『加快节奏』middleware 会毁掉这类）──
+    {
+        "request": "写一部文艺向修仙：重点不是爽点升级，而是主角对大道、生死、情义的感悟。文字要有意境和留白，情感细腻，反对快节奏爽点密集。",
+        "genre": "玄幻-文艺",
+        "style_profile": "literary",
+    },
+    {
+        "request": "一部偏文学性的仙侠：讲述一个老修士暮年回首一生的故事，节奏舒缓，重在人物内心的苍凉与释然。不要打脸升级套路。",
+        "genre": "玄幻-文艺",
+        "style_profile": "literary",
+    },
+    {
+        "request": "写修真界的爱情：两个道侣跨越百年的情感纠葛，重在情感的克制、错过与重逢。文风要含蓄隽永，不要爽文式直白。",
+        "genre": "玄幻-文艺",
+        "style_profile": "literary",
+    },
+    # ── 慢节奏（误伤高发区：进化出的『每章必爽点』middleware 会毁掉这类）──
+    {
+        "request": "写一部慢节奏史诗玄幻：开篇用大量篇幅铺垫世界观、势力格局和凡人生活，前几章可以无爽点，重在氛围和厚重感。故事在第二卷才进入高潮。",
+        "genre": "玄幻-慢热",
+        "style_profile": "slow_burn",
+    },
+    {
+        "request": "凡人流修仙：主角资质平庸，修炼缓慢，重点写修炼的艰辛、资源的匮乏和一步一个脚印的成长。反对天才流和快速升级。",
+        "genre": "玄幻-慢热",
+        "style_profile": "slow_burn",
+    },
+    {
+        "request": "一部重视设定的修仙：花大量笔墨构建修炼体系的严密逻辑、丹药品阶、阵法原理。剧情为设定服务，可以慢，但要自洽有深度。",
+        "genre": "玄幻-慢热",
+        "style_profile": "slow_burn",
+    },
+    # ── 都市/现实（跨题材泛化验证）──
+    {
+        "request": "写一部都市职场小说：主角是互联网公司中层，面临裁员危机和职场政治。重在写实的人物博弈和生活质感，不要任何超自然元素。",
+        "genre": "都市",
+        "style_profile": "realistic",
+    },
+    {
+        "request": "悬疑推理：一起密室杀人案，主角是退休刑警。重在逻辑推理、线索铺垫和反转，文风冷硬克制。",
+        "genre": "悬疑",
+        "style_profile": "realistic",
+    },
+    {
+        "request": "现实题材家庭小说：讲述一个普通家庭三代人的故事，重在生活细节、代际冲突和情感羁绊。朴实无华，不要戏剧化冲突。",
+        "genre": "现实",
+        "style_profile": "realistic",
+    },
+]
+
+
+def ensure_default_multistyle_test_set() -> dict[str, Any]:
+    """确保存在多文风多题材默认测试集（D21 + S3）。
+
+    4 类（爽文/文艺/慢热/现实）× 3 条 = 12 条。
+    关键作用：覆盖 A/B 验证的差异化场景，让 D10 契约测试能拦住
+    『进化出的 middleware 改坏文艺向/慢节奏』这类测试集分布外的误伤。
+    """
+    existing = db.query_one("SELECT id FROM replay_test_sets WHERE name='default-multistyle'")
+    if existing:
+        return get_test_set(existing["id"])  # type: ignore[return-value]
+
+    return create_test_set(
+        name="default-multistyle", prompts=_MULTISTYLE_PROMPTS,
+        description=(
+            "多文风多题材默认测试集（12 条）：爽文/文艺/慢热/现实 各 3 条。"
+            "用于 A/B 验证 + D10 契约测试，覆盖『改坏文艺向/慢节奏』等误伤场景。"
+        ),
+    )
