@@ -20,6 +20,7 @@ from app.stats import router as stats_router
 from app.rules import router as rules_router
 from app.prompts import router as prompts_router
 from app.evaluation_api import router as evaluation_router
+from app.harness_api import router as harness_router
 from app.web.router import router as web_router
 from app.scan import start_scan_scheduler
 from app.active import start_active_poller
@@ -43,6 +44,7 @@ app.include_router(stats_router, prefix="/api")
 app.include_router(rules_router, prefix="/api")
 app.include_router(prompts_router, prefix="/api")
 app.include_router(evaluation_router, prefix="/api")
+app.include_router(harness_router, prefix="/api")
 # 页面路由（HTML，无前缀）
 app.include_router(web_router)
 

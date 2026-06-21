@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     judge_api_key: str = ""
     judge_base_url: str = ""
 
+    # ── Self-Harness（Phase 2）──
+    # harness 代码根目录（harnesses/<version>/harness.py）。相对路径基于项目根。
+    harnesses_root: str = "backend/app/harnesses"
+
     @property
     def _monitoring_root(self) -> Path:
         """monitoring/ 目录（本文件在 app/ 下，上一级是 monitoring/）。"""
