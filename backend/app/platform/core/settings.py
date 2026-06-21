@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     # monitoring 不可用时降级读缓存。默认 backend/.prompt_cache。
     prompt_cache_dir: str = ".prompt_cache"
 
+    # ── Self-Harness Phase 1（T1.3）───────────────────────────
+    # 是否走 harness 装配路径（契约化 harness 驱动装配）。
+    # 默认 False（走旧 _agent_for_workspace 直接装配，保证现有行为不变）。
+    # T1.4 等价性验证通过后可手动打开。
+    writer_use_harness: bool = False
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

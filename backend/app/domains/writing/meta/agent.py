@@ -186,6 +186,13 @@ class MetaAgentService(BaseAgentService):
     def _agent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, workspace_id: str | None = None, *, model=None, checkpointer=None, owner_id: str | None = None):
         # 多用户隔离（T2.4/T2.5）：model 用用户解密 key 构建，
         # checkpointer 用用户的分库 saver。两者外部注入，缺省回退全局（管理员兜底）。
+        # Self-Harness Phase 1 T1.3：开关控制走 harness 装配还是旧直接装配。
+        # 默认 False（旧行为）。T1.4 等价性验证通过后可打开。
+        if getattr(self.settings, "writer_use_harness", False):
+            return self._assemble_via_harness(
+                workspace_path, trace_id, workspace_id,
+                model=model, checkpointer=checkpointer, owner_id=owner_id,
+            )
         if model is None:
             model = build_writer_model(self.settings)
         if checkpointer is None:
@@ -219,6 +226,190 @@ class MetaAgentService(BaseAgentService):
             checkpointer=checkpointer,
             middleware=middleware,
             skills=skill_sources,
+        )
+
+    def _assemble_via_harness(
+        self,
+        workspace_path: Path,
+        trace_id: str | None = None,
+        workspace_id: str | None = None,
+        *,
+        model=None,
+        checkpointer=None,
+        owner_id: str | None = None,
+    ):
+        """Self-Harness Phase 1 T1.3：经 harness 装配 agent。
+
+        与 _agent_for_workspace 等价，但装配逻辑由 WriterHarnessV1 的 build 方法驱动。
+        本方法是 harness 与底层工厂（create_deep_agent/build_deep_subagent）的适配层：
+          - 取 harness build 出的装配意图（prompt/skills/middleware/subagents）
+          - 对每个 subagent harness 按 is_custom/is_deep/普通 分发装配
+          - deep subagent 的 evolution_spec 由本方法据 evaluator_kind 构建（需 middleware_factory）
+          - 合并通用 middleware（PathGuard/Trace/Serialize/ArtifactPrerequisite）+ harness 自有 middleware
+
+        等价性依据：harness v1 build 方法内部复用现有 load_prompt/FilesystemPermission/同路径，
+        本方法的 middleware 合并顺序与现有 _middleware_for_* 一致。
+        """
+        from app.platform.harness import HarnessContext
+        from app.harnesses.v1 import WriterHarnessV1
+
+        if model is None:
+            model = build_writer_model(self.settings)
+        if checkpointer is None:
+            checkpointer = self.checkpointer
+
+        # 风格解析（与旧路径一致）
+        meta_style = self._resolve_meta_style(workspace_id, owner_id) if workspace_id else None
+        storybuilding_style = self._resolve_style_for_subagent(workspace_id, "storybuilding_style", owner_id) if workspace_id else None
+        detail_outline_style = self._resolve_style_for_subagent(workspace_id, "detail_outline_style", owner_id) if workspace_id else None
+        writing_style = self._resolve_style_for_subagent(workspace_id, "writing_style", owner_id) if workspace_id else None
+
+        ctx = HarnessContext(
+            workspace_path=workspace_path,
+            trace_id=trace_id,
+            owner_id=owner_id,
+            workspace_id=workspace_id,
+            meta_style=meta_style,
+            storybuilding_style=storybuilding_style,
+            detail_outline_style=detail_outline_style,
+            writing_style=writing_style,
+        )
+
+        harness = WriterHarnessV1()
+        backend = self._backend_for_workspace(workspace_path)
+
+        # ── meta 层 middleware（含 Trace，与旧路径一致）──
+        meta_middleware = harness.build_middleware(ctx)
+        if trace_id:
+            meta_middleware.insert(1, TraceMiddleware(self.trace_recorder, trace_id, "meta-agent"))
+
+        # ── meta skills backend 组合 ──
+        meta_skills = harness.build_skills(ctx)
+        effective_backend, skill_sources = compose_skills_backend(backend, meta_skills)
+
+        # ── 装配各 subagent（按 harness 类型分发）──
+        subagents: list = [self._general_subagent_for_workspace(workspace_path, trace_id)]
+        for sh in harness.build_subagents(ctx):
+            subagents.append(self._assemble_one_subagent(sh, ctx, model, backend))
+
+        # 记录 prompt 版本（与旧路径一致，T13）
+        from app.platform.prompt import load_prompt
+        self._current_prompt_version = load_prompt("meta_system").version
+
+        return create_deep_agent(
+            model=model,
+            tools=harness.build_tools(ctx),
+            system_prompt=harness.build_system_prompt(ctx),
+            subagents=subagents,
+            backend=effective_backend,
+            checkpointer=checkpointer,
+            middleware=meta_middleware,
+            skills=skill_sources,
+        )
+
+    def _assemble_one_subagent(self, sh, ctx, model, backend):
+        """按 SubagentHarness 类型分发装配（custom / deep / 普通）。"""
+        from app.platform.agent.runtime import SubAgent
+        from app.domains.writing.expert_agent.factory import build_deep_subagent
+
+        # middleware_factory：给通用 middleware（与 _middleware_for_* 等价）
+        def middleware_factory(agent_name: str):
+            return self._middleware_for_subagent_via_harness(ctx, agent_name)
+
+        # 自定义装配（如 interview）
+        if sh.is_custom:
+            assembler = {
+                "model": model,
+                "backend": backend,
+                "middleware_factory": middleware_factory,
+            }
+            compiled = sh.build_compiled(ctx, assembler=assembler)
+            if compiled is not None:
+                return compiled
+            # build_compiled 返回 None 则降级走普通 spec
+            return SubAgent(**sh.build_spec(ctx))
+
+        # Deep 版（storybuilding/detail_outline/writing）
+        if sh.is_deep:
+            params = sh.build_deep_params(ctx)
+            # 执行端据 evaluator_kind 构建 evolution_spec（需 middleware_factory）
+            evolution_spec = self._build_evolution_spec(
+                params.get("evaluator_kind"), ctx, middleware_factory,
+            )
+            # 合并 middleware：通用 middleware（factory）+ harness 自有
+            sub_mw = list(middleware_factory(f"{sh.name}-subagent"))
+            sub_mw.extend(params.get("subagent_middleware", []))
+            return build_deep_subagent(
+                name=sh.name,
+                description=sh.build_description(ctx),
+                model=model,
+                system_prompt=params["system_prompt"],
+                evolution_spec=evolution_spec,
+                subagent_middleware=sub_mw,
+                backend=backend,
+                artifact_paths=params.get("artifact_paths") or None,
+                max_revisions=params.get("max_revisions", 1),
+                skills=params.get("skills") or None,
+            )
+
+        # 普通 SubAgent 规格
+        spec = SubAgent(**sh.build_spec(ctx))
+        spec["middleware"] = middleware_factory(f"{sh.name}-subagent")
+        return spec
+
+    def _middleware_for_subagent_via_harness(self, ctx, agent_name: str) -> list[AgentMiddleware]:
+        """harness 路径的通用 middleware 工厂（与 _middleware_for_workspace/
+        _middleware_for_pipeline_subagent 等价）。
+
+        detail-outline/writing 需 ArtifactPrerequisite（产物前置检查），
+        其他 subagent 只需 ErrorRecovery/PathGuard/FileWriteSerialize(+Trace)。
+        """
+        workspace_path = ctx.workspace_path
+        trace_id = ctx.trace_id
+        if agent_name in ("detail-outline-subagent", "writing-subagent"):
+            middleware: list[AgentMiddleware] = []
+            prerequisites = self._artifact_prerequisites_for_pipeline_subagent(workspace_path, agent_name)
+            if prerequisites:
+                middleware.append(ArtifactPrerequisiteMiddleware(prerequisites))
+            middleware.extend(self._middleware_for_workspace(workspace_path, trace_id, agent_name))
+            return middleware
+        return self._middleware_for_workspace(workspace_path, trace_id, agent_name)
+
+    def _build_evolution_spec(self, evaluator_kind: str | None, ctx, middleware_factory):
+        """据 evaluator_kind 构建对应 evolution 评估子代理规格。
+
+        harness 只标 evaluator_kind（不直接依赖 evaluator builder），执行端据此分发。
+        与现有 build_*_deep_subagent 内的 evaluator 装配等价。
+        """
+        from app.platform.agent.runtime import SubAgent
+        workspace_path = ctx.workspace_path
+
+        if evaluator_kind == "storybuilding":
+            from app.domains.writing.expert_agent.evaluators.storybuilding import build_storybuilding_evaluator
+            eval_spec = build_storybuilding_evaluator(
+                workspace_path, middleware_factory("storybuilding-evaluation-subagent"),
+            )
+        elif evaluator_kind == "detail-outline":
+            from app.domains.writing.expert_agent.evaluators.detail_outline import build_detail_outline_evaluator
+            eval_spec = build_detail_outline_evaluator(
+                workspace_path, middleware_factory("detail-outline-evaluation-subagent"),
+                context_file_paths=["outline.md", "character/*.md", "storyline.md", "storyline/*.md"],
+            )
+        elif evaluator_kind == "writing":
+            from app.domains.writing.expert_agent.evaluators.writing import build_writing_evaluator
+            eval_spec = build_writing_evaluator(
+                workspace_path, middleware_factory("writing-evaluation-subagent"),
+                context_file_paths=["outline.md", "storyline.md", "storyline/*.md", "character/*.md"],
+            )
+        else:
+            raise ValueError(f"未知 evaluator_kind: {evaluator_kind}")
+
+        return SubAgent(
+            name="evolution",
+            description=eval_spec.get("description", "评估产出质量，返回评分和修订建议。"),
+            system_prompt=eval_spec["system_prompt"],
+            permissions=eval_spec.get("permissions"),
+            middleware=eval_spec.get("middleware"),
         )
 
     def _load_system_prompt(self, meta_style: str | None = None) -> str:
