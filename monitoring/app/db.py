@@ -285,6 +285,39 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_harness_labels ON harness_versions(labels);
             CREATE INDEX IF NOT EXISTS idx_harness_status ON harness_versions(status);
+
+            -- Phase 3 T3.1：badcase 独立记录（D20 立即写表+延迟触发）
+            -- 现状嵌在 evaluation_runs/evaluation_scores，抽出独立表便于聚合计数。
+            CREATE TABLE IF NOT EXISTS badcase_records (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id      TEXT NOT NULL REFERENCES runs(trace_id) ON DELETE CASCADE,
+                layer         TEXT NOT NULL,           -- content / subagent
+                target        TEXT NOT NULL,           -- novel / agent_name
+                metric        TEXT NOT NULL,           -- 维度名
+                score         REAL NOT NULL,
+                evidence      TEXT,                    -- judge 依据（来自 evaluation_scores）
+                signature_id  INTEGER,                 -- 匹配到的失败签名（NULL=待匹配，D15）
+                created_at    TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_badcase_dim ON badcase_records(layer, target, metric, signature_id);
+            CREATE INDEX IF NOT EXISTS idx_badcase_trace ON badcase_records(trace_id);
+
+            -- Phase 3 T3.2：失败签名（D8 Mining 产物，D12 LLM 提炼）
+            CREATE TABLE IF NOT EXISTS failure_signatures (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                layer           TEXT NOT NULL,
+                target          TEXT NOT NULL,
+                metric          TEXT NOT NULL,
+                signature_text  TEXT NOT NULL,         -- LLM 提炼的人话描述
+                -- S10 组件归因（proposer 据此改 harness）
+                target_component  TEXT NOT NULL,       -- prompt / skill / middleware / subagent
+                target_ref        TEXT NOT NULL,       -- 具体哪个：writing_system / RevisionLimitMiddleware / ...
+                status          TEXT NOT NULL DEFAULT 'open',  -- open/mining/proposed/resolved
+                badcase_count   INTEGER DEFAULT 0,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_signature_dim ON failure_signatures(layer, target, metric, status);
             """
         )
         conn.commit()

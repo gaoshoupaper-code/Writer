@@ -69,28 +69,35 @@ def evaluate_trace(trace_id: str) -> dict[str, Any] | None:
             (datetime.now(UTC).isoformat(), trace_id),
         )
 
-        # 6. 自动连锁（Phase 2）：badcase → 诊断 → 生成候选 prompt
-        # 失败不阻塞评估主流程（候选可经 API 手动重试）
-        candidates: list[dict[str, Any]] = []
+        # 6. 自动连锁（Self-Harness Phase 3 T3.3）：badcase → 写 badcase_records
+        #    （D20 立即写表+延迟触发）+ match_signature（D15）。
+        #    旧的「立即 diagnose→optimize」已废弃（S15 硬冻结），Mining 改为攒够才提炼。
+        #    失败不阻塞评估主流程。
+        mining_result: dict[str, Any] = {"recorded": 0, "matched": []}
         if badcase["is_badcase"]:
             try:
-                from app.diagnosis import diagnose_badcase
-                from app.optimizer import optimize_candidate
-                diagnosed = diagnose_badcase(trace_id, badcase)
-                for cand in diagnosed:
-                    if "id" in cand:
-                        optimized = optimize_candidate(cand["id"])
-                        if optimized:
-                            cand["optimized"] = optimized
-                        candidates.append(cand)
+                from app import mining
+                # D20：立即写 badcase_records（不立即触发诊断）
+                count = mining.record_badcases_from_evaluation(trace_id, badcase)
+                mining_result["recorded"] = count
+                # D15：每条 badcase 尝试匹配已有签名（不强制，无匹配则待后续提炼）
+                for flagged in badcase.get("flagged_dimensions", []):
+                    sig_id = mining.match_signature(
+                        flagged["layer"], flagged["target"], flagged["metric"],
+                        flagged.get("evidence", ""),
+                    )
+                    if sig_id:
+                        mining_result["matched"].append({
+                            "metric": flagged["metric"], "signature_id": sig_id,
+                        })
             except Exception:
-                logger.exception("自动连锁诊断/优化失败 %s", trace_id)
+                logger.exception("Mining 接入失败 %s", trace_id)
 
         return {
             "content": content_result,
             "subagent": subagent_results,
             "badcase": badcase,
-            "candidates": candidates,
+            "mining": mining_result,
         }
     except Exception as exc:
         logger.exception("evaluate_trace 失败 %s", trace_id)
@@ -218,17 +225,19 @@ def _detect_badcase(
     """badcase 判定：任一维度低于阈值即 badcase（需求决策）。"""
     flagged: list[dict[str, Any]] = []
 
-    # 内容维度
+    # 内容维度（evidence 共享整体依据，judge 对内容层输出的是综合 evidence）
     if not content_result.get("skipped"):
         threshold = rubric.CONTENT_BADCASE_THRESHOLD
+        content_evidence = content_result.get("evidence", "")
         for metric, score in content_result.get("scores", {}).items():
             if float(score) < threshold:
                 flagged.append({
                     "layer": "content", "target": "novel",
                     "metric": metric, "score": float(score), "threshold": threshold,
+                    "evidence": content_evidence,
                 })
 
-    # subagent 维度
+    # subagent 维度（每个 subagent 有自己的 evidence）
     threshold = rubric.SUBAGENT_BADCASE_THRESHOLD
     for agent, res in subagent_results.items():
         if res.get("skipped"):
@@ -238,6 +247,7 @@ def _detect_badcase(
                 "layer": "subagent", "target": agent,
                 "metric": res.get("key", agent),
                 "score": float(res.get("score", 0)), "threshold": threshold,
+                "evidence": res.get("evidence", ""),
             })
 
     return {
