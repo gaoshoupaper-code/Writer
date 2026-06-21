@@ -318,6 +318,30 @@ def init_db() -> None:
                 updated_at      TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_signature_dim ON failure_signatures(layer, target, metric, status);
+
+            -- Phase 4 T4.4：harness A/B 实验（D6 N seed + S11 完整统计量）
+            CREATE TABLE IF NOT EXISTS harness_experiments (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                candidate_version INTEGER NOT NULL,     -- harness_versions.version（候选）
+                prod_version      INTEGER,              -- 对比的 production 版本
+                signature_id      INTEGER,              -- 针对哪个签名
+                test_set_id       INTEGER,              -- 用了哪个测试集
+                seed_count        INTEGER NOT NULL,     -- N（D22 校准定）
+                -- 完整统计量（S11）
+                prod_scores_json  TEXT,                 -- [s1, s2, ...]
+                cand_scores_json  TEXT,
+                prod_mean REAL, prod_std REAL,
+                cand_mean REAL, cand_std REAL,
+                ci_low REAL, ci_high REAL,             -- 候选均值的置信区间
+                p_value REAL,
+                verdict           TEXT,                -- win / lose / tie
+                confidence        REAL,                -- 置信度 0~1
+                static_check_passed INTEGER,           -- D10 静态检查结果（0/1/NULL未跑）
+                status            TEXT NOT NULL DEFAULT 'running',  -- running/done/error
+                created_at        TEXT NOT NULL,
+                finished_at       TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_exp_candidate ON harness_experiments(candidate_version);
             """
         )
         conn.commit()
