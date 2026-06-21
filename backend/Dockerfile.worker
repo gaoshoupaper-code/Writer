@@ -1,0 +1,40 @@
+# Self-Harness worker 容器（Phase 2 T2.2，S7 Docker 隔离）
+#
+# 每个 worker（生产版 + 沙箱候选版）一个容器。
+# 基础镜像含 backend 全部依赖 + 执行端代码。
+# harness 代码作为 volume 挂载（C5），workspace 也挂载（C8）。
+#
+# ⚠️ 需真机验证：构建镜像 + 起容器 + curl /health + 测 SSE 转发。
+#    当前环境无法确认 Docker 状态，本文件为待验证 artifact。
+#
+# 构建：docker build -t writer-worker backend/
+# 运行：docker run -p <port>:8000 \
+#   -v <harnesses_host>:/app/harnesses \
+#   -v <workspace_host>:/app/workspace \
+#   -e WRITER_USE_HARNESS=true \
+#   writer-worker python -m app.worker.server --port 8000 --harness-version <id> --harnesses-root /app/harnesses
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# 系统依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# 先装依赖（利用 Docker 层缓存）
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir -e . || pip install --no-cache-dir fastapi uvicorn httpx pydantic-settings langchain-openai langgraph-checkpoint-sqlite python-dotenv
+
+# 复制执行端代码
+COPY app/ ./app/
+
+# harness 代码 + workspace 通过 volume 挂载（不打进镜像）
+# harnesses/ 和 workspace/ 是挂载点
+VOLUME ["/app/harnesses", "/app/workspace"]
+
+EXPOSE 8000
+
+# 默认启动命令（实际 port/version 由 docker run 参数覆盖）
+CMD ["python", "-m", "app.worker.server", "--port", "8000", "--harness-version", "1", "--harnesses-root", "/app/harnesses"]

@@ -265,6 +265,26 @@ def init_db() -> None:
                 calibrated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_judge_cal_dim ON judge_calibration(layer, target, metric);
+
+            -- Phase 2 T2.4：harness 版本管理（D2 代码定义 + S8 文件系统+git）
+            -- 一个 harness 版本 = 一个 WriterHarness 实现（代码文件）。
+            -- label 互斥（复用 prompt 模式）：production/latest/candidate 同一时刻只指向一个版本。
+            CREATE TABLE IF NOT EXISTS harness_versions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                version         INTEGER NOT NULL,       -- 单调递增
+                code_path       TEXT NOT NULL,          -- 文件系统路径（harnesses/<id>/harness.py）
+                git_commit      TEXT,                   -- git commit hash（可空，未提交时）
+                parent_version  INTEGER,                -- 从哪个版本进化来（进化谱系）
+                source          TEXT NOT NULL DEFAULT 'initial',  -- initial / proposed / approved
+                labels          TEXT DEFAULT '',        -- 逗号分隔：production/latest/candidate
+                signature_id    INTEGER,                -- 针对哪个失败签名进化（proposed 时填）
+                proposer_meta   TEXT,                   -- JSON：proposer 模型/耗时/diff 摘要
+                status          TEXT NOT NULL DEFAULT 'draft',  -- draft/sandbox_validating/static_checked/ab_testing/approved/rejected
+                created_at      TEXT NOT NULL,
+                UNIQUE(version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_harness_labels ON harness_versions(labels);
+            CREATE INDEX IF NOT EXISTS idx_harness_status ON harness_versions(status);
             """
         )
         conn.commit()
