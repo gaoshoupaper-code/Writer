@@ -138,11 +138,96 @@ def validate_json_surface(content: str, config: dict) -> tuple[bool, list[str]]:
 
 
 def validate_python_surface(content: str, config: dict) -> tuple[bool, list[str]]:
-    """C 类（受限 Python）全闸：复用 static_check + 契约（带 state_schema）。
+    """C 类（受限 Python）全闸：C4 危险模式 + C5 误伤 + C 类契约（带 state_schema 的 middleware）。
 
-    C 类是唯一能改 State schema 的 surface，过 C4（危险模式）+ C5（误伤）
-    + 结构检查（定义 middleware 类 + 有 state_schema 属性）三道闸。
-    T3.2 补 state_schema 契约的严格检查，此处先复用 static_check 兜底。
+    C 类是唯一能改 State schema 的 surface（stateful_middleware）。校验三道闸：
+      1. 语法（AST 解析）
+      2. C4 危险模式（os/subprocess/eval/exec/socket/写文件）——复用 static_check 的扫描
+      3. C5 误伤硬编码——复用 static_check 的扫描
+      4. C 类契约：必须定义一个 AgentMiddleware 子类，且有 state_schema 属性
+
+    与整体 harness 的 static_check 区别：整体 harness 要求 WriterHarness 子类，
+    C 类片段要求的是单个 middleware 类（带 state_schema），结构检查不同。
     """
-    return static_check(content)
+    errors: list[str] = []
+
+    # ── 语法检查 ──
+    try:
+        tree = ast.parse(content)
+    except SyntaxError as exc:
+        return False, [f"语法错误: {exc}"]
+
+    # ── C4/C5 危险模式扫描（复用 static_check 的模式列表）──
+    for pattern, msg in _DANGEROUS_PATTERNS:
+        if re.search(pattern, content):
+            errors.append(f"[C4 危险模式] {msg}")
+    for pattern, msg in _HARDCODED_REJECT_PATTERNS:
+        if re.search(pattern, content):
+            errors.append(f"[C5 误伤风险] {msg}")
+
+    # ── C 类契约：定义带 state_schema 的 AgentMiddleware 子类 ──
+    contract_errors = _check_c_middleware_contract(tree)
+    errors.extend(contract_errors)
+
+    return len(errors) == 0, errors
+
+
+def _check_c_middleware_contract(tree: ast.Module) -> list[str]:
+    """C 类 surface 契约检查：必须定义一个带 state_schema 属性的 middleware 类。
+
+    契约要求（D3 + 设计接口契约）：
+      - 定义至少一个类
+      - 该类继承自 AgentMiddleware（或带 Middleware 后缀的基类）
+      - 该类有 state_schema 属性（类级赋值）
+
+    宽松匹配类名含 "Middleware" 或基类含 "AgentMiddleware"/"Middleware"，
+    避免强依赖执行端的精确 import 路径（evolution 是独立 venv）。
+    """
+    errors: list[str] = []
+    middleware_classes: list[ast.ClassDef] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        # 基类名含 Middleware（AgentMiddleware 或自定义 XxxMiddleware）
+        base_names = []
+        for base in node.bases:
+            name = _get_name(base)
+            if name:
+                base_names.append(name)
+        is_mw = any("Middleware" in n for n in base_names)
+        # 或类名本身含 Middleware（兜底）
+        if not is_mw and "Middleware" in node.name:
+            is_mw = True
+        if is_mw:
+            middleware_classes.append(node)
+
+    if not middleware_classes:
+        errors.append(
+            "[C 类契约] 未定义 Middleware 子类（C 类 surface 必须定义一个继承 "
+            "AgentMiddleware 或类名含 Middleware 的类）"
+        )
+        return errors
+
+    # 检查至少一个 middleware 类有 state_schema 属性
+    has_state_schema = False
+    for cls in middleware_classes:
+        for stmt in cls.body:
+            # 类级赋值：state_schema = GoalState
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name) and target.id == "state_schema":
+                        has_state_schema = True
+                        break
+            # 带注解赋值：state_schema: type = GoalState
+            if isinstance(stmt, ast.AnnAssign):
+                t = stmt.target
+                if isinstance(t, ast.Name) and t.id == "state_schema":
+                    has_state_schema = True
+                    break
+    if not has_state_schema:
+        errors.append(
+            "[C 类契约] Middleware 类未定义 state_schema 属性（C 类必须通过 "
+            "state_schema 声明改了哪些 State channel）"
+        )
+    return errors
 
