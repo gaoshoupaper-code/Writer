@@ -138,7 +138,7 @@ class SurfacePhase1Test(unittest.TestCase):
         from app.improvement import surface_repo
         surface_repo.create_version("prompt", "p1", "writing", "c1", status="approved")
         surface_repo.create_version("prompt", "p1", "writing", "c2", status="draft")
-        approved = surface_repo.list_versions("prompt", "p1", status="approved")
+        approved = surface_repo.list_versions("prompt", "p1", "writing", status="approved")
         self.assertEqual(len(approved), 1)
         self.assertEqual(approved[0]["version"], 1)
 
@@ -147,14 +147,34 @@ class SurfacePhase1Test(unittest.TestCase):
         surface_repo.create_version("prompt", "p1", "writing", "c1", status="approved")
         surface_repo.create_version("prompt", "p1", "writing", "c2", status="approved")
         # approved 最高版 = v2
-        av = surface_repo.get_approved_version("prompt", "p1")
+        av = surface_repo.get_approved_version("prompt", "p1", "writing")
         self.assertIsNotNone(av)
         self.assertEqual(av["version"], 2)
 
     def test_get_approved_version_none(self) -> None:
         from app.improvement import surface_repo
         surface_repo.create_version("prompt", "p1", "writing", "c1", status="draft")
-        self.assertIsNone(surface_repo.get_approved_version("prompt", "p1"))
+        self.assertIsNone(surface_repo.get_approved_version("prompt", "p1", "writing"))
+
+    def test_same_name_different_scope_independent(self) -> None:
+        """同名 surface 在不同 scope 是独立的线（UNIQUE 含 scope 的核心价值）。"""
+        from app.improvement import surface_repo
+        # ContextAssembler 在 storybuilding 和 writing 用不同参数——必须独立版本线
+        a = surface_repo.create_version(
+            "middleware_params", "ContextAssembler", "storybuilding",
+            '{"args":{"file_paths":["demand.md"]}}', status="approved",
+        )
+        b = surface_repo.create_version(
+            "middleware_params", "ContextAssembler", "writing",
+            '{"args":{"file_paths":["demand.md","detail/*.md"]}}', status="approved",
+        )
+        self.assertEqual(a["version"], 1)  # 各自独立从 1 开始
+        self.assertEqual(b["version"], 1)
+        # 按 scope 各取各的
+        sa = surface_repo.get_approved_version("middleware_params", "ContextAssembler", "storybuilding")
+        sw = surface_repo.get_approved_version("middleware_params", "ContextAssembler", "writing")
+        self.assertIn("demand.md", sa["content"])
+        self.assertIn("detail/*.md", sw["content"])
 
     def test_list_by_scope(self) -> None:
         from app.improvement import surface_repo
@@ -271,7 +291,7 @@ class SurfacePhase1Test(unittest.TestCase):
                                     "code", status="approved")
         m = manifest_repo.publish_production()
         ok, mismatches = manifest_repo.check_replay_compatible(
-            m, [{"surface_name": "GoalMiddleware", "version": 1}]
+            m, [{"surface_name": "GoalMiddleware", "scope": "meta", "version": 1}]
         )
         self.assertTrue(ok)
         self.assertEqual(mismatches, [])
@@ -287,7 +307,7 @@ class SurfacePhase1Test(unittest.TestCase):
         m = manifest_repo.publish_production()
         # trace 记录的是 v1，但当前 manifest 是 v2 → 不兼容
         ok, mismatches = manifest_repo.check_replay_compatible(
-            m, [{"surface_name": "GoalMiddleware", "version": 1}]
+            m, [{"surface_name": "GoalMiddleware", "scope": "meta", "version": 1}]
         )
         self.assertFalse(ok)
         self.assertTrue(any("版本不一致" in msg for msg in mismatches))

@@ -146,7 +146,7 @@ def publish_production(
         return result
 
 
-def _build_entries(approved: dict[tuple[str, str], dict[str, Any]]) -> dict[str, Any]:
+def _build_entries(approved: dict[tuple[str, str, str], dict[str, Any]]) -> dict[str, Any]:
     """从 approved 版本分组构造 entries_json 结构。
 
     结构（见设计文档接口契约）：
@@ -155,25 +155,26 @@ def _build_entries(approved: dict[tuple[str, str], dict[str, Any]]) -> dict[str,
           {"surface_type", "surface_name", "scope", "version", "id"}, ...
         ],
         "schema_lock": {
-          "c_surfaces": [{"surface_name", "version"}, ...]  # C 类版本指针（回放契约）
+          "c_surfaces": [{"surface_name", "scope", "version"}, ...]  # C 类版本指针（回放契约）
         }
       }
     """
     surfaces: list[dict[str, Any]] = []
     c_surfaces: list[dict[str, Any]] = []
-    for (surface_type, surface_name), row in sorted(approved.items()):
+    for (surface_type, surface_name, scope), row in sorted(approved.items()):
         entry = {
             "surface_type": surface_type,
             "surface_name": surface_name,
-            "scope": row["scope"],
+            "scope": scope,
             "version": row["version"],
             "id": row["id"],
         }
         surfaces.append(entry)
-        # C 类单独记入 schema_lock（回放契约锁定其版本）
+        # C 类单独记入 schema_lock（回放契约锁定其版本，带 scope 防同名歧义）
         if surface_registry.is_c_code(surface_type):
             c_surfaces.append({
                 "surface_name": surface_name,
+                "scope": scope,
                 "version": row["version"],
             })
     return {
@@ -187,18 +188,18 @@ def _diff_against_parent(parent_version: int, new_entries: dict[str, Any]) -> st
     parent = get_manifest(parent_version)
     if parent is None:
         return f"基于 parent v{parent_version}（已不存在）"
-    parent_map: dict[tuple[str, str], int] = {
-        (s["surface_type"], s["surface_name"]): s["version"]
+    parent_map: dict[tuple[str, str, str], int] = {
+        (s["surface_type"], s["surface_name"], s["scope"]): s["version"]
         for s in get_entries(parent)["surfaces"]
     }
     changes: list[str] = []
     for s in new_entries["surfaces"]:
-        key = (s["surface_type"], s["surface_name"])
+        key = (s["surface_type"], s["surface_name"], s["scope"])
         old_v = parent_map.get(key)
         if old_v is None:
-            changes.append(f"+{s['surface_name']}(v{s['version']})")
+            changes.append(f"+{s['surface_name']}/{s['scope']}(v{s['version']})")
         elif old_v != s["version"]:
-            changes.append(f"~{s['surface_name']}(v{old_v}→v{s['version']})")
+            changes.append(f"~{s['surface_name']}/{s['scope']}(v{old_v}→v{s['version']})")
     return ", ".join(changes) if changes else "无变化（重新发布）"
 
 
@@ -213,30 +214,35 @@ def check_replay_compatible(
 
     Args:
         replay_manifest: 回放用的 manifest 行
-        trace_c_surfaces: trace 记录的当时 C 类 surface 版本 [{surface_name, version}]
+        trace_c_surfaces: trace 记录的当时 C 类 surface 版本
+            [{surface_name, scope, version}]
 
     Returns: (compatible, mismatch_descriptions)。
     C 类改动 State schema，版本不一致 → 回放失真 → 必须拦截。
     A/B 类无此约束（它们不改 schema）。
     """
     replay_entries = get_entries(replay_manifest)
+    # key = (surface_name, scope)，C 类按 name+scope 唯一标识
     replay_c = {
-        s["surface_name"]: s["version"]
+        (s["surface_name"], s["scope"]): s["version"]
         for s in replay_entries["schema_lock"]["c_surfaces"]
     }
-    trace_c = {s["surface_name"]: s["version"] for s in trace_c_surfaces}
+    trace_c = {
+        (s["surface_name"], s.get("scope", "")): s["version"]
+        for s in trace_c_surfaces
+    }
 
     mismatches: list[str] = []
     # replay 多出的 C 类（trace 时还没有）
-    for name, ver in replay_c.items():
-        if name not in trace_c:
-            mismatches.append(f"C 类 {name}(v{ver}) 在 trace 时不存在")
+    for (name, scope), ver in replay_c.items():
+        if (name, scope) not in trace_c:
+            mismatches.append(f"C 类 {name}/{scope}(v{ver}) 在 trace 时不存在")
     # trace 有的 C 类，版本不一致
-    for name, ver in trace_c.items():
-        if name not in replay_c:
-            mismatches.append(f"C 类 {name}(v{ver}) 在回放 manifest 中缺失")
-        elif replay_c[name] != ver:
+    for (name, scope), ver in trace_c.items():
+        if (name, scope) not in replay_c:
+            mismatches.append(f"C 类 {name}/{scope}(v{ver}) 在回放 manifest 中缺失")
+        elif replay_c[(name, scope)] != ver:
             mismatches.append(
-                f"C 类 {name} 版本不一致: trace=v{ver} vs replay=v{replay_c[name]}"
+                f"C 类 {name}/{scope} 版本不一致: trace=v{ver} vs replay=v{replay_c[(name, scope)]}"
             )
     return len(mismatches) == 0, mismatches

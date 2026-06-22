@@ -344,15 +344,17 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_exp_candidate ON harness_experiments(candidate_version);
 
             -- Phase 6（self-harness 对齐重构）：surface 统一版本表
-            -- 一个 (surface_type, surface_name) = 一条"surface 线"，多个 version。
+            -- 一个 (surface_type, surface_name, scope) = 一条"surface 线"，多个 version。
             -- 替代 prompt_versions（A 类文本）+ 未来 B 类 JSON 参数 + C 类受限 Python。
             -- label 废弃（决策 D5：manifest 统一接管），仅留 source/status 追踪。
+            -- UNIQUE 含 scope：同名 surface（如 ContextAssembler/permissions）在不同 scope
+            -- 是不同的线（参数不同），必须 scope 维度区分，否则跨 scope 冲突。
             CREATE TABLE IF NOT EXISTS surface_versions (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
                 surface_type      TEXT NOT NULL,         -- prompt/skill/description/middleware_params/permissions/stateful_middleware（见 surface_registry）
                 surface_name      TEXT NOT NULL,         -- 具体名：writing_system / StorylineSingleLineLimit / GoalMiddleware / ...
                 scope             TEXT NOT NULL,         -- meta/storybuilding/detail-outline/writing/interview/global（归属 subagent）
-                version           INTEGER NOT NULL,      -- 同 (surface_type, surface_name) 下单调递增
+                version           INTEGER NOT NULL,      -- 同 (surface_type, surface_name, scope) 下单调递增
                 content           TEXT NOT NULL,         -- A 类=文本 / B 类=JSON / C 类=受限 Python（由 content_kind 决定）
                 content_kind      TEXT NOT NULL,         -- text / json / python（校验分发依据）
                 config            TEXT DEFAULT '{}',     -- 附属配置（如 model temperature，JSON）
@@ -364,7 +366,7 @@ def init_db() -> None:
                 proposer_meta     TEXT,                  -- JSON：proposer 模型/diff 摘要
                 static_check_passed INTEGER,             -- 0/1/NULL（C 类必填，A/B 可 NULL）
                 created_at        TEXT NOT NULL,
-                UNIQUE(surface_type, surface_name, version)
+                UNIQUE(surface_type, surface_name, scope, version)
             );
             CREATE INDEX IF NOT EXISTS idx_sv_surface ON surface_versions(surface_type, surface_name);
             CREATE INDEX IF NOT EXISTS idx_sv_scope ON surface_versions(scope);

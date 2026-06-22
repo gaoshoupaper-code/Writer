@@ -86,11 +86,11 @@ def create_version(
     # content_kind 由 surface_type 决定（编译期保证一致，不允许调用方覆盖）
     content_kind = type_def.content_kind.value
 
-    # version 单调递增（同 surface 线内）
+    # version 单调递增（同 surface 线内 = type+name+scope 三元组）
     latest = db.query_one(
         "SELECT MAX(version) AS mv FROM surface_versions "
-        "WHERE surface_type=? AND surface_name=?",
-        (surface_type, surface_name),
+        "WHERE surface_type=? AND surface_name=? AND scope=?",
+        (surface_type, surface_name, scope),
     )
     next_version = (latest["mv"] or 0) + 1 if latest and latest["mv"] else 1
 
@@ -109,17 +109,20 @@ def create_version(
             _now(),
         ),
     )
-    return get_version(surface_type, surface_name, next_version)  # type: ignore[return-value]
+    return get_version(surface_type, surface_name, scope, next_version)  # type: ignore[return-value]
 
 
 # ── 查询 ─────────────────────────────────────────────────────
 
 
-def get_version(surface_type: str, surface_name: str, version: int) -> dict[str, Any] | None:
-    """按 (type, name, version) 精确取版本。"""
+def get_version(
+    surface_type: str, surface_name: str, scope: str, version: int,
+) -> dict[str, Any] | None:
+    """按 (type, name, scope, version) 精确取版本。"""
     return db.query_one(
-        "SELECT * FROM surface_versions WHERE surface_type=? AND surface_name=? AND version=?",
-        (surface_type, surface_name, version),
+        "SELECT * FROM surface_versions "
+        "WHERE surface_type=? AND surface_name=? AND scope=? AND version=?",
+        (surface_type, surface_name, scope, version),
     )
 
 
@@ -131,39 +134,45 @@ def get_version_by_id(version_id: int) -> dict[str, Any] | None:
 def list_versions(
     surface_type: str,
     surface_name: str,
+    scope: str,
     *,
     status: str | None = None,
 ) -> list[dict[str, Any]]:
-    """列某条 surface 线的所有版本（按 version 倒序）。
+    """列某条 surface 线（type+name+scope）的所有版本（按 version 倒序）。
 
     可按 status 过滤（如只看 approved）。
     """
     if status:
         return db.query_all(
             "SELECT * FROM surface_versions "
-            "WHERE surface_type=? AND surface_name=? AND status=? ORDER BY version DESC",
-            (surface_type, surface_name, status),
+            "WHERE surface_type=? AND surface_name=? AND scope=? AND status=? "
+            "ORDER BY version DESC",
+            (surface_type, surface_name, scope, status),
         )
     return db.query_all(
         "SELECT * FROM surface_versions "
-        "WHERE surface_type=? AND surface_name=? ORDER BY version DESC",
-        (surface_type, surface_name),
+        "WHERE surface_type=? AND surface_name=? AND scope=? ORDER BY version DESC",
+        (surface_type, surface_name, scope),
     )
 
 
-def get_latest_version(surface_type: str, surface_name: str) -> dict[str, Any] | None:
+def get_latest_version(
+    surface_type: str, surface_name: str, scope: str,
+) -> dict[str, Any] | None:
     """取某条线的最新版本（max version，不论 status）。"""
-    rows = list_versions(surface_type, surface_name)
+    rows = list_versions(surface_type, surface_name, scope)
     return rows[0] if rows else None
 
 
-def get_approved_version(surface_type: str, surface_name: str) -> dict[str, Any] | None:
-    """取某条线当前 approved 的最高版本。
+def get_approved_version(
+    surface_type: str, surface_name: str, scope: str,
+) -> dict[str, Any] | None:
+    """取某条线（type+name+scope）当前 approved 的最高版本。
 
-    manifest 聚合（D7）用此方法：每个 (type, name) 取其 approved 最高版本。
+    manifest 聚合（D7）用此方法：每个 (type, name, scope) 取其 approved 最高版本。
     若无 approved 版本返回 None（该 surface 在 manifest 中缺失，装配时按缺失处理）。
     """
-    rows = list_versions(surface_type, surface_name, status=STATUS_APPROVED)
+    rows = list_versions(surface_type, surface_name, scope, status=STATUS_APPROVED)
     return rows[0] if rows else None
 
 
@@ -185,19 +194,19 @@ def list_by_scope(scope: str, *, status: str | None = None) -> list[dict[str, An
     )
 
 
-def list_all_approved_grouped() -> dict[tuple[str, str], dict[str, Any]]:
-    """取所有 surface 线各自的 approved 最高版本，按 (type, name) 分组。
+def list_all_approved_grouped() -> dict[tuple[str, str, str], dict[str, Any]]:
+    """取所有 surface 线各自的 approved 最高版本，按 (type, name, scope) 分组。
 
     manifest 聚合发布（D7 + D12）的主查询：一次拿到所有该进 manifest 的版本。
-    Returns: {(surface_type, surface_name): version_row}。
+    Returns: {(surface_type, surface_name, scope): version_row}。
     """
     rows = db.query_all(
         "SELECT * FROM surface_versions WHERE status=? ORDER BY version DESC",
         (STATUS_APPROVED,),
     )
-    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in rows:
-        key = (row["surface_type"], row["surface_name"])
+        key = (row["surface_type"], row["surface_name"], row["scope"])
         # 倒序遍历，首次出现的即该线最高 version
         if key not in grouped:
             grouped[key] = row
@@ -253,12 +262,14 @@ def reject(version_id: int) -> dict[str, Any]:
 # ── 便捷读取（供执行端 loader / proposer 用）────────────────
 
 
-def get_content(surface_type: str, surface_name: str, version: int) -> dict[str, Any] | None:
-    """按 (type, name, version) 取版本内容（含 config 解析）。
+def get_content(
+    surface_type: str, surface_name: str, scope: str, version: int,
+) -> dict[str, Any] | None:
+    """按 (type, name, scope, version) 取版本内容（含 config 解析）。
 
     执行端 manifest_loader 按 manifest entries 的 version 指针调此方法拉内容。
     """
-    row = get_version(surface_type, surface_name, version)
+    row = get_version(surface_type, surface_name, scope, version)
     if row is None:
         return None
     return {
