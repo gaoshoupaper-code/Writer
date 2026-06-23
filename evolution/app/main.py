@@ -20,8 +20,7 @@ from app.view.stats import router as stats_router
 from app.diagnosis.rules import router as rules_router
 from app.improvement.prompts import router as prompts_router
 from app.view.evaluation_api import router as evaluation_router
-from app.improvement.harness_api import router as harness_router
-from app.improvement.surface_api import router as surface_router
+from app.improvement.snapshot_api import router as snapshot_router
 from app.view.web.router import router as web_router
 from app.ingestion.scan import start_scan_scheduler
 from app.view.active import start_active_poller
@@ -45,8 +44,7 @@ app.include_router(stats_router, prefix="/api")
 app.include_router(rules_router, prefix="/api")
 app.include_router(prompts_router, prefix="/api")
 app.include_router(evaluation_router, prefix="/api")
-app.include_router(harness_router, prefix="/api")
-app.include_router(surface_router, prefix="/api")
+app.include_router(snapshot_router, prefix="/api")
 # 页面路由（HTML，无前缀）
 app.include_router(web_router)
 

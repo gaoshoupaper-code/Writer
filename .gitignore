@@ -6,19 +6,25 @@ __pycache__/
 venv/
 
 # 环境变量
-backend/.env
+executor/.env
+executor/.env*
 
 # 运行时数据
-backend/workspace/
-backend/checkpoints.db*
-backend/checkpoints/
-backend/app.db
-backend/app.db-*
-backend/app.db.bak.*
-backend/skills/
+executor/workspace/
+executor/checkpoints.db*
+executor/checkpoints/
+executor/app.db
+executor/app.db-*
+executor/app.db.bak.*
+executor/app.platform.core.db*
+executor/skills/
 backup/
 pre-multiuser-backup-*
 forensics-*/
+
+# 论文/参考资料（不入仓库）
+*.pdf
+_paper_extract.txt
 
 # Node
 node_modules/
@@ -38,15 +44,15 @@ Thumbs.db
 .claude/md/
 
 # 本地临时/调试文件（不提交，保留本地）
-backend/diag.log
-backend/spike_*.py
+executor/diag.log
+executor/spike_*.py
 
 # 第三方/部署产物（独立部署，不入主仓库）
 langfuse/
 
-# monitoring 服务：只入源码，不入运行产物
-monitoring/.env
-monitoring/*.db
-monitoring/*.db.bak
-monitoring/start.log
-monitoring/.pytest_cache/
+# evolution 服务：只入源码，不入运行产物
+evolution/.env
+evolution/*.db
+evolution/*.db.bak
+evolution/start.log
+evolution/.pytest_cache/

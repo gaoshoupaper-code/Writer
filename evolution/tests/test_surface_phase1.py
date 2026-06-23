@@ -2,7 +2,7 @@
 
 覆盖：
 - 新表建出 + 幂等迁移
-- surface_registry：类型/层/content_kind/scope 校验
+- contracts.surface_types：类型/层/content_kind/scope 校验
 - surface_repo：版本单调递增、status 流转、scope/type 查询、approved 聚合
 - manifest_repo：发布聚合（D7）、production 唯一性、schema_lock、回放契约校验（D12）
 - 全局锁快照幂等（多次发布不漂移）
@@ -64,14 +64,14 @@ class SurfacePhase1Test(unittest.TestCase):
     # ── surface_registry ────────────────────────────────────
 
     def test_registry_known_types(self) -> None:
-        from app.improvement import surface_registry as sr
+        from contracts import surface_types as sr
         types = sr.list_types()
         for expected in ("prompt", "skill", "description", "middleware_params",
                          "permissions", "stateful_middleware"):
             self.assertIn(expected, types)
 
     def test_registry_layer_mapping(self) -> None:
-        from app.improvement import surface_registry as sr
+        from contracts import surface_types as sr
         self.assertEqual(sr.get_layer("prompt"), sr.SurfaceLayer.A_TEXT)
         self.assertEqual(sr.get_layer("middleware_params"), sr.SurfaceLayer.B_PARAM)
         self.assertEqual(sr.get_layer("stateful_middleware"), sr.SurfaceLayer.C_CODE)
@@ -79,7 +79,7 @@ class SurfacePhase1Test(unittest.TestCase):
         self.assertFalse(sr.is_c_code("prompt"))
 
     def test_registry_rejects_unknown(self) -> None:
-        from app.improvement import surface_registry as sr
+        from contracts import surface_types as sr
         with self.assertRaises(KeyError):
             sr.get_type_def("nonexistent_type")
         with self.assertRaises(ValueError):
@@ -87,7 +87,7 @@ class SurfacePhase1Test(unittest.TestCase):
 
     def test_registry_content_kind_consistent(self) -> None:
         """content_kind 由 surface_type 决定（编译期一致性）。"""
-        from app.improvement import surface_registry as sr
+        from contracts import surface_types as sr
         self.assertEqual(sr.get_content_kind("prompt"), sr.ContentKind.TEXT)
         self.assertEqual(sr.get_content_kind("middleware_params"), sr.ContentKind.JSON)
         self.assertEqual(sr.get_content_kind("stateful_middleware"), sr.ContentKind.PYTHON)

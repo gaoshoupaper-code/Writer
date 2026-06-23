@@ -1,5 +1,80 @@
 # CLAUDE.md
 
+## 文档同步铁律（最高优先级）
+
+**必须遵守**：任何开发任务（写新功能 / 修 bug / 重构 / 改配置）收尾前，**必须**执行
+下方的【文档同步自检清单】。**未执行完不得宣告任务完成。**
+
+### 背景
+
+本项目在 `docs/` 下维护一套"活文档"（living doc）——它只反映项目**当前的样子**，
+不记变更历史。文档是产品负责人（A 角色，非开发者）掌控项目的唯一依靠。
+文档一旦和代码对不上，掌控就断了。因此每次改动代码后，必须同步检查文档是否仍准确。
+
+### 文档结构（你要维护什么）
+
+```
+docs/
+├── README.md                       ← 系统全景（整个系统一张图 + 三大端下钻入口）
+├── executor/文件大地图.md           ← executor 每个文件（目录树+作用，含 writing 域全部文件）
+├── evolution/文件大地图.md          ← evolution 每个文件（目录树+作用）
+├── frontend/文件大地图.md           ← frontend 每个文件（目录树+作用）
+```
+**核心约定**：三大端的"文件大地图"是看全局的地图——按真实目录树组织，
+每个文件标两三句精炼作用。改了某端的文件，必须同步该端的文件大地图。
+
+### 文档同步自检清单（每个任务收尾必走）
+
+**第 1 步：列出本次改了哪些文件**
+把所有被改动 / 新增 / 删除的文件列出来。
+
+**第 2 步：把改动文件映射到 docs/ 对应篇目**
+按下表判断每处改动该检查哪篇文档：
+
+| 改动类型 | 该检查 |
+|---------|--------|
+| 改了 executor 任何文件 | `docs/executor/文件大地图.md` |
+| 改了 evolution 任何文件 | `docs/evolution/文件大地图.md` |
+| 改了 frontend 任何文件 | `docs/frontend/文件大地图.md` |
+| 改了系统级结构（跨端、顶层目录、main.py） | `docs/README.md`（系统全景） |
+| 改了 writing 域编排逻辑/流程 | `docs/executor/文件大地图.md`（写作流水线分组） |
+| 改了 writing 域支撑组件（风格/护栏/服务/工具） | `docs/executor/文件大地图.md`（写作流水线分组） |
+| 新增/删除/改了某文件本身的职责 | 该端的**文件大地图.md 必须更新** |
+| 只改了提示词内容（prompts/*.md）或技能内容（skills/） | 通常无需改 docs（内容非结构）；**除非增删整个文件 → 更新文件大地图** |
+
+**第 3 步：对每篇该检查的文档，标注三态之一**
+
+- `已更新`：你同步了文档内容，使其反映本次改动。
+- `无需更新`：你确认过，本次改动不影响该篇（即使代码变了，文档描述仍准确）。
+- `待补`：需要更新但本次没做完——**必须说明原因**，不能默默放过。
+
+### 收尾汇报（D6）
+
+自检清单走完后，在任务收尾回复里用**一句话**告诉用户：
+"本次更新了 docs/ 下：[文件名列表]"（或"无需更新"）。
+让用户知道文档动了哪，可随时抽查。
+
+### 写作规范（更新文档时遵守）
+
+- **活文档**：只写"现在的样子"，不写"本次改了什么"。不记 changelog。
+- **语言风格：白话但不口语化**。用直白易懂的表述讲清楚逻辑，但保持书面语的专业感——
+  避免口水话、网络用语、随意感叹（不要"其实吧""超级""哦"这类词）。
+- **大白话逻辑为主**：正文用直接陈述 + 因果逻辑 + 层次递进（"X 做 A，产出 B，传给 Y 做 C"），语言精炼不说冗余过度的词语。
+- **术语括号注释**：专业术语**第一次出现时**括号注大白话，
+  如"路由（router，就是分发请求的交警）"。同篇重复出现不再注。
+- **尽量少用类比**：类比只在纯逻辑实在讲不清时偶尔用一处，不作为主要表达手段。
+- **文件级掌控（L2 颗粒度）**：文件地图里每个文件的作用**至少写两三句话**——
+  要说清它**干什么 + 为什么需要它 / 在流程里解决什么问题**，不能只一句话带过。
+  不列 `__init__.py`（仅为 Python 包标记，无业务逻辑）。
+- **文件大地图用卡片式（重要范式）**：三大端的文件大地图用"分区卡片"组织，不是 ASCII 目录树。
+  规范：每个逻辑分组（按目录或按职责）= 一张卡片，卡片之间用 `---` 分隔；每张卡片顶部用
+  `> **这组管什么**：...` 一句话说清该组的定位；下面是该组的文件表（列：文件/行数/作用）。
+  大文件（如 meta/agent.py 1161 行、projector.py 900 行）在作用描述里点明体量和重要性。
+  每张大地图末尾附"文件体量速览"条形图，让大头一眼可见。
+- **不自造结构**：严格按"文档结构"的层级和命名，不随意新建文档。
+
+---
+
 Behavioral guidelines to reduce common LLM coding mistakes.
 Merge with project-specific instructions as needed.
 
@@ -16,17 +91,30 @@ Before implementing:
 - If a simpler approach exists, say so. Push back when warranted.
 - If something is unclear, stop. Name what's confusing. Ask.
 
-## 2. Simplicity First
+## 2. Robust & Clean First, Simple Second
 
-**Minimum code that solves the problem. Nothing speculative.**
+**功能架构健壮完善优先，代码干净整洁，其次简洁。** Architecture must hold up; the code must be clean; simplicity serves both.
 
+**First, make it robust and complete:**
+- Handle the edge cases the problem *actually* has—don't skip them for brevity.
+- Get the architecture right: clear module boundaries, correct responsibilities, and abstractions only where the domain genuinely needs them.
+- Correctness and structural soundness outweigh line count.
+
+**Keep it clean—no dead weight, no clutter:**
+- No dead code, unused imports, or leftover scaffolding. If it's not doing work, it's gone.
+- One responsibility per module/function; no tangled side effects or hidden state.
+- Naming and structure that say what the code does—reader shouldn't have to reverse-engineer it.
+- Remove the mess your changes create (orphans, stale comments, now-pointless branches) as you go.
+
+**Then, make it as simple as robustness allows:**
 - No features beyond what was asked.
 - No abstractions for single-use code.
 - No "flexibility" or "configurability" that wasn't requested.
 - No error handling for impossible scenarios.
-- If you write 200 lines and it could be 50, rewrite it.
+- If 200 lines could be 50 *without losing robustness*, rewrite it.
 
-Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+The order is fixed: **robust & clean → simple**. Never trade correctness, structural soundness, or clarity for fewer lines.
+Ask yourself: "Is it robust and complete? Is it clean? Is it as simple as it can be without sacrificing either?" All three must be yes.
 
 ## 3. Surgical Changes
 
