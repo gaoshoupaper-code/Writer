@@ -3,7 +3,7 @@
 
 把《后端 Agent 架构重构 · 需求基准》第 144-152 行的 6 条分层铁律变成
 机器可拦的检查。当前以 baseline 告警模式运行：存量违规登记在
-``backend/layering_baseline.txt``，新增违规才会 fail（exit 1）。
+``executor/layering_baseline.txt``，新增违规才会 fail（exit 1）。
 
 铁律（来自需求基准文档 §分层依赖铁律）：
   R1 platform/ 不得 import domains/ 或 infrastructure/
@@ -34,10 +34,16 @@ from pathlib import Path
 
 # ── 配置 ────────────────────────────────────────────────────────────────
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BACKEND_APP = REPO_ROOT / "backend" / "app"
-BASELINE_FILE = REPO_ROOT / "backend" / "layering_baseline.txt"
+BACKEND_APP = REPO_ROOT / "executor" / "app"
+BASELINE_FILE = REPO_ROOT / "executor" / "layering_baseline.txt"
+# 共享契约包（执行端与进化端的单一真源，Phase 1 建立）
+CONTRACTS_DIR = REPO_ROOT / "contracts"
+# 进化端（Phase 2 拆层后：业务4层 + core 公共底座）
+EVOLUTION_APP = REPO_ROOT / "evolution" / "app"
+# evolution 业务层（core 不得依赖这些）
+EVOLUTION_BUSINESS_LAYERS = {"ingestion", "diagnosis", "improvement", "view"}
 
-# 三分层根（相对 backend/app/）
+# 三分层根（相对 executor/app/）
 PLATFORM = "platform"
 DOMAINS = "domains"
 INFRA = "infrastructure"
@@ -61,7 +67,7 @@ CROSSCUTTING = {"auth", "admin", "api"}
 class Violation:
     """一条分层违规。"""
     rule: str          # 规则编号，如 "R1"
-    importer: str      # 违规文件相对 backend/app/ 的路径
+    importer: str      # 违规文件相对 executor/app/ 的路径
     imported: str      # 被引用的模块，如 "app.writer.middleware"
     detail: str        # 人类可读说明
 
@@ -75,7 +81,7 @@ class ScanResult:
 
 # ── import 解析 ────────────────────────────────────────────────────────
 def _module_path(file_path: Path) -> str:
-    """文件 → 模块 dotted path（相对 backend/app/，去掉 app 前缀）。"""
+    """文件 → 模块 dotted path（相对 executor/app/，去掉 app 前缀）。"""
     rel = file_path.relative_to(BACKEND_APP).with_suffix("")
     parts = list(rel.parts)
     if parts and parts[-1] == "__init__":
@@ -89,11 +95,95 @@ def _file_to_dotted(file_path: Path) -> str:
 
 
 def _collect_app_files() -> list[Path]:
-    """递归收集 backend/app/ 下所有 .py（排除 __pycache__）。"""
+    """递归收集 executor/app/ 下所有 .py（排除 __pycache__）。"""
     return sorted(
         p for p in BACKEND_APP.rglob("*.py")
         if "__pycache__" not in p.parts
     )
+
+
+def _collect_contracts_files() -> list[Path]:
+    """递归收集 contracts/ 下所有 .py（排除 __pycache__）。"""
+    if not CONTRACTS_DIR.exists():
+        return []
+    return sorted(
+        p for p in CONTRACTS_DIR.rglob("*.py")
+        if "__pycache__" not in p.parts
+    )
+
+
+def scan_contracts() -> list[Violation]:
+    """扫描 contracts/ 包，检查它是否违反「不依赖任何一端」的铁律。
+
+    RC1: contracts/ 不得 import app.*（executor 或 evolution 的内部模块）。
+         contracts 是共享契约层，必须零业务依赖。
+         contracts 内部互引（contracts.trace → contracts.api 等）合法。
+
+    与 executor 的 6 条铁律独立——contracts 不是 executor 的一部分。
+    """
+    violations: list[Violation] = []
+    for file_path in _collect_contracts_files():
+        imports = _parse_file_imports(file_path)
+        # _parse_file_imports 只抽 app.* 模块；contracts 不应 import 任何 app.*
+        for module in imports:
+            if module.startswith("app."):
+                rel = str(file_path.relative_to(REPO_ROOT)).replace("\\", "/")
+                violations.append(Violation(
+                    rule="RC1",
+                    importer=rel,
+                    imported=module,
+                    detail="contracts/ 禁止依赖 app.*（executor/evolution 内部模块），契约层必须零业务依赖",
+                ))
+    return violations
+
+
+def _collect_evolution_files() -> list[Path]:
+    """递归收集 evolution/app/ 下所有 .py（排除 __pycache__）。"""
+    if not EVOLUTION_APP.exists():
+        return []
+    return sorted(
+        p for p in EVOLUTION_APP.rglob("*.py")
+        if "__pycache__" not in p.parts
+    )
+
+
+def scan_evolution() -> list[Violation]:
+    """扫描 evolution/app/，检查进化端的分层铁律。
+
+    RE1: evolution/app/core/ 不得 import 业务层（ingestion/diagnosis/improvement/view）。
+         core 是公共底座（db/llm/settings/models），必须零业务依赖——否则会造成循环依赖
+         （业务层依赖 core，core 又反过来依赖业务层）。
+
+    evolution 的 4 个业务层之间目前允许跨层依赖（流水线阶段间有天然的数据流向，
+    如 improvement 依赖 diagnosis 的结果）。后续如需更严格的层间隔离可追加规则。
+    """
+    violations: list[Violation] = []
+    for file_path in _collect_evolution_files():
+        # 判断是否在 core/ 下
+        try:
+            rel_to_app = file_path.relative_to(EVOLUTION_APP)
+        except ValueError:
+            continue
+        parts = rel_to_app.parts
+        if len(parts) < 2 or parts[0] != "core":
+            continue  # 只检查 core/ 下的文件
+
+        imports = _parse_file_imports(file_path)
+        rel = str(file_path.relative_to(REPO_ROOT)).replace("\\", "/")
+        for module in imports:
+            # app.X.Y... → 取 X（第一层）
+            segs = module.split(".")
+            if len(segs) < 2 or segs[0] != "app":
+                continue
+            top_layer = segs[1] if len(segs) > 1 else ""
+            if top_layer in EVOLUTION_BUSINESS_LAYERS:
+                violations.append(Violation(
+                    rule="RE1",
+                    importer=rel,
+                    imported=module,
+                    detail=f"evolution core/ 禁止依赖业务层 {top_layer}/（公共底座不得反向依赖业务）",
+                ))
+    return violations
 
 
 def _resolve_import_to_app_modules(node: ast.Import | ast.ImportFrom) -> list[str]:
@@ -155,7 +245,7 @@ def _check(
     """对单个文件应用 6 条铁律。
 
     Args:
-        importer_rel: 文件相对 backend/app/ 的真实路径（含 __init__.py）。
+        importer_rel: 文件相对 executor/app/ 的真实路径（含 __init__.py）。
         importer_dotted: 文件的 app.X.Y 模块路径（用于判定所在 domain）。
     """
     layer = _first_layer(importer_dotted)
@@ -308,7 +398,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="分层依赖 linter")
     parser.add_argument(
         "--update", action="store_true",
-        help="重新生成 baseline 文件（消除存量后用，会覆盖 backend/layering_baseline.txt）",
+        help="重新生成 baseline 文件（消除存量后用，会覆盖 executor/layering_baseline.txt）",
     )
     parser.add_argument(
         "--strict", action="store_true",
@@ -359,6 +449,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.strict and result.violations:
         print(f"\n❌ strict 模式：仍有 {len(result.violations)} 条存量违规未消除：", file=sys.stderr)
         for v in result.violations:
+            print(f"  {_format_violation(v)}", file=sys.stderr)
+        return 1
+
+    # ── contracts 契约层独立性检查（Phase 1）──
+    # contracts 不走 baseline：它是共享契约，任何 app.* 依赖都直接 fail。
+    contracts_violations = scan_contracts()
+    if contracts_violations:
+        print(f"\n❌ contracts/ 契约层发现 {len(contracts_violations)} 条违规：", file=sys.stderr)
+        for v in contracts_violations:
+            print(f"  {_format_violation(v)}", file=sys.stderr)
+        return 1
+
+    # ── evolution 进化端分层检查（Phase 2）──
+    # core/ 不得依赖业务层。evolution 不走 baseline（4层刚拆完，应零违规）。
+    evolution_violations = scan_evolution()
+    if evolution_violations:
+        print(f"\n❌ evolution/ core 层发现 {len(evolution_violations)} 条违规：", file=sys.stderr)
+        for v in evolution_violations:
             print(f"  {_format_violation(v)}", file=sys.stderr)
         return 1
 

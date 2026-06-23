@@ -1,21 +1,16 @@
-"""静态检查 + 契约测试（Phase 4 T4.3，D10）。
+"""静态检查 + surface 校验（Phase 6 surface 体系）。
 
-proposer 生成的任意 Python（D4）在进 A/B 前必须过这关。
-evolution（优化端）做纯静态分析（AST + 正则），实例化检查由 backend
-（执行端）的沙箱做（T4.2，沙箱在 backend 环境加载 harness 验证契约方法可调用）。
+proposer 生成的 surface content 在进 A/B 前必须过校验。
+evolution 做 AST 分析 + 正则扫描，按 surface_type 分发到 text/json/python 校验。
 
-evolution 侧静态检查内容：
-  - 语法检查（AST 解析）
-  - 结构检查：必须有 WriterHarness 子类
-  - C4 危险模式扫描（os.system/subprocess/eval/exec/socket 等——防越权）
-  - C5 危险硬编码扫描（无条件拒绝特定题材——防误伤）
-
-实例化检查（加载 harness.py 调 build 方法验证返回类型）在 backend 沙箱做，
-因为需要 backend 的基类环境（evolution 是独立 venv，不能 import backend）。
+校验内容（按 surface 层，contracts.surface_types）：
+  - A_TEXT（纯文本）：非空 + 长度上限（validate_text_surface）
+  - B_PARAM（JSON 参数）：合法 JSON 解析（validate_json_surface）
+  - C_CODE（受限 Python）：C4 危险模式 + C5 误伤 + C 类契约（validate_python_surface）
 
 返回 (passed: bool, errors: list[str])。
 
-设计依据：设计文档 D10 + 第三道闸风险分析。
+设计依据：设计文档 D10 + surface 三层分层 + 第三道闸风险分析。
 """
 from __future__ import annotations
 
@@ -42,52 +37,6 @@ _HARDCODED_REJECT_PATTERNS = [
     (r"if.*文艺.*:\s*return.*error", "禁止硬编码拒绝特定题材（会误伤文艺向）"),
     (r"if.*慢热.*:\s*return.*error", "禁止硬编码拒绝特定节奏（会误伤慢热向）"),
 ]
-
-
-def static_check(code: str) -> tuple[bool, list[str]]:
-    """对 proposer 生成的 harness 代码做静态检查 + 契约测试。
-
-    Args:
-        code: 完整的 harness.py 代码字符串
-
-    Returns:
-        (passed, errors)。passed=True 表示全过，errors 为失败原因列表。
-    """
-    errors: list[str] = []
-
-    # ── 语法检查（AST 解析）──
-    try:
-        tree = ast.parse(code)
-    except SyntaxError as exc:
-        return False, [f"语法错误: {exc}"]
-
-    # ── C4: 危险模式扫描（防越权）──
-    for pattern, msg in _DANGEROUS_PATTERNS:
-        if re.search(pattern, code):
-            errors.append(f"[C4 危险模式] {msg}")
-
-    # ── C5: 危险硬编码扫描（防误伤，D10 第三道闸核心）──
-    for pattern, msg in _HARDCODED_REJECT_PATTERNS:
-        if re.search(pattern, code):
-            errors.append(f"[C5 误伤风险] {msg}")
-
-    # ── 结构检查：必须有 WriterHarness 子类 ──
-    if not _has_writer_harness_subclass(tree):
-        errors.append("未定义 WriterHarness 子类")
-
-    return len(errors) == 0, errors
-
-
-def _has_writer_harness_subclass(tree: ast.Module) -> bool:
-    """AST 检查是否定义了 WriterHarness 的子类。"""
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ClassDef):
-            continue
-        for base in node.bases:
-            name = _get_name(base)
-            if name and "WriterHarness" in name:
-                return True
-    return False
 
 
 def _get_name(node: ast.expr) -> str | None:
@@ -230,4 +179,44 @@ def _check_c_middleware_contract(tree: ast.Module) -> list[str]:
             "state_schema 声明改了哪些 State channel）"
         )
     return errors
+
+
+# ── surface validator 注册表（surface_type → validator 函数）──────────────
+#
+# 替代原 surface_registry 里通过 SurfaceTypeDef.validator 字段的间接调用。
+# contracts.surface_types 只含类型定义（零依赖），validator 实现留 evolution。
+# pipeline/proposer 调 VALIDATOR_MAP[surface_type](content, config) 分发校验。
+
+from contracts import surface_types as _st
+
+VALIDATOR_MAP: dict[str, object] = {
+    # A 类（纯文本）→ validate_text_surface
+    **{
+        t: validate_text_surface
+        for t in (t for t in _st.REGISTRY if _st.get_layer(t) == _st.SurfaceLayer.A_TEXT)
+    },
+    # B 类（JSON）→ validate_json_surface
+    **{
+        t: validate_json_surface
+        for t in (t for t in _st.REGISTRY if _st.get_layer(t) == _st.SurfaceLayer.B_PARAM)
+    },
+    # C 类（受限 Python）→ validate_python_surface
+    **{
+        t: validate_python_surface
+        for t in (t for t in _st.REGISTRY if _st.get_layer(t) == _st.SurfaceLayer.C_CODE)
+    },
+}
+
+
+def validate_surface(surface_type: str, content: str, config: dict | None = None) -> tuple[bool, list[str]]:
+    """按 surface_type 分发到对应 validator。
+
+    替代旧路径 type_def.validator(content, config)。
+    未知 surface_type 抛 KeyError（contracts.get_type_def 会拦）。
+    """
+    # 先校验 type 合法（contracts 抛 KeyError）
+    _st.get_type_def(surface_type)
+    validator = VALIDATOR_MAP[surface_type]
+    return validator(content, config or {})  # type: ignore[operator]
+
 

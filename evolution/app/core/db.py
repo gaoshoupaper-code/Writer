@@ -269,29 +269,6 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_judge_cal_dim ON judge_calibration(layer, target, metric);
 
-            -- Phase 2 T2.4：harness 版本管理（D2 代码定义 + S8 文件系统+git）
-            -- ⚠️ DEPRECATED（Phase 6 T5.3，2026-06-23）：surface_versions + harness_manifests 取代。
-            -- 整体 harness 被 surface 体系（A/B/C 三类 bounded change）取代。
-            -- 本表保留只读（历史记录 + Phase 1-4 整体 harness 路径后备），不再写入新版本。
-            -- 一个 harness 版本 = 一个 WriterHarness 实现（代码文件）。
-            -- label 互斥（复用 prompt 模式）：production/latest/candidate 同一时刻只指向一个版本。
-            CREATE TABLE IF NOT EXISTS harness_versions (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                version         INTEGER NOT NULL,       -- 单调递增
-                code_path       TEXT NOT NULL,          -- 文件系统路径（harnesses/<id>/harness.py）
-                git_commit      TEXT,                   -- git commit hash（可空，未提交时）
-                parent_version  INTEGER,                -- 从哪个版本进化来（进化谱系）
-                source          TEXT NOT NULL DEFAULT 'initial',  -- initial / proposed / approved
-                labels          TEXT DEFAULT '',        -- 逗号分隔：production/latest/candidate
-                signature_id    INTEGER,                -- 针对哪个失败签名进化（proposed 时填）
-                proposer_meta   TEXT,                   -- JSON：proposer 模型/耗时/diff 摘要
-                status          TEXT NOT NULL DEFAULT 'draft',  -- draft/sandbox_validating/static_checked/ab_testing/approved/rejected
-                created_at      TEXT NOT NULL,
-                UNIQUE(version)
-            );
-            CREATE INDEX IF NOT EXISTS idx_harness_labels ON harness_versions(labels);
-            CREATE INDEX IF NOT EXISTS idx_harness_status ON harness_versions(status);
-
             -- Phase 3 T3.1：badcase 独立记录（D20 立即写表+延迟触发）
             -- 现状嵌在 evaluation_runs/evaluation_scores，抽出独立表便于聚合计数。
             CREATE TABLE IF NOT EXISTS badcase_records (
@@ -325,11 +302,13 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_signature_dim ON failure_signatures(layer, target, metric, status);
 
-            -- Phase 4 T4.4：harness A/B 实验（D6 N seed + S11 完整统计量）
-            CREATE TABLE IF NOT EXISTS harness_experiments (
+            -- A/B 实验记录（Phase 7：candidate_version 语义重定向为 harness_snapshots.version）
+            -- Phase 6 的 surface 级/manifest 级 A/B 已随旧表 DROP 清空历史（D10=b1）。
+            -- 新体系下 candidate_version = harness_snapshots.version（整包版本号）。
+            CREATE TABLE IF NOT EXISTS ab_experiments (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                candidate_version INTEGER NOT NULL,     -- harness_versions.version（候选）
-                prod_version      INTEGER,              -- 对比的 production 版本
+                candidate_version INTEGER NOT NULL,     -- 候选版本（Phase 7: harness_snapshots.version 整包版本号）
+                prod_version      INTEGER,              -- 对比的 production 版本（harness_snapshots.version）
                 signature_id      INTEGER,              -- 针对哪个签名
                 test_set_id       INTEGER,              -- 用了哪个测试集
                 seed_count        INTEGER NOT NULL,     -- N（D22 校准定）
@@ -347,54 +326,39 @@ def init_db() -> None:
                 created_at        TEXT NOT NULL,
                 finished_at       TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_exp_candidate ON harness_experiments(candidate_version);
+            CREATE INDEX IF NOT EXISTS idx_exp_candidate ON ab_experiments(candidate_version);
 
-            -- Phase 6（self-harness 对齐重构）：surface 统一版本表
-            -- 一个 (surface_type, surface_name, scope) = 一条"surface 线"，多个 version。
-            -- 替代 prompt_versions（A 类文本）+ 未来 B 类 JSON 参数 + C 类受限 Python。
-            -- label 废弃（决策 D5：manifest 统一接管），仅留 source/status 追踪。
-            -- UNIQUE 含 scope：同名 surface（如 ContextAssembler/permissions）在不同 scope
-            -- 是不同的线（参数不同），必须 scope 维度区分，否则跨 scope 冲突。
-            CREATE TABLE IF NOT EXISTS surface_versions (
-                id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                surface_type      TEXT NOT NULL,         -- prompt/skill/description/middleware_params/permissions/stateful_middleware（见 surface_registry）
-                surface_name      TEXT NOT NULL,         -- 具体名：writing_system / StorylineSingleLineLimit / GoalMiddleware / ...
-                scope             TEXT NOT NULL,         -- meta/storybuilding/detail-outline/writing/interview/global（归属 subagent）
-                version           INTEGER NOT NULL,      -- 同 (surface_type, surface_name, scope) 下单调递增
-                content           TEXT NOT NULL,         -- A 类=文本 / B 类=JSON / C 类=受限 Python（由 content_kind 决定）
-                content_kind      TEXT NOT NULL,         -- text / json / python（校验分发依据）
-                config            TEXT DEFAULT '{}',     -- 附属配置（如 model temperature，JSON）
-                commit_message    TEXT,                  -- 版本说明（proposer 改了啥）
-                source            TEXT NOT NULL DEFAULT 'manual',  -- manual/proposed/ab_winner/migrated
-                status            TEXT NOT NULL DEFAULT 'draft',   -- draft/static_checked/ab_testing/approved/rejected
-                parent_version    INTEGER,               -- 从哪个版本进化来（进化谱系）
-                signature_id      INTEGER,               -- 针对哪个失败签名（proposed 时填）
-                proposer_meta     TEXT,                  -- JSON：proposer 模型/diff 摘要
-                static_check_passed INTEGER,             -- 0/1/NULL（C 类必填，A/B 可 NULL）
-                created_at        TEXT NOT NULL,
-                UNIQUE(surface_type, surface_name, scope, version)
-            );
-            CREATE INDEX IF NOT EXISTS idx_sv_surface ON surface_versions(surface_type, surface_name);
-            CREATE INDEX IF NOT EXISTS idx_sv_scope ON surface_versions(scope);
-            CREATE INDEX IF NOT EXISTS idx_sv_status ON surface_versions(status);
+            -- Phase 7（harness 包化重构，决策 D10=b1）：
+            -- surface_versions / harness_manifests 已废弃（DROP，见 _drop_legacy_harness_tables）。
+            -- harness 定义从 DB 行变成 Agent 包目录（evolution/harnesses/current/），
+            -- 版本粒度从 surface 级变整包级（D6=①），快照存 harness_snapshots.tar_blob。
+            -- ab_experiments.candidate_version 语义从"surface_version/manifest_version"
+            -- 重定向为"harness_snapshots.version"（历史行随旧表 DROP 清空）。
 
-            -- Phase 6：harness manifest（部署快照）
-            -- 一份 manifest = 各 surface 当前 approved 版本的指针聚合。
-            -- manifest 是 approved 聚合产物（决策 D7），不是被编辑对象；同时刻只有一个 production。
-            CREATE TABLE IF NOT EXISTS harness_manifests (
-                id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                manifest_version  INTEGER NOT NULL,      -- 单调递增（部署版本号）
-                parent_version    INTEGER,               -- 上一版 manifest（进化谱系）
-                entries_json      TEXT NOT NULL,         -- {surfaces:[{surface_type,surface_name,scope,version}], schema_lock:{channels,c_surfaces}}
-                status            TEXT NOT NULL DEFAULT 'draft',  -- draft/production/retired（同时刻只一个 production）
-                change_summary    TEXT,                  -- 本版改了哪些 surface（相对 parent）
-                created_at        TEXT NOT NULL,
-                UNIQUE(manifest_version)
+            -- harness_snapshots：整包快照（替代 harness_manifests，D6=① 整包单版本）
+            -- 一份快照 = 某个版本的完整 Agent 包 tar（不可变）。
+            -- 同时刻只有一个 status='production'（发布时旧 production 降 retired）。
+            -- tar_blob 存整包 tar（prompts/middleware/subagents/skills/tools 全在里面）。
+            -- schema_lock 记 C 类 surface 名+版本（回放契约，C 类改 state_schema 要锁版本）。
+            CREATE TABLE IF NOT EXISTS harness_snapshots (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                version         INTEGER NOT NULL UNIQUE,        -- 整包版本号，单调递增（D6=①）
+                parent_version  INTEGER,                         -- 上一版快照（进化谱系）
+                tar_blob        BLOB NOT NULL,                   -- 整包 tar（不可变快照）
+                tar_size        INTEGER,                         -- 字节数（观测用）
+                schema_lock     TEXT NOT NULL,                   -- C 类 surface 名+版本 JSON（回放契约）
+                change_summary  TEXT,                            -- 相对 parent 改了哪些文件
+                status          TEXT NOT NULL DEFAULT 'production', -- production/retired（同时刻只一个 production）
+                created_at      TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_hm_status ON harness_manifests(status);
+            CREATE INDEX IF NOT EXISTS idx_hs_status ON harness_snapshots(status);
+            CREATE INDEX IF NOT EXISTS idx_hs_version ON harness_snapshots(version);
             """
         )
         conn.commit()
+
+        # Phase 7 幂等迁移：DROP 废弃的 surface_versions/harness_manifests（D10=b1）
+        _drop_legacy_harness_tables(conn)
 
         # 第二期幂等迁移：给已存在的 rules 表补候选规则字段
         _migrate_rules_columns(conn)
@@ -505,6 +469,34 @@ def _seed_agent_prompt_map(conn: sqlite3.Connection) -> None:
                VALUES (?, ?, ?)""",
             [(a, p, r) for a, p, r in _AGENT_PROMPT_SEED],
         )
+        conn.commit()
+
+
+def _drop_legacy_harness_tables(conn: sqlite3.Connection) -> None:
+    """幂等迁移：DROP 废弃的 surface_versions + harness_manifests（Phase 7，D10=b1）。
+
+    harness 定义从 DB 行变成 Agent 包目录（evolution/harnesses/current/）。
+    surface 级版本管理被整包级快照（harness_snapshots）取代。
+
+    连锁清理：ab_experiments 历史行清空（candidate_version 曾引用 surface_version/
+    manifest_version，旧表 DROP 后成悬空指针）。新体系下 candidate_version 指向
+    harness_snapshots.version。用户已接受丢失历史 A/B 数据（D10=b1）。
+
+    幂等：DROP TABLE IF EXISTS 重复执行不报错。
+    """
+    existing = {row[1] for row in conn.execute(
+        "SELECT * FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    legacy = {"surface_versions", "harness_manifests"}
+    if not (legacy & existing):
+        return  # 已迁移过（两表都不存在）
+    with _lock:
+        # ab_experiments 历史行先清（candidate_version 引用将失效）
+        if "ab_experiments" in existing:
+            conn.execute("DELETE FROM ab_experiments")
+        for table in sorted(legacy & existing):
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+            logger.info("DROP 废弃表: %s（Phase 7 harness 包化重构）", table)
         conn.commit()
 
 

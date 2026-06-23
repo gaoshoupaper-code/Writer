@@ -46,22 +46,15 @@ class Settings(BaseSettings):
     # evolution 不可用时降级读缓存。默认 executor/.prompt_cache。
     prompt_cache_dir: str = ".prompt_cache"
 
-    # ── Self-Harness Phase 1（T1.3）───────────────────────────
-    # 是否走 harness 装配路径（契约化 harness 驱动装配）。
-    # 默认 False（走旧 _agent_for_workspace 直接装配，保证现有行为不变）。
-    # T1.4 等价性验证通过后可手动打开。
-    writer_use_harness: bool = False
-
-    # ── Self-Harness Phase 6（surface 体系，T5.1）──────────────
-    # 是否走 manifest 装配路径（surface 体系，经 evolution 拉 manifest 装配）。
-    # 优先级：writer_use_manifest > writer_use_harness > 旧直接装配。
-    # 默认 False。打开前需：① evolution 已 migrate_to_surface 生成首版 manifest；
-    # ② worker 启动时能拉到 manifest。打开后走 _assemble_via_manifest。
-    writer_use_manifest: bool = False
-
     # manifest loader 本地缓存目录（Phase 6 T4.1）：evolution 不可用时降级读缓存。
     # 默认 executor/.manifest_cache。
     manifest_cache_dir: str = ".manifest_cache"
+
+    # Agent 包目录路径（Phase 7 包化重构，D8=X 生产路径）。
+    # 执行端同进程 import 此目录作为 Python package，调 assemble(ctx) 装配 agent。
+    # 默认指向 evolution/harnesses/current/（同机部署，真理源在 evolution）。
+    # 相对路径基于项目根 Writer/。
+    harness_package_path: str = "evolution/harnesses/current"
 
     model_config = SettingsConfigDict(
         env_file=".env",

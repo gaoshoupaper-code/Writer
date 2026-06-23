@@ -40,6 +40,25 @@ logger = logging.getLogger("writer.manifest_loader")
 
 
 @dataclass
+class AssembleContext:
+    """请求级装配上下文（manifest 装配用，替代原 HarnessContext）。
+
+    每次装配传入新 ctx，含装配 agent 所需的全部请求级信息：
+    workspace/trace/owner/style。
+    """
+
+    workspace_path: Path
+    trace_id: str | None = None
+    owner_id: str | None = None
+    workspace_id: str | None = None
+    # 风格相关（meta 风格 + 各 subagent 风格 suffix）
+    meta_style: str | None = None
+    storybuilding_style: str | None = None
+    detail_outline_style: str | None = None
+    writing_style: str | None = None
+
+
+@dataclass
 class AssembledSubagent:
     """单个子代理的装配意图（执行端读它装配）。"""
 

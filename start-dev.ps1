@@ -1,32 +1,32 @@
 $ErrorActionPreference = "Stop"
 
 $rootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$backendDir = Join-Path $rootDir "backend"
+$executorDir = Join-Path $rootDir "executor"
 $frontendDir = Join-Path $rootDir "frontend"
-$backendPython = Join-Path $backendDir ".venv\Scripts\python.exe"
-$backendActivate = Join-Path $backendDir ".venv\Scripts\Activate.ps1"
-$backendEntry = Join-Path $backendDir "app\main.py"
+$executorPython = Join-Path $executorDir ".venv\Scripts\python.exe"
+$executorActivate = Join-Path $executorDir ".venv\Scripts\Activate.ps1"
+$executorEntry = Join-Path $executorDir "app\main.py"
 $frontendPackage = Join-Path $frontendDir "package.json"
 
-if (-not (Test-Path -LiteralPath $backendEntry)) {
-    throw "Backend entry file not found: $backendEntry"
+if (-not (Test-Path -LiteralPath $executorEntry)) {
+    throw "Executor entry file not found: $executorEntry"
 }
 
 if (-not (Test-Path -LiteralPath $frontendPackage)) {
     throw "Frontend package.json not found: $frontendPackage"
 }
 
-if (-not (Test-Path -LiteralPath $backendPython)) {
-    throw "Backend virtualenv python not found: $backendPython"
+if (-not (Test-Path -LiteralPath $executorPython)) {
+    throw "Executor virtualenv python not found: $executorPython"
 }
 
-if (-not (Test-Path -LiteralPath $backendActivate)) {
-    throw "Backend virtualenv activation script not found: $backendActivate"
+if (-not (Test-Path -LiteralPath $executorActivate)) {
+    throw "Executor virtualenv activation script not found: $executorActivate"
 }
 
-$backendCommand = @"
-Set-Location -LiteralPath '$backendDir'
-& '$backendActivate'
+$executorCommand = @"
+Set-Location -LiteralPath '$executorDir'
+& '$executorActivate'
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 7788
 "@
 
@@ -38,8 +38,8 @@ npm.cmd run dev
 Start-Process powershell.exe -ArgumentList @(
     "-NoExit",
     "-ExecutionPolicy", "Bypass",
-    "-Command", $backendCommand
-) -WorkingDirectory $backendDir -WindowStyle Normal
+    "-Command", $executorCommand
+) -WorkingDirectory $executorDir -WindowStyle Normal
 
 Start-Process powershell.exe -ArgumentList @(
     "-NoExit",
@@ -47,6 +47,6 @@ Start-Process powershell.exe -ArgumentList @(
     "-Command", $frontendCommand
 ) -WorkingDirectory $frontendDir -WindowStyle Normal
 
-Write-Host "Writer backend is starting at http://127.0.0.1:7788"
+Write-Host "Writer executor is starting at http://127.0.0.1:7788"
 Write-Host "Writer frontend is starting at http://127.0.0.1:3000"
 

@@ -198,25 +198,26 @@ def prompt_refreshed(notice: PromptRefreshNotice) -> dict[str, str]:
     return {"status": "ok", "name": notice.name, "label": notice.label}
 
 
-@router.post("/manifest/refreshed")
-def manifest_refreshed(body: "ManifestRefreshNotice") -> dict[str, Any]:
-    """evolution 通知执行端「有新 production manifest 发布」（Phase 6 T4.5）。
+@router.post("/snapshot/refreshed")
+def snapshot_refreshed(body: "SnapshotRefreshNotice") -> dict[str, Any]:
+    """evolution 通知执行端「有新 production 快照发布」（Phase 7 T5.4）。
 
-    evolution 发布新 production manifest 后（manifest_publisher.notify_executor），
-    发此通知。执行端标记 manifest 缓存 stale，下次 assemble 时重拉 evolution。
+    evolution 发布新快照后（snapshot_publisher.notify_executor），发此通知。
 
-    只带 manifest_version 标识，不带内容——内容仍由执行端主动拉取。
-    幂等：重复通知无害（mark_stale 是布尔标记）。
+    Phase 7 语义：执行端的 Agent 包是进程级缓存（package_loader._loaded_package），
+    换版本需重启进程（D11 设计）。本端点只记录日志——真正生效靠下次进程重启
+    重新 load_current_package 加载新包内容。
 
-    替代 /prompts/refreshed 在 manifest 体系下的职责（决策 D5：manifest 统一接管）。
+    幂等：重复通知无害（仅记日志）。
+    替代 Phase 6 的 /manifest/refreshed（包化取代 manifest 指针）。
     """
-    from app.platform.harness.manifest_loader import get_loader
-    get_loader().mark_stale()
-    logger.info("manifest v%s 标记 stale，下次 assemble 时重拉", body.manifest_version)
-    return {"status": "ok", "manifest_version": body.manifest_version}
+    from app.platform.harness.package_loader import reset_cache
+    reset_cache()  # 清缓存，下次 load_current_package 重新加载（同进程内热更新）
+    logger.info("快照 v%s 通知：包缓存已清，下次 load 重载", body.snapshot_version)
+    return {"status": "ok", "snapshot_version": body.snapshot_version}
 
 
-class ManifestRefreshNotice(BaseModel):
-    """manifest 变更通知 body（evolution → 执行端）。"""
+class SnapshotRefreshNotice(BaseModel):
+    """快照变更通知 body（evolution → 执行端，Phase 7）。"""
 
-    manifest_version: int
+    snapshot_version: int

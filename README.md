@@ -4,8 +4,17 @@ Minimal runnable skeleton for a screenplay generation agent.
 
 ## Architecture
 
-- `backend/`: FastAPI API with a DeepAgents-powered screenplay service
+- `executor/`: FastAPI API with a DeepAgents-powered screenplay service（执行端）
+- `evolution/`: trace 摄入、查询、进化流水线（进化端，surface 体系 + manifest 发布）
+- `contracts/`: 执行端与进化端共享的类型契约（trace schema + 跨端 API + surface 类型 + manifest wire-format），零业务依赖
 - `frontend/`: Next.js writing workspace for collecting inputs and displaying output
+
+### 执行端 ↔ 进化端装配链路（surface 体系）
+
+执行端装配 agent 不再硬编码，而是从进化端拉取 production manifest（各 surface 当前
+approved 版本的指针聚合），按 manifest 装配。manifest 唯一路径（无降级后备），
+evolution 服务不可用时执行端报错。surface 类型契约（A/B/C 三层）+ manifest wire-format
+定义在共享包 `contracts/`，两端 import，确保数据形状一致。
 
 ### 分层依赖铁律（重构护栏）
 
@@ -23,21 +32,21 @@ python scripts/check_layering.py          # baseline 模式：只拦新增违规
 python scripts/check_layering.py --strict # 严格模式：存量违规也 fail（重构完成后用）
 ```
 
-存量违规登记在 `backend/layering_baseline.txt`（当前 6 条：1 条 core→writer + 5 条 image→writer）。每消除一条就从 baseline 删一行，或重跑 `python scripts/check_layering.py --update`。CI（`.github/workflows/layering.yml`）在 PR 时自动跑此检查。
+存量违规登记在 `executor/layering_baseline.txt`（当前 6 条：1 条 core→writer + 5 条 image→writer）。每消除一条就从 baseline 删一行，或重跑 `python scripts/check_layering.py --update`。CI（`.github/workflows/layering.yml`）在 PR 时自动跑此检查。
 
 ## Why this shape
 
 This first version optimizes for a fast feedback loop.
-The backend already uses the Agent boundary we will keep long term, while the frontend is a small but real workspace instead of a disposable demo page.
+The executor already uses the Agent boundary we will keep long term, while the frontend is a small but real workspace instead of a disposable demo page.
 
 The main trade-off is that the first API only supports one workflow: generate a logline, synopsis, and five beats from a premise.
 That is intentional because it keeps the data contract stable while we validate the product loop.
 
-## Run the backend
+## Run the executor（执行端）
 
-1. Create a virtual environment in `backend/`.
-2. Install dependencies from `backend/pyproject.toml`.
-3. Copy `backend/.env.example` to `backend/.env`.
+1. Create a virtual environment in `executor/`.
+2. Install dependencies from `executor/pyproject.toml`.
+3. Copy `executor/.env.example` to `executor/.env`.
 4. Start with `WRITER_AGENT_MODE=mock` so the app runs before you add model keys.
 5. Run:
 
@@ -45,7 +54,7 @@ That is intentional because it keeps the data contract stable while we validate 
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 7788
 ```
 
-Backend URL: `http://127.0.0.1:7788`
+Executor URL: `http://127.0.0.1:7788`
 
 ## Run the frontend
 
@@ -68,12 +77,12 @@ From the repo root, run:
 ```
 
 This opens two terminal windows:
-- backend: `uvicorn` on `http://127.0.0.1:7788`
+- executor: `uvicorn` on `http://127.0.0.1:7788`
 - frontend: `next dev` on `http://127.0.0.1:3000`
 
 ## Switch to a live model
 
-Set these values in `backend/.env`:
+Set these values in `executor/.env`:
 
 ```env
 OPENAI_API_KEY=your_key

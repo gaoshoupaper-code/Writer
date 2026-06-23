@@ -1,0 +1,16 @@
+[project]
+name = "writer-contracts"
+version = "0.1.0"
+description = "Writer 执行端(executor)与进化端(evolution)共享的契约层：trace 数据 schema + 跨端 API 模型。零业务依赖，两端各自 import。"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.6.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+# 只打包 contracts/ 顶层包，不误纳 executor/evolution/frontend
+include = ["contracts*"]
