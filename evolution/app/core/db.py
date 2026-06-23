@@ -157,6 +157,9 @@ def init_db() -> None:
             );
 
             -- prompts：prompt 线（Phase 4 T9，langfuse 式版本管理）
+            -- ⚠️ DEPRECATED（Phase 6 T5.3，2026-06-23）：surface_versions 表取代。
+            -- prompt 现为 surface_type='prompt'，由 harness_manifests 统一接管（决策 D5）。
+            -- 本表保留只读（历史记录），不再写入。迁移见 migrate_to_surface.py。
             -- 一个 name 对应一条 prompt，多个 version。
             CREATE TABLE IF NOT EXISTS prompts (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -267,6 +270,9 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_judge_cal_dim ON judge_calibration(layer, target, metric);
 
             -- Phase 2 T2.4：harness 版本管理（D2 代码定义 + S8 文件系统+git）
+            -- ⚠️ DEPRECATED（Phase 6 T5.3，2026-06-23）：surface_versions + harness_manifests 取代。
+            -- 整体 harness 被 surface 体系（A/B/C 三类 bounded change）取代。
+            -- 本表保留只读（历史记录 + Phase 1-4 整体 harness 路径后备），不再写入新版本。
             -- 一个 harness 版本 = 一个 WriterHarness 实现（代码文件）。
             -- label 互斥（复用 prompt 模式）：production/latest/candidate 同一时刻只指向一个版本。
             CREATE TABLE IF NOT EXISTS harness_versions (

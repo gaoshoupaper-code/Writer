@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 
 from pathlib import Path
@@ -51,6 +52,8 @@ PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 META_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 
 # SSE 心跳间隔已收敛到 platform.streaming.DEFAULT_HEARTBEAT_INTERVAL（PR-07a）。
+
+logger = logging.getLogger("writer.meta_agent")
 
 
 class MetaAgentService(BaseAgentService):
