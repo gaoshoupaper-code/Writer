@@ -15,6 +15,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, BackgroundTasks
 from pydantic import BaseModel
 
+import app.core.db as db
 from app.ingestion import importer
 from app.core.settings import settings
 
@@ -33,11 +34,16 @@ class NotifyBody(BaseModel):
     # Phase 3：trace_path 字段已废弃（解耦后 evolution 不读文件）。
     # 执行端 T3.4 后不再发送；收到时忽略，不影响摄入。
     trace_path: str = ""
-    status: Literal["completed", "failed", "cancelled"] = "completed"
+    # HITL：状态变迁即推送（awaiting_input / running / 终态）。
+    # running 是 resume 后的状态变迁（awaiting_input→running），也需摄入同步。
+    status: Literal["running", "awaiting_input", "completed", "failed", "cancelled"] = "completed"
 
 
-def _fetch_trace_content(trace_id: str) -> tuple[list, str | None] | None:
+def _fetch_trace_content(trace_id: str, since_seq: int = 0) -> tuple[list, str | None] | None:
     """从执行端 HTTP 拉取 trace 内容（run 摘要 + 事件列表）。
+
+    since_seq（D8 增量）：只拉 sequence > since_seq 的事件。首次摄入传 0（全量）。
+    执行端 GET /internal/traces/{trace_id}?since_seq=N 支持。
 
     Returns:
         (events, workspace_id_hint) 或 None（拉取失败/未找到）。
@@ -46,8 +52,9 @@ def _fetch_trace_content(trace_id: str) -> tuple[list, str | None] | None:
     from contracts.trace import TraceLogEvent
 
     url = f"{settings.executor_url}/internal/traces/{trace_id}"
+    params = {"since_seq": since_seq} if since_seq > 0 else None
     try:
-        resp = httpx.get(url, timeout=_FETCH_TIMEOUT)
+        resp = httpx.get(url, timeout=_FETCH_TIMEOUT, params=params)
         if resp.status_code == 404:
             logger.warning("拉取 trace %s：执行端索引未命中（可能进程重启）", trace_id)
             return None
@@ -57,60 +64,133 @@ def _fetch_trace_content(trace_id: str) -> tuple[list, str | None] | None:
         workspace_hint = data.get("run", {}).get("workspace_id")
         return events, workspace_hint
     except Exception as exc:
-        logger.warning("拉取 trace %s 失败：%s", trace_id, exc)
+        logger.warning("拉取 trace %s 失败：%s", exc)
         return None
+
+
+def _load_prior_events(trace_id: str) -> tuple[list, int]:
+    """读取本地已入库的事件（增量合并用，D8）+ 当前高水位。
+
+    Returns:
+        (prior_events, ingested_seq)。trace 不在库时返回 ([], 0)。
+    """
+    import json
+    from contracts.trace import TraceLogEvent
+
+    row = db.query_one("SELECT ingested_seq FROM runs WHERE trace_id = ?", (trace_id,))
+    if row is None:
+        return [], 0
+    seq = row["ingested_seq"] or 0
+    if seq == 0:
+        return [], 0
+    rows = db.query_all(
+        "SELECT payload_json FROM event_payloads WHERE trace_id = ? ORDER BY sequence",
+        (trace_id,),
+    )
+    prior = [TraceLogEvent.model_validate(json.loads(r["payload_json"])) for r in rows]
+    return prior, seq
 
 
 async def _ingest_async(trace_id: str) -> None:
     """在线程池中拉取 trace 内容并摄入（HTTP + 投影 + 写库，避免阻塞事件循环）。
 
+    增量摄入（D8）：读本地高水位 ingested_seq → 只拉增量事件 → 合并旧事件全量投影。
     摄入完成后：
-    - 旧 LLM-judge（执行层泛维度评估）：仅异常 trace 触发（向后兼容）
-    - 新双层评估（网文专业领域评估）：全量触发，但 run_purpose=optimization 的
-      trace 跳过（防自指断路：优化回放的产出不进评估池，复用 recorder D12 预留）
+    - 旧 LLM-judge：已解除（不再对单条 trace 实时评估）
+    - 新双层评估：仅终态触发（completed/cancelled/failed），awaiting_input/running 跳过
     """
-    fetched = await asyncio.to_thread(_fetch_trace_content, trace_id)
+    prior_events, since_seq = await asyncio.to_thread(_load_prior_events, trace_id)
+    fetched = await asyncio.to_thread(_fetch_trace_content, trace_id, since_seq)
     if fetched is None:
         return
     events, workspace_hint = fetched
-    tid = await asyncio.to_thread(importer.ingest_events, events, workspace_hint)
+    # 增量场景：本次无新事件（since_seq 已是最新）。
+    # 仍可能是状态变迁通知（如 awaiting_input→running，resume 不产生事件只改 index），
+    # 故不直接 return：用执行端 run 摘要的 status 覆盖本地，保持状态最终一致。
+    if since_seq > 0 and not events:
+        await asyncio.to_thread(_sync_status_only, trace_id)
+        return
+    tid = await asyncio.to_thread(importer.ingest_events, events, workspace_hint, None, prior_events)
     if tid is None:
         return
-    # 旧 LLM-judge：仅异常 trace（向后兼容，执行层评估仍有价值）
-    await asyncio.to_thread(_maybe_judge, tid)
-    # 新双层评估：全量触发（防自指断路：optimization trace 跳过）
-    await asyncio.to_thread(_maybe_evaluate, tid, events)
+    # 旧 LLM-judge 已解除（不再触发）
+    # 新双层评估：仅终态触发（awaiting_input/running 不评估，防半成品污染）
+    await asyncio.to_thread(_maybe_evaluate, tid, events, prior_events)
+
+
+def _sync_status_only(trace_id: str) -> None:
+    """无新事件时的状态同步：从执行端拉 run 摘要，覆盖本地 runs.status。
+
+    典型场景：HITL resume（awaiting_input→running）不写 trace 事件，只改 index
+    status。此时增量拉取无新事件，但本地 status 仍需同步，否则进化端永远停在旧状态。
+    拉取失败静默（下次 scan/notify 会补）。
+    """
+    import httpx
+    url = f"{settings.executor_url}/internal/traces/{trace_id}"
+    try:
+        resp = httpx.get(url, timeout=_FETCH_TIMEOUT)
+        resp.raise_for_status()
+        run = resp.json().get("run", {})
+    except Exception as exc:
+        logger.warning("状态同步拉取 %s 失败：%s", trace_id, exc)
+        return
+    status = run.get("status")
+    if not status:
+        return
+    db.execute(
+        "UPDATE runs SET status = ?, event_count = ? WHERE trace_id = ?",
+        (status, run.get("event_count"), trace_id),
+    )
 
 
 def _maybe_judge(trace_id: str) -> None:
-    """若 LLM 启用且 trace 异常，触发旧 LLM-judge（执行层评估）。失败静默。"""
-    try:
-        from app.diagnosis.judge import is_anomalous, judge_trace
-        from app.core.llm import judge_enabled
-        if not judge_enabled() or not is_anomalous(trace_id):
-            return
-        judge_trace(trace_id)
-    except Exception:
-        logger.exception("LLM-judge 触发失败 %s", trace_id)
+    """[已解除] 旧 LLM-judge（执行层评估）。
+
+    HITL 改造（需求决策）：不再对单条 trace 实时触发旧 judge。此函数保留为空壳，
+    避免其他调用点报错；调用链已在 _ingest_async 移除。双层评估（_maybe_evaluate）
+    仍是活跃的评估入口。
+    """
+    return
 
 
-def _maybe_evaluate(trace_id: str, events: list[Any]) -> None:
-    """全量触发双层评估（T1.5）。
+def _maybe_evaluate(trace_id: str, events: list[Any], prior_events: list[Any] | None = None) -> None:
+    """触发双层评估（仅终态）。
 
-    防自指断路（D12）：从 run_start 事件取 run_purpose，
-    optimization 的 trace 跳过评估（不进评估池，避免优化回放自评形成正反馈）。
+    HITL 改造：awaiting_input 是中间态，不评估（防半成品污染评估池）。只有终态
+    （completed/cancelled/failed）才触发。
+    防自指断路（D12）：optimization trace 跳过。
+    合并 prior_events 一起判断（run_start 可能在旧事件里）。
     """
     try:
         from app.diagnosis.evaluation import evaluate_trace
         from app.core.llm import judge_enabled
         if not judge_enabled():
             return
-        if _is_optimization_trace(events):
+        # 合并事件判断终态 + run_purpose
+        merged = list(events) + (prior_events or [])
+        if _is_awaiting(merged):
+            logger.info("双层评估跳过 %s：awaiting_input 中间态", trace_id)
+            return
+        if not _is_terminal(merged):
+            logger.info("双层评估跳过 %s：非终态", trace_id)
+            return
+        if _is_optimization_trace(merged):
             logger.info("双层评估跳过 %s：optimization trace（防自指断路）", trace_id)
             return
         evaluate_trace(trace_id)
     except Exception:
         logger.exception("双层评估触发失败 %s", trace_id)
+
+
+def _is_awaiting(events: list[Any]) -> bool:
+    """最后一条状态事件是否为 run_awaiting（当前处于 awaiting_input）。"""
+    last = next((e for e in reversed(events) if e.type in ("run_awaiting", "run_end", "run_error", "run_cancelled")), None)
+    return last is not None and last.type == "run_awaiting"
+
+
+def _is_terminal(events: list[Any]) -> bool:
+    """trace 是否已到终态（有 run_end/run_error/run_cancelled）。"""
+    return any(e.type in ("run_end", "run_error", "run_cancelled") for e in events)
 
 
 def _is_optimization_trace(events: list[Any]) -> bool:

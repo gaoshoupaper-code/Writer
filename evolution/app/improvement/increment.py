@@ -67,7 +67,12 @@ def reconstruct_full_input(
         # 找到链的起点（range 为空 = 全量起点）。
         if not base_input_found:
             if event_range is None:
-                collected_messages = extract_messages(event_input)
+                # ⚠️ 必须拷贝：extract_messages 返回的是 event_input["messages"]
+                # 的原始 list 引用。若直接赋值，下面 collected_messages.extend(...) 会
+                # 把后续增量尾部追加进起点事件的 input.messages，污染源 events。
+                # 进化端详情视图会对同一条 trace 连续为每个 llm_start 调用本函数，
+                # 每次都污染起点 → 起点列表雪球式增长 → MemoryError。
+                collected_messages = list(extract_messages(event_input))
                 base_input_found = True
             continue
 

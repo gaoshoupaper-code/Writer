@@ -146,11 +146,17 @@ async def ab_replay(req: ABReplayRequest) -> ABReplayResponse:
     response_model=TraceContentResponse,
     responses={404: {"description": "trace_id 未找到（索引丢失或 trace 不存在）"}},
 )
-def get_trace_content(trace_id: str) -> TraceContentResponse:
+def get_trace_content(
+    trace_id: str,
+    since_seq: int = Query(0, description="只返回 sequence > since_seq 的事件（增量拉取，D8）"),
+) -> TraceContentResponse:
     """拉取 trace 完整内容（run 摘要 + 事件列表）。
 
     evolution 收到 trace 完成通知后调此端点，替代旧的「传文件路径让 evolution
     读文件」的耦合方式。依赖 recorder 的 _trace_workspace 索引定位 workspace。
+
+    since_seq（D8 增量）：只返回 sequence > since_seq 的事件。run 摘要始终全量返回
+    （含最新 status/event_count），evolution 据此更新 runs 表。0 = 全量事件。
 
     404 场景：trace_id 不在索引中（进程重启导致索引丢失），evolution 应靠
     scan 兜底（GET /internal/traces）补拉。
@@ -159,7 +165,7 @@ def get_trace_content(trace_id: str) -> TraceContentResponse:
     run = recorder.find_run_by_trace_id(trace_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"trace_id not found: {trace_id}")
-    events = recorder.read_trace_events(trace_id)
+    events = recorder.read_trace_events(trace_id, since_seq=since_seq)
     if events is None:
         raise HTTPException(status_code=404, detail=f"trace file missing: {trace_id}")
     return TraceContentResponse(run=run, events=events)

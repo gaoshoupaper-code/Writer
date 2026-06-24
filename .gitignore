@@ -52,7 +52,7 @@ langfuse/
 
 # evolution 服务：只入源码，不入运行产物
 evolution/.env
-evolution/*.db
-evolution/*.db.bak
+evolution/**/*.db
+evolution/**/*.db.bak
 evolution/start.log
 evolution/.pytest_cache/

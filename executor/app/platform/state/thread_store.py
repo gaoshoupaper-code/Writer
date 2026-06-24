@@ -120,6 +120,7 @@ class ThreadStore:
         return self._to_thread_summary(row, owner_id)
 
     # ── bootstrap（元数据 + 产物聚合，产物部分委托 artifacts）──
+    def bootstrap_workspace(self, owner_id: str, workspace_id: str) -> dict | None:
         """一次返回 workspace 元数据 + 全部产物。
 
         元数据（workspace + threads）由本类查询，产物读取委托给 artifacts。

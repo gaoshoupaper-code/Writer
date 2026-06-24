@@ -13,12 +13,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-TraceStatus = Literal["running", "completed", "failed"]
+TraceStatus = Literal["running", "awaiting_input", "completed", "failed", "cancelled"]
 TraceEventType = Literal[
     "run_start",
     "run_end",
     "run_error",
     "run_meta",
+    "run_awaiting",
+    "run_cancelled",
     "llm_start",
     "llm_end",
     "llm_error",

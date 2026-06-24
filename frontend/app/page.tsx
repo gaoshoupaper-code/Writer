@@ -1042,6 +1042,19 @@ export default function Home() {
   }
 
   function handleStopGeneration() {
+    // D6 停止信号：先发显式 POST /stop（fire-and-forget），再 abort SSE。
+    // 后端据 _user_stop_requested 标记区分"用户主动停止"vs"连接断开"，
+    // 两者都收尾成 cancelled，仅 error 文案来源不同。
+    if (activeThreadId && liveTraceId) {
+      apiFetch(`${API_BASE_URL}/api/screenplay/stop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ thread_id: activeThreadId, trace_id: liveTraceId }),
+        credentials: "include",
+      }).catch(() => {
+        /* fire-and-forget：失败不影响 abort（连接断会走 client_disconnect 收尾）*/
+      });
+    }
     abortControllerRef.current?.abort();
   }
 

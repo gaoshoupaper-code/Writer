@@ -145,11 +145,22 @@ def _reconstruct_incremental_inputs(events: list[TraceLogEvent]) -> list[TraceLo
 
     # 重建需要 dict 形态（increment.reconstruct_full_input 操作 dict）。
     events_raw = [e.model_dump() for e in events]
+    # ⚠️ 必须「先算后写」：reconstruct_full_input 遍历 events_raw 时会读取每条
+    # llm_start 的 input（增量尾部）。若边算边把重建出的「完整 input」写回
+    # events_raw，后续事件的重建就会读到前序已被膨胀成完整 input 的事件，并把它
+    # 当作增量尾部再次累加 → collected_messages 指数级膨胀，几个增量事件就能
+    # 把内存撑爆（MemoryError → Internal Server Error）。
+    # 因此先把所有重建结果算到独立映射，循环结束后再统一写回，保证遍历期间
+    # events_raw 始终是原始增量 input。
+    reconstructed: dict[str, Any] = {}
     for event_raw in events_raw:
         if event_raw.get("type") != "llm_start":
             continue
         if event_raw.get("input_context_range") is None:
             continue  # 全量，无需重建
-        full_input = reconstruct_full_input(events_raw, event_raw)
-        event_raw["input"] = full_input
+        reconstructed[event_raw["event_id"]] = reconstruct_full_input(events_raw, event_raw)
+    for event_raw in events_raw:
+        full_input = reconstructed.get(event_raw["event_id"])
+        if full_input is not None:
+            event_raw["input"] = full_input
     return [TraceLogEvent.model_validate(e) for e in events_raw]

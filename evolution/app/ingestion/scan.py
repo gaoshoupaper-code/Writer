@@ -43,8 +43,11 @@ async def _scan_loop() -> None:
 def _scan_once() -> int:
     """扫描一次，返回本次补摄入的数量。
 
-    调执行端 GET /internal/traces 拿近期 trace 清单，
-    对 runs 表里没有的 trace_id 逐个拉取内容并摄入。
+    庚方案（D9）：调执行端 GET /internal/traces 拿近期 trace 清单（带 status），
+    逐条对比 evolution runs 表的 status：
+    - evolution 没有 → 新 trace，拉取摄入
+    - status 不一致 → 状态变迁（如 awaiting_input→completed），重拉摄入
+    - status 一致 → 跳过
     """
     import httpx
 
@@ -61,18 +64,24 @@ def _scan_once() -> int:
     if not recent_traces:
         return 0
 
-    # 已摄入的 trace_id 集合
-    ingested = {r["trace_id"] for r in db.query_all("SELECT trace_id FROM runs")}
+    # 已摄入的 trace_id → status 映射（用于变迁检测）
+    ingested_rows = db.query_all("SELECT trace_id, status FROM runs")
+    ingested_status = {r["trace_id"]: r["status"] for r in ingested_rows}
     count = 0
     for item in recent_traces:
         trace_id = item.get("trace_id", "")
-        if not trace_id or trace_id in ingested:
+        if not trace_id:
             continue
-        # 复用 ingestion 的 HTTP 拉取 + 摄入逻辑
+        executor_status = item.get("status", "")
+        local_status = ingested_status.get(trace_id)
+        # 跳过条件：已摄入且 status 一致（无变迁）
+        if local_status is not None and local_status == executor_status:
+            continue
+        # 新 trace 或 status 变迁 → 拉取摄入
         tid = _fetch_and_ingest(trace_id, item.get("workspace_id"))
         if tid:
             count += 1
-            logger.info("兜底摄入: %s", tid)
+            logger.info("兜底摄入: %s (变更: %s→%s)", tid, local_status, executor_status)
             _maybe_judge_scan(tid)
     return count
 

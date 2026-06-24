@@ -8,9 +8,24 @@
 
 from __future__ import annotations
 
+import logging
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+
+# Windows 控制台默认用 GBK（代码页 936）解码，Python 日志输出 UTF-8 中文会乱码。
+# 强制 stderr 流用 UTF-8，根治中文日志乱码（root logger + uvicorn logger 都受益）。
+try:
+    sys.stderr.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, Exception):
+    pass  # 某些环境（重定向到文件）无 reconfigure，忽略
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:     %(message)s",
+)
 
 from app.core import db
 from app.core.settings import settings
