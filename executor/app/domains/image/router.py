@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -114,6 +115,8 @@ async def _image_event_generator(payload: ImageGenerateRequest, thread, *, owner
 
         if result.pending_interrupt is not None:
             iv = result.pending_interrupt
+            # HITL：标记 awaiting_input（D1，与 writing domain 一致）
+            trace_recorder.await_input_run(thread, trace.trace_id)
             payload_dict = iv if isinstance(iv, dict) else {"question": str(iv)}
             if "kind" not in payload_dict:
                 payload_dict["kind"] = "choice"
@@ -131,6 +134,15 @@ async def _image_event_generator(payload: ImageGenerateRequest, thread, *, owner
                         break
             yield _sse("final", {"content": content, "thread_id": thread.thread_id})
         trace_recorder.complete_run(thread, trace.trace_id)
+    except asyncio.CancelledError:
+        # D4/D5/D6：CancelledError 三路分流（与 writing domain 一致）
+        if trace_recorder.is_user_stop_requested(trace.trace_id):
+            trace_recorder.cancel_run(thread, trace.trace_id, reason="user_stop")
+        elif trace_recorder.is_awaiting_input(trace.trace_id):
+            pass  # interrupt 期间断连：保持 awaiting_input
+        else:
+            trace_recorder.cancel_run(thread, trace.trace_id, reason="client_disconnect")
+        raise
     except BaseException as exc:
         trace_recorder.fail_run(thread, trace.trace_id, exc)
         yield _sse("error", {"error": str(exc)[:500]})

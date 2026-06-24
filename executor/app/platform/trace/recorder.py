@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from app.schemas.screenplay import ThreadSummary
@@ -32,6 +32,19 @@ _FLUSH_BATCH_MAX = 200  # 单批最多写多少行（避免一批太大又阻塞
 # evolution 通知：evolution_notify_url 配置后，trace 结束时 POST 通知它摄入。
 # 用懒 import + 短超时，任何失败都静默降级（evolution 兜底扫描会补漏通知的 trace）。
 _EVOLUTION_NOTIFY_TIMEOUT = 2.0
+
+# HITL cancelled 收尾的来源类型（D5：状态统一 cancelled，error 字段区分来源）。
+CancelReason = Literal["user_stop", "client_disconnect", "timeout"]
+_CANCEL_REASON_MESSAGES: dict[str, str] = {
+    "user_stop": "User stopped",
+    "client_disconnect": "Stream cancelled (client disconnected)",
+    "timeout": "Awaiting input timeout (2h)",
+}
+
+# 僵尸清理：awaiting_input 超 2h 未 resume → cancelled（需求决策）。
+# 扫描间隔 5min（2h 阈值，无需高频）。
+_ZOMBIE_TIMEOUT_SEC = 2 * 60 * 60  # 2h
+_ZOMBIE_SCAN_INTERVAL = 5 * 60     # 5min
 
 
 @dataclass
@@ -72,6 +85,12 @@ class TraceRecorder:
         self._pending_writes: deque[tuple[Path, str]] = deque()
         self._pending_lock = RLock()
         self._drain_task: asyncio.Task[None] | None = None
+        # 僵尸清理后台任务（D：扫 awaiting_input 超 2h 的 trace → cancelled）
+        self._zombie_task: asyncio.Task[None] | None = None
+        # HITL 停止标记（D6）：trace_id → 用户是否点了"停止"按钮。
+        # 区分"用户主动停止"（走 cancel reason=user_stop）与"连接断开"
+        # （走 cancel reason=client_disconnect）。cancel 收尾时清除。
+        self._user_stop_requested: dict[str, bool] = {}
 
     def create_run(self, thread: ThreadSummary, endpoint: str, run_purpose: str = "user_generation") -> TraceRunHandle:
         trace_id = f"trace-{uuid4().hex}"
@@ -126,13 +145,54 @@ class TraceRecorder:
     def resume_run(self, thread: ThreadSummary, trace_id: str) -> tuple[TraceRunHandle, bool]:
         """续接活跃 trace（HITL resume 缝合点3）。
 
-        内存活跃（_queues 命中）→ 复用 queue/lock/sequence/monotonic/run_path，
-            is_new=False（不发 run_start，前端主动激活 trace-1）。
-        不活跃（服务重启等内存丢失）→ 降级 create_run，is_new=True（发 run_start）。← D2=A
+        三条路径（D10 双键恢复）：
+        1. 内存活跃（_queues 命中）→ 复用，is_new=False（不发 run_start）。
+        2. 内存丢失但 index 命中 awaiting_input → 重建最小活跃态，is_new=False
+           （执行端重启后仍能 resume 同一条 trace，丙方案）。
+        3. 都不命中 → 降级 create_run，is_new=True（发 run_start）。← D2=A
+
+        resume 后状态变迁：awaiting_input → running。复用/重建路径都要把 index
+        改回 running 并 notify evolution（否则 index 永远停在 awaiting_input，
+        前端/进化端看不到 trace 已恢复执行）。
         """
+        # 路径1：内存命中（正常情况）
         if trace_id in self._queues:
+            self._update_index_status(thread, trace_id, "running", None)
+            _notify_evolution(thread, trace_id, "running", None)
             return TraceRunHandle(trace_id=trace_id, queue=self._queues[trace_id]), False
+        # 路径2：index 命中 awaiting_input → 重建（执行端重启后）
+        run = self.find_run_by_trace_id(trace_id)
+        if run is not None and run.status == "awaiting_input":
+            handle = self._rebuild_active_state(thread, run)
+            self._update_index_status(thread, trace_id, "running", None)
+            _notify_evolution(thread, trace_id, "running", None)
+            return handle, False
+        # 路径3：降级开新 trace（兜底）
         return self.create_run(thread, "screenplay.generate.stream"), True
+
+    def _rebuild_active_state(
+        self, thread: ThreadSummary, run: TraceRunSummary
+    ) -> TraceRunHandle:
+        """从 index run summary 重建最小活跃态（D10，丙方案）。
+
+        执行端重启后内存活跃态丢失，但 index.json + jsonl + langgraph checkpoint
+        都还在。此方法重建 recorder 的记账状态让 append_event 能继续工作：
+        queue/lock/seq/path/endpoints/workspace（_increment_states 不重建→降级全量）。
+        """
+        trace_id = run.trace_id
+        run_path = Path(thread.workspace_path) / run.path
+        # event_count = last_seq（正常情况两者相等，D10.乙），seq 从此续接
+        last_seq = run.event_count
+        self._locks[trace_id] = RLock()
+        self._sequences[trace_id] = last_seq
+        self._queues[trace_id] = asyncio.Queue()
+        # duration 诊断值会不准（perf_counter 重置），可接受
+        self._started_monotonic[trace_id] = time.perf_counter()
+        self._run_paths[trace_id] = run_path
+        # _increment_states 不重建 → 退化为全量存储（recorder 既有降级设计）
+        self._run_endpoints[trace_id] = run.endpoint
+        self._trace_workspace[trace_id] = thread.workspace_path
+        return TraceRunHandle(trace_id=trace_id, queue=self._queues[trace_id])
 
     def register_run(
         self,
@@ -252,6 +312,60 @@ class TraceRecorder:
         """drain 协程是否在运行（用于 append_event 选择异步/同步写盘路径）。"""
         return self._drain_task is not None and not self._drain_task.done()
 
+    # ── HITL：awaiting_input 状态 + 停止标记 ──────────────────────
+
+    def await_input_run(self, thread: ThreadSummary, trace_id: str) -> TraceLogEvent:
+        """标记 trace 进入 awaiting_input（HITL interrupt，非终态）。
+
+        agent 调 ask_user → interrupt() 暂停图后由 domain 层调用（D1）。
+        写 run_awaiting 事件 + 更新 index status=awaiting_input + flush 落盘 +
+        notify evolution（状态变迁即推，R 方案）。
+
+        与 complete/cancel/fail 的关键区别：**不清内存活跃态**——agent 仍挂在
+        interrupt 点，等待 Command(resume) 续接。state 已由 langgraph checkpoint
+        落盘，recorder 只记录"等待中"这一状态变迁。
+        """
+        event = self.append_event(
+            trace_id,
+            {
+                "type": "run_awaiting",
+                "status": "awaiting_input",
+                "source": "system",
+            },
+        )
+        # 更新 index 状态（不走 _finalize_run——那是终态收尾，会清内存）
+        self._update_index_status(thread, trace_id, "awaiting_input", None)
+        self.flush_sync(trace_id)
+        # 状态变迁通知 evolution（awaiting_input 也摄入，己方案）
+        _notify_evolution(thread, trace_id, "awaiting_input", None)
+        return event
+
+    def is_awaiting_input(self, trace_id: str) -> bool:
+        """trace 是否处于 awaiting_input 状态。
+
+        优先读内存（活跃态还在则最快）；内存丢了读 index（执行端重启后）。
+        agent.generate_stream 的 CancelledError 分支用它判断"连接断开时是否
+        在 interrupt 期间"——是则保持 awaiting_input 不收尾（D4）。
+        """
+        # 内存活跃态：从最近的 run_awaiting 事件推断（_sequences 在 = 还活跃）
+        if trace_id in self._sequences:
+            # 活跃 trace，查 index 确认当前态（避免读到 resume 后的 running）
+            run = self.find_run_by_trace_id(trace_id)
+            return run is not None and run.status == "awaiting_input"
+        return False
+
+    def request_user_stop(self, trace_id: str) -> None:
+        """标记用户点了停止按钮（D6 停止信号）。
+
+        POST /stop 端点调用。cancel_run 收尾时读此标记区分 user_stop /
+        client_disconnect，并清除标记。
+        """
+        self._user_stop_requested[trace_id] = True
+
+    def is_user_stop_requested(self, trace_id: str) -> bool:
+        """用户是否请求了停止（D6）。CancelledError 分支读它分流收尾。"""
+        return self._user_stop_requested.get(trace_id, False)
+
     def complete_run(self, thread: ThreadSummary, trace_id: str) -> TraceLogEvent:
         duration_ms = self._duration_ms(trace_id)
         event = self.append_event(
@@ -269,10 +383,40 @@ class TraceRecorder:
     def fail_run(self, thread: ThreadSummary, trace_id: str, error: BaseException) -> TraceLogEvent:
         return self._fail_run(thread, trace_id, f"{error.__class__.__name__}: {error}")
 
-    def cancel_run(self, thread: ThreadSummary, trace_id: str) -> TraceLogEvent:
-        # CancelledError 既可能是用户主动停止，也可能是 cloudflared/Cloudflare 因空闲
-        # 超时掐断连接 —— 这里只如实描述触发条件，不臆断成"用户停止"。
-        return self._fail_run(thread, trace_id, "Stream cancelled (client disconnected or user stopped)")
+    def cancel_run(
+        self,
+        thread: ThreadSummary,
+        trace_id: str,
+        reason: CancelReason = "client_disconnect",
+    ) -> TraceLogEvent:
+        """标记 trace 为 cancelled（终态）。
+
+        cancelled 表示"执行未完成"——区别于 failed（agent 报错）。三种来源：
+        - user_stop：用户点了停止按钮（配合 _user_stop_requested 标记，D6）
+        - client_disconnect：SSE 连接断开（cloudflared/Cloudflare 超时、网络抖动）
+        - timeout：awaiting_input 超 2h 未响应（僵尸清理）
+        收尾时清除停止标记。
+        """
+        error_message = _CANCEL_REASON_MESSAGES.get(reason, "Cancelled")
+        # 清除停止标记（无论是否命中，收尾后都不再需要）
+        self._user_stop_requested.pop(trace_id, None)
+        return self._cancel_run(thread, trace_id, error_message)
+
+    def _cancel_run(self, thread: ThreadSummary, trace_id: str, error_message: str) -> TraceLogEvent:
+        """写 run_cancelled 事件并收尾（终态 cancelled）。"""
+        duration_ms = self._duration_ms(trace_id)
+        event = self.append_event(
+            trace_id,
+            {
+                "type": "run_cancelled",
+                "status": "cancelled",
+                "source": "system",
+                "duration_ms": duration_ms,
+                "error": error_message,
+            },
+        )
+        self._finalize_run(thread, trace_id, "cancelled", duration_ms, error_message)
+        return event
 
     def _fail_run(self, thread: ThreadSummary, trace_id: str, error_message: str) -> TraceLogEvent:
         duration_ms = self._duration_ms(trace_id)
@@ -300,13 +444,27 @@ class TraceRecorder:
         if self._drain_task is None or self._drain_task.done():
             self._drain_task = asyncio.create_task(self._drain_loop())
 
+    def start_zombie_scanner(self) -> None:
+        """启动僵尸清理后台任务（由应用 lifespan 调用，幂等）。
+
+        扫 index 中 status=awaiting_input 且超 _ZOMBIE_TIMEOUT_SEC 未 resume 的 trace，
+        标记为 cancelled（reason=timeout）+ notify evolution。
+        """
+        if self._zombie_task is None or self._zombie_task.done():
+            self._zombie_task = asyncio.create_task(self._zombie_scan_loop())
+
     async def aclose(self) -> None:
-        """关闭：停止 drain 协程，并把残余事件全部落盘（由 lifespan shutdown 调用）。"""
+        """关闭：停止 drain/僵尸扫描协程，并把残余事件全部落盘（由 lifespan shutdown 调用）。"""
         if self._drain_task is not None:
             self._drain_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._drain_task
             self._drain_task = None
+        if self._zombie_task is not None:
+            self._zombie_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._zombie_task
+            self._zombie_task = None
         # 停 drain 后再同步刷一次，保证进程退出前所有事件落盘。
         self._flush_all_sync()
 
@@ -321,6 +479,121 @@ class TraceRecorder:
             batch = self._take_pending_batch()
             if batch:
                 await asyncio.to_thread(self._write_batch_sync, batch)
+
+    async def _zombie_scan_loop(self) -> None:
+        """后台僵尸清理循环：周期扫 awaiting_input 超时的 trace → cancelled。"""
+        while True:
+            await asyncio.sleep(_ZOMBIE_SCAN_INTERVAL)
+            try:
+                await asyncio.to_thread(self._zombie_scan_once)
+            except Exception:
+                # 扫描异常不应拖垮后台任务，静默继续下一轮
+                pass
+
+    def _zombie_scan_once(self) -> int:
+        """扫描一次 awaiting_input 超时 trace，标记为 cancelled。
+
+        遍历 _trace_workspace 索引，读每个 workspace 的 index.json，
+        找 status=awaiting_input 且 run_awaiting 事件距今超 _ZOMBIE_TIMEOUT_SEC 的 trace。
+        由于 index 不存"何时进入 awaiting"（_finalize_run 才记时间），这里从
+        jsonl 读最后一条 run_awaiting 事件的时间戳判断超时。
+
+        返回清理的数量。
+        """
+        now = datetime.now(UTC)
+        count = 0
+        seen_ws: set[str] = set()
+        # 复制 _trace_workspace 的 items 避免扫描中字典变动
+        for trace_id, ws_path in list(self._trace_workspace.items()):
+            if ws_path in seen_ws:
+                continue
+            seen_ws.add(ws_path)
+            index_path = Path(ws_path) / "traces" / "index.json"
+            if not index_path.exists():
+                continue
+            try:
+                with index_path.open("r", encoding="utf-8") as f:
+                    runs = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            if not isinstance(runs, dict):
+                continue
+            for tid, run_data in runs.items():
+                if run_data.get("status") != "awaiting_input":
+                    continue
+                # 从 jsonl 读最后一条 run_awaiting 时间戳判断超时
+                run_path = Path(ws_path) / str(run_data.get("path", ""))
+                if not run_path.exists():
+                    continue
+                awaiting_ts = self._last_awaiting_timestamp(run_path)
+                if awaiting_ts is None:
+                    continue
+                try:
+                    elapsed = (now - datetime.fromisoformat(awaiting_ts)).total_seconds()
+                except (ValueError, TypeError):
+                    continue
+                if elapsed < _ZOMBIE_TIMEOUT_SEC:
+                    continue
+                # 超时 → cancelled。重建 thread 摘要从 index 取信息。
+                self._cancel_zombie(tid, run_data, ws_path)
+                count += 1
+        return count
+
+    def _last_awaiting_timestamp(self, trace_path: Path) -> str | None:
+        """从 jsonl 读最后一条 run_awaiting 事件的时间戳（倒序找）。"""
+        try:
+            # 倒序读，找最后一条 run_awaiting
+            lines = trace_path.read_text(encoding="utf-8").splitlines()
+            for line in reversed(lines):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    data = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if data.get("type") == "run_awaiting":
+                    return data.get("timestamp")
+            return None
+        except OSError:
+            return None
+
+    def _cancel_zombie(self, trace_id: str, run_data: dict[str, Any], ws_path: str) -> None:
+        """将僵尸 awaiting_input trace 标记为 cancelled（超时）。"""
+        # 构造最小 ThreadSummary（cancel_run/_finalize_run 需要 thread 定位 index）
+        from app.schemas.screenplay import ThreadSummary
+        thread = ThreadSummary(
+            thread_id=str(run_data.get("thread_id", "")),
+            workspace_id=str(run_data.get("workspace_id", "")),
+            session_name=str(run_data.get("session_name", "")),
+            workspace_path=ws_path,
+            created_at=run_data.get("started_at", ""),
+            updated_at=run_data.get("started_at", ""),
+        )
+        # 若内存活跃态还在（罕见：同进程长时间未 resume），走正常 cancel 路径收尾
+        if trace_id in self._sequences:
+            self._cancel_run(thread, trace_id, _CANCEL_REASON_MESSAGES["timeout"])
+        else:
+            # 内存已无（常见）：直接写 run_cancelled 事件 + 更新 index + notify
+            self._cancel_zombie_no_memory(thread, trace_id)
+
+    def _cancel_zombie_no_memory(self, thread: ThreadSummary, trace_id: str) -> None:
+        """内存活跃态已丢失的僵尸 trace 收尾（直接写事件 + 更新 index）。"""
+        # 临时重建最小活跃态让 append_event 工作
+        run = self.find_run_by_trace_id(trace_id)
+        if run is None:
+            return
+        run_path = Path(thread.workspace_path) / run.path
+        self._locks[trace_id] = RLock()
+        self._sequences[trace_id] = run.event_count
+        self._run_paths[trace_id] = run_path
+        try:
+            self._cancel_run(thread, trace_id, _CANCEL_REASON_MESSAGES["timeout"])
+        finally:
+            # _cancel_run → _finalize_run 已清内存，兜底再清一次
+            self._locks.pop(trace_id, None)
+            self._sequences.pop(trace_id, None)
+            self._run_paths.pop(trace_id, None)
 
     def _take_pending_batch(self) -> list[tuple[Path, str]]:
         """从缓冲区取出一批待写行（线程安全，最多 _FLUSH_BATCH_MAX 条）。"""
@@ -415,9 +688,10 @@ class TraceRecorder:
             return None
         return TraceRunSummary.model_validate(run_data)
 
-    def read_trace_events(self, trace_id: str) -> list[TraceLogEvent] | None:
-        """按 trace_id 读取 trace 的完整事件列表（Phase 3 evolution 拉取用）。
+    def read_trace_events(self, trace_id: str, since_seq: int = 0) -> list[TraceLogEvent] | None:
+        """按 trace_id 读取 trace 的事件列表（Phase 3 evolution 拉取用）。
 
+        since_seq（D8 增量）：只返回 sequence > since_seq 的事件。0 = 全量。
         依赖 _trace_workspace 索引定位 workspace，再从 run summary 的 path 拼 jsonl。
         """
         run = self.find_run_by_trace_id(trace_id)
@@ -429,7 +703,10 @@ class TraceRecorder:
         trace_path = Path(ws_path) / run.path
         if not trace_path.exists():
             return None
-        return self._read_events(trace_path)
+        events = self._read_events(trace_path)
+        if since_seq > 0:
+            events = [e for e in events if e.sequence > since_seq]
+        return events
 
     def list_recent_runs(self, since_iso: str = "") -> list[dict[str, Any]]:
         """列出近期完成的 trace（Phase 3 evolution scan 兜底用）。
@@ -500,17 +777,20 @@ class TraceRecorder:
 
         返回内存中正在运行的 trace 摘要，供 evolution 轮询展示活跃大盘。
         不读文件、不持久化，纯内存读取。
+        status 字段（awaiting_input/running）从 index 读——活跃态只有这两种，
+        终态(completed/cancelled/failed) 的 trace 已被 _finalize_run 清出内存。
         """
-        import time
-
         now = time.perf_counter()
         result: list[dict[str, Any]] = []
         for trace_id, started in self._started_monotonic.items():
+            run = self.find_run_by_trace_id(trace_id)
+            status = run.status if run else "running"
             result.append({
                 "trace_id": trace_id,
                 "endpoint": self._run_endpoints.get(trace_id, ""),
                 "duration_ms": int((now - started) * 1000),
                 "event_count": self._sequences.get(trace_id, 0),
+                "status": status,
             })
         return result
 
@@ -556,6 +836,29 @@ class TraceRecorder:
                 event = TraceLogEvent.model_validate(_sanitize_event_data(event_data))
                 events_by_id.setdefault(event.event_id, event)
         return sorted(events_by_id.values(), key=lambda event: (event.timestamp, event.sequence))
+
+    def _update_index_status(
+        self,
+        thread: ThreadSummary,
+        trace_id: str,
+        status: str,
+        error: str | None,
+    ) -> None:
+        """更新 index.json 的 trace 状态（非终态变更用，如 awaiting_input）。
+
+        与 _finalize_run 的区别：不清内存、不设 ended_at/duration_ms、不导出摘要、
+        不发终态通知。仅更新 status + event_count（保证监测面板/evolution 看到最新态）。
+        """
+        runs = self._read_run_index(thread)
+        run = runs.get(trace_id)
+        if run is None:
+            return  # index 没有则无法更新（不应发生，静默）
+        run["status"] = status
+        run["event_count"] = self._sequences.get(trace_id, run.get("event_count", 0))
+        if error is not None:
+            run["error"] = error
+        runs[trace_id] = run
+        self._write_index(thread, runs)
 
     def _finalize_run(
         self,

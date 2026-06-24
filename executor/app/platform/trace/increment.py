@@ -258,7 +258,10 @@ def reconstruct_full_input(
         if not base_input_found:
             if event_range is None:
                 # 这是全量起点，它的 input 是完整的。
-                collected_messages = extract_messages(event_input)
+                # ⚠️ 必须拷贝：extract_messages 返回 event_input["messages"] 的原始
+                # list 引用，直接赋值后下面 extend 会污染源 events（连续重建时起点
+                # 列表雪球增长 → MemoryError）。与 evolution 端 increment.py 同步。
+                collected_messages = list(extract_messages(event_input))
                 base_input_found = True
             continue
 

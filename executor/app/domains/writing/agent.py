@@ -286,6 +286,10 @@ class MetaAgentService(BaseAgentService):
 
             if result.pending_interrupt is not None:
                 iv = result.pending_interrupt
+                # HITL：interrupt 命中 → 标记 trace awaiting_input 并落盘（D1）。
+                # domain 层决定调用时机；recorder 写 run_awaiting + 更新 index +
+                # notify evolution（不清内存，等 Command(resume) 续接）。
+                self.trace_recorder.await_input_run(thread, trace.trace_id)
                 interrupt_payload: dict[str, Any] = {
                     "thread_id": thread.thread_id,
                     "source": "interview",
@@ -310,7 +314,16 @@ class MetaAgentService(BaseAgentService):
             yield _sse("trace_snapshot", snapshot.model_dump(mode="json"))
             yield _sse("final", response.model_dump())
         except asyncio.CancelledError:
-            self.trace_recorder.cancel_run(thread, trace.trace_id)
+            # D4/D5/D6：CancelledError 三路分流。
+            # - user_stop：用户点了停止按钮（_user_stop_requested 标记命中）→ cancelled
+            # - awaiting_input：interrupt 期间连接断开 → 保持 awaiting_input 不收尾（可 resume）
+            # - 否则：running 期间连接断开 → cancelled（agent 被 finally 真中止不可恢复）
+            if self.trace_recorder.is_user_stop_requested(trace.trace_id):
+                self.trace_recorder.cancel_run(thread, trace.trace_id, reason="user_stop")
+            elif self.trace_recorder.is_awaiting_input(trace.trace_id):
+                pass  # interrupt 期间断连：保持 awaiting_input，等用户 resume
+            else:
+                self.trace_recorder.cancel_run(thread, trace.trace_id, reason="client_disconnect")
             raise
         except BaseException as exc:
             self.trace_recorder.fail_run(thread, trace.trace_id, exc)

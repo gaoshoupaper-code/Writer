@@ -36,26 +36,41 @@ def ingest_events(
     events: list[TraceLogEvent],
     workspace_id_hint: str | None = None,
     trace_path: Path | None = None,
+    prior_events: list[TraceLogEvent] | None = None,
 ) -> str | None:
     """摄入已解析的事件列表：投影 + 入库（Phase 3 HTTP 拉取入口）。
 
     与 ingest_trace 的区别：不读文件，直接接收 events（从 executor HTTP 端点拉取后调用）。
     trace_path 可选——仅用于 run summary 的路径字段记录（debugging 用），解耦后可为 None。
 
+    增量支持（D8）：prior_events 传入本地已入库的旧事件，与本次拉取的增量事件合并后
+    全量投影。无 prior_events 时为首次摄入（全量）。nodes 必须全量重投影（projector
+    需完整事件流配对），故内部仍 DELETE+INSERT。
+
     Returns:
         摄入的 trace_id；若无有效事件则返回 None。
     """
-    if not events:
+    # 合并旧事件（增量场景）：按 sequence 去重，旧+新合并后排序
+    if prior_events:
+        seen = {e.sequence for e in events}
+        merged = list(events) + [e for e in prior_events if e.sequence not in seen]
+        all_events = sorted(merged, key=lambda e: e.sequence)
+    else:
+        all_events = events
+
+    if not all_events:
         return None
 
-    run, owner_user_id = _derive_run_summary(events, trace_path, workspace_id_hint)
+    run, owner_user_id = _derive_run_summary(all_events, trace_path, workspace_id_hint)
 
     # 幂等：同 trace_id 重复摄入先删旧记录（trace_flags/nodes/events 随 ON DELETE CASCADE）
     db.execute("DELETE FROM runs WHERE trace_id = ?", (run.trace_id,))
 
-    _write_run(run, owner_user_id)
-    _write_events(run.trace_id, events)
-    _write_nodes(run.trace_id, run, events)
+    # ingested_seq = 已处理的最大 sequence（高水位，D7）
+    ingested_seq = max(e.sequence for e in all_events)
+    _write_run(run, owner_user_id, ingested_seq)
+    _write_events(run.trace_id, all_events)
+    _write_nodes(run.trace_id, run, all_events)
 
     # 摄入完成后跑规则标红（数据已就绪）
     try:
@@ -75,6 +90,8 @@ def _derive_run_summary(
     run_start = next((e for e in events if e.type == "run_start"), None)
     run_end = next((e for e in events if e.type == "run_end"), None)
     run_error = next((e for e in events if e.type == "run_error"), None)
+    run_awaiting = next((e for e in events if e.type == "run_awaiting"), None)
+    run_cancelled = next((e for e in events if e.type == "run_cancelled"), None)
 
     # run_start 的 input 携带 endpoint/thread_id/workspace_id/session_name
     start_input = (run_start.input if run_start and isinstance(run_start.input, dict) else {}) or {}
@@ -90,11 +107,19 @@ def _derive_run_summary(
         ended_at = run_end.timestamp
         status = run_end.status if run_end.status != "running" else "completed"
         duration_ms = run_end.duration_ms
+    elif run_cancelled:
+        ended_at = run_cancelled.timestamp
+        status = "cancelled"
+        duration_ms = run_cancelled.duration_ms
+        error = run_cancelled.error
     elif run_error:
         ended_at = run_error.timestamp
         status = "failed"
         duration_ms = run_error.duration_ms
         error = run_error.error
+    elif run_awaiting:
+        # awaiting_input 是中间态（非终态）：无 ended_at/duration_ms
+        status = "awaiting_input"
 
     # workspace_id：优先 run_start.input，其次 hint
     workspace_id = str(start_input.get("workspace_id") or workspace_id_hint or "unknown")
@@ -121,18 +146,18 @@ def _derive_run_summary(
     ), owner_user_id
 
 
-def _write_run(run: TraceRunSummary, owner_user_id: str = "unknown") -> None:
+def _write_run(run: TraceRunSummary, owner_user_id: str = "unknown", ingested_seq: int = 0) -> None:
     db.execute(
         """INSERT INTO runs
            (trace_id, workspace_id, thread_id, session_name, endpoint, status,
             started_at, ended_at, duration_ms, event_count, error, ingested_at,
-            owner_user_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            owner_user_id, ingested_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             run.trace_id, run.workspace_id, run.thread_id, run.session_name, run.endpoint,
             run.status, run.started_at, run.ended_at, run.duration_ms, run.event_count,
             run.error, datetime.now(UTC).isoformat(),
-            owner_user_id,
+            owner_user_id, ingested_seq,
         ),
     )
 

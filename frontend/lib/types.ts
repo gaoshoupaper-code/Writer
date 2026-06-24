@@ -139,12 +139,14 @@ export type StreamEvent = {
   data: Record<string, unknown>;
 };
 
-export type TraceStatus = "running" | "completed" | "failed";
+export type TraceStatus = "running" | "awaiting_input" | "completed" | "failed" | "cancelled";
 
 export type TraceEventType =
   | "run_start"
   | "run_end"
   | "run_error"
+  | "run_awaiting"
+  | "run_cancelled"
   | "llm_start"
   | "llm_end"
   | "llm_error"

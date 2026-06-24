@@ -99,6 +99,8 @@ async def _lifespan(application: FastAPI):
     # 启动 trace 写盘 drain 协程：append_event 不再同步写盘，改入内存缓冲，
     # 由此后台协程成批落盘（to_thread，不占事件循环）。
     trace_recorder.start_drain()
+    # 启动僵尸清理：扫 awaiting_input 超 2h 未 resume 的 trace → cancelled
+    trace_recorder.start_zombie_scanner()
     pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
     yield
     # 关闭 drain 并刷掉残余事件，保证进程退出前 trace 数据完整。

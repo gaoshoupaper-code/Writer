@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 from datetime import UTC, datetime
@@ -25,6 +26,8 @@ from app.core.settings import settings
 # 写操作通过一把全局锁串行化，避免 SQLite "database is locked"。
 # 用 RLock（可重入）：init_db 持锁后调用迁移函数，迁移函数内部也需加锁，必须可重入。
 _lock = threading.RLock()
+
+logger = logging.getLogger(__name__)
 
 
 def _connect() -> sqlite3.Connection:
@@ -60,13 +63,14 @@ def init_db() -> None:
                 thread_id     TEXT,
                 session_name  TEXT,
                 endpoint      TEXT,
-                status        TEXT NOT NULL,          -- completed / failed / cancelled(running 不入库)
+                status        TEXT NOT NULL,          -- awaiting_input / completed / failed / cancelled (running 不入库)
                 started_at    TEXT,
                 ended_at      TEXT,
                 duration_ms   INTEGER,
                 event_count   INTEGER DEFAULT 0,
                 error         TEXT,
-                ingested_at   TEXT NOT NULL           -- evolution 入库时间
+                ingested_at   TEXT NOT NULL,          -- evolution 入库时间
+                ingested_seq  INTEGER DEFAULT 0       -- 已从执行端拉取到的最大事件 sequence（增量高水位，D7）
             );
 
             -- nodes：projector 投影出的树节点，1 trace N 行
@@ -364,6 +368,8 @@ def init_db() -> None:
         _migrate_rules_columns(conn)
         # Phase 3 幂等迁移：给 runs 表补 owner_user_id 列（D2/D16 按用户隔离）
         _migrate_runs_owner_user_id(conn)
+        # HITL 幂等迁移：给 runs 表补 ingested_seq 列（D7 增量高水位）
+        _migrate_runs_ingested_seq(conn)
         # Phase 4 幂等迁移：prompt 版本管理表（T9 langfuse 式）
         _migrate_prompt_tables(conn)
         # Phase 6 幂等迁移：failure_signatures 加 surface_type/surface_scope 列（决策 D4/D9）
@@ -405,6 +411,19 @@ def _migrate_runs_owner_user_id(conn: sqlite3.Connection) -> None:
     with _lock:
         conn.execute("ALTER TABLE runs ADD COLUMN owner_user_id TEXT NOT NULL DEFAULT 'unknown'")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_owner ON runs(owner_user_id)")
+        conn.commit()
+
+
+def _migrate_runs_ingested_seq(conn: sqlite3.Connection) -> None:
+    """幂等迁移：给 runs 表补 ingested_seq 列（HITL D7 增量高水位）。
+
+    存量数据默认 0（下次扫描会全量重拉校准）。新数据由 importer 摄入时写入。
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    if "ingested_seq" in existing:
+        return
+    with _lock:
+        conn.execute("ALTER TABLE runs ADD COLUMN ingested_seq INTEGER DEFAULT 0")
         conn.commit()
 
 

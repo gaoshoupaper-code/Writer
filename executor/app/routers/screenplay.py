@@ -18,7 +18,9 @@ from app.routers.context import (
     generation_started,
     get_agent_service,
     get_thread_store,
+    get_trace_recorder,
 )
+from pydantic import BaseModel
 from app.schemas.screenplay import (
     ScreenplayGenerateRequest,
     ScreenplayGenerateResponse,
@@ -70,3 +72,23 @@ async def stream_screenplay(payload: ScreenplayGenerateRequest, user: CurrentUse
             "X-Accel-Buffering": "no",
         },
     )
+
+
+class StopRequest(BaseModel):
+    """停止生成请求（D6 停止信号：前端"停止"按钮显式发送）。"""
+
+    thread_id: str
+    trace_id: str
+
+
+@router.post("/screenplay/stop")
+def stop_screenplay(req: StopRequest, user: CurrentUser = Depends(current_user)):
+    """标记用户请求停止某条 trace（D6）。
+
+    前端"停止"按钮先调此端点（fire-and-forget），再 abort SSE 连接。
+    recorder 打 _user_stop_requested 标记，generate_stream 的 CancelledError
+    分支据此区分 user_stop / client_disconnect（两种都收尾成 cancelled，
+    仅 error 文案来源不同）。
+    """
+    get_trace_recorder().request_user_stop(req.trace_id)
+    return {"status": "accepted", "trace_id": req.trace_id}

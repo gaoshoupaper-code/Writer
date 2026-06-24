@@ -17,6 +17,7 @@
       <tr>
         <th>Trace ID</th>
         <th>Endpoint</th>
+        <th>状态</th>
         <th>已运行</th>
         <th>事件数</th>
       </tr>
@@ -26,6 +27,13 @@
       <tr>
         <td class="mono">{{ r.trace_id[:20] }}...</td>
         <td>{{ r.endpoint }}</td>
+        <td>
+          {% if r.status == 'awaiting_input' %}
+            <span class="badge flag">等待输入</span>
+          {% else %}
+            <span class="badge">运行中</span>
+          {% endif %}
+        </td>
         <td>
           {% set secs = (r.duration_ms / 1000) | round(1) %}
           {% if secs > 60 %}

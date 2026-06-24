@@ -465,7 +465,15 @@ function projectTraceDetail(run: TraceRunSummary, events: TraceLogEvent[]): Trac
 // ── chain_summary 生成函数（前端版本，与后端 chain_summary.py 保持一致） ──
 
 function runSummary(run: TraceRunSummary): string {
-  const statusLabel = run.status === "completed" ? "完成" : run.status === "failed" ? "失败" : "运行中";
+  const statusLabel = run.status === "completed"
+    ? "完成"
+    : run.status === "failed"
+      ? "失败"
+      : run.status === "awaiting_input"
+        ? "等待输入"
+        : run.status === "cancelled"
+          ? "已取消"
+          : "运行中";
   const duration = run.duration_ms != null ? `${(run.duration_ms / 1000).toFixed(run.duration_ms < 10000 ? 1 : 0)}s` : "--";
   return `${run.endpoint} · ${statusLabel} · ${duration}`;
 }
@@ -661,7 +669,7 @@ function truncate(str: string, max: number): string {
 // ── 辅助函数 ──
 
 function updateRunFromEvent(run: TraceRunSummary, event: TraceLogEvent): TraceRunSummary {
-  if (event.type === "run_end" || event.type === "run_error") {
+  if (event.type === "run_end" || event.type === "run_error" || event.type === "run_cancelled") {
     return {
       ...run,
       status: event.status,
@@ -670,6 +678,9 @@ function updateRunFromEvent(run: TraceRunSummary, event: TraceLogEvent): TraceRu
       event_count: event.sequence,
       error: event.error ?? run.error,
     };
+  }
+  if (event.type === "run_awaiting") {
+    return { ...run, status: "awaiting_input", event_count: Math.max(run.event_count, event.sequence) };
   }
   return { ...run, status: event.status === "failed" ? "failed" : run.status, event_count: Math.max(run.event_count, event.sequence) };
 }
