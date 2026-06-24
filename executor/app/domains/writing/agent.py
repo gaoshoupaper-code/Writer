@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -13,6 +12,7 @@ from langgraph.types import Command
 
 from app.platform.agent.base_service import BaseAgentService
 from app.platform.streaming import ExtraTask, run_agent_stream
+from app.domains.writing.events import WritingEventSink
 from app.domains.writing.expert_agent.services.storyline_graph import generate_storyline_graph
 from app.domains.writing.models import build_writer_model
 from app.platform.agent.middleware import (
@@ -27,7 +27,6 @@ from app.schemas.screenplay import (
     ScreenplayGenerateResponse,
     ThreadSummary,
 )
-from app.schemas.checkpoint import CheckpointMessage, CheckpointState, CheckpointToolCall
 
 # SSE 心跳间隔已收敛到 platform.streaming.DEFAULT_HEARTBEAT_INTERVAL（PR-07a）。
 
@@ -102,17 +101,17 @@ class MetaAgentService(BaseAgentService):
     ):
         """Phase 7：经 Agent 包装配（替代 _assemble_via_manifest）。
 
-        与 _assemble_via_manifest 的区别：
-        - 旧：从 evolution 拉 production manifest → manifest_loader.assemble → 补 model/backend → create_deep_agent
-        - 新：import Agent 包 → 构建 RuntimeContext → package.assemble(ctx) → 包内完成全部装配
+        import Agent 包 → 构建 RuntimeContext（含 styles）→ package.assemble(ctx)。
+        执行端只负责构建 model/backend/checkpointer + 解析 styles，装配全在包内。
 
-        执行端只负责：构建 model/backend/checkpointer + RuntimeContext，装配全在包内。
-        风格注入（meta_style / *_style）由执行端解析后通过 RuntimeContext 传入——
-        但当前 RuntimeContext 不含风格字段（Phase 7 包化后风格 suffix 注入移到包内 assemble，
-        后续 Phase 补充；当前包内 assemble 用包内 prompt 不含风格 suffix）。
+        风格注入（D2/D4）：从 styling store 解析当前 workspace 的激活风格，
+        按 scope 名填充 ctx.styles（包内 assemble 消费，注入各 subagent prompt）。
+        scope→字段名映射就地处写（D4 决策）：
+          meta → meta_style, storybuilding → storybuilding_style,
+          detail-outline → detail_outline_style, writing → writing_style。
         """
         from contracts.runtime_context import RuntimeContext
-        from app.platform.harness.package_loader import load_current_package
+        from app.platform.agent.loader import load_current_package
         from app.domains.writing.models import build_writer_model
         from app.platform.agent.middleware import TraceMiddleware
 
@@ -123,6 +122,28 @@ class MetaAgentService(BaseAgentService):
 
         backend = self._backend_for_workspace(workspace_path)
 
+        # 风格解析（D4 就地转换：scope 名 key，styling 字段名查值）
+        # 无激活风格时 styles=None，包内用裸 prompt（无 suffix）。
+        styles: dict[str, str] | None = None
+        if workspace_id:
+            style_map = {
+                "meta": ("meta_style", None),  # (字段名, subagent style_key)，meta 无 subagent key
+                "storybuilding": ("storybuilding_style", "storybuilding_style"),
+                "detail-outline": ("detail_outline_style", "detail_outline_style"),
+                "writing": ("writing_style", "writing_style"),
+            }
+            resolved: dict[str, str] = {}
+            meta_style = self._resolve_meta_style(workspace_id, owner_id)
+            if meta_style:
+                resolved["meta"] = meta_style
+            for scope, (_, sub_key) in style_map.items():
+                if sub_key is None:
+                    continue
+                suffix = self._resolve_style_for_subagent(workspace_id, sub_key, owner_id)
+                if suffix:
+                    resolved[scope] = suffix
+            styles = resolved or None
+
         ctx = RuntimeContext(
             model=model,
             backend=backend,
@@ -130,6 +151,7 @@ class MetaAgentService(BaseAgentService):
             workspace_path=workspace_path,
             trace_id=trace_id,
             owner_id=owner_id,
+            styles=styles,
             trace_recorder=self.trace_recorder,
             trace_middleware_cls=TraceMiddleware,  # T2：类由执行端注入，包内实例化
         )
@@ -137,24 +159,9 @@ class MetaAgentService(BaseAgentService):
         pkg = load_current_package()
         return pkg.assemble(ctx)
 
-    async def get_thread_checkpoint(self, thread_id: str, *, owner_id: str | None = None) -> CheckpointState:
-        """读取 thread 的最新 checkpoint，规范化为 CheckpointState。"""
-        checkpointer = await self._resolve_checkpointer(owner_id)
-        config = {"configurable": {"thread_id": thread_id}}
-        checkpoint = await checkpointer.aget(config)
-        if checkpoint is None:
-            print(f"[checkpoint] thread_id={thread_id} → aget returned None (no checkpoint saved)")
-            return CheckpointState(thread_id=thread_id, messages=[])
-        channel_values = checkpoint.get("channel_values", {})
-        raw_messages = channel_values.get("messages", [])
-        print(f"[checkpoint] thread_id={thread_id} → channel_keys={list(channel_values.keys())}, messages_count={len(raw_messages)}")
-        messages = []
-        for msg in raw_messages:
-            try:
-                messages.append(_normalize_message(msg))
-            except Exception as exc:
-                print(f"[checkpoint] skip message: {exc}")
-        return CheckpointState(thread_id=thread_id, messages=messages)
+    # get_thread_checkpoint 复用 BaseAgentService 基类实现（PR-10 已提取，
+    # 含 _normalize_message 规范化）。本地重复的 override + _normalize_message
+    # / _map_role 已删除，消除与 base_service.py 的重复定义。
 
     def generate(
         self,
@@ -249,122 +256,8 @@ class MetaAgentService(BaseAgentService):
             "callbacks": [TraceCallbackHandler(self.trace_recorder, trace.trace_id)],
             "recursion_limit": 200,
         }
-        active_tasks: dict[str, dict] = {}
-        # 子代理调用计数：按 subagent_type 累计，用于 storybuilding 轮次与 writing 章节号推断降级（D6）
-        subagent_call_counts: dict[str, int] = {}
 
-        # ── 事件分发 sink（领域专属，闭包捕获 thread/active_tasks/计数器）─────
-        async def on_event(event: dict) -> list[str]:
-            frames: list[str] = []
-            kind = event["event"]
-            name = event.get("name", "")
-            data = event.get("data", {})
-
-            if kind == "on_chat_model_end":
-                output = data.get("output")
-                tool_calls = _extract_tool_calls(output)
-                text = _extract_model_text(output)
-                evt_data = {"text": text}
-                if tool_calls:
-                    evt_data["tool_calls"] = tool_calls
-                frames.append(_sse("model_output", evt_data))
-
-            elif kind == "on_chain_start" and name == "tools":
-                tool_inputs = data.get("input", [])
-                parent_task_id, subagent_name = _current_parent_task(active_tasks)
-                for tc in tool_inputs:
-                    if isinstance(tc, dict):
-                        tool_name = tc.get("name", "unknown")
-                        call_id = tc.get("id", "")
-                        call_payload: dict[str, Any] = {
-                            "tool": tool_name,
-                            "input": tc.get("args", {}),
-                            "call_id": call_id,
-                            "parent_task_id": parent_task_id,
-                            "subagent_name": subagent_name,
-                        }
-                        # task 工具：派发焦点信息（D6/D7）—— 章节号、总章数、轮次
-                        if tool_name == "task":
-                            args = tc.get("args", {}) or {}
-                            sub = _extract_subagent_name(args)
-                            description = str(args.get("description", "") or "")
-                            subagent_call_counts[sub] = subagent_call_counts.get(sub, 0) + 1
-                            call_ordinal = subagent_call_counts[sub]
-                            chapter_index = _extract_chapter_index(description)
-                            total_chapters = await asyncio.to_thread(
-                                _count_total_chapters, Path(thread.workspace_path)
-                            )
-                            # writing 章节号降级：正则失败时按 writing 调用序推断（D6）
-                            if sub == "writing" and chapter_index is None:
-                                chapter_index = call_ordinal
-                            if call_id:
-                                active_tasks[call_id] = {
-                                    "name": sub,
-                                    "chapter_index": chapter_index,
-                                    "total_chapters": total_chapters,
-                                    "iteration": call_ordinal,
-                                }
-                            call_payload["subagent_type"] = sub
-                            call_payload["chapter_index"] = chapter_index
-                            call_payload["total_chapters"] = total_chapters
-                            call_payload["iteration"] = call_ordinal
-                        frames.append(_sse("tool_call", call_payload))
-
-            elif kind == "on_tool_end":
-                output_payload: dict[str, Any] = {
-                    "tool": name,
-                    "output": str(data.get("output", ""))[:2000],
-                    "call_id": _extract_tool_call_id(data),
-                }
-                if name == "task":
-                    call_id = _extract_tool_call_id(data)
-                    if call_id and call_id in active_tasks:
-                        task_meta = active_tasks.pop(call_id)
-                        finished_subagent = task_meta.get("name")
-                        # storybuilding 完成后派生流程图：确定性、纯后端。
-                        # 失败已被模块内部 try/except 吞掉，这里只读不抛，绝不阻断 SSE 流。
-                        if finished_subagent == "storybuilding":
-                            await asyncio.to_thread(
-                                generate_storyline_graph, Path(thread.workspace_path)
-                            )
-                        # writing 写完章节后实时算字数（D7），随 tool_output 推给前端
-                        if finished_subagent == "writing":
-                            chapter_index = task_meta.get("chapter_index")
-                            if chapter_index:
-                                word_count = await asyncio.to_thread(
-                                    _count_chapter_words,
-                                    Path(thread.workspace_path),
-                                    chapter_index,
-                                )
-                                if word_count is not None:
-                                    output_payload["word_count"] = word_count
-                                    output_payload["chapter_index"] = chapter_index
-                frames.append(_sse("tool_output", output_payload))
-
-            elif kind == "on_tool_error":
-                # 单工具失败：推 tool_error SSE，前端据此标红/重试中（点1 S4）
-                # data.error 在部分版本缺失，output 常是异常对象，兜底取
-                err = data.get("error") or data.get("output") or ""
-                frames.append(_sse("tool_error", {
-                    "tool": name,
-                    "call_id": _extract_tool_call_id(data),
-                    "error": str(err)[:500],
-                }))
-
-            elif kind == "on_chat_model_stream":
-                chunk = data.get("chunk")
-                if hasattr(chunk, "content"):
-                    content = chunk.content
-                elif isinstance(chunk, dict):
-                    content = chunk.get("content", "")
-                else:
-                    content = ""
-                if content:
-                    frames.append(_sse("model_stream", {"content": content}))
-
-            return frames
-
-        # ── trace_pump 作为额外并发任务（与 agent 事件/心跳公平竞争 asyncio.wait）──
+        # trace_pump 作为额外并发任务（与 agent 事件/心跳公平竞争 asyncio.wait）
         def _on_trace_done(finished: asyncio.Task) -> tuple[asyncio.Task | None, list[str]]:
             update = finished.result()
             return asyncio.create_task(_next_trace_update(trace_queue)), [update] if update else []
@@ -374,14 +267,12 @@ class MetaAgentService(BaseAgentService):
             on_done=_on_trace_done,
         )
 
-        # 闭包 sink：领域专属事件分发（适配 EventSink 协议，on_event 是协程）
-        class _WritingSink:
-            async def on_event(self_inner, event: dict) -> list[str]:
-                return await on_event(event)
+        # 领域事件分发：章节号/字数/task 派发等 writing 专属逻辑封装在 WritingEventSink（M4 抽离）
+        sink = WritingEventSink(thread)
 
         sse_iter, result = await run_agent_stream(
             agent, agent_input, config,
-            sink=_WritingSink(),
+            sink=sink,
             extra_tasks=[trace_extra],
         )
 
@@ -638,78 +529,6 @@ def _sse(event_type: str, payload: object) -> str:
     return f"event: {event_type}\ndata: {data}\n\n"
 
 
-def _normalize_message(msg: object) -> CheckpointMessage:
-    """将 LangChain BaseMessage 转为 CheckpointMessage schema。"""
-    # dict 形式（从 checkpoint serde 还原）
-    if isinstance(msg, dict):
-        role = str(msg.get("type", msg.get("role", ""))).lower()
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            # multimodal content blocks → 拼接文本
-            content = "\n".join(
-                block.get("text", "") if isinstance(block, dict) else str(block)
-                for block in content
-                if isinstance(block, dict) and block.get("type") == "text" or isinstance(block, str)
-            )
-        content = str(content) if content else ""
-        tool_calls = None
-        raw_calls = msg.get("tool_calls")
-        if isinstance(raw_calls, list):
-            tool_calls = [
-                CheckpointToolCall(name=str(tc.get("name", "")), id=str(tc.get("id", "")))
-                for tc in raw_calls
-                if isinstance(tc, dict)
-            ]
-        name = msg.get("name")
-        return CheckpointMessage(
-            role=_map_role(role),
-            content=content,
-            tool_calls=tool_calls,
-            name=str(name) if name else None,
-        )
-
-    # LangChain message 对象
-    msg_type = getattr(msg, "type", "") or ""
-    content = getattr(msg, "content", "")
-    if isinstance(content, list):
-        content = "\n".join(
-            block.get("text", "") if isinstance(block, dict) else str(block)
-            for block in content
-            if isinstance(block, dict) and block.get("type") == "text" or isinstance(block, str)
-        )
-    content = str(content) if content else ""
-
-    tool_calls = None
-    raw_calls = getattr(msg, "tool_calls", None)
-    if isinstance(raw_calls, list):
-        tool_calls = [
-            CheckpointToolCall(name=str(tc.get("name", "")), id=str(tc.get("id", "")))
-            for tc in raw_calls
-            if isinstance(tc, dict)
-        ]
-
-    name = getattr(msg, "name", None)
-    return CheckpointMessage(
-        role=_map_role(msg_type),
-        content=content,
-        tool_calls=tool_calls,
-        name=str(name) if name else None,
-    )
-
-
-def _map_role(msg_type: str) -> str:
-    """将 LangChain 消息类型映射为标准化 role。"""
-    mapping = {
-        "system": "system",
-        "human": "human",
-        "user": "human",
-        "ai": "ai",
-        "assistant": "ai",
-        "tool": "tool",
-    }
-    return mapping.get(msg_type, msg_type)
-
-
 async def _next_trace_update(queue) -> str:
     event = await queue.get()
     return _sse("trace_event", event.model_dump())
@@ -720,147 +539,3 @@ def _drain_trace_queue(queue) -> list[dict]:
     while not queue.empty():
         events.append(queue.get_nowait().model_dump())
     return events
-
-
-def _extract_tool_calls(message: object) -> list[dict]:
-    """Pull tool_call info from a chat model output message."""
-    calls = []
-    if hasattr(message, "tool_calls"):
-        for tc in message.tool_calls:
-            calls.append({"name": tc.get("name", ""), "args": tc.get("args", {})})
-    elif isinstance(message, dict):
-        for tc in message.get("tool_calls", []):
-            calls.append({"name": tc.get("name", ""), "args": tc.get("args", {})})
-    return calls
-
-
-def _extract_model_text(message: object) -> str:
-    """Extract text content from a chat model output message."""
-    if hasattr(message, "content"):
-        content = message.content
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return "\n".join(
-                item.get("text", "")
-                for item in content
-                if isinstance(item, dict) and item.get("type") == "text"
-            )
-    if isinstance(message, dict):
-        content = message.get("content", "")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return "\n".join(
-                item.get("text", "")
-                for item in content
-                if isinstance(item, dict) and item.get("type") == "text"
-            )
-    return ""
-
-
-def _extract_subagent_name(args: object) -> str:
-    """Pull the subagent name from task() tool arguments."""
-    if isinstance(args, dict):
-        return str(args.get("subagent_type") or args.get("name") or "unknown")
-    return "unknown"
-
-
-def _extract_tool_call_id(data: dict) -> str | None:
-    """Get the tool call ID from an on_tool_end event's data."""
-    if not isinstance(data, dict):
-        return None
-    inp = data.get("input")
-    if isinstance(inp, dict):
-        cid = inp.get("id") or inp.get("call_id")
-        if cid:
-            return str(cid)
-    return data.get("call_id")
-
-
-def _current_parent_task(active_tasks: dict[str, dict]) -> tuple[str | None, str | None]:
-    """Return (call_id, name) of the most recently active SubAgent task."""
-    if not active_tasks:
-        return None, None
-    last_id = next(reversed(active_tasks))
-    return last_id, active_tasks[last_id]["name"]
-
-
-# ── 焦点信息辅助（D6/D7）：章节号正则 + 总章数 + 字数，纯后端计算，零侵入 Meta Agent ──
-
-_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
-
-
-def _cn_to_int(text: str) -> int | None:
-    """中文数字转整数（支持 十/百，如"二十三"→23）。无法解析返回 None。"""
-    if not text:
-        return None
-    total = 0
-    section = 0
-    for ch in text:
-        if ch in _CN_DIGITS:
-            section = _CN_DIGITS[ch]
-        elif ch == "十":
-            section = section if section else 1
-            total += section * 10
-            section = 0
-        elif ch == "百":
-            section = section if section else 1
-            total += section * 100
-            section = 0
-        else:
-            return None
-    return total + section if (total or section) else None
-
-
-def _cn_or_int(token: str) -> int | None:
-    """将 "3" 或 "二十三" 统一转为整数。"""
-    token = token.strip()
-    if token.isdigit():
-        return int(token)
-    return _cn_to_int(token)
-
-
-def _extract_chapter_index(description: str) -> int | None:
-    """从 task 描述中正则提取章节号（D6）。支持 "第3章" / "第三章" / "chapter 3" 等。"""
-    if not description:
-        return None
-    # "第3章" / "第三章" / "第 3 章"
-    m = re.search(r"第\s*([0-9一二三四五六七八九十百]+)\s*章", description)
-    if m:
-        return _cn_or_int(m.group(1))
-    # "chapter 3" / "chapter-03" / "chapter_3"
-    m = re.search(r"chapter[\s\-_]*([0-9]+)", description, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    return None
-
-
-def _count_total_chapters(workspace_path: Path) -> int | None:
-    """总章数 = detail/chapter-*.md 的最大编号（D6）。
-
-    detail 阶段完成后才进入 writing，此时细纲齐全；取最大编号比正则 overview 更鲁棒。
-    """
-    detail_dir = workspace_path / "detail"
-    if not detail_dir.exists():
-        return None
-    nums: list[int] = []
-    for path in detail_dir.glob("chapter-*.md"):
-        m = re.search(r"chapter-(\d+)", path.name)
-        if m:
-            nums.append(int(m.group(1)))
-    return max(nums) if nums else None
-
-
-def _count_chapter_words(workspace_path: Path, chapter_index: int) -> int | None:
-    """读 chapter/chapter-XX.md 算去空白字符数（D7 焦点文案字数）。"""
-    chapter_dir = workspace_path / "chapter"
-    for name in (f"chapter-{chapter_index:02d}.md", f"chapter-{chapter_index}.md"):
-        path = chapter_dir / name
-        if path.exists():
-            try:
-                text = path.read_text(encoding="utf-8")
-            except OSError:
-                return None
-            return len(re.sub(r"\s", "", text))
-    return None

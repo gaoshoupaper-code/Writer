@@ -74,6 +74,7 @@ def assemble(ctx: RuntimeContext):
     from .middleware.meta_readonly import MetaReadOnlyMiddleware
     from .middleware.goal import GoalMiddleware
     from .subagents.interview import build_interview_deep_subagent
+    from .subagents.types import apply_style_suffix
     # runtime 是 DeepAgents SDK 隔离层（执行端平台能力，包依赖它如同依赖 deepagents）
     from app.platform.agent.runtime import (
         GENERAL_PURPOSE_SUBAGENT, SubAgent, compose_skills_backend, create_deep_agent,
@@ -95,8 +96,11 @@ def assemble(ctx: RuntimeContext):
             ctx.trace_recorder, ctx.trace_id, "meta-agent",
         ))
 
-    # ── meta system prompt ──
-    meta_prompt = _read_prompt("meta_system")
+    # ── meta system prompt（含风格 suffix 注入，D2/D4）──
+    styles = ctx.styles or {}
+    meta_prompt = apply_style_suffix(
+        _read_prompt("meta_system"), styles.get("meta"),
+    )
 
     # ── meta skills backend 组合 ──
     meta_skills = _skill_abs_paths("meta")
@@ -137,13 +141,16 @@ def assemble(ctx: RuntimeContext):
 
     subagents.append(build_storybuilding_deep_subagent(
         workspace_path, ctx.model, ctx.backend, middleware_factory,
+        style_suffix=styles.get("storybuilding"),
     ))
     subagents.append(build_detail_outline_deep_subagent(
         workspace_path, ctx.model, ctx.backend, middleware_factory,
+        style_suffix=styles.get("detail-outline"),
         context_file_paths=["outline.md", "character/*.md", "storyline.md", "storyline/*.md"],
     ))
     subagents.append(build_writing_deep_subagent(
         workspace_path, ctx.model, ctx.backend, middleware_factory,
+        style_suffix=styles.get("writing"),
         context_file_paths=["outline.md", "storyline.md", "storyline/*.md", "character/*.md"],
     ))
 

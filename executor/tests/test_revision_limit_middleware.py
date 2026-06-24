@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 from langchain_core.messages import ToolMessage
 
-from app.domains.writing.expert_agent.middleware.revision_limit_middleware import RevisionLimitMiddleware
+# middleware 已迁进 harness 包（Phase 7），测试通过包加载后 import
+from app.platform.agent.loader import load_current_package
+load_current_package()
+from harness_current.middleware.revision_limit import RevisionLimitMiddleware
 
 
 def _request(
