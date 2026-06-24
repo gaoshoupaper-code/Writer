@@ -7,7 +7,10 @@ from typing import Any
 
 from langchain_core.messages import ToolMessage
 
-from app.domains.writing.middleware.meta_readonly_middleware import (
+# MetaReadOnlyMiddleware 已迁进 harness 包（Phase 7），通过包加载后 import
+from app.platform.agent.loader import load_current_package
+load_current_package()
+from harness_current.middleware.meta_readonly import (
     MetaReadOnlyMiddleware,
     _resolve_subagent,
 )

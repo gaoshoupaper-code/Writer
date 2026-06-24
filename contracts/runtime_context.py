@@ -57,6 +57,11 @@ class RuntimeContext:
         trace_middleware_cls: TraceMiddleware 类（执行端定义，ctx 传入，包内实例化）。
             None 时包不挂载 Trace。与 trace_recorder 配合（T2 设计）。
             类型用 object 避免硬依赖；实际是 AgentMiddleware 子类。
+        styles: 风格 suffix 映射（key=包内 scope 名，value=suffix 文本）。
+            scope 名：meta / storybuilding / detail-outline / writing。
+            执行端从 styling store 解析后填充；包内 assemble 读此字段把对应
+            suffix 注入各 subagent 的 system_prompt（via apply_style_suffix）。
+            None 或缺 key = 该 scope 无风格注入（用裸 prompt）。
     """
 
     # 请求级（每次 assemble 新建）
@@ -66,6 +71,7 @@ class RuntimeContext:
     workspace_path: Path
     trace_id: str | None = None
     owner_id: str | None = None
+    styles: dict[str, str] | None = None  # scope 名 → 风格 suffix 文本
     # 平台级（进程内复用）
     trace_recorder: object | None = None
     trace_middleware_cls: object | None = None  # TraceMiddleware 类，执行端注入

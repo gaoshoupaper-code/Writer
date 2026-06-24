@@ -15,7 +15,7 @@
   5. worker 进程结束（一次性，跑完即退）
 
 与生产路径的区别：
-  - 生产：package_loader.load_current_package()（同进程，固定路径）
+  - 生产：loader.load_current_package()（同进程，固定路径）
   - A/B：load_package_at(临时目录)（子进程，解压快照）
   装配入口统一是 package.assemble(ctx)。
 

@@ -12,7 +12,10 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
 
-from app.domains.writing.expert_agent.middleware.revision_limit_middleware import RevisionLimitMiddleware
+# RevisionLimitMiddleware 已迁进 harness 包（Phase 7），通过包加载后 import
+from app.platform.agent.loader import load_current_package
+load_current_package()
+from harness_current.middleware.revision_limit import RevisionLimitMiddleware
 from app.platform.agent.middleware import ArtifactValidationMiddleware
 
 

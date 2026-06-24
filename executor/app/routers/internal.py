@@ -211,7 +211,7 @@ def snapshot_refreshed(body: "SnapshotRefreshNotice") -> dict[str, Any]:
     幂等：重复通知无害（仅记日志）。
     替代 Phase 6 的 /manifest/refreshed（包化取代 manifest 指针）。
     """
-    from app.platform.harness.package_loader import reset_cache
+    from app.platform.agent.loader import reset_cache
     reset_cache()  # 清缓存，下次 load_current_package 重新加载（同进程内热更新）
     logger.info("快照 v%s 通知：包缓存已清，下次 load 重载", body.snapshot_version)
     return {"status": "ok", "snapshot_version": body.snapshot_version}

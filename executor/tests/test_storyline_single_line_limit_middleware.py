@@ -7,7 +7,10 @@ from types import SimpleNamespace
 
 from langchain_core.messages import ToolMessage
 
-from app.domains.writing.expert_agent.middleware.storyline_single_line_limit import (
+# StorylineSingleLineLimitMiddleware 已迁进 harness 包（Phase 7），通过包加载后 import
+from app.platform.agent.loader import load_current_package
+load_current_package()
+from harness_current.middleware.storyline_single_line_limit import (
     StorylineSingleLineLimitMiddleware,
 )
 

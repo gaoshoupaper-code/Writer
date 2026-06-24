@@ -7,8 +7,11 @@ from langchain.agents.factory import _resolve_schemas
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain.tools import ToolRuntime
 
-from app.domains.writing.middleware.goal_middleware import GoalMiddleware
-from app.domains.writing.tools.goal import GoalState, aset_goal, set_goal
+# GoalMiddleware + goal tool 已迁进 harness 包（Phase 7），通过包加载后 import
+from app.platform.agent.loader import load_current_package
+load_current_package()
+from harness_current.middleware.goal import GoalMiddleware
+from harness_current.tools.goal import GoalState, aset_goal, set_goal
 
 
 class GoalMiddlewareTest(unittest.TestCase):

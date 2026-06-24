@@ -18,7 +18,7 @@ from app.domains.writing.styling.router import init_style_module
 from app.domains.writing.styling.router import router as style_router
 from app.domains.writing.styling.store import CreateTypeStore
 from app.domains.writing.expert_agent.services.character import CharacterService
-from app.domains.writing.meta import MetaAgentService
+from app.domains.writing.agent import MetaAgentService
 from app.platform.agent.middleware import TraceCallbackHandler  # noqa: F401 — image router 用
 from app.platform.core.checkpoint_pool import (
     CheckpointPool,
@@ -35,9 +35,6 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
 
-_active_generations = 0
-
-
 def _log(event: str, **fields) -> None:
     """诊断日志：结构化 JSON 到 stdout（flush 保证即时输出）。
 
@@ -46,20 +43,6 @@ def _log(event: str, **fields) -> None:
     """
     record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "event": event, **fields}
     print(json.dumps(record, ensure_ascii=False), flush=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 settings = get_settings()

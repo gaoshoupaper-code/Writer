@@ -8,9 +8,9 @@
   submodule_search_locations 是让包内相对 import（from .middleware import X）生效的
   关键——没有它，包被当作普通模块加载，相对 import 会失败。
 
-  与旧 manifest_loader（从 DB 拉 surface content）的区别：
+  与旧 manifest_loader（Phase 6，已废弃删除）的区别：
   - manifest_loader：fetch_production → _enrich_with_content → assemble（数据来自 DB）
-  - package_loader：importlib 加载目录 → package.assemble(ctx)（数据来自包目录）
+  - 本模块：importlib 加载目录 → package.assemble(ctx)（数据来自包目录）
 
   本模块只管"把包加载进 Python 解释器"，装配逻辑在包内 __init__.py:assemble。
 
