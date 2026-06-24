@@ -131,12 +131,12 @@ docs/     = 你正在看的这套文档
        ↓
 3. executor 的 router（在 app/routers/screenplay.py）收到请求
        ↓
-4. router 调用 MetaAgentService（在 domains/writing/meta/agent.py）
-   这是写作流水线的"总指挥"
+4. router 调用 MetaAgentService（在 domains/writing/agent.py）
+   这是写作流水线的"服务壳"
        ↓
-5. 总指挥按顺序派活给四个子代理（写作流水线的核心）：
-   访谈员 → 故事建筑师 → 分场细化员 → 正文写手
-   每个环节产出一份中间文件，传给下一环
+5. 服务壳构建运行时上下文，调 harness 包（evolution/harnesses/current/）装配 agent，
+   再编排 SSE 流式生成。流水线四岗位（访谈员→故事建筑师→分场细化员→正文写手）
+   的装配逻辑都在 harness 包内，每个环节产出一份中间文件，传给下一环
        ↓
 6. 流水线跑完，剧本成品返回给 router
        ↓
