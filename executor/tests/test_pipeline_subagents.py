@@ -40,27 +40,27 @@ class TestRevisionLimitMiddleware(unittest.TestCase):
         result = mw.wrap_tool_call(req, lambda r: "ok")
         self.assertEqual(result, "ok")
 
-    def test_evolution_call_within_limit(self):
-        """evolution 调用在限制内应该放行。"""
+    def test_review_call_within_limit(self):
+        """review 调用在限制内应该放行。"""
         mw = RevisionLimitMiddleware(max_revisions=3)
-        req = self._make_request("task", "evolution")
+        req = self._make_request("task", "review")
         result = mw.wrap_tool_call(req, lambda r: "eval-result")
         self.assertEqual(result, "eval-result")
 
-    def test_evolution_call_exceeds_limit(self):
-        """evolution 调用超过限制应该返回终止消息。"""
+    def test_review_call_exceeds_limit(self):
+        """review 调用超过限制应该返回终止消息。"""
         mw = RevisionLimitMiddleware(max_revisions=2)
-        req = self._make_request("task", "evolution")
+        req = self._make_request("task", "review")
         # 前 2 次放行
         mw.wrap_tool_call(req, lambda r: "eval-1")
         mw.wrap_tool_call(req, lambda r: "eval-2")
         # 第 3 次应该被拦截
         result = mw.wrap_tool_call(req, lambda r: "should-not-reach")
         self.assertIsInstance(result, ToolMessage)
-        self.assertIn("评估上限", result.content)
+        self.assertIn("审查上限", result.content)
 
-    def test_non_evolution_task_passes_through(self):
-        """task 工具但目标不是 evolution 时应该放行。"""
+    def test_non_review_task_passes_through(self):
+        """task 工具但目标不是 review 时应该放行。"""
         mw = RevisionLimitMiddleware(max_revisions=1)
         req = self._make_request("task", "other-subagent")
         result = mw.wrap_tool_call(req, lambda r: "ok")

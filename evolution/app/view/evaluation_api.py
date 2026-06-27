@@ -13,11 +13,71 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, HTTPException
 
 import app.core.db as db
 
 router = APIRouter(tags=["evaluation"])
+
+
+# ── 字面路径必须先于 /evaluation/{trace_id} 注册，否则会被 {trace_id} 吞掉 ──
+
+@router.get("/evaluation/stats/overview")
+def evaluation_overview() -> dict[str, Any]:
+    """评估大盘：已评估 trace 数 / badcase 数 / 各维度均分。
+
+    含双层均分聚合（content_avg / subagent_avg）+ 阈值，供前端大盘卡片直接展示。
+    """
+    from app.diagnosis.rubrics import xianxia as rubric
+
+    total = db.query_one("SELECT count(*) AS c FROM evaluation_runs WHERE status='done'")
+    badcase_traces = db.query_all(
+        """SELECT trace_id, count(*) AS flagged FROM evaluation_scores
+           WHERE (layer='content' AND score < ?) OR (layer='subagent' AND score < ?)
+           GROUP BY trace_id""",
+        (rubric.CONTENT_BADCASE_THRESHOLD, rubric.SUBAGENT_BADCASE_THRESHOLD),
+    )
+    # 各维度均分
+    avg = db.query_all(
+        """SELECT layer, target, metric, AVG(score) AS avg_score
+           FROM evaluation_scores GROUP BY layer, target, metric
+           ORDER BY layer, target"""
+    )
+    content_avg_rows = [d for d in avg if d["layer"] == "content"]
+    subagent_avg_rows = [d for d in avg if d["layer"] == "subagent"]
+    content_avg = (sum(d["avg_score"] for d in content_avg_rows) / len(content_avg_rows)) if content_avg_rows else 0
+    subagent_avg = (sum(d["avg_score"] for d in subagent_avg_rows) / len(subagent_avg_rows)) if subagent_avg_rows else 0
+    return {
+        "evaluated_count": total["c"] if total else 0,
+        "badcase_count": len(badcase_traces),
+        "dimension_averages": avg,
+        "content_avg": content_avg,
+        "subagent_avg": subagent_avg,
+        "content_threshold": rubric.CONTENT_BADCASE_THRESHOLD,
+        "subagent_threshold": rubric.SUBAGENT_BADCASE_THRESHOLD,
+    }
+
+
+@router.get("/evaluation/list")
+def evaluation_list(limit: int = 100) -> list[dict[str, Any]]:
+    """已评估 trace 列表：每条带双层均分 + badcase 维度数 + 评估时间。
+
+    供前端评估列表页渲染（对应旧 Jinja2 /evaluation 的 evaluated_traces 查询）。
+    """
+    from app.diagnosis.rubrics import xianxia as rubric
+
+    rows = db.query_all(
+        f"""SELECT er.trace_id, er.status AS eval_status, er.finished_at AS evaluated_at,
+            (SELECT AVG(score) FROM evaluation_scores WHERE trace_id=er.trace_id AND layer='content') AS content_avg,
+            (SELECT AVG(score) FROM evaluation_scores WHERE trace_id=er.trace_id AND layer='subagent') AS subagent_avg,
+            (SELECT count(*) FROM evaluation_scores WHERE trace_id=er.trace_id
+             AND ((layer='content' AND score < {rubric.CONTENT_BADCASE_THRESHOLD})
+               OR (layer='subagent' AND score < {rubric.SUBAGENT_BADCASE_THRESHOLD}))) AS badcase_count
+            FROM evaluation_runs er WHERE er.status='done'
+            ORDER BY er.finished_at DESC LIMIT ?""",
+        (limit,),
+    )
+    return [dict(r) for r in rows]
 
 
 @router.get("/evaluation/{trace_id}")
@@ -111,206 +171,3 @@ def get_deliveries(trace_id: str) -> dict[str, Any]:
     from app.diagnosis.eval_extractor import summarize_deliveries
     summary = summarize_deliveries(trace_id)
     return {"trace_id": trace_id, "deliveries": summary}
-
-
-@router.get("/evaluation/stats/overview")
-def evaluation_overview() -> dict[str, Any]:
-    """评估大盘：已评估 trace 数 / badcase 数 / 各维度均分。"""
-    from app.diagnosis.rubrics import xianxia as rubric
-
-    total = db.query_one("SELECT count(*) AS c FROM evaluation_runs WHERE status='done'")
-    badcase_traces = db.query_all(
-        """SELECT trace_id, count(*) AS flagged FROM evaluation_scores
-           WHERE (layer='content' AND score < ?) OR (layer='subagent' AND score < ?)
-           GROUP BY trace_id""",
-        (rubric.CONTENT_BADCASE_THRESHOLD, rubric.SUBAGENT_BADCASE_THRESHOLD),
-    )
-    # 各维度均分
-    avg = db.query_all(
-        """SELECT layer, target, metric, AVG(score) AS avg_score
-           FROM evaluation_scores GROUP BY layer, target, metric
-           ORDER BY layer, target"""
-    )
-    return {
-        "evaluated_count": total["c"] if total else 0,
-        "badcase_count": len(badcase_traces),
-        "dimension_averages": avg,
-    }
-
-
-# ── Phase 2：诊断与候选 ──
-
-
-@router.get("/candidates")
-def list_candidates(status: str | None = None) -> list[dict[str, Any]]:
-    """列改进候选（improvement_candidates）。
-
-    query param status 可选过滤（pending/optimized/ab_testing/approved/rejected）。
-    """
-    from app.diagnosis.diagnosis import list_candidates as _list
-    return _list(status)
-
-
-@router.get("/candidates/{candidate_id}")
-def get_candidate(candidate_id: int) -> dict[str, Any]:
-    """查单个候选详情（含诊断结论 + 候选 prompt 版本内容）。"""
-    cand = db.query_one("SELECT * FROM improvement_candidates WHERE id=?", (candidate_id,))
-    if cand is None:
-        raise HTTPException(status_code=404, detail="候选不存在")
-    result = dict(cand)
-    # 附带候选版本内容（若有）
-    if cand["candidate_version_id"]:
-        import app.improvement.prompts_repo as repo
-        ver = db.query_one(
-            "SELECT * FROM prompt_versions WHERE id=?", (cand["candidate_version_id"],)
-        )
-        if ver:
-            result["candidate_version"] = {
-                "version": ver["version"], "content": ver["content"],
-                "commit_message": ver["commit_message"],
-            }
-    return result
-
-
-@router.post("/candidates/{candidate_id}/optimize")
-def trigger_optimize(candidate_id: int) -> dict[str, Any]:
-    """手动（重新）生成某候选的改进版 prompt（忽略幂等会重生成）。
-
-    自动连锁已在评估时生成过；此端点用于重试/手动触发。
-    """
-    from app.core.llm import judge_enabled
-    if not judge_enabled():
-        raise HTTPException(status_code=400, detail="LLM 未配置")
-    cand = db.query_one("SELECT * FROM improvement_candidates WHERE id=?", (candidate_id,))
-    if cand is None:
-        raise HTTPException(status_code=404, detail="候选不存在")
-    # 重置已生成的版本，强制重新优化
-    db.execute(
-        "UPDATE improvement_candidates SET candidate_version_id=NULL, status='pending' WHERE id=?",
-        (candidate_id,),
-    )
-    from app.improvement.optimizer import optimize_candidate
-    result = optimize_candidate(candidate_id)
-    if result is None:
-        raise HTTPException(status_code=500, detail="优化失败，见日志")
-    return {"candidate_id": candidate_id, "result": result}
-
-
-# ── Phase 3：A/B 实验与批准上线 ──
-
-
-@router.post("/candidates/{candidate_id}/experiment")
-def trigger_experiment(
-    candidate_id: int, test_set_id: int | None = None, background_tasks: BackgroundTasks = None,
-) -> dict[str, Any]:
-    """触发某候选的 A/B 实验（后台异步跑，立即返回 experiment_id）。
-
-    实验跑完（生成+评估+对比，可能数十分钟）后查 GET /experiments/{id} 看结果。
-    """
-    cand = db.query_one("SELECT * FROM improvement_candidates WHERE id=?", (candidate_id,))
-    if cand is None:
-        raise HTTPException(status_code=404, detail="候选不存在")
-    if cand["candidate_version_id"] is None:
-        raise HTTPException(status_code=400, detail="候选无改进版本，先 POST /optimize")
-
-    # 先建实验记录拿 id，再后台跑（让调用方立即拿到 id 可轮询）
-    from app.improvement.experiment import run_experiment
-    if background_tasks is not None:
-        background_tasks.add_task(run_experiment, candidate_id, test_set_id)
-        return {"status": "started", "candidate_id": candidate_id, "test_set_id": test_set_id}
-    # 无 background_tasks（直接调用）：同步跑（仅供测试）
-    result = run_experiment(candidate_id, test_set_id)
-    return {"status": "done", "result": result}
-
-
-@router.get("/experiments")
-def list_experiments(status: str | None = None) -> list[dict[str, Any]]:
-    """列 A/B 实验记录。"""
-    from app.improvement.experiment import list_experiments as _list
-    return _list(status)
-
-
-@router.get("/experiments/{experiment_id}")
-def get_experiment(experiment_id: int) -> dict[str, Any]:
-    """查单个实验详情。"""
-    row = db.query_one("SELECT * FROM ab_experiments WHERE id=?", (experiment_id,))
-    if row is None:
-        raise HTTPException(status_code=404, detail="实验不存在")
-    import json as _json
-    item = dict(row)
-    if row["production_scores_json"]:
-        item["production"] = _json.loads(row["production_scores_json"])
-    if row["candidate_scores_json"]:
-        item["candidate"] = _json.loads(row["candidate_scores_json"])
-    return item
-
-
-@router.post("/experiments/{experiment_id}/approve")
-def approve_experiment(experiment_id: int) -> dict[str, Any]:
-    """批准实验上线：candidate 版本升 production label（原 production 降 staging）。
-
-    仅 verdict=win 的实验可批准。批准后：
-      - candidate 版本 → production label
-      - 原 production 版本 → staging label（保留可回滚）
-      - improvement_candidates.status → approved
-    """
-    import app.improvement.prompts_repo as repo
-
-    exp = db.query_one("SELECT * FROM ab_experiments WHERE id=?", (experiment_id,))
-    if exp is None:
-        raise HTTPException(status_code=404, detail="实验不存在")
-    if exp["verdict"] != "win":
-        raise HTTPException(status_code=400, detail=f"仅 win 实验可批准，当前 verdict={exp['verdict']}")
-
-    # 找 candidate 版本（通过 improvement_candidates）
-    cand = db.query_one(
-        "SELECT candidate_version_id, prompt_name FROM improvement_candidates WHERE id=?",
-        (exp["candidate_id"],),
-    )
-    if cand is None or cand["candidate_version_id"] is None:
-        raise HTTPException(status_code=400, detail="候选版本缺失")
-
-    prompt = repo.get_prompt_by_name(cand["prompt_name"])
-    if prompt is None:
-        raise HTTPException(status_code=400, detail="prompt 线不存在")
-
-    # candidate 版本升 production（label 互斥自动把原 production 移走）
-    repo.set_labels(cand["candidate_version_id"], [repo.PRODUCTION_LABEL, repo.LATEST_LABEL])
-    # 原 production 降 staging：找当前非 candidate 的最高版本，打 staging
-    versions = repo.list_versions(prompt["id"])
-    for v in versions:
-        labels = [s.strip() for s in (v["labels"] or "").split(",") if s.strip()]
-        if v["id"] != cand["candidate_version_id"] and repo.PRODUCTION_LABEL not in labels:
-            # 给历史版本打 staging（标记可回滚）
-            if "staging" not in labels:
-                repo.set_labels(v["id"], labels + ["staging"])
-            break
-
-    # 更新候选状态
-    db.execute(
-        "UPDATE improvement_candidates SET status='approved' WHERE id=?",
-        (cand["id"] if cand else 0,),
-    )
-    db.execute(
-        "UPDATE ab_experiments SET status='approved' WHERE id=?", (experiment_id,)
-    )
-    return {
-        "status": "approved", "experiment_id": experiment_id,
-        "prompt_name": cand["prompt_name"],
-        "message": f"candidate 已升 production，原 production 降 staging（可回滚）",
-    }
-
-
-@router.get("/replay-testsets")
-def list_replay_testsets() -> list[dict[str, Any]]:
-    """列回放测试集。"""
-    from app.improvement.replay import list_test_sets
-    return list_test_sets()
-
-
-@router.post("/replay-testsets/seed-default")
-def seed_default_testset() -> dict[str, Any]:
-    """初始化默认玄幻测试集（幂等）。"""
-    from app.improvement.replay import ensure_default_test_set
-    result = ensure_default_test_set()
-    return {"status": "ok", "test_set": result}

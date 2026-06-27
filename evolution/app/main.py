@@ -32,10 +32,13 @@ from app.core.settings import settings
 from app.ingestion.ingestion import router as ingestion_router
 from app.view.traces import router as traces_router
 from app.view.stats import router as stats_router
-from app.diagnosis.rules import router as rules_router
-from app.improvement.prompts import router as prompts_router
 from app.view.evaluation_api import router as evaluation_router
 from app.improvement.snapshot_api import router as snapshot_router
+from app.view.active import router as active_api_router
+from app.view.agent_package import router as agent_package_router
+from app.view.sse_stream import router as sse_router
+from app.adapt.api import router as adapt_router
+from app.view.versions_api import router as versions_router
 from app.view.web.router import router as web_router
 from app.ingestion.scan import start_scan_scheduler
 from app.view.active import start_active_poller
@@ -52,16 +55,35 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Writer Evolution", version="0.1.0", lifespan=lifespan)
+
+# D11 CORS：dev 模式前端（localhost:3457）直连 evolution，需允许跨域。
+# prod 同源（StaticFiles 托管），CORS 不生效（无跨域）。
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3457", "http://127.0.0.1:3457"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # API 路由统一挂 /api 前缀，避免与页面路由（/、/traces、/rules）冲突
 app.include_router(ingestion_router, prefix="/api")
 app.include_router(traces_router, prefix="/api")
 app.include_router(stats_router, prefix="/api")
-app.include_router(rules_router, prefix="/api")
-app.include_router(prompts_router, prefix="/api")
 app.include_router(evaluation_router, prefix="/api")
 app.include_router(snapshot_router, prefix="/api")
-# 页面路由（HTML，无前缀）
-app.include_router(web_router)
+# 监测前端新增端点（D7 active 富化 / D8 agent-package / D9 SSE stream）
+app.include_router(active_api_router, prefix="/api")
+app.include_router(agent_package_router, prefix="/api")
+app.include_router(sse_router, prefix="/api")
+# Phase 8 adapt：手动触发 AEGIS 进化循环（决策 A12a）+ 查询/控制（驾驶舱后端）
+app.include_router(adapt_router, prefix="/api")
+# 配置版本谱系视图（前端版本谱系页 D8）
+app.include_router(versions_router, prefix="/api")
+# D6：旧 Jinja2 监测前端退到 /legacy 前缀（新 Next.js 前端接管根路径）。
+# 未迁移的页（overview/evaluation/rules/experiments）暂继续用旧前端兜底。
+app.include_router(web_router, prefix="/legacy")
 
 
 @app.get("/health")
@@ -77,3 +99,20 @@ def config() -> dict[str, str]:
         "executor_url": str(settings.executor_url),
         "db_path": str(settings.db_path),
     }
+
+
+# D1/D6：StaticFiles 托管新 Next.js 前端静态产物（next build 的 out/）。
+# 挂在根路径 /，html=True 实现 SPA fallback（未知路由回落 index.html）。
+# 必须在所有 API + /legacy 之后挂（否则会吞掉 /api 和 /legacy 路径）。
+# 开发模式（无 out 目录）跳过——dev 用 next dev --port 3457 独立跑。
+from pathlib import Path as _Path
+_frontend_out = _Path(__file__).resolve().parent.parent / "frontend" / "out"
+if _frontend_out.is_dir():
+    from starlette.staticfiles import StaticFiles
+    app.mount("/", StaticFiles(directory=str(_frontend_out), html=True), name="frontend")
+else:
+    import logging as _logging
+    _logging.getLogger("evolution").info(
+        "监测前端静态产物未找到（%s），跳过 StaticFiles 托管。"
+        "生产模式需先在 evolution/frontend/ 执行 npm run build。", _frontend_out
+    )

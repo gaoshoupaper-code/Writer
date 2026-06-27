@@ -59,12 +59,14 @@ class MetaReadOnlyMiddlewareTest(unittest.TestCase):
             ("/storyline.md", "storybuilding"),
             ("/storyline/主线.md", "storybuilding"),
             ("/worldview.md", "storybuilding"),
-            ("/evaluation.md", "storybuilding"),
+            ("/review/storybuilding.md", "storybuilding"),
+            ("/review/detail.md", "detail-outline"),
             ("/detail/chapter-01.md", "detail-outline"),
             ("/chapter/chapter-01.md", "writing"),
             ("/novel.md", "writing"),
             ("/state_log.md", "writing"),
             ("/review/chapter-01.md", "writing"),
+            ("/review/其他.md", "writing"),
         ]
         for file_path, expected in cases:
             with self.subTest(path=file_path):

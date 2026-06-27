@@ -86,81 +86,19 @@ def traces_page(
 
 @router.get("/traces/{trace_id}", response_class=HTMLResponse)
 def trace_detail_page(request: Request, trace_id: str) -> HTMLResponse:
-    """trace 详情页：节点树 + flags。"""
+    """trace 详情页：节点树。"""
     run = db.query_one("SELECT * FROM runs WHERE trace_id = ?", (trace_id,))
     if run is None:
         return templates.TemplateResponse(request, "empty.html", {"active": "traces", "message": "Trace 不存在"})
-    flags = db.query_all(
-        """SELECT f.metric_value, r.name, r.metric, r.op, r.threshold
-           FROM trace_flags f JOIN rules r ON r.id = f.rule_id
-           WHERE f.trace_id = ? ORDER BY r.id""",
-        (trace_id,),
-    )
     # 重新投影拿节点树（与 /traces/{id} API 一致）
     nodes, events_count = _project_nodes(trace_id, run)
-    # LLM-judge 评分（第二期）
-    score = db.query_one(
-        "SELECT score, verdict, summary, rubric_json FROM trace_scores WHERE trace_id=? ORDER BY id DESC LIMIT 1",
-        (trace_id,),
-    )
-    judgment = db.query_one("SELECT status, error FROM judgment_runs WHERE trace_id=?", (trace_id,))
-    import json as _json
-    if score and score["rubric_json"]:
-        score = dict(score)
-        score["rubric"] = _json.loads(score["rubric_json"])
-    # prompt 版本：从 run_meta 事件取（后端 recorder 在 trace 收尾时写入）。
-    prompt_versions = _extract_prompt_versions(trace_id)
     return templates.TemplateResponse(
         request, "trace_detail.html",
         {
-            "active": "traces", "run": run, "nodes": nodes, "flags": flags,
-            "events_count": events_count, "score": score, "judgment": judgment,
-            "judge_enabled": _judge_enabled(),
-            "prompt_versions": prompt_versions,
+            "active": "traces", "run": run, "nodes": nodes,
+            "events_count": events_count,
+            "flags": [], "score": None, "judgment": None, "prompt_versions": [],
         },
-    )
-
-
-@router.get("/rules", response_class=HTMLResponse)
-def rules_page(request: Request) -> HTMLResponse:
-    """规则管理页。"""
-    all_rules = db.query_all("SELECT * FROM rules ORDER BY id DESC")
-    # 分三组：manual+approved / pending(候选待审) / rejected
-    pending = [r for r in all_rules if r["source"] == "llm_candidate" and r.get("status") == "pending"]
-    active = [r for r in all_rules if r.get("status") != "pending" and r.get("status") != "rejected"]
-    rejected = [r for r in all_rules if r.get("status") == "rejected"]
-    hit_counts = {r["rule_id"]: r["c"] for r in db.query_all(
-        "SELECT rule_id, count(*) AS c FROM trace_flags GROUP BY rule_id"
-    )}
-    return templates.TemplateResponse(
-        request, "rules.html",
-        {
-            "active": "rules", "pending": pending, "rules": active, "rejected": rejected,
-            "hit_counts": hit_counts, "judge_enabled": _judge_enabled(),
-        },
-    )
-
-
-@router.get("/prompts", response_class=HTMLResponse)
-def prompts_page(request: Request) -> HTMLResponse:
-    """prompt 版本管理页（Phase 4 T9）。"""
-    import app.improvement.prompts_repo as repo
-    prompts = repo.list_prompts()
-    # 每个 prompt 附带版本数和当前 production 版本
-    enriched = []
-    for p in prompts:
-        versions = repo.list_versions(p["id"])
-        prod = repo.get_version_by_label(p["id"], repo.PRODUCTION_LABEL)
-        enriched.append({
-            **p,
-            "version_count": len(versions),
-            "production_version": prod["version"] if prod else None,
-            "latest_version": versions[0]["version"] if versions else None,
-            "production_content": prod["content"] if prod else None,
-        })
-    return templates.TemplateResponse(
-        request, "prompts.html",
-        {"active": "prompts", "prompts": enriched},
     )
 
 
@@ -255,32 +193,6 @@ def evaluation_detail_page(request: Request, trace_id: str) -> HTMLResponse:
     )
 
 
-@router.get("/experiments", response_class=HTMLResponse)
-def experiments_page(request: Request) -> HTMLResponse:
-    """A/B 实验页（Phase 3 T3.5）：候选列表 + 实验结果 + 测试集。"""
-    from app.diagnosis.diagnosis import list_candidates
-    from app.improvement.experiment import list_experiments
-    from app.improvement.replay import list_test_sets
-
-    return templates.TemplateResponse(
-        request, "experiments.html",
-        {
-            "active": "experiments",
-            "candidates": list_candidates(),
-            "experiments": list_experiments(),
-            "testsets": list_test_sets(),
-        },
-    )
-
-
-def _judge_enabled() -> bool:
-    try:
-        from app.core.llm import judge_enabled
-        return judge_enabled()
-    except Exception:
-        return False
-
-
 # ── 概览页用的聚合 SQL ──
 
 _OVERVIEW_SQL = """SELECT
@@ -336,59 +248,3 @@ def _project_nodes(trace_id: str, run: dict[str, Any]) -> tuple[list[dict[str, A
     projection = projector.TraceProjector().project(summary, events)
     # 按深度缩进排序：run(0) → agent(1) → 叶子
     return [n.model_dump() for n in projection.nodes], len(events)
-
-
-def _extract_prompt_versions(trace_id: str) -> list[dict[str, Any]]:
-    """从 run_meta 事件提取 prompt 版本信息，并按版本号取正文。
-
-    后端 recorder 在 trace 收尾时写一条 type=run_meta 事件，input 含
-    {"prompt_versions": {prompt_name: version_int}}。这里查 event_payloads
-    取出该字典，再按 name+version 从 prompts 表取正文（旧 trace 可能引用
-    已非 production 的历史版本，故按精确 version 取）。
-
-    Returns: [{name, version, found, content, commit_message, created_at}, ...]
-             found=False 表示该 prompt/version 在库里已不存在，仍返回 name+version。
-    """
-    import app.improvement.prompts_repo as repo
-
-    rows = db.query_all(
-        "SELECT payload_json FROM event_payloads WHERE trace_id = ? AND type = 'run_meta' ORDER BY sequence",
-        (trace_id,),
-    )
-    versions_map: dict[str, int] = {}
-    for r in rows:
-        try:
-            payload = json.loads(r["payload_json"])
-        except (json.JSONDecodeError, TypeError):
-            continue
-        pv = (payload.get("input") or {}).get("prompt_versions")
-        if isinstance(pv, dict):
-            # 合并多个 run_meta（取每个 prompt 最后一次记录的版本）
-            versions_map.update({k: int(v) for k, v in pv.items() if isinstance(v, (int, float, str))})
-
-    result: list[dict[str, Any]] = []
-    for name, version in versions_map.items():
-        try:
-            version_int = int(version)
-        except (TypeError, ValueError):
-            continue
-        content_data = repo.get_prompt_version_content(name, version_int)
-        if content_data:
-            result.append({
-                "name": name,
-                "version": version_int,
-                "found": True,
-                "content": content_data["content"],
-                "commit_message": content_data.get("commit_message"),
-                "created_at": content_data.get("created_at"),
-            })
-        else:
-            result.append({
-                "name": name,
-                "version": version_int,
-                "found": False,
-                "content": None,
-                "commit_message": None,
-                "created_at": None,
-            })
-    return result

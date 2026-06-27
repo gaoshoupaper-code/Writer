@@ -17,10 +17,9 @@
   - /storyline.md          — 线纲索引（故事核心+故事线一览表）
   - /storyline/<name>.md   — 故事线详情（每条一个文件）
   - /worldview.md          — 世界观文件
-  - /evaluation.md         — 评估报告文件
   - /novel.md              — 小说正文文件
   - /chapter/<name>.md     — 正文章节文件
-  - /review/<name>.md      — 审查报告文件
+  - /review/<name>.md      — 审查报告文件（正文/细纲/故事构建审查产物）
   - /detail/<name>.md      — 细纲文件
   - /state_log.md          — 状态日志文件
 
@@ -51,10 +50,9 @@ WRITING_WRITE_PATTERNS = (
     re.compile(r"^/storyline\.md$"),            # 线纲索引（故事核心+一览表）
     re.compile(r"^/storyline/[^/]+\.md$"),      # 故事线详情（每条一个文件）
     re.compile(r"^/worldview\.md$"),            # 世界观
-    re.compile(r"^/evaluation\.md$"),           # 评估报告
     re.compile(r"^/novel\.md$"),                # 小说正文
     re.compile(r"^/chapter/[^/]+\.md$"),        # 正文章节
-    re.compile(r"^/review/[^/]+\.md$"),         # 审查报告
+    re.compile(r"^/review/[^/]+\.md$"),         # 审查报告（正文/细纲/故事构建）
     re.compile(r"^/detail/[^/]+\.md$"),         # 细纲
     re.compile(r"^/state_log\.md$"),            # 状态日志
 )
@@ -72,6 +70,10 @@ class FilesystemPathGuardMiddleware(AgentMiddleware):
     拦截写入工具调用，校验路径合法性，将合法路径规范化为虚拟路径格式。
     非法路径会被替换为 ToolMessage 错误响应，阻止实际写入操作。
     """
+
+    # compose 配置驱动装配时，assemble 按 _inject_from_ctx 从 ctx 取运行时值注入
+    # __init__（决策 D13a/D14b）。workspace_path 是运行时值，不进 config.params。
+    _inject_from_ctx = ["workspace_path"]
 
     def __init__(
         self,

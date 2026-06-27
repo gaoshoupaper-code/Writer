@@ -6,11 +6,11 @@
 - 人物（character/*.md）和世界观（worldview.md）由单代理统一维护
 
 事件以事件组为单位插入故事线，按三幕式比例编排。
-每次产出后自动调用 evolution 进行跨维度统一评估，单次评估修订（仅调用 1 次 evolution）。
+每次产出后自动调用 review 进行跨维度统一审查，单次审查修订（仅调用 1 次 review）。
 
 导出的公共 API：
   - build_storybuilding_subagent():        构建故事构建子代理规格
-  - build_storybuilding_deep_subagent():   构建 DeepAgent 版本（含统一评估循环）
+  - build_storybuilding_deep_subagent():   构建 DeepAgent 版本（含统一审查循环）
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from app.platform.agent.runtime import (
 )
 
 from .factory import build_deep_subagent
-from .evaluators.storybuilding import build_storybuilding_evaluator
+from .reviewers.storybuilding import build_storybuilding_reviewer
 from .types import apply_style_suffix
 from ..middleware.storyline_single_line_limit import (
     StorylineSingleLineLimitMiddleware,
@@ -96,9 +96,9 @@ def build_storybuilding_deep_subagent(
     style_suffix: str | None = None,
     context_file_paths: list[str] | None = None,
 ) -> CompiledSubAgent:
-    """构建基于 DeepAgent 的 storybuilding 子代理（含统一评估循环）。
+    """构建基于 DeepAgent 的 storybuilding 子代理（含统一审查循环）。
 
-    子代理自主决策：产出/扩展各维度 → 调用 evolution 统一评估 → 根据反馈修订。
+    子代理自主决策：产出/扩展各维度 → 调用 review 统一审查 → 根据反馈修订。
     默认不使用 ContextAssemblerMiddleware——agent 根据任务自主读取所需文件。
     但可通过 context_file_paths 注入指定文件（如 demand.md）。
 
@@ -127,22 +127,22 @@ def build_storybuilding_deep_subagent(
         workspace_root, storybuilding_middleware, style_suffix
     )
 
-    # ---- 统一评估子代理规格（评估器自主读取所有文件） ----
-    evaluation_spec = build_storybuilding_evaluator(
+    # ---- 统一审查子代理规格（审查器自主读取所有文件） ----
+    review_spec = build_storybuilding_reviewer(
         workspace_root,
-        middleware_factory("storybuilding-evaluation-subagent"),
+        middleware_factory("storybuilding-review-subagent"),
     )
 
-    # ---- 构建 evolution SubAgent dict ----
-    evolution = SubAgent(
-        name="evolution",
+    # ---- 构建 review SubAgent dict ----
+    review = SubAgent(
+        name="review",
         description=(
-            "统一评估所有故事维度（人物、世界观、故事核心、故事线、事件组）的跨维度一致性。"
-            "自主读取所有产物，写入 evaluation.md，返回评分和修订建议。"
+            "统一审查所有故事维度（人物、世界观、故事核心、故事线、事件组）的跨维度一致性。"
+            "自主读取所有产物，写入 review/storybuilding.md，返回评分和修订建议。"
         ),
-        system_prompt=evaluation_spec["system_prompt"],
-        permissions=evaluation_spec.get("permissions"),
-        middleware=evaluation_spec.get("middleware"),
+        system_prompt=review_spec["system_prompt"],
+        permissions=review_spec.get("permissions"),
+        middleware=review_spec.get("middleware"),
     )
 
     # ---- Skill 路径：初构 + 增量 ----
@@ -163,12 +163,12 @@ def build_storybuilding_deep_subagent(
             "增量迭代：按人物/故事线比值分流两种互斥模式——"
             "人物充足(>3)新增一条故事线，人物不足(≤3)新增一个人物并融入现有故事、不新增故事线；"
             "每次调用只执行一种模式，可循环多次调用。"
-            "内置统一评估：产出后调用 evolution 评估跨维度一致性，单次评估修订（仅 1 次）。"
+            "内置统一审查：产出后调用 review 审查跨维度一致性，单次审查修订（仅 1 次）。"
             "委托时必须说明：使用初构还是增量 Skill、本轮焦点、用户扩展方向。"
         ),
         model=model,
         system_prompt=primary_spec["system_prompt"],
-        evolution_spec=evolution,
+        review_spec=review,
         subagent_middleware=primary_spec.get("middleware"),
         backend=backend,
         artifact_paths=[workspace_root / "storyline.md", workspace_root / "storyline", workspace_root / "storyline" / "timeline.md"],

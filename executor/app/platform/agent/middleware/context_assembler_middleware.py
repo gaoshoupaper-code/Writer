@@ -46,6 +46,11 @@ class ContextAssemblerMiddleware(AgentMiddleware):
     - 动态回调：根据任务文本动态计算文件列表，适用于 writing（需根据章节号选择不同文件）
     """
 
+    # compose 配置驱动装配时，assemble 按 _inject_from_ctx 从 ctx 取运行时值注入
+    # __init__（决策 D13a/D14b）。workspace_root 是运行时值，不进 config.params。
+    # 注意：__init__ 的第一个参数名是 workspace_root（不是 workspace_path）。
+    _inject_from_ctx = ["workspace_root"]
+
     def __init__(
         self,
         workspace_root: Path,

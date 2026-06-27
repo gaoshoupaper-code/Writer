@@ -1,4 +1,4 @@
-"""Detail Outline 子代理 — 逐章细纲生成 + evolution 评估循环。"""
+"""Detail Outline 子代理 — 逐章细纲生成 + review 审查循环。"""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from app.platform.agent.runtime import (
     SubAgentSpec,
 )
 from .factory import build_deep_subagent
-from .evaluators.detail_outline import build_detail_outline_evaluator
+from .reviewers.detail_outline import build_detail_outline_reviewer
 from .types import apply_style_suffix
 
 # 细纲子代理的系统提示词文件路径
@@ -68,10 +68,10 @@ def build_detail_outline_deep_subagent(
     style_suffix: str | None = None,
     context_file_paths: list[str] | None = None,
 ) -> CompiledSubAgent:
-    """构建基于 DeepAgent 的 detail-outline 子代理（内含 evolution 评估循环）。
+    """构建基于 DeepAgent 的 detail-outline 子代理（内含 review 审查循环）。
 
     替代 build_detail_outline_pipeline_subagent 的 StateGraph 管道模式。
-    子代理自主决策：生成 → 调用 evolution 评估 → 根据反馈修订（单次评估修订）。
+    子代理自主决策：生成 → 调用 review 审查 → 根据反馈修订（单次审查修订）。
 
     Args:
         workspace_root:      工作区根目录
@@ -92,26 +92,26 @@ def build_detail_outline_deep_subagent(
     ))
     primary_spec = build_detail_outline_subagent(project_middleware, style_suffix)
 
-    # ---- evolution 子代理规格 ----
-    # 注意：context_file_paths 只注入「评估基准类」文件（大纲/人物/剧情线），
-    # 刻意排除评估对象本体 detail/*.md。原因：detail/*.md 全量注入会超过
+    # ---- review 子代理规格 ----
+    # 注意：context_file_paths 只注入「审查基准类」文件（大纲/人物/剧情线），
+    # 刻意排除审查对象本体 detail/*.md。原因：detail/*.md 全量注入会超过
     # FilesystemMiddleware 的消息落盘阈值，被替换为「内容过大已存盘」占位符，
-    # 导致评估子代理实际看不到待评估内容而空转秒退。
-    # 待评估的本批 chapter-XX.md 由父代理在 task description 中给出明确路径，
-    # 评估子代理自行 read_file 读取（见 detail_outline_evaluation.md 步骤 1）。
-    evaluation_spec = build_detail_outline_evaluator(
+    # 导致审查子代理实际看不到待审查内容而空转秒退。
+    # 待审查的本批 chapter-XX.md 由父代理在 task description 中给出明确路径，
+    # 审查子代理自行 read_file 读取（见 detail_outline_review.md 步骤 1）。
+    review_spec = build_detail_outline_reviewer(
         workspace_root,
-        middleware_factory("detail-outline-evaluation-subagent"),
+        middleware_factory("detail-outline-review-subagent"),
         context_file_paths=["outline.md", "character/*.md", "storyline.md", "storyline/*.md"],
     )
 
-    # ---- 构建 evolution SubAgent dict ----
-    evolution = SubAgent(
-        name="evolution",
-        description="评估 detail/ 下细纲文件的质量，写入 detail/evaluation.md，返回评分和修订建议。",
-        system_prompt=evaluation_spec["system_prompt"],
-        permissions=evaluation_spec.get("permissions"),
-        middleware=evaluation_spec.get("middleware"),
+    # ---- 构建 review SubAgent dict ----
+    review = SubAgent(
+        name="review",
+        description="审查 detail/ 下细纲文件的质量，写入 review/detail.md，返回评分和修订建议。",
+        system_prompt=review_spec["system_prompt"],
+        permissions=review_spec.get("permissions"),
+        middleware=review_spec.get("middleware"),
     )
 
     # ---- 组装 system prompt ----
@@ -127,12 +127,12 @@ def build_detail_outline_deep_subagent(
             "适用：storybuilding 产出 timeline.md 后，需要把事件编排进章节时调用。"
             "每次处理 timeline 的下一批 5-8 个事件，自主决定分几章、每章几事件，"
             "写入 detail/chapter-XX.md 并增量更新 detail/overview.md。"
-            "内置 evolution 评估：批次生成后统一评估质量，如建议修订则自动修订（单次，仅 1 次）。"
+            "内置 review 审查：批次生成后统一审查质量，如建议修订则自动修订（单次，仅 1 次）。"
             "委托时请说明创作目标（可选）。"
         ),
         model=model,
         system_prompt=system_prompt,
-        evolution_spec=evolution,
+        review_spec=review,
         subagent_middleware=primary_spec.get("middleware"),
         backend=backend,
         max_revisions=1,

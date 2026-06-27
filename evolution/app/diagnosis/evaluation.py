@@ -70,35 +70,10 @@ def evaluate_trace(trace_id: str) -> dict[str, Any] | None:
             (datetime.now(UTC).isoformat(), trace_id),
         )
 
-        # 6. 自动连锁（Self-Harness Phase 3 T3.3）：badcase → 写 badcase_records
-        #    （D20 立即写表+延迟触发）+ match_signature（D15）。
-        #    旧的「立即 diagnose→optimize」已废弃（S15 硬冻结），Mining 改为攒够才提炼。
-        #    失败不阻塞评估主流程。
-        mining_result: dict[str, Any] = {"recorded": 0, "matched": []}
-        if badcase["is_badcase"]:
-            try:
-                from app.diagnosis import mining
-                # D20：立即写 badcase_records（不立即触发诊断）
-                count = mining.record_badcases_from_evaluation(trace_id, badcase)
-                mining_result["recorded"] = count
-                # D15：每条 badcase 尝试匹配已有签名（不强制，无匹配则待后续提炼）
-                for flagged in badcase.get("flagged_dimensions", []):
-                    sig_id = mining.match_signature(
-                        flagged["layer"], flagged["target"], flagged["metric"],
-                        flagged.get("evidence", ""),
-                    )
-                    if sig_id:
-                        mining_result["matched"].append({
-                            "metric": flagged["metric"], "signature_id": sig_id,
-                        })
-            except Exception:
-                logger.exception("Mining 接入失败 %s", trace_id)
-
         return {
             "content": content_result,
             "subagent": subagent_results,
             "badcase": badcase,
-            "mining": mining_result,
         }
     except Exception as exc:
         logger.exception("evaluate_trace 失败 %s", trace_id)

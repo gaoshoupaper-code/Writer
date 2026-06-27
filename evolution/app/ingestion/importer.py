@@ -72,14 +72,6 @@ def ingest_events(
     _write_events(run.trace_id, all_events)
     _write_nodes(run.trace_id, run, all_events)
 
-    # 摄入完成后跑规则标红（数据已就绪）
-    try:
-        from app.diagnosis.rules_engine import evaluate_trace
-        evaluate_trace(run.trace_id)
-    except Exception:
-        # 规则评估失败不影响摄入主流程
-        pass
-
     return run.trace_id
 
 

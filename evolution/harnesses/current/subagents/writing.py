@@ -1,4 +1,4 @@
-"""Writing 子代理 — 正文写作 + evolution 审查循环。"""
+"""Writing 子代理 — 正文写作 + review 审查循环。"""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from langchain_core.language_models import BaseChatModel
 
 from app.platform.agent.middleware import ContextAssemblerMiddleware
 from .factory import build_deep_subagent
-from .evaluators.writing import build_writing_evaluator
+from .reviewers.writing import build_writing_reviewer
 from .types import apply_style_suffix
 
 # 写作子代理的系统提示词文件路径
@@ -79,9 +79,9 @@ def build_writing_deep_subagent(
     style_suffix: str | None = None,
     context_file_paths: list[str] | None = None,
 ) -> CompiledSubAgent:
-    """构建基于 DeepAgent 的 writing 子代理（内含 evolution 审查循环）。
+    """构建基于 DeepAgent 的 writing 子代理（内含 review 审查循环）。
 
-    子代理自主决策：写作 → 调用 evolution 审查 → 根据反馈修订（单次审查修订）。
+    子代理自主决策：写作 → 调用 review 审查 → 根据反馈修订（单次审查修订）。
 
     Args:
         workspace_root:      工作区根目录
@@ -103,27 +103,27 @@ def build_writing_deep_subagent(
     ))
     primary_spec = build_writing_subagent(writing_middleware, style_suffix)
 
-    # ---- evolution 子代理规格 ----
-    # 注意：context_file_paths 只注入「评估基准类」文件（大纲/剧情线/人物），
-    # 刻意排除评估对象本体 chapter/*.md 和细纲 detail/*.md。原因：
+    # ---- review 子代理规格 ----
+    # 注意：context_file_paths 只注入「审查基准类」文件（大纲/剧情线/人物），
+    # 刻意排除审查对象本体 chapter/*.md 和细纲 detail/*.md。原因：
     # chapter/*.md 全量注入会超过 FilesystemMiddleware 的消息落盘阈值，被替换为
     # 「内容过大已存盘」占位符，导致审查子代理实际看不到待审查正文而空转秒退。
     # 待审查的本章文件路径由父代理在 task description 中给出，审查子代理自行
-    # read_file 读取（见 writing_evaluation.md 步骤 1）。detail/ 细纲也由子代理
+    # read_file 读取（见 writing_review.md 步骤 1）。detail/ 细纲也由子代理
     # 按需 read_file 做一致性核对，不作为前置上下文注入。
-    evaluation_spec = build_writing_evaluator(
+    review_spec = build_writing_reviewer(
         workspace_root,
-        middleware_factory("writing-evaluation-subagent"),
+        middleware_factory("writing-review-subagent"),
         context_file_paths=["outline.md", "storyline.md", "storyline/*.md", "character/*.md"],
     )
 
-    # ---- 构建 evolution SubAgent dict ----
-    evolution = SubAgent(
-        name="evolution",
+    # ---- 构建 review SubAgent dict ----
+    review = SubAgent(
+        name="review",
         description="审查正文章节质量，写入 review/ 下对应文件，返回审查结论和修订建议。",
-        system_prompt=evaluation_spec["system_prompt"],
-        permissions=evaluation_spec.get("permissions"),
-        middleware=evaluation_spec.get("middleware"),
+        system_prompt=review_spec["system_prompt"],
+        permissions=review_spec.get("permissions"),
+        middleware=review_spec.get("middleware"),
     )
 
     # ---- 组装 system prompt ----
@@ -136,14 +136,14 @@ def build_writing_deep_subagent(
     return build_deep_subagent(
         name="writing",
         description=(
-            "适用：需要生成、追加或修订单个正文章节时调用；不用于大纲、角色或评估。"
-            "内置 evolution 审查：写作后自动审查质量，如果审查建议修订会自动修订（单次审查修订，仅 1 次）。"
+            "适用：需要生成、追加或修订单个正文章节时调用；不用于大纲、角色或审查。"
+            "内置 review 审查：写作后自动审查质量，如果审查建议修订会自动修订（单次审查修订，仅 1 次）。"
             "输入上下文包含 character/（角色设计）、outline.md（大纲剧情）和 detail/（对应细纲）。"
             "委托时请说明章节编号、本章目标、出场人物和关键约束。"
         ),
         model=model,
         system_prompt=system_prompt,
-        evolution_spec=evolution,
+        review_spec=review,
         subagent_middleware=primary_spec.get("middleware"),
         backend=backend,
         max_revisions=1,

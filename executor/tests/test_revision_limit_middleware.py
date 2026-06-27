@@ -37,30 +37,30 @@ class _CallTracker:
 
 
 class RevisionLimitMiddlewareTest(unittest.TestCase):
-    def test_first_evolution_call_passes(self) -> None:
+    def test_first_review_call_passes(self) -> None:
         mw = RevisionLimitMiddleware(max_revisions=1)
         tracker = _CallTracker()
 
-        result = mw.wrap_tool_call(_request("task", "evolution"), tracker)
+        result = mw.wrap_tool_call(_request("task", "review"), tracker)
 
         self.assertEqual(result, "passed-through")
         self.assertEqual(mw._revision_count, 1)
 
-    def test_second_evolution_call_is_blocked(self) -> None:
+    def test_second_review_call_is_blocked(self) -> None:
         mw = RevisionLimitMiddleware(max_revisions=1)
         tracker = _CallTracker()
 
-        mw.wrap_tool_call(_request("task", "evolution", "c1"), tracker)
-        # 第 2 次 evolution 调用 → 超限拦截，handler 不应被调用
-        result = mw.wrap_tool_call(_request("task", "evolution", "c2"), tracker)
+        mw.wrap_tool_call(_request("task", "review", "c1"), tracker)
+        # 第 2 次 review 调用 → 超限拦截，handler 不应被调用
+        result = mw.wrap_tool_call(_request("task", "review", "c2"), tracker)
 
         self.assertIsInstance(result, ToolMessage)
-        self.assertIn("评估上限", result.content)
+        self.assertIn("审查上限", result.content)
         self.assertEqual(result.name, "task")
         self.assertEqual(tracker.calls, 1)
         self.assertEqual(mw._revision_count, 2)
 
-    def test_non_evolution_task_passes_without_count(self) -> None:
+    def test_non_review_task_passes_without_count(self) -> None:
         mw = RevisionLimitMiddleware(max_revisions=1)
         tracker = _CallTracker()
 
@@ -81,23 +81,23 @@ class RevisionLimitMiddlewareTest(unittest.TestCase):
     def test_before_agent_resets_count_for_new_invocation(self) -> None:
         """同一实例多调用周期：第 1 周期达上限被拦，before_agent 重置后第 2 周期重新放行。
 
-        覆盖真实装配盲区——storybuilding 子代理 graph 会话内多次 task 复用同一实例，
-        评估额度须按「每次子代理调用」重置（这正是线上「后续调用没评估」的根因）。
+        覆盖真实装配盲区——子代理 graph 会话内多次 task 复用同一实例，
+        审查额度须按「每次子代理调用」重置（这正是线上「后续调用没审查」的根因）。
         """
         mw = RevisionLimitMiddleware(max_revisions=1)
         tracker = _CallTracker()
 
-        # 调用周期 1（storybuilding 被父 agent task 委托一次）
+        # 调用周期 1（子代理被父 agent task 委托一次）
         mw.before_agent(state={}, runtime=None)
-        mw.wrap_tool_call(_request("task", "evolution", "c1"), tracker)
-        blocked = mw.wrap_tool_call(_request("task", "evolution", "c2"), tracker)
+        mw.wrap_tool_call(_request("task", "review", "c1"), tracker)
+        blocked = mw.wrap_tool_call(_request("task", "review", "c2"), tracker)
         self.assertIsInstance(blocked, ToolMessage)
         self.assertEqual(tracker.calls, 1)
 
-        # 调用周期 2：重置后重新享有评估额度
+        # 调用周期 2：重置后重新享有审查额度
         mw.before_agent(state={}, runtime=None)
         self.assertEqual(mw._revision_count, 0)
-        result = mw.wrap_tool_call(_request("task", "evolution", "c3"), tracker)
+        result = mw.wrap_tool_call(_request("task", "review", "c3"), tracker)
         self.assertEqual(result, "passed-through")
         self.assertEqual(mw._revision_count, 1)
         self.assertEqual(tracker.calls, 2)

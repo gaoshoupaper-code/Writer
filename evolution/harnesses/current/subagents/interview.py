@@ -2,7 +2,7 @@
 
 通过 ask_user 工具（interrupt）与用户多轮问答，按 demand 模板逐项填充 demand.md；
 维度齐全后请求用户确认，confirmed 后交回 MetaAgent。
-不挂 evolution（需求访谈无客观质量标准）。多轮 interrupt 冒泡由 P0 spike 验证。
+不挂 review（需求访谈无客观质量标准）。多轮 interrupt 冒泡由 P0 spike 验证。
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def build_interview_deep_subagent(
     backend: object,
     middleware_factory: Callable[[str], list[AgentMiddleware]],
 ) -> CompiledSubAgent:
-    """构建访谈子代理（DeepAgent，无 evolution，方式2 HITL）。
+    """构建访谈子代理（DeepAgent，无 review，方式2 HITL）。
 
     Args:
         workspace_root:     工作区根目录
@@ -62,7 +62,7 @@ def build_interview_deep_subagent(
         description=(
             "适用：需要与用户多轮对话收集创作需求时调用。"
             "通过 ask_user 工具逐项提问，按 demand.md 模板填充核心/设定/风格/约束四层维度，"
-            "维度齐全后请求用户确认成型。产出 demand.md，不挂评估。"
+            "维度齐全后请求用户确认成型。产出 demand.md，不挂审查。"
         ),
         runnable=graph,
     )

@@ -82,7 +82,6 @@ def _scan_once() -> int:
         if tid:
             count += 1
             logger.info("兜底摄入: %s (变更: %s→%s)", tid, local_status, executor_status)
-            _maybe_judge_scan(tid)
     return count
 
 
@@ -97,15 +96,3 @@ def _fetch_and_ingest(trace_id: str, workspace_hint: str | None) -> str | None:
     events, hint = fetched
     # 优先用列表端点返回的 workspace_id
     return importer.ingest_events(events, workspace_hint or hint)
-
-
-def _maybe_judge_scan(trace_id: str) -> None:
-    """兜底摄入后，若 LLM 启用且 trace 异常，触发评估。"""
-    try:
-        from app.diagnosis.judge import is_anomalous, judge_trace
-        from app.core.llm import judge_enabled
-        if not judge_enabled() or not is_anomalous(trace_id):
-            return
-        judge_trace(trace_id)
-    except Exception:
-        logger.exception("LLM-judge 触发失败(兜底) %s", trace_id)

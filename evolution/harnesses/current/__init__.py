@@ -55,14 +55,25 @@ def _skill_abs_paths(scope: str) -> list[str]:
     return []
 
 
-def assemble(ctx: RuntimeContext):
+def assemble(ctx: RuntimeContext, config: dict | None = None, source_root: Path | None = None):
     """装配完整创作 Agent（meta + 4 个 subagent）。
 
     入参 ctx 含全部运行时值（model/backend/checkpointer/workspace/trace/owner +
     trace_recorder + trace_middleware_cls）。包内只读 ctx，不依赖执行端其他状态。
 
+    Phase 8 compose 配置化（决策 D4a/D9a/D12a）：
+      - config + source_root 有值时：middleware 列表 + prompt 从 config 读（配置驱动）。
+      - config 为 None 时：走原硬编码逻辑（向后兼容，渐进迁移）。
+      - subagent 的专属逻辑（context 注入/style/storyline 约束）保留在 build_*（D12a），
+        不从 config 读——config 只管通用 middleware 列表 + prompt 文本 + skills。
+
     TraceMiddleware 挂载（T2）：ctx.trace_middleware_cls 有值时实例化并插入 middleware
     列表（index 1，紧跟 ErrorRecovery）。类定义在执行端（不进包，D2'）。
+
+    Args:
+        ctx:         RuntimeContext（运行时值）
+        config:      HarnessConfig JSON（可选，有值时配置驱动组装）
+        source_root: 包根目录（可选，config 有值时用于 class_ref 解析 + prompt 读取）
 
     Returns: create_deep_agent 返回的 CompiledStateGraph。
     """
@@ -81,38 +92,73 @@ def assemble(ctx: RuntimeContext):
     )
 
     workspace_path = ctx.workspace_path
+    styles = ctx.styles or {}
 
-    # ── meta 层 middleware ──
-    meta_middleware: list = [
-        ErrorRecoveryMiddleware(),
-        MetaReadOnlyMiddleware(),
-        FilesystemPathGuardMiddleware(workspace_path),
-        FileWriteSerializeMiddleware(),
-        GoalMiddleware(),  # C 类，带 state_schema（仅 meta 层）
-    ]
+    # ── 硬编码 middleware 工厂（config 为 None 时用，或作为 fallback）──
+    def _hardcoded_meta_middleware() -> list:
+        return [
+            ErrorRecoveryMiddleware(),
+            MetaReadOnlyMiddleware(),
+            FilesystemPathGuardMiddleware(workspace_path),
+            FileWriteSerializeMiddleware(),
+            GoalMiddleware(),
+        ]
+
+    def _hardcoded_subagent_middleware() -> list:
+        return [
+            ErrorRecoveryMiddleware(),
+            FilesystemPathGuardMiddleware(workspace_path),
+            FileWriteSerializeMiddleware(),
+        ]
+
+    # ── 配置驱动：从 config 读 middleware 列表（D4a/D9a）──
+    use_config = config is not None and source_root is not None
+    if use_config:
+        # 延迟 import：assembler 在执行端，包不直接依赖它（通过 source_root 加载）
+        import importlib
+        # assembler 在 executor 侧，包内通过 app.platform.agent.assembler 调用
+        from app.platform.agent.assembler import build_middleware_list
+        # source_root 对应的包模块（已由 loader 加载到 sys.modules）
+        pkg_module = importlib.import_module("harness_current")
+
+        meta_pipeline = config.get("meta_pipeline", {})
+        meta_middleware = build_middleware_list(
+            meta_pipeline.get("processors", []), ctx, pkg_module,
+        )
+        # config 驱动的 prompt：从 config 读 prompt body（内容型 slot）
+        meta_prompt_slot = meta_pipeline.get("slots", {}).get("system_prompt", {})
+        meta_prompt_body = meta_prompt_slot.get("params", {}).get("body", "")
+        meta_prompt = apply_style_suffix(meta_prompt_body, styles.get("meta"))
+        # skills 从 config 读
+        meta_skills_rel = meta_pipeline.get("slots", {}).get("skills", [])
+        meta_skills = [str(source_root / s) for s in meta_skills_rel]
+    else:
+        # 硬编码路径（向后兼容）
+        meta_middleware = _hardcoded_meta_middleware()
+        meta_prompt = apply_style_suffix(_read_prompt("meta_system"), styles.get("meta"))
+        meta_skills = _skill_abs_paths("meta")
+
     # TraceMiddleware 挂载（T2：类由 ctx 注入，包内实例化）
     if ctx.trace_recorder is not None and ctx.trace_id and ctx.trace_middleware_cls:
         meta_middleware.insert(1, ctx.trace_middleware_cls(
             ctx.trace_recorder, ctx.trace_id, "meta-agent",
         ))
 
-    # ── meta system prompt（含风格 suffix 注入，D2/D4）──
-    styles = ctx.styles or {}
-    meta_prompt = apply_style_suffix(
-        _read_prompt("meta_system"), styles.get("meta"),
-    )
-
     # ── meta skills backend 组合 ──
-    meta_skills = _skill_abs_paths("meta")
     effective_backend, skill_sources = compose_skills_backend(ctx.backend, meta_skills)
 
-    # ── 通用 middleware 工厂（subagent 用）──
+    # ── subagent middleware 工厂 ──
     def middleware_factory(agent_name: str) -> list:
-        mw = [
-            ErrorRecoveryMiddleware(),
-            FilesystemPathGuardMiddleware(workspace_path),
-            FileWriteSerializeMiddleware(),
-        ]
+        if use_config:
+            # 从 config 读对应 subagent 的 processors
+            # agent_name 映射到 config 的 subagent key（去 -subagent 后缀 + 连字符转下划线）
+            key = agent_name.replace("-subagent", "").replace("-", "_")
+            sub_cfg = config.get("subagents", {}).get(key, {})
+            mw = build_middleware_list(
+                sub_cfg.get("processors", []), ctx, pkg_module,
+            )
+        else:
+            mw = _hardcoded_subagent_middleware()
         if ctx.trace_recorder is not None and ctx.trace_id and ctx.trace_middleware_cls:
             mw.insert(1, ctx.trace_middleware_cls(
                 ctx.trace_recorder, ctx.trace_id, agent_name,
@@ -127,12 +173,12 @@ def assemble(ctx: RuntimeContext):
     gp_spec["middleware"] = middleware_factory("general-purpose-subagent")
     subagents.append(gp_spec)
 
-    # 2. interview（custom，无 evolution）
+    # 2. interview（custom，无 review）
     subagents.append(build_interview_deep_subagent(
         workspace_path, ctx.model, ctx.backend, middleware_factory,
     ))
 
-    # 3-5. deep subagents（各自完整装配：prompt/skills/专属middleware/evaluator）
+    # 3-5. deep subagents（各自完整装配：prompt/skills/专属middleware/reviewer）
     # 调用包内 build_*_deep_subagent，它们含全部专属逻辑（storyline 单线约束 /
     # context 注入 / skills 路径 / style suffix），assemble 不重复这些。
     from .subagents.storybuilding import build_storybuilding_deep_subagent

@@ -78,7 +78,7 @@ overview.md 同时是下次调用的进度追踪依据。
 
 ## Skill 使用（必读，硬性要求）
 
-你有一个 `detail-planning` Skill，它定义了细纲规划的完整执行流程（进度定位 → 取事件批次 → 读取上下文 → 自主分章 → 写入产物）和 evolution 评估循环的使用方法。
+你有一个 `detail-planning` Skill，它定义了细纲规划的完整执行流程（进度定位 → 取事件批次 → 读取上下文 → 自主分章 → 写入产物）和 review 审查循环的使用方法。
 
 **每次细纲任务开始前，必须先 `read_file` 读取 `detail-planning` Skill 的完整内容并严格遵循其流程，不得跳过。**
 
@@ -86,32 +86,32 @@ overview.md 同时是下次调用的进度追踪依据。
 - Skill 的完整路径会在注入的「Skills System」列表中给出（形如 `-> Read '<path>/SKILL.md' for full instructions`）。用 `read_file` 读取该路径，并传 `limit=1000` 以保证读取完整。
 - 这是硬性要求，不可跳过：不读 Skill 直接开写属于违规。
 
-## evolution 评估（单次，硬性要求）
+## review 审查（单次，硬性要求）
 
-完成本批所有 chapter-XX.md + overview.md 写入后，必须调用 `evolution` 子代理评估本批章节质量。**全流程只调用 evolution 1 次**（由中间件硬上限保障，超限会被拦截）。
+完成本批所有 chapter-XX.md + overview.md 写入后，必须调用 `review` 子代理审查本批章节质量。**全流程只调用 review 1 次**（由中间件硬上限保障，超限会被拦截）。
 
-评估流程：
-1. 调用 `evolution` 子代理评估本批章节（评估维度：时间序正确性、爽点有效性、节奏疏密、人物一致性、与 timeline 一致性、章末钩子与粒度边界）。
-2. **调用 evolution 时，description 必须明确列出待评估文件的完整路径**，让 evolution 自行 `read_file` 读取，不要依赖前置上下文（前置上下文不含待评估文件）。格式示例：
+审查流程：
+1. 调用 `review` 子代理审查本批章节（审查维度：时间序正确性、爽点有效性、节奏疏密、人物一致性、与 timeline 一致性、章末钩子与粒度边界）。
+2. **调用 review 时，description 必须明确列出待审查文件的完整路径**，让 review 自行 `read_file` 读取，不要依赖前置上下文（前置上下文不含待审查文件）。格式示例：
    ```
-   评估本批细纲质量。待评估文件：
+   审查本批细纲质量。待审查文件：
    - /detail/chapter-15.md
    - /detail/chapter-16.md
    对照基准：/storyline/timeline.md、/character/*.md。
    ```
    文件路径必须与实际写入的路径一致（章节号、`/detail/` 前缀）。
-3. evolution 自主 `read_file` 读取上述 detail/ 文件 + storyline/timeline.md + character/*.md，写评估报告到 `detail/evaluation.md`，返回评分和修改建议。
-4. 根据 evolution 返回结果：
+3. review 自主 `read_file` 读取上述 detail/ 文件 + storyline/timeline.md + character/*.md，写审查报告到 `review/detail.md`，返回评分和修改建议。
+4. 根据 review 返回结果：
    - 返回「无需修改」→ 直接进入返回步骤。
-   - 返回「建议修改」/「必须修改」→ 读取 `detail/evaluation.md`，按核心问题修订本批章节文件**一次**，**不再二次评估**，直接进入返回步骤。
-5. 你只能修订本批新建的 chapter-XX.md，不能改 detail/evaluation.md（那是 evolution 的产物）以外的 timeline.md 等其他文件。
+   - 返回「建议修改」/「必须修改」→ 读取 `review/detail.md`，按核心问题修订本批章节文件**一次**，**不再二次审查**，直接进入返回步骤。
+5. 你只能修订本批新建的 chapter-XX.md，不能改 `review/detail.md`（那是 review 的产物）以外的 timeline.md 等其他文件。
 
 ## 回复格式
 
 - 使用纯文本，不返回 JSON。
-- 回复前必须先完成所有文件写入（chapter-XX.md + overview.md）和 evolution 评估流程。
+- 回复前必须先完成所有文件写入（chapter-XX.md + overview.md）和 review 审查流程。
 - 回复必须包含以下字段（格式示例）：
-  - `执行修订：是 / 否`（是否按 evolution 建议修订）
+  - `执行修订：是 / 否`（是否按 review 建议修订）
   - `质量风险：有 / 无`（如有，简要说明）
   - `事件范围：timeline 序 X~Y`（本批消费的 timeline 事件序号范围）
   - `章节范围：chapter-XX ~ chapter-YY`（本批生成的章节号范围）

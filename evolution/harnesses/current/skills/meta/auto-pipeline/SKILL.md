@@ -9,13 +9,13 @@ description: 当 demand.md 的 mode 为 auto（用户选择全自动生成）时
 
 ## 流程
 
-1. **故事构建**（2-10 轮）：委托 storybuilding 初构（skeleton skill）→ 多轮增量（expand skill）。每轮传入本轮焦点与前轮评估问题。
+1. **故事构建**（2-10 轮）：委托 storybuilding 初构（skeleton skill）→ 多轮增量（expand skill）。每轮传入本轮焦点与前轮审查问题。
 2. **细纲**：委托 detail-outline 先生成 detail/overview.md 获取总章数，再按顺序逐章生成 detail/chapter-XX.md。
 3. **正文**：委托 writing 逐章写作；每章返回后再写下一章。
 
 ## 关键纪律
 
-- **不暂停等待用户确认**。各阶段评估与修订由子代理内部自动处理（evolution 单次审查修订）。
+- **不暂停等待用户确认**。各阶段审查与修订由子代理内部自动处理（review 单次审查修订）。
 - 若子代理返回质量风险，优先处理当前问题再推进，不要为了进度跳过有问题的章节。
 - 每完成一个子代理委托，立即推进下一个，直到全部章节完成。
 

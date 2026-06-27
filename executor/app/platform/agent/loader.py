@@ -1,23 +1,20 @@
-"""Agent 包加载器（Phase 7 T3.1，D8=X 生产路径）。
+"""Agent 包加载器（Phase 7 T3.1 + Phase 8 compose 热加载升级）。
 
-执行端同进程 import evolution/harnesses/current/ 作为 Python package，
-调 package.assemble(ctx) 装配完整 agent。
+执行端通过 importlib 加载 harness 包目录作为 Python package，
+调 package.assemble(ctx, config, source_root) 装配完整 agent。
 
 加载机制（关键）：
   importlib.util.spec_from_file_location + submodule_search_locations。
   submodule_search_locations 是让包内相对 import（from .middleware import X）生效的
   关键——没有它，包被当作普通模块加载，相对 import 会失败。
 
-  与旧 manifest_loader（Phase 6，已废弃删除）的区别：
-  - manifest_loader：fetch_production → _enrich_with_content → assemble（数据来自 DB）
-  - 本模块：importlib 加载目录 → package.assemble(ctx)（数据来自包目录）
+Phase 8 变更（compose 配置化 + 热加载，决策 D10b/#16）：
+  - 生产路径从"直读 evolution/harnesses/current/"改为"git pull bare repo → 加载 checkout 目录"
+  - 新增 load_package(path) 通用函数：加载任意路径的包（候选 A/B 用）
+  - 新增 reload_current()：清缓存 + git pull + 重新加载（不重启进程，决策 #16）
+  - 候选路径：load_package(checkout_commit 返回的临时目录)
 
-  本模块只管"把包加载进 Python 解释器"，装配逻辑在包内 __init__.py:assemble。
-
-A/B/回放路径（D7=② 子进程隔离）不经过本模块——那些在 worker 子进程里按
-解压后的临时目录加载。本模块只服务生产热路径（current 包）。
-
-设计依据：设计文档 D8=X（生产同进程）+ D1=B（包自带 assemble）。
+设计依据：设计文档 D8=X + D10b + #16 + D9a。
 """
 from __future__ import annotations
 
@@ -31,42 +28,32 @@ from app.platform.core.settings import get_settings
 
 logger = logging.getLogger("writer.package_loader")
 
-# 模块级缓存：加载一次后复用（current 包进程内不变，换版本需重启——D11 设计）
+# 模块级缓存：生产包加载一次后复用（热加载时清缓存重建，决策 #16）
 _loaded_package: ModuleType | None = None
 
 
-def load_current_package() -> ModuleType:
-    """加载 Agent 包（current），返回包模块（含 assemble 函数）。
+def load_package(pkg_path: Path, mod_name: str = "harness_current") -> ModuleType:
+    """加载指定路径的 Agent 包，返回包模块（含 assemble 函数）。
 
-    幂等：首次加载后缓存，重复调用返回同一模块实例。
-    current 包进程内不变（D11：换版本需重启进程），故缓存安全。
+    通用加载函数：生产路径和候选 A/B 路径都用它，只是传不同的 pkg_path。
+    submodule_search_locations 让包内相对 import 生效。
 
-    Returns: 包模块对象，调用方取 mod.assemble(ctx) 装配 agent。
+    Args:
+        pkg_path: 包根目录（含 __init__.py）
+        mod_name: 模块注册名（生产用 harness_current，候选用唯一名避免冲突）
+
+    Returns:
+        包模块对象，调用方取 mod.assemble(ctx, config, source_root) 装配 agent。
 
     Raises:
         FileNotFoundError: 包目录或 __init__.py 不存在。
         ImportError: 包 __init__.py 执行失败（含包内 import 错误）。
     """
-    global _loaded_package
-    if _loaded_package is not None:
-        return _loaded_package
-
-    s = get_settings()
-    pkg_path = Path(s.harness_package_path)
-    if not pkg_path.is_absolute():
-        # 相对项目根 Writer/（executor/ 的上一级）
-        pkg_path = Path(__file__).resolve().parents[4] / pkg_path
     pkg_path = pkg_path.resolve()
-
     init_path = pkg_path / "__init__.py"
     if not init_path.exists():
-        raise FileNotFoundError(
-            f"Agent 包不存在: {init_path}。请确认 evolution/harnesses/current/ 已建立。"
-        )
+        raise FileNotFoundError(f"Agent 包不存在: {init_path}")
 
-    mod_name = "harness_current"
-    # submodule_search_locations：让包内相对 import 生效的关键。
-    # spec_from_file_location 不带此参数时，包被当普通模块，from .middleware import 会失败。
     spec = importlib.util.spec_from_file_location(
         mod_name,
         init_path,
@@ -80,17 +67,60 @@ def load_current_package() -> ModuleType:
     try:
         spec.loader.exec_module(mod)
     except Exception:
-        # 加载失败要清理 sys.modules，避免半加载状态残留
         sys.modules.pop(mod_name, None)
         raise
-    _loaded_package = mod
-    logger.info("Agent 包已加载: %s (assemble 可用)", pkg_path)
+    logger.info("Agent 包已加载: %s (mod=%s)", pkg_path, mod_name)
     return mod
 
 
-def reset_cache() -> None:
-    """清除包缓存（测试用，或手动重载）。生产路径不调（D11：换版本重启进程）。"""
+def load_current_package() -> ModuleType:
+    """加载生产 Agent 包（current），返回包模块。
+
+    Phase 8：从 git pull 的生产 checkout 目录加载（非直读 evolution 工作目录）。
+    幂等：首次加载后缓存，reload_current() 后重新加载。
+
+    Returns: 包模块对象。
+    """
     global _loaded_package
     if _loaded_package is not None:
-        sys.modules.pop("harness_current", None)
+        return _loaded_package
+
+    # Phase 8：git pull 生产 checkout（决策 D10b）
+    from app.platform.agent.git_sync import pull_production
+    checkout = pull_production()
+    _loaded_package = load_package(checkout, "harness_current")
+    return _loaded_package
+
+
+def reload_current() -> ModuleType:
+    """热加载：清缓存 + git pull + 重新加载生产包（决策 #16，不重启进程）。
+
+    evolution ship 后调 executor /reload 端点触发本函数。
+
+    Returns: 重新加载后的包模块。
+    """
+    global _loaded_package
+    # 清缓存：pop sys.modules 里包及其子模块（middleware.* 等）
+    _purge_package_modules("harness_current")
+    _loaded_package = None
+
+    from app.platform.agent.git_sync import pull_production
+    checkout = pull_production()
+    _loaded_package = load_package(checkout, "harness_current")
+    logger.info("生产包热加载完成: %s", checkout)
+    return _loaded_package
+
+
+def _purge_package_modules(prefix: str) -> None:
+    """从 sys.modules 清除指定包前缀的所有模块（含子模块）。"""
+    keys_to_remove = [k for k in sys.modules if k == prefix or k.startswith(prefix + ".")]
+    for k in keys_to_remove:
+        sys.modules.pop(k, None)
+
+
+def reset_cache() -> None:
+    """清除包缓存（测试用，或手动重载）。生产路径用 reload_current()。"""
+    global _loaded_package
+    if _loaded_package is not None:
+        _purge_package_modules("harness_current")
         _loaded_package = None

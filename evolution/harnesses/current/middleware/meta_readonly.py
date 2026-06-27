@@ -34,12 +34,15 @@ _FILESYSTEM_WRITE_TOOLS = {"write_file", "edit_file"}
 # 前缀用虚拟路径形式（带前导斜杠），匹配时先规范化输入路径再比对。
 _PATH_TO_SUBAGENT: list[tuple[str, str]] = [
     ("/demand.md", "interview（需求分析）"),
-    # storybuilding：三层故事构建产物（人物/故事线/世界观/总纲/卷纲/评估）
+    # storybuilding：三层故事构建产物（人物/故事线/世界观/总纲/卷纲）
     ("/character/", "storybuilding（故事构建）"),
     ("/outline.md", "storybuilding（故事构建）"),
     ("/storyline", "storybuilding（故事构建）"),
     ("/worldview.md", "storybuilding（故事构建）"),
-    ("/evaluation.md", "storybuilding（故事构建）"),
+    # review/ 下审查产物按子代理精确归类（精确路径优先于 /review/ 兜底）
+    ("/review/storybuilding.md", "storybuilding（故事构建）"),
+    ("/review/detail.md", "detail-outline（细纲）"),
+    ("/review/chapter/", "writing（正文写作）"),
     ("/detail/", "detail-outline（细纲）"),
     # writing：正文及配套产物
     ("/chapter/", "writing（正文写作）"),
@@ -54,10 +57,13 @@ _FULL_MAPPING_TABLE = """\
   - /character/*.md                     → storybuilding（故事构建）
   - /outline.md                         → storybuilding（故事构建）
   - /storyline.md、/storyline/*.md      → storybuilding（故事构建）
-  - /worldview.md、/evaluation.md       → storybuilding（故事构建）
+  - /worldview.md                       → storybuilding（故事构建）
+  - /review/storybuilding.md            → storybuilding（故事构建）
+  - /review/detail.md                   → detail-outline（细纲）
+  - /review/chapter-*.md                → writing（正文写作）
   - /detail/*.md                        → detail-outline（细纲）
   - /chapter/*.md、/novel.md            → writing（正文写作）
-  - /state_log.md、/review/*.md         → writing（正文写作）"""
+  - /state_log.md                       → writing（正文写作）"""
 
 
 class MetaReadOnlyMiddleware(AgentMiddleware):

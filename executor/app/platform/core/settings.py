@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     # 相对路径基于项目根 Writer/。
     harness_package_path: str = "evolution/harnesses/current"
 
+    # ── compose Git 传输层（Phase 8，决策 D10b）──
+    # harness bare repo 路径/URL。executor 从此 pull/clone 源码。
+    # 同机阶段本地路径，异机时改 URL（如 git@host:harness.git）。
+    harness_bare_repo: str = "evolution/harness.git"
+    # harness 源码 clone 缓存目录（executor 本地，pull/clone 到此）。
+    harness_clone_dir: str = ".harness_checkout"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

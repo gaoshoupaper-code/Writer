@@ -62,8 +62,7 @@ def list_traces(
         params.append(owner)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     rows = db.query_all(
-        f"""SELECT r.*, (SELECT count(*) FROM trace_flags f WHERE f.trace_id = r.trace_id) AS flag_count
-            FROM runs r {where_sql}
+        f"""SELECT r.* FROM runs r {where_sql}
             ORDER BY r.started_at DESC LIMIT ? OFFSET ?""",
         tuple(params + [limit, offset]),
     )
@@ -74,7 +73,7 @@ def list_traces(
             endpoint=r["endpoint"], status=r["status"],
             started_at=r["started_at"], ended_at=r["ended_at"],
             duration_ms=r["duration_ms"], event_count=r["event_count"] or 0,
-            error=r["error"], flag_count=r["flag_count"],
+            error=r["error"], flag_count=0,
             owner_user_id=r.get("owner_user_id") or "unknown",
         )
         for r in rows

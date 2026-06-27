@@ -35,10 +35,18 @@ class Settings(BaseSettings):
     judge_api_key: str = ""
     judge_base_url: str = ""
 
+    # ── compose Git 传输层（Phase 8，决策 D10b/D11a）──
+    # harness bare repo 路径（同机阶段本地路径，异机时改 URL）。
+    # evolution 工作目录 harnesses/current/ commit → push 到此 bare repo。
+    # executor 从此 bare repo pull/clone。
+    harness_bare_repo: str = "harness.git"
+    # harness 工作目录（evolution 编辑源码的地方）。
+    harness_work_dir: str = "harnesses/current"
+
     @property
     def _evolution_root(self) -> Path:
-        """evolution/ 目录（本文件在 app/ 下，上一级是 evolution/）。"""
-        return Path(__file__).resolve().parent.parent
+        """evolution/ 目录（本文件在 app/core/ 下，上三级是 evolution/）。"""
+        return Path(__file__).resolve().parent.parent.parent
 
     @property
     def _project_root(self) -> Path:
@@ -60,6 +68,22 @@ class Settings(BaseSettings):
     def db_path(self) -> Path:
         """SQLite 数据库文件的绝对路径。相对路径基于 evolution/ 目录。"""
         path = Path(self.evolution_db)
+        if not path.is_absolute():
+            path = self._evolution_root / path
+        return path.resolve()
+
+    @property
+    def harness_bare_repo_path(self) -> Path:
+        """harness bare repo 绝对路径。相对路径基于 evolution/ 目录（决策 D10b）。"""
+        path = Path(self.harness_bare_repo)
+        if not path.is_absolute():
+            path = self._evolution_root / path
+        return path.resolve()
+
+    @property
+    def harness_work_dir_path(self) -> Path:
+        """harness 工作目录绝对路径（决策 D11a）。"""
+        path = Path(self.harness_work_dir)
         if not path.is_absolute():
             path = self._evolution_root / path
         return path.resolve()

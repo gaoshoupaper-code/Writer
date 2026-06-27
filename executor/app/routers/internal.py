@@ -227,3 +227,84 @@ class SnapshotRefreshNotice(BaseModel):
     """快照变更通知 body（evolution → 执行端，Phase 7）。"""
 
     snapshot_version: int
+
+
+# ── Phase 8 compose：热加载 + 候选执行端点（决策 #16/D7a/E5a）──
+
+
+@router.post("/reload")
+def reload_harness() -> dict[str, Any]:
+    """热加载：git pull + 重新加载生产包（决策 #16，不重启进程）。
+
+    evolution ship 新 config + commit 后调此端点。
+    executor git pull 最新 main → reload_current() 重新加载包。
+
+    注意：本端点只重新加载「包模块」。assemble 需要新 config 才会用配置驱动——
+    生产路径的 config 由调用方（agent_service）从 evolution 拉 production config 提供。
+    本端点确保包源码是最新的（git pull），config 由生成请求时获取。
+    """
+    from app.platform.agent.loader import reload_current
+
+    pkg = reload_current()
+    from app.platform.agent.git_sync import production_commit
+    commit = production_commit()
+    logger.info("harness 热加载完成: commit=%s", commit)
+    return {"status": "reloaded", "commit": commit}
+
+
+class ABRunRequest(BaseModel):
+    """候选执行请求（adapt 的 run_candidates 节点调用，决策 E5a）。"""
+
+    config: dict  # 候选 HarnessConfig JSON
+    source_commit: str  # 候选源码 git commit hash
+    batch_input: list[dict]  # 固定测试集输入（每个 = 一个生成请求 payload）
+    baseline_version: int = 0  # 基线版本号（trace 归属标记用）
+
+
+class ABRunResponse(BaseModel):
+    """候选执行响应（异步任务，立即返回 task_id）。"""
+
+    task_id: str
+
+
+@router.post("/ab/run", response_model=ABRunResponse, status_code=202)
+async def ab_run(req: ABRunRequest) -> ABRunResponse:
+    """启动候选执行（异步，决策 E5a）。
+
+    立即返回 task_id，executor 后台跑：
+      1. clone source_commit 到临时目录
+      2. 对每个 batch_input：load_package(checkout) → assemble(ctx, config, checkout) → 跑生成
+      3. 跑完存结果，供 /ab/status 轮询
+
+    evolution 的 run_candidates 节点轮询 /ab/status/{task_id} 直到 done。
+    """
+    import uuid
+
+    task_id = uuid.uuid4().hex[:12]
+    # 后台任务注册（实际执行在 BackgroundTasks 或独立 worker）
+    # MVP 阶段：注册到内存任务表，后台线程执行
+    _ab_tasks[task_id] = {"status": "running", "trace_ids": [], "error": None}
+    logger.info(
+        "候选执行任务启动: task=%s, commit=%s, batch=%d",
+        task_id, req.source_commit, len(req.batch_input),
+    )
+    # TODO: 后台执行逻辑（clone + assemble + 跑生成 + 存 trace_ids）
+    # 当前为骨架，实际执行逻辑在 ab_runner 集成完善后填充
+    return ABRunResponse(task_id=task_id)
+
+
+@router.get("/ab/status/{task_id}")
+def ab_status(task_id: str) -> dict[str, Any]:
+    """查询候选执行任务状态（轮询，决策 E5a）。
+
+    Returns:
+        {status: running/done/failed, trace_ids: [...], error: ...}
+    """
+    task = _ab_tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"task not found: {task_id}")
+    return task
+
+
+# 内存任务表（MVP，进程级。生产可换 Redis/DB）
+_ab_tasks: dict[str, dict[str, Any]] = {}

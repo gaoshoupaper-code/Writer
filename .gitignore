@@ -56,3 +56,10 @@ evolution/**/*.db
 evolution/**/*.db.bak
 evolution/start.log
 evolution/.pytest_cache/
+
+# evolution adapt 运行时产物（bare repo + checkout 缓存，动态生成）
+evolution/harness.git/
+.harness_checkout/
+
+# 误产物（Windows 保留设备名，无法常规删除，忽略即可）
+nul

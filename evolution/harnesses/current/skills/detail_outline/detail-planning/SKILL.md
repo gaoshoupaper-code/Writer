@@ -2,13 +2,13 @@
 name: detail-planning
 description: >-
   【每次细纲任务开始前必读】章节细纲规划执行流程。读 timeline.md 取下一批事件，
-  自主分章，写入 chapter-XX.md 并增量更新 overview.md，完成后调用 evolution 评估（单次）。
+  自主分章，写入 chapter-XX.md 并增量更新 overview.md，完成后调用 review 审查（单次）。
   本 Skill 是细纲任务的唯一执行入口，跳过它直接开写属于违规。
 ---
 
 # detail-planning
 
-章节细纲规划执行流程。读全局事件时间线，按固定事件批次自主分章，完成后调用 evolution 评估（单次）。
+章节细纲规划执行流程。读全局事件时间线，按固定事件批次自主分章，完成后调用 review 审查（单次）。
 
 > **必读约束**：本 Skill 是细纲任务的唯一执行入口。系统提示词已要求你「每次细纲任务开始前必须先读取本 Skill 并遵循其流程」。请完整阅读下方流程后再开始操作，不得跳过任何步骤。
 
@@ -29,21 +29,21 @@ description: >-
 
 完成当前批次后**立即返回**，等待父代理下一个指令。不自行开始下一批。
 
-## evolution 评估（单次）
+## review 审查（单次）
 
-完成本批写入后，调用 evolution 评估（**全流程只调用 1 次**）：
+完成本批写入后，调用 review 审查（**全流程只调用 1 次**）：
 
-1. 调用 evolution 子代理评估本批章节质量（时间序正确性、爽点有效性、节奏疏密、人物一致性、与 timeline 一致性）。**调用时 description 必须明确列出待评估文件的完整路径**（前置上下文不含待评估文件，evolution 需自行 `read_file`）。格式示例：
+1. 调用 review 子代理审查本批章节质量（时间序正确性、爽点有效性、节奏疏密、人物一致性、与 timeline 一致性）。**调用时 description 必须明确列出待审查文件的完整路径**（前置上下文不含待审查文件，review 需自行 `read_file`）。格式示例：
    ```
-   评估本批细纲质量。待评估文件：
+   审查本批细纲质量。待审查文件：
    - /detail/chapter-15.md
    - /detail/chapter-16.md
    对照基准：/storyline/timeline.md、/character/*.md。
    ```
-2. evolution `read_file` 读取上述 detail/ 文件 + storyline/timeline.md，写评估报告到 detail/evaluation.md，返回评分和修改建议。
-3. 根据 evolution 返回结果：
+2. review `read_file` 读取上述 detail/ 文件 + storyline/timeline.md，写审查报告到 review/detail.md，返回评分和修改建议。
+3. 根据 review 返回结果：
    - "无需修改" → 直接返回。
-   - "建议修改" / "必须修改" → 读 detail/evaluation.md，修订本批章节文件**一次**，不再二次评估，直接返回。
+   - "建议修改" / "必须修改" → 读 review/detail.md，修订本批章节文件**一次**，不再二次审查，直接返回。
 4. 返回父代理时回复包含：是否执行修订、是否有质量风险、本批 timeline 事件序号范围、本批章节号范围。
    - 格式示例：`执行修订：否\n质量风险：无\n事件范围：timeline 序 6~10\n章节范围：chapter-04 ~ chapter-06`
 

@@ -3,7 +3,7 @@ name: chapter-writing
 description: >-
   【每次正文写作/修订任务开始前必读】正文章节的写作与修订执行流程。
   当需要生成新章节、修订已有章节、或根据 review 反馈修改章节时激活。
-  包含上下文准备、细纲遵循规则和 evolution 审查循环的使用方法。
+  包含上下文准备、细纲遵循规则和 review 审查循环的使用方法。
   本 Skill 是正文写作的唯一执行入口，跳过它直接开写属于违规。
 ---
 
@@ -49,18 +49,18 @@ description: >-
 - 如果修订来自 review，必须覆盖原章节文件而不是另存为新文件。
 - 优先解决 review 指出的关键问题。
 
-## evolution 审查（单次）
+## review 审查（单次）
 
-完成章节写入后，调用 evolution 审查（**全流程只调用 1 次**）：
+完成章节写入后，调用 review 审查（**全流程只调用 1 次**）：
 
-1. 调用 `evolution` 子代理审查章节质量。**调用时 description 必须明确列出待审查文件的完整路径**（前置上下文不含待审查正文，evolution 需自行 `read_file`）。格式示例：
+1. 调用 `review` 子代理审查章节质量。**调用时 description 必须明确列出待审查文件的完整路径**（前置上下文不含待审查正文，review 需自行 `read_file`）。格式示例：
    ```
    审查本章正文质量。待审查文件：
    - /chapter/chapter-01.md
    对照基准：/outline.md、/storyline/timeline.md、/character/*.md、/detail/chapter-01.md。
    ```
-2. evolution 会 `read_file` 读取该章节文件并写入审查报告到 `review/` 目录下对应文件，然后返回审查结论和修订建议。
-3. 根据 evolution 返回结果决定下一步：
+2. review 会 `read_file` 读取该章节文件并写入审查报告到 `review/` 目录下对应文件，然后返回审查结论和修订建议。
+3. 根据 review 返回结果决定下一步：
    - 返回 **"通过"** 或 **"无需修改"** → 直接向父代理返回结果。
    - 返回 **"建议修订"** 或 **"必须修订"** → 读取 `review/` 下的审查报告，根据核心问题和修改建议修订同一个章节文件**一次**，**不再二次审查**，直接进入返回步骤。
 4. 返回父代理时，回复中包含：**是否执行修订**、**是否有质量风险**、**是否需要调整大纲或状态**。
@@ -68,7 +68,7 @@ description: >-
 
 ## 注意事项
 
-- 只修订同一个 `chapter/chapter-XX.md` 文件；不要新建章节，不要修改 `outline.md`、`character/`、`state_log.md` 或 `evaluation.md`。
+- 只修订同一个 `chapter/chapter-XX.md` 文件；不要新建章节，不要修改 `outline.md`、`character/`、`state_log.md`。
 - 如果确实需要调整大纲或状态，只在回复中标记建议，不要自行修改。
-- evolution（review 子代理）每次审查都是独立的，不携带之前审查的历史。
+- review（审查子代理）每次审查都是独立的，不携带之前审查的历史。
 - 你会积累上下文：在修订轮次中，你的历史对话会保留，让你能基于之前写过的版本和 review 反馈逐步改进。
