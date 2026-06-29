@@ -37,6 +37,10 @@ class NotifyBody(BaseModel):
     # HITL：状态变迁即推送（awaiting_input / running / 终态）。
     # running 是 resume 后的状态变迁（awaiting_input→running），也需摄入同步。
     status: Literal["running", "awaiting_input", "completed", "failed", "cancelled"] = "completed"
+    # 手动测试兜底（D-Q14）：任务在产出 trace 前就失败时，executor 带 task_id 通知。
+    # 此时 trace_id 为空，按 task_id 反查测试记录标 failed。
+    task_id: str | None = None
+    error: str | None = None
 
 
 def _fetch_trace_content(trace_id: str, since_seq: int = 0) -> tuple[list, str | None] | None:
@@ -116,6 +120,10 @@ async def _ingest_async(trace_id: str) -> None:
     # 旧 LLM-judge 已解除（不再触发）
     # 新双层评估：仅终态触发（awaiting_input/running 不评估，防半成品污染）
     await asyncio.to_thread(_maybe_evaluate, tid, events, prior_events)
+    # 手动测试状态同步：按 trace_id 同步 manual_tests 终态（D-Q3）
+    run_row = db.query_one("SELECT status FROM runs WHERE trace_id=?", (tid,))
+    if run_row:
+        await asyncio.to_thread(_sync_manual_test_status, tid, run_row["status"])
 
 
 def _sync_status_only(trace_id: str) -> None:
@@ -211,6 +219,47 @@ async def notify(body: NotifyBody, background_tasks: BackgroundTasks) -> dict[st
 
     返回 202 Accepted（摄入在后台进行，不阻塞执行端的 complete_run 调用）。
     摄入失败只记日志——执行端不依赖此返回（失败兜底扫描会补）。
+
+    手动测试兜底（D-Q14）：trace_id 为空 + task_id 有值 = 任务在产出 trace 前失败，
+    按 task_id 反查测试记录标 failed（不走摄入链路）。
     """
+    # 手动测试兜底：task 失败无 trace
+    if not body.trace_id and body.task_id:
+        _mark_test_failed_by_task(body.task_id, body.error or "executor task failed")
+        return {"status": "accepted", "task_id": body.task_id}
     background_tasks.add_task(_ingest_async, body.trace_id)
     return {"status": "accepted", "trace_id": body.trace_id}
+
+
+def _mark_test_failed_by_task(task_id: str, error: str) -> None:
+    """按 task_id 把仍在 running 的测试记录标 failed（D-Q14 兜底）。"""
+    try:
+        from app.tests import repo as test_repo
+
+        row = test_repo.find_pending_by_task_id(task_id)
+        if row:
+            test_repo.mark_failed(row["test_id"], error)
+            logger.info("测试记录 %s 兜底标 failed（task=%s）", row["test_id"], task_id)
+    except Exception:
+        logger.exception("兜底标记测试 failed 失败 task=%s", task_id)
+
+
+def _sync_manual_test_status(trace_id: str, run_status: str) -> None:
+    """trace 摄入完成后，按 trace_id 同步关联的手动测试记录状态（D-Q3）。
+
+    completed → done；failed/cancelled → failed。
+    """
+    try:
+        from app.tests import repo as test_repo
+
+        row = test_repo.find_by_trace_id(trace_id)
+        if not row:
+            return  # 非 manual_test 触发的 trace，跳过
+        if row["status"] in ("done", "failed"):
+            return  # 已终结，不重复更新
+        if run_status == "completed":
+            test_repo.mark_done(row["test_id"], trace_id)
+        elif run_status in ("failed", "cancelled"):
+            test_repo.mark_failed(row["test_id"], f"trace {run_status}", trace_id=trace_id)
+    except Exception:
+        logger.exception("同步手动测试状态失败 trace=%s", trace_id)

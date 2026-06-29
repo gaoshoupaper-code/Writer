@@ -218,6 +218,43 @@ def init_db() -> None:
                 UNIQUE(session_id, round)
             );
             CREATE INDEX IF NOT EXISTS idx_ar_session ON adapt_rounds(session_id);
+
+            -- evolve_sessions：单进化 Agent 的 session（替换 adapt_rounds 的多轮语义）
+            CREATE TABLE IF NOT EXISTS evolve_sessions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id      TEXT NOT NULL,           -- uuid
+                case_id         TEXT NOT NULL,           -- evalset case 标识
+                status          TEXT NOT NULL,           -- running/done/failed
+                baseline_trace  TEXT,                    -- baseline trace_id
+                candidate_trace TEXT,                    -- candidate trace_id
+                baseline_score  REAL,                    -- verifier 分数（overall 均值）
+                candidate_score REAL,                    -- verifier分数（overall 均值）
+                report_json     TEXT,                    -- Agent 产出的对比报告 JSON
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_es_session ON evolve_sessions(session_id);
+            CREATE INDEX IF NOT EXISTS idx_es_case ON evolve_sessions(case_id);
+
+            -- manual_tests：手动单次测试记录（决策 D3/D5/D-Q7）
+            -- 一次手动测试 = 选数据集 + 选 Agent 版本 → 跑一次 → 一条 trace。
+            -- trace_id 为引用（trace 是唯一真源），pending/running 或无 trace 失败时为 NULL。
+            -- version_type: working / snapshot；version_id: 快照 version 号，working 时 NULL。
+            -- retry_of: 重试指向原失败 test_id（首发为 NULL，决策 D11）。
+            CREATE TABLE IF NOT EXISTS manual_tests (
+                test_id        TEXT PRIMARY KEY,            -- uuid
+                case_id        TEXT NOT NULL,               -- evalset case 标识
+                version_type   TEXT NOT NULL,               -- working / snapshot
+                version_id     INTEGER,                     -- 快照 version 号；working 时 NULL
+                trace_id       TEXT,                        -- 关联 trace id；pending/running 时 NULL
+                task_id        TEXT,                        -- executor /internal/ab/run 轮询句柄
+                status         TEXT NOT NULL,               -- pending / running / done / failed
+                error          TEXT,                        -- 失败摘要；非 failed 时 NULL
+                retry_of       TEXT,                        -- 重试指向原 test_id；首发 NULL
+                created_at     TEXT NOT NULL                -- 创建时间（ISO8601）
+            );
+            CREATE INDEX IF NOT EXISTS idx_mt_status ON manual_tests(status);
+            CREATE INDEX IF NOT EXISTS idx_mt_created ON manual_tests(created_at);
             """
         )
         conn.commit()

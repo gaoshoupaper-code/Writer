@@ -37,7 +37,8 @@ from app.improvement.snapshot_api import router as snapshot_router
 from app.view.active import router as active_api_router
 from app.view.agent_package import router as agent_package_router
 from app.view.sse_stream import router as sse_router
-from app.adapt.api import router as adapt_router
+from app.evolve.api import router as evolve_router
+from app.tests.api import router as tests_router
 from app.view.versions_api import router as versions_router
 from app.view.web.router import router as web_router
 from app.ingestion.scan import start_scan_scheduler
@@ -77,8 +78,10 @@ app.include_router(snapshot_router, prefix="/api")
 app.include_router(active_api_router, prefix="/api")
 app.include_router(agent_package_router, prefix="/api")
 app.include_router(sse_router, prefix="/api")
-# Phase 8 adapt：手动触发 AEGIS 进化循环（决策 A12a）+ 查询/控制（驾驶舱后端）
-app.include_router(adapt_router, prefix="/api")
+# 进化端单进化 Agent：手动触发 + 查询 + SSE（替换旧 adapt 4 阶段）
+app.include_router(evolve_router, prefix="/api")
+# 手动单次测试入口（数据集选择 + Agent 版本选择 + 独立测试记录，D-Q9）
+app.include_router(tests_router, prefix="/api")
 # 配置版本谱系视图（前端版本谱系页 D8）
 app.include_router(versions_router, prefix="/api")
 # D6：旧 Jinja2 监测前端退到 /legacy 前缀（新 Next.js 前端接管根路径）。

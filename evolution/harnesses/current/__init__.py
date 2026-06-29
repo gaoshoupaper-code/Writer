@@ -144,6 +144,17 @@ def assemble(ctx: RuntimeContext, config: dict | None = None, source_root: Path 
             ctx.trace_recorder, ctx.trace_id, "meta-agent",
         ))
 
+    # interview 直通：workspace 已有 confirmed demand.md 时挂 DemandPreloadMiddleware
+    # （评估集自动跑场景。生产交互路径 demand.md 由 interview 产出，不会预先 confirmed）
+    demand_path = workspace_path / "demand.md"
+    if demand_path.exists():
+        try:
+            if "status: confirmed" in demand_path.read_text(encoding="utf-8")[:300]:
+                from .middleware.demand_preload import DemandPreloadMiddleware
+                meta_middleware.append(DemandPreloadMiddleware(workspace_path))
+        except Exception:
+            pass
+
     # ── meta skills backend 组合 ──
     effective_backend, skill_sources = compose_skills_backend(ctx.backend, meta_skills)
 
