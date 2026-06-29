@@ -63,3 +63,8 @@ evolution/harness.git/
 
 # 误产物（Windows 保留设备名，无法常规删除，忽略即可）
 nul
+
+.understand-anything/
+
+# Claude Code 本地权限配置（含个人路径，不入库）
+.claude/settings.local.json

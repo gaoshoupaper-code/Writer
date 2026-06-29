@@ -1,0 +1,320 @@
+// Writer 系统 C4 模型
+// 对齐 docs/架构分层图.md 的四层结构: L1 Context / L2 Container / L3 Component
+// 目录名严格对齐代码, 不用别名; LikeC4 用 FQN(点号)表达层级, 不用子 model 块
+
+specification {
+  // ---- 角色 ----
+  element actor {
+    style {
+      shape person
+      color green
+    }
+  }
+
+  // ---- 外部系统 ----
+  element external-system {
+    notation "External System"
+    style {
+      opacity 20%
+      color muted
+    }
+  }
+
+  // ---- 系统级 ----
+  element system {
+    notation "Software System"
+    style {
+      opacity 20%
+    }
+  }
+
+  // ---- Container 层(L2): 可部署/运行的进程或前端包 ----
+  element container-web {
+    notation "Frontend (Web)"
+    style {
+      shape browser
+    }
+  }
+
+  element container-service {
+    notation "Service (Backend)"
+    style {
+      opacity 20%
+    }
+  }
+
+  // ---- Component 层(L3): 层/模块 ----
+  element layer {
+    style {
+      shape rectangle
+      opacity 20%
+    }
+  }
+
+  element component {
+    style {
+      shape rectangle
+      opacity 20%
+    }
+  }
+
+  // ---- 共享包 ----
+  element shared-package {
+    notation "Shared Package"
+    style {
+      shape rectangle
+      opacity 30%
+    }
+  }
+
+  // ---- 数据存储 ----
+  element database {
+    notation "Database"
+    style {
+      shape storage
+      opacity 30%
+    }
+  }
+}
+
+model {
+  // ==================== L1 · System Context ====================
+  author = actor '作者 / 编剧' {
+    description '使用 Writer 进行创作, 提需求 / 看剧本'
+    -> writer.frontend '提需求 / 看剧本'
+  }
+
+  llm = external-system '大模型 (DeepSeek 等)' {
+    description '被两端共同调用'
+  }
+
+  writer = system 'Writer' {
+    description 'AI 辅助写作 + 进化系统'
+
+    // ---- L2 容器 ----
+    frontend = container-web 'Frontend 前端网页' {
+      technology 'Next.js'
+      description '用户唯一入口. 只碰 executor, 不直接碰 evolution'
+      -> executor 'HTTP 请求'
+    }
+
+    executor = container-service 'executor 执行端' {
+      technology 'FastAPI / Python'
+      description '写作执行服务. 接前端 HTTP + 接 evolution 的 /internal'
+      this -> llm '调用'
+      this -> writer.evolution '①trace 完成通知 / ②被拉取 trace / ⑤被通知 prompt 更新 / ⑥被通知快照发布'
+      this -> writer.db '读写'
+
+      // ============= executor 内部分层(L2 Container 内部, 对齐分层铁律 routers->domains->platform->harness) =============
+      routers = layer 'app/routers/' {
+        description 'HTTP 路由层. 接前端 + 接 evolution 的 /internal'
+        this -> domains '转给业务域'
+      }
+      domains = layer 'app/domains/' {
+        description '业务域层 (writing 写作 / image 图像)'
+        this -> platform '调用'
+      }
+      platform = layer 'app/platform/' {
+        description '公共底座层 (agent 装配 / trace / 状态 / 鉴权)'
+        this -> harness '加载'
+
+        // ============= platform 内部组件(L3, 对齐分层图 L3 platform 视图) =============
+        agentPlatform = component 'agent/' {
+          description 'Agent 装配 + loader + runtime'
+          this -> prompt '装配时读'
+        }
+        trace = component 'trace/' {
+          description '执行轨迹记录. 完成后通知 evolution'
+          this -> writer.evolution '通知 trace 完成'
+        }
+        state = component 'state/' {
+          description '工作区 / 风格 / 产物存储'
+        }
+        streaming = component 'streaming/' {
+          description 'SSE 流式输出'
+        }
+        prompt = component 'prompt/' {
+          description 'prompt 加载 + label 切换'
+        }
+        auth = component 'auth/' {
+          description '鉴权'
+        }
+      }
+      harness = layer 'evolution/harnesses/current/' {
+        description 'Agent 包 (流水线装配 + prompt + skill). 被 platform 加载, 不反向依赖'
+      }
+
+      // ============= domains/writing 内部组件(L3, 对齐分层图 L3 writing 视图) =============
+      meta = component 'agent.py (MetaAgentService)' {
+        description '写作流水线总指挥'
+        this -> subagents '委托'
+        this -> styleSvc '风格注入'
+        this -> events '领域事件分发'
+      }
+      subagents = component 'expert_agent/services/' {
+        description '四岗位子代理 (访谈 / 故事建筑 / 分场 / 正文)'
+        this -> styleSvc '读'
+      }
+      styleSvc = component 'styling/' {
+        description '风格注入'
+      }
+      events = component 'events.py' {
+        description '领域事件分发'
+      }
+    }
+
+    evolution = container-service 'evolution 进化端' {
+      technology 'FastAPI / Python'
+      description '进化服务. 用户不直接用, 在背后观察 executor / 优化 executor'
+      this -> writer.executor '③主动拉取 trace / ④A/B 回放请求 / ⑦推送 prompt 更新 / ⑧推送新快照'
+      this -> llm '调用'
+      this -> writer.db '读写'
+
+      // ============= evolution 内部分层(L2 Container 内部, 对齐分层图 L2 evolution 视图) =============
+      // 两套机制并存(项目正从 adapt 四阶段迁向 evolve 单 Agent):
+      //   1. 单进化 Agent(新): app/evolve/ 一个 DeepAgent 跑通全闭环
+      //   2. 分阶段流水线(原有): ingestion -> diagnosis -> improvement
+      evolveApi = layer 'app/evolve/ + app/view/' {
+        description 'HTTP 接口层. 手动进化 / 大盘 / SSE'
+        this -> pipeline '触发流水线'
+        this -> singleAgent '触发单 Agent 进化'
+      }
+      singleAgent = layer 'app/evolve/ (单进化 Agent)' {
+        description '新机制: 一个 DeepAgent 自主跑通 baseline->改 harness->candidate->打分->报告 全闭环'
+        this -> compose '改写 harness 后装配'
+      }
+      pipeline = layer 'app/ingestion/ · diagnosis/ · improvement/' {
+        description '原有机制: 采集 trace -> 规则/LLM 诊断 -> 改进 prompt 并发版'
+        this -> compose '产出 harness 配置'
+        this -> evoCore '读写'
+      }
+      compose = layer 'app/compose/' {
+        description '装配层 (HarnessConfig 构建)'
+        this -> harnessSrc '改写 harness 源码'
+      }
+      evoCore = layer 'app/core/' {
+        description '公共底座 (DB / LLM / settings)'
+      }
+      harnessSrc = layer 'harnesses/current/' {
+        description 'Agent 包源码 (被 evolve Agent 改写的对象)'
+      }
+    }
+
+    db = database 'Database' {
+      technology 'SQLite'
+      description '两端各自的元数据/trace 存储(分库)'
+    }
+  }
+
+  // ---- 外部关系: 前端 + evolution 进 executor 都打在 routers ----
+  writer.frontend -> writer.executor.routers 'HTTP'
+  evolution -> writer.executor.routers 'HTTP /internal'
+
+  // ---- contracts 共享包(独立, 只被依赖不依赖任何一端) ----
+  contracts = shared-package 'contracts/' {
+    description '两端的数据合同. 铁律: 只被依赖, 不 import executor 也不 import evolution'
+  }
+  writer.executor -> contracts 'import'
+  writer.evolution -> contracts 'import'
+}
+
+// ==================== Views ====================
+views {
+  // L1 · 系统总览(给所有人)
+  view index {
+    title 'Writer 系统总览 (L1 Context)'
+    include *
+  }
+
+  // L1 · Writer Context
+  view writerContext of writer {
+    title 'Writer — System Context'
+    include author, llm
+  }
+
+  // L2 · executor 容器视图(给开发: 看动哪层)
+  view executorContainer of writer.executor {
+    title 'executor — Container 视图'
+    include *
+  }
+
+  // L2 · evolution 容器视图
+  view evolutionContainer of writer.evolution {
+    title 'evolution — Container 视图'
+    include *
+  }
+
+  // L3 · platform 内部组件(改底座时看)
+  view executorPlatform of writer.executor.platform {
+    title 'executor · platform/ — Component 视图'
+    include *
+  }
+
+  // L3 · writing 域内部(改写作流水线时看)
+  view executorWriting of writer.executor.domains {
+    title 'executor · domains/ — Component 视图'
+    include *
+  }
+
+  // L4 · 跨端进化闭环(动态视图, 对齐分层图 L4 sequenceDiagram)
+  // 一次完整的「观察→进化→回灌」闭环, 怎么穿过上面的分层
+  dynamic view evolutionLoop {
+    title 'L4 · 跨端进化闭环'
+    description '
+      一次完整的「观察 → 进化 → 回灌」闭环.
+      下次想加进化能力 / 改 trace 回灌机制, 照着这张图定位改哪里.
+    '
+
+    // —— 用户侧: 提需求 → 执行端跑流水线 ——
+    author -> writer.frontend '提需求' {
+      notes '用户在网页发起创作请求'
+    }
+    writer.frontend -> writer.executor 'HTTP 生成请求' {
+      notes '进入 routers → domains → platform → harness 分层链'
+    }
+    writer.executor -> writer.frontend '返回剧本' {
+      notes 'harness 装配 agent 跑完流水线, 剧本 + trace 经由 executor 返回'
+    }
+
+    // —— 进化端接管: 观察 ——
+    writer.executor -> writer.evolution.evolveApi '①通知 trace 完成' {
+      notes 'HTTP /internal. 铁律: 两端永远走 HTTP, 绝不互读文件系统'
+    }
+    writer.evolution.evolveApi -> writer.executor.routers '②拉取 trace 内容' {
+      notes 'GET /internal/traces'
+    }
+    writer.executor.routers -> writer.evolution.evolveApi '返回 trace 数据'
+
+    // —— 进化端接管: 进化(诊断 + 优化 + A/B 验证) ——
+    writer.evolution.pipeline -> writer.evolution.pipeline '③诊断 trace + ④优化 harness 源码' {
+      notes 'ingestion 采集 → diagnosis 诊断 → improvement 改进. 或走 singleAgent 单 Agent 闭环'
+    }
+    writer.evolution.compose -> writer.evolution.harnessSrc '提交新 harness 版本(git)'
+    writer.evolution.evolveApi -> writer.executor.routers '⑤A/B 验证请求' {
+      notes 'POST /internal/ab/run. 在执行端跑 candidate harness 对比 baseline'
+    }
+    writer.executor.routers -> writer.evolution.evolveApi '返回 A/B 结果'
+
+    // —— 回灌: 推送新快照, 执行端清缓存 ——
+    writer.evolution.evolveApi -> writer.executor.routers '⑥通知快照发布' {
+      notes 'POST /internal/snapshot/refreshed'
+    }
+    writer.executor.routers -> writer.executor.platform '清包缓存'
+    writer.executor.platform -> writer.executor.harness '下次重载新 harness' {
+      notes '下一个用户请求, 自动用上进化后的 harness. 闭环完成.'
+    }
+
+    // 样式: 把 Writer 系统内的元素压暗, 突出跨端交互
+    include
+      writer with {
+        color gray
+        opacity 10%
+      }
+    style * {
+      color secondary
+    }
+    style author {
+      color green
+    }
+  }
+}
