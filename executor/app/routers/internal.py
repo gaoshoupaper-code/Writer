@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import logging
 import uuid
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from pydantic import BaseModel
 
 from contracts.api import TraceContentResponse, TraceListItem, TraceListResponse, PromptRefreshNotice
@@ -253,12 +254,18 @@ def reload_harness() -> dict[str, Any]:
 
 
 class ABRunRequest(BaseModel):
-    """候选执行请求（adapt 的 run_candidates 节点调用，决策 E5a）。"""
+    """候选执行请求（evolve 的 run_baseline/run_candidate 工具调用，D2 同进程热加载）。
 
-    config: dict  # 候选 HarnessConfig JSON
-    source_commit: str  # 候选源码 git commit hash
-    batch_input: list[dict]  # 固定测试集输入（每个 = 一个生成请求 payload）
-    baseline_version: int = 0  # 基线版本号（trace 归属标记用）
+    字段对齐新设计（.claude/md/20260627_135113）：
+    - config：候选 HarnessConfig JSON（baseline=True 时可省略，用硬编码）
+    - demand_md：预置 demand.md 内容（interview 直通用）
+    - baseline：True=跑当前 Agent（无 config），False=跑进化后 Agent（用 config）
+    - source_commit：快照版本 git commit；None=用 harnesses/current（working 包）
+    """
+    config: dict | None = None  # 候选 HarnessConfig JSON（baseline=True 时可省略）
+    demand_md: str = ""  # 预置 demand.md 内容（interview 直通）
+    baseline: bool = True  # True=当前 Agent，False=候选 Agent
+    source_commit: str | None = None  # 快照版本 git commit；None=working 包（harnesses/current）
 
 
 class ABRunResponse(BaseModel):
@@ -268,37 +275,137 @@ class ABRunResponse(BaseModel):
 
 
 @router.post("/ab/run", response_model=ABRunResponse, status_code=202)
-async def ab_run(req: ABRunRequest) -> ABRunResponse:
-    """启动候选执行（异步，决策 E5a）。
+async def ab_run(req: ABRunRequest, background_tasks: BackgroundTasks) -> ABRunResponse:
+    """启动候选执行（异步，D2 同进程热加载）。
 
     立即返回 task_id，executor 后台跑：
-      1. clone source_commit 到临时目录
-      2. 对每个 batch_input：load_package(checkout) → assemble(ctx, config, checkout) → 跑生成
-      3. 跑完存结果，供 /ab/status 轮询
+      1. 准备隔离 workspace + 写 demand.md（interview 直通）
+      2. importlib 加载 source_root（同进程热加载）
+      3. assemble(ctx, config, source_root) 跑生成
+      4. 存 trace_ids 到 _ab_tasks，供 /ab/status 轮询
 
-    evolution 的 run_candidates 节点轮询 /ab/status/{task_id} 直到 done。
+    evolution 的 run_baseline/run_candidate 工具轮询 /ab/status/{task_id} 直到 done。
     """
+    import threading
     import uuid
 
     task_id = uuid.uuid4().hex[:12]
-    # 后台任务注册（实际执行在 BackgroundTasks 或独立 worker）
-    # MVP 阶段：注册到内存任务表，后台线程执行
-    _ab_tasks[task_id] = {"status": "running", "trace_ids": [], "error": None}
+    _ab_tasks[task_id] = {
+        "status": "running",
+        "trace_ids": [],
+        "error": None,
+        # 取消标志：stop 端点 set() 后，_execute_ab 在 super-step 边界中断
+        "cancel_event": threading.Event(),
+    }
     logger.info(
-        "候选执行任务启动: task=%s, commit=%s, batch=%d",
-        task_id, req.source_commit, len(req.batch_input),
+        "候选执行任务启动: task=%s, baseline=%s",
+        task_id, req.baseline,
     )
-    # TODO: 后台执行逻辑（clone + assemble + 跑生成 + 存 trace_ids）
-    # 当前为骨架，实际执行逻辑在 ab_runner 集成完善后填充
+
+    # 后台执行
+    background_tasks.add_task(_execute_ab, task_id, req)
     return ABRunResponse(task_id=task_id)
+
+
+def _execute_ab(task_id: str, req: "ABRunRequest") -> None:
+    """后台执行 A/B 生成（同步阻塞跑完，写结果到 _ab_tasks）。"""
+    # 取消标志（ab_run 端点创建，run_ab_generation 在 super-step 边界检查）
+    task_state = _ab_tasks.get(task_id) or {}
+    cancel_event = task_state.get("cancel_event")
+    # source_root：快照版本按 source_commit checkout；working 包用 harnesses/current
+    checked_out: Path | None = None
+    try:
+        from app.routers.ab_endpoint import run_ab_generation
+        from app.platform.core.settings import get_settings as _get_writer_settings
+        from app.routers.context import get_trace_recorder
+
+        writer_settings = _get_writer_settings()
+        trace_recorder = get_trace_recorder()
+        if req.source_commit:
+            # 快照版本：clone bare repo + checkout 指定 commit 到临时目录
+            from app.platform.agent.git_sync import checkout_commit, cleanup_checkout
+
+            source_root = checkout_commit(req.source_commit)
+            checked_out = source_root
+            logger.info("快照执行: task=%s commit=%s → %s", task_id, req.source_commit, source_root)
+        else:
+            # working 包：harness 包工作目录（生产路径 current）
+            source_root = Path(writer_settings.harness_package_path).resolve()
+            if not source_root.exists():
+                # 回退：从 evolution 工作目录找
+                source_root = Path(__file__).resolve().parents[3] / "evolution" / "harnesses" / "current"
+
+        trace_id = run_ab_generation(
+            config=req.config if not req.baseline else None,
+            source_root=source_root,
+            demand_md=req.demand_md,
+            trace_recorder=trace_recorder,
+            writer_settings=writer_settings,
+            on_trace_created=lambda tid: _ab_tasks.update(
+                {task_id: {"status": "running", "trace_ids": [tid], "error": None,
+                           "cancel_event": cancel_event}}
+            ),
+            cancel_event=cancel_event,
+        )
+        # run_ab_generation 在 cancelled 时已调 cancel_run 收尾；这里区分终态
+        if cancel_event.is_set():
+            _ab_tasks[task_id] = {
+                "status": "cancelled", "trace_ids": [trace_id], "error": None,
+                "cancel_event": cancel_event,
+            }
+            logger.info("候选执行任务被停止: task=%s trace=%s", task_id, trace_id)
+        else:
+            _ab_tasks[task_id] = {"status": "done", "trace_ids": [trace_id], "error": None,
+                                  "cancel_event": cancel_event}
+            logger.info("候选执行任务完成: task=%s trace=%s", task_id, trace_id)
+    except BaseException as exc:
+        logger.exception("候选执行任务失败: task=%s", task_id)
+        _ab_tasks[task_id] = {"status": "failed", "trace_ids": [], "error": str(exc),
+                              "cancel_event": cancel_event}
+        # 失败兜底通知 evolution（trace 可能尚未创建，ingest 链路收不到）
+        _notify_evolution_task_failed(task_id, str(exc))
+    finally:
+        if checked_out is not None:
+            from app.platform.agent.git_sync import cleanup_checkout
+
+            cleanup_checkout(checked_out)
+
+
+def _notify_evolution_task_failed(task_id: str, error: str) -> None:
+    """任务在产出 trace 前就失败时，主动通知 evolution 按 task_id 标记测试记录 failed。
+
+    与 _notify_evolution（recorder.py）平行：那条走 trace_id，这条走 task_id。
+    纯副作用、彻底降级（fire-and-forget，异常静默）。
+    """
+    try:
+        from app.platform.core.settings import get_settings
+        from app.platform.trace.recorder import _EVOLUTION_NOTIFY_TIMEOUT
+
+        url = get_settings().evolution_notify_url
+        if not url:
+            return
+        import httpx
+
+        httpx.post(
+            url,
+            json={
+                "trace_id": "",  # 无 trace
+                "task_id": task_id,
+                "status": "failed",
+                "error": error,
+            },
+            timeout=_EVOLUTION_NOTIFY_TIMEOUT,
+        )
+    except Exception:
+        pass
 
 
 @router.get("/ab/status/{task_id}")
 def ab_status(task_id: str) -> dict[str, Any]:
-    """查询候选执行任务状态（轮询，决策 E5a）。
+    """查询候选执行任务状态（轮询）。
 
     Returns:
-        {status: running/done/failed, trace_ids: [...], error: ...}
+        {status: running/done/failed/cancelled, trace_ids: [...], error: ...}
     """
     task = _ab_tasks.get(task_id)
     if task is None:
@@ -306,5 +413,33 @@ def ab_status(task_id: str) -> dict[str, Any]:
     return task
 
 
-# 内存任务表（MVP，进程级。生产可换 Redis/DB）
+@router.post("/ab/stop/{task_id}")
+def ab_stop(task_id: str) -> dict[str, Any]:
+    """请求停止运行中的候选执行任务（边界停）。
+
+    set 取消标志 → _execute_ab 在下一个 super-step 边界中断 → trace 收尾 cancelled。
+    不会立即中断（需等当前 LLM/节点周期结束），响应快但停止有数秒延迟。
+
+    - task 不存在 → 404
+    - task 已终态（done/failed/cancelled）→ 409，无需停止
+    - task running → set 标志，返回 accepted
+    """
+    task = _ab_tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"task not found: {task_id}")
+    if task.get("status") != "running":
+        raise HTTPException(
+            status_code=409,
+            detail=f"task {task_id} 已终态（{task.get('status')}），无需停止",
+        )
+    cancel_event = task.get("cancel_event")
+    if cancel_event is None:
+        # 老任务无取消标志（兼容）：无法停止
+        raise HTTPException(status_code=409, detail=f"task {task_id} 不支持停止")
+    cancel_event.set()
+    logger.info("候选执行任务收到停止请求: task=%s", task_id)
+    return {"status": "accepted", "task_id": task_id}
+
+
+# 内存任务表（进程级。生产可换 Redis/DB）
 _ab_tasks: dict[str, dict[str, Any]] = {}
