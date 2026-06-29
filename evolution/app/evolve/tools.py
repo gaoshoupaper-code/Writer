@@ -11,6 +11,10 @@ DeepAgent 框架自带 read_file/write_file/edit_file/glob/grep/execute/task，
   report(content)   产出对比报告（必须最后调用）
 
 工具共享 EvolveContext（session 信息 + 事件总线）。
+
+注意（D15）：EvolveContext 已迁出到 ctx.py，用 contextvars 隔离。
+本模块保留 set_tool_context / ctx_global 作为向后兼容入口（委托到 ctx.py），
+Phase 4 驱动器重构后本模块的工具将拆解到子代理。
 """
 from __future__ import annotations
 
@@ -24,8 +28,9 @@ from langchain_core.tools import tool
 
 from app.compose.bootstrap import build_v1_config
 from app.core.settings import settings
-from app.evolve import events as ev_events
+from app.evolve import events as ev_events  # noqa: F401  （向后兼容 re-export）
 from app.evolve import verifier
+from app.evolve.ctx import EvolveContext, get_tool_context, set_tool_context
 from app.evolve.evalset import load_case_demand
 
 logger = logging.getLogger("evolution.evolve.tools")
@@ -34,41 +39,10 @@ logger = logging.getLogger("evolution.evolve.tools")
 _POLL_INTERVAL = 10
 _POLL_TIMEOUT = 3600
 
-
-class EvolveContext:
-    """工具间共享的 session 上下文（一次进化流程的载体）。
-
-    每个工具通过闭包捕获唯一的 ctx 实例，实现状态传递 + 事件推送。
-    """
-
-    def __init__(self, session_id: str, case_id: str) -> None:
-        self.session_id = session_id
-        self.case_id = case_id
-        self.events: ev_events.SessionEvents | None = None  # 由 api 启动时注入
-
-        # 流程状态（工具间传递）
-        self.baseline_trace: str = ""
-        self.candidate_trace: str = ""
-        self.baseline_score: float | None = None
-        self.candidate_score: float | None = None
-        self.report: dict[str, Any] = {}
-
-        # 当前 config（run_baseline 用原始 config，run_candidate 用 Agent 改后的）
-        # 改动检测：Agent 改完源码/edits 后，run_candidate 时重新 build config
-        self._edits_path = (
-            Path(__file__).resolve().parent.parent.parent
-            / "data" / "evolve_workspace" / "edits.json"
-        )
-
-    # ── 事件推送便捷方法 ──
-
-    def emit_step(self, tool: str, status: str, **extra: Any) -> None:
-        if self.events:
-            self.events.emit_step(tool, status, **extra)
-
-    def emit_log(self, message: str) -> None:
-        if self.events:
-            self.events.emit_log(message)
+# 向后兼容：ctx_global 委托到 contextvar（D15）。
+# 旧代码 `from app.evolve.tools import ctx_global` 仍可读，但读取的是
+# 当前协程上下文的 ctx（通过 property 代理，见下方 ctx_global 定义）。
+# 新代码应直接用 get_tool_context()。
 
 
 # ── executor HTTP 调用 ─────────────────────────────────────
@@ -157,14 +131,49 @@ def _run_on_executor(
     raise TimeoutError(f"executor task {task_id} 轮询超时")
 
 
-# 模块级 ctx 占位（工具工厂 set_tool_context 时注入）
-ctx_global: EvolveContext | None = None
+# 向后兼容：ctx_global 改为模块级 property 代理，读取当前 contextvar 的 ctx。
+# 这样旧代码 `ctx_global.xxx` 透明地读到当前 session 的 ctx，无需逐行改。
+# 新代码请用 get_tool_context()。
+class _CtxGlobalProxy:
+    """ctx_global 代理：透明读取当前 contextvar 绑定的 EvolveContext。
+
+    旧代码用 `ctx_global.report` / `ctx_global is None` 等访问透明生效。
+    赋值 `ctx_global = xxx` 应改用 set_tool_context()，但为兼容旧式直接赋值
+    场景，__setattr__ 转发到 contextvar（若已绑定则改其属性，否则报错）。
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        ctx = get_tool_context()
+        if ctx is None:
+            raise AttributeError(
+                f"ctx_global 未绑定：当前协程上下文没有 EvolveContext，"
+                f"请先 set_tool_context()。访问的属性：{name}"
+            )
+        return getattr(ctx, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # 允许模块初始化时跳过（私有成员）。其余转发到当前 ctx。
+        ctx = get_tool_context()
+        if ctx is None:
+            raise AttributeError(
+                f"ctx_global 未绑定，无法设置 {name}。请先 set_tool_context()。"
+            )
+        setattr(ctx, name, value)
+
+    def __bool__(self) -> bool:
+        """支持 `if ctx_global:` 判断。"""
+        return get_tool_context() is not None
+
+    def __eq__(self, other: object) -> bool:
+        if other is None:
+            return get_tool_context() is None
+        return get_tool_context() is other
 
 
-def set_tool_context(ctx: EvolveContext) -> None:
-    """注入当前 session 的 ctx（每次进化流程启动时调用）。"""
-    global ctx_global
-    ctx_global = ctx
+# 模块级单例代理（旧代码继续 import ctx_global）
+ctx_global = _CtxGlobalProxy()
+
+# set_tool_context 已从 ctx.py re-export（上方 import）。
 
 
 # ── 6 个领域工具 ────────────────────────────────────────────
@@ -181,7 +190,7 @@ def _make_tools() -> list:
         用当前 production config + 当前 harness 源码跑生成。
         这是进化流程的第一步——拿到 baseline 作为改进基准。
         """
-        if ctx_global is None:
+        if get_tool_context() is None:
             return "错误：session 未初始化"
         ctx_global.emit_step("run_baseline", "running")
         try:
@@ -209,7 +218,7 @@ def _make_tools() -> list:
         用 Agent 产出的改动（edits.json + 改动后的源码）跑生成。
         必须在产出改动之后调用。
         """
-        if ctx_global is None:
+        if get_tool_context() is None:
             return "错误：session 未初始化"
         ctx_global.emit_step("run_candidate", "running")
         try:
@@ -239,7 +248,7 @@ def _make_tools() -> list:
         Args:
             trace_id: 要读的 trace id
         """
-        if ctx_global is None:
+        if get_tool_context() is None:
             return "错误：session 未初始化"
         ctx_global.emit_step("read_trace", "running", trace_id=trace_id)
         try:
@@ -281,7 +290,7 @@ def _make_tools() -> list:
         返回完整的 config JSON + harnesses/current/ 下所有文件路径。
         你可以用 read_file 读具体某个文件的完整内容。
         """
-        if ctx_global is None:
+        if get_tool_context() is None:
             return "错误：session 未初始化"
         ctx_global.emit_step("read_surface", "running")
         try:
@@ -318,7 +327,7 @@ def _make_tools() -> list:
         Args:
             trace_id: 要打分的 trace id
         """
-        if ctx_global is None:
+        if get_tool_context() is None:
             return "错误：session 未初始化"
         ctx_global.emit_step("read_verifier", "running", trace_id=trace_id)
         try:
@@ -362,7 +371,7 @@ def _make_tools() -> list:
         Args:
             content: 报告正文（markdown）
         """
-        if ctx_global is None:
+        if get_tool_context() is None:
             return "错误：session 未初始化"
         ctx_global.emit_step("report", "running")
 
@@ -408,4 +417,120 @@ def _make_tools() -> list:
     return [run_baseline, run_candidate, read_trace, read_surface, read_verifier, report]
 
 
-__all__ = ["EvolveContext", "set_tool_context", "_make_tools"]
+# ── 驱动器模式工具（D1：合并 run_test + report）──────────────────
+
+
+def make_driver_tools() -> list:
+    """构建驱动器主代理的工具集（D1：run_test + report）。
+
+    与一把手 _make_tools（6 工具）的区别：
+      - run_baseline/run_candidate 合并为 run_test(config_variant)（D1/D6）。
+      - 评估/方案/执行委托给子代理（驱动器只调 task），不需要 read_trace 等。
+      - run_test 复用 runner.py 的公共轮询（D6）。
+    """
+    from app.evolve.evalset import load_case_demand
+
+    @tool
+    def run_test(config_variant: str) -> str:
+        """跑一次生成测试，返回 trace_id。
+
+        baseline 已有（历史 trace 池输入），所以本工具只用于跑 candidate。
+        config_variant=candidate 时用改后的 harness（执行子代理落地后的改动）。
+
+        Args:
+            config_variant: "baseline" 或 "candidate"。candidate 用改后的 config+源码。
+        """
+        ctx = get_tool_context()
+        if ctx is None:
+            return "错误：session 未初始化"
+        if config_variant not in ("baseline", "candidate"):
+            return "config_variant 必须是 baseline 或 candidate"
+        phase = "run_candidate" if config_variant == "candidate" else "run_baseline"
+        ctx.emit_step("run_test", "running", phase=phase, variant=config_variant)
+        try:
+            demand_md = load_case_demand(ctx.case_id)
+            # 构建配置
+            if config_variant == "baseline":
+                config = build_v1_config()
+            else:
+                # candidate：读执行子代理产出的 edits.json
+                base = build_v1_config()
+                edits_path = Path(ctx._edits_path)
+                if edits_path.exists():
+                    import json
+                    try:
+                        edits_list = json.loads(edits_path.read_text(encoding="utf-8"))
+                        if isinstance(edits_list, list) and edits_list:
+                            from app.compose import edits as edit_ops
+                            config = edit_ops.apply_edits(base, edits_list)
+                        else:
+                            config = base
+                    except Exception:
+                        logger.warning("edits.json 解析失败，用 baseline config", exc_info=True)
+                        config = base
+                else:
+                    config = base
+
+            # 跑生成（复用 runner 公共轮询 D6）
+            from app.evolve.runner import run_generation
+            trace_id = run_generation(
+                config=config,
+                demand_md=demand_md,
+                baseline=(config_variant == "baseline"),
+            )
+            if config_variant == "baseline":
+                ctx.baseline_trace = trace_id
+            else:
+                ctx.candidate_trace = trace_id
+            from app.evolve import db as ev_db
+            if config_variant == "baseline":
+                ev_db.update_session(ctx.session_id, baseline_trace=trace_id)
+            else:
+                ev_db.update_session(ctx.session_id, candidate_trace=trace_id)
+            ctx.emit_step("run_test", "done", phase=phase, trace_id=trace_id, variant=config_variant)
+            return f"{config_variant} 跑完，trace_id={trace_id}"
+        except Exception as e:
+            ctx.emit_step("run_test", "failed", phase=phase, error=str(e))
+            return f"{config_variant} 跑失败：{e}"
+
+    @tool
+    def report(content: str) -> str:
+        """产出最终的对比报告。这必须是流水线最后一步。
+
+        报告应包含：改了什么、baseline/candidate 评估对比、是否改进、结论。
+
+        Args:
+            content: 报告正文（markdown）
+        """
+        ctx = get_tool_context()
+        if ctx is None:
+            return "错误：session 未初始化"
+        ctx.emit_step("report", "running", phase="report")
+        # 护栏：report 前必须有两轮评估（eval_report_path + candidate_eval_path）
+        if not ctx.eval_report_path or not ctx.candidate_eval_path:
+            ctx.emit_step("report", "blocked", phase="report", reason="缺评估")
+            return (
+                "报告前必须完成 baseline 和 candidate 两轮评估。"
+                f"eval_report_path={ctx.eval_report_path}, "
+                f"candidate_eval_path={ctx.candidate_eval_path}"
+            )
+        report_data = {
+            "content": content,
+            "baseline_trace": ctx.baseline_trace,
+            "candidate_trace": ctx.candidate_trace,
+            "eval_report_path": ctx.eval_report_path,
+            "candidate_eval_path": ctx.candidate_eval_path,
+            "design_doc_path": ctx.design_doc_path,
+            "change_log_path": ctx.change_log_path,
+        }
+        ctx.report = report_data
+        from app.evolve import db as ev_db
+        ev_db.update_session(ctx.session_id, status="done", report=report_data)
+        ctx.emit_report(report_data)
+        ctx.emit_step("report", "done", phase="report")
+        return "报告已提交。流水线完成。"
+
+    return [run_test, report]
+
+
+__all__ = ["EvolveContext", "set_tool_context", "get_tool_context", "_make_tools", "make_driver_tools"]

@@ -27,7 +27,7 @@ from pydantic import BaseModel
 from app.evolve import db as ev_db
 from app.evolve import events as ev_events
 from app.evolve import evalset
-from app.evolve.agent import run_evolve_session
+from app.evolve.agent import run_evolve_pipeline, run_evolve_session
 from app.evolve.tools import EvolveContext
 
 logger = logging.getLogger("evolution.evolve.api")
@@ -36,7 +36,7 @@ router = APIRouter(tags=["evolve"])
 
 
 class EvolveStartRequest(BaseModel):
-    """进化启动请求。"""
+    """进化启动请求（一把手模式，向后兼容）。"""
 
     case: str = "case-001"  # 评估集 case 标识
 
@@ -44,6 +44,23 @@ class EvolveStartRequest(BaseModel):
 class EvolveStartResponse(BaseModel):
     session_id: str
     case: str
+    status: str  # started
+
+
+class PipelineStartRequest(BaseModel):
+    """驱动器模式启动请求（6 阶段流水线，D4）。
+
+    baseline_trace 是输入（历史 trace 池），流水线不跑 baseline 生成。
+    """
+
+    case: str = "case-001"
+    baseline_trace: str  # 必填：历史 trace 池的 trace_id
+
+
+class PipelineStartResponse(BaseModel):
+    session_id: str
+    case: str
+    baseline_trace: str
     status: str  # started
 
 
@@ -90,7 +107,7 @@ async def evolve_start(
 
 
 async def _run_evolve_bg(ctx: EvolveContext, user_input: str) -> None:
-    """后台执行进化 Agent（后台 task）。"""
+    """后台执行进化 Agent（一把手模式，后台 task）。"""
     try:
         result = await run_evolve_session(ctx, user_input)
         if ctx.events:
@@ -100,6 +117,68 @@ async def _run_evolve_bg(ctx: EvolveContext, user_input: str) -> None:
                 ctx.events.finish("failed", result.get("error", "未产出报告"))
     except Exception as e:
         logger.exception("进化 session %s 后台执行异常", ctx.session_id)
+        if ctx.events:
+            ctx.events.finish("failed", str(e))
+        ev_db.update_session(ctx.session_id, status="failed")
+
+
+# ── 驱动器模式触发（D4：6 阶段流水线）────────────────────────────
+
+
+@router.post("/evolve/pipeline/start", response_model=PipelineStartResponse, status_code=202)
+async def pipeline_start(
+    req: PipelineStartRequest,
+    background_tasks: BackgroundTasks,
+) -> PipelineStartResponse:
+    """触发驱动器模式进化流水线（6 阶段：评估baseline→方案→执行→跑candidate→评估candidate→报告）。
+
+    baseline_trace 是输入（历史 trace 池已有），流水线不跑 baseline 生成。
+    """
+    if not evalset.case_exists(req.case):
+        raise HTTPException(
+            status_code=404,
+            detail=f"评估集 case {req.case} 不存在，可用: {evalset.list_cases()}",
+        )
+    # 校验 baseline_trace 存在
+    from app.view.traces import get_trace
+    try:
+        get_trace(req.baseline_trace)
+    except Exception:
+        raise HTTPException(
+            status_code=404,
+            detail=f"baseline_trace {req.baseline_trace} 不存在",
+        )
+
+    session_id = uuid.uuid4().hex[:12]
+    events = await ev_events.register(session_id)
+    ev_db.create_session(session_id, req.case)
+
+    ctx = EvolveContext(session_id=session_id, case_id=req.case)
+    ctx.events = events
+
+    background_tasks.add_task(_run_pipeline_bg, ctx, req.baseline_trace)
+
+    logger.info(
+        "驱动器流水线启动: session=%s case=%s baseline=%s",
+        session_id, req.case, req.baseline_trace,
+    )
+    return PipelineStartResponse(
+        session_id=session_id, case=req.case,
+        baseline_trace=req.baseline_trace, status="started",
+    )
+
+
+async def _run_pipeline_bg(ctx: EvolveContext, baseline_trace: str) -> None:
+    """后台执行驱动器流水线（6 阶段）。"""
+    try:
+        result = await run_evolve_pipeline(ctx, baseline_trace)
+        if ctx.events:
+            if result["status"] == "done":
+                ctx.events.finish("done")
+            else:
+                ctx.events.finish("failed", result.get("error", "未产出报告"))
+    except Exception as e:
+        logger.exception("驱动器流水线 %s 后台执行异常", ctx.session_id)
         if ctx.events:
             ctx.events.finish("failed", str(e))
         ev_db.update_session(ctx.session_id, status="failed")

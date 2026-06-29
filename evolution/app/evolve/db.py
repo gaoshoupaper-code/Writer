@@ -26,10 +26,15 @@ def update_session(
     session_id: str,
     *,
     status: str | None = None,
+    phase: str | None = None,
     baseline_trace: str | None = None,
     candidate_trace: str | None = None,
     baseline_score: float | None = None,
     candidate_score: float | None = None,
+    eval_report_path: str | None = None,
+    design_doc_path: str | None = None,
+    change_log_path: str | None = None,
+    candidate_eval_path: str | None = None,
     report: dict[str, Any] | None = None,
 ) -> None:
     """更新 session 字段（只更新非 None 的字段）。"""
@@ -38,6 +43,9 @@ def update_session(
     if status is not None:
         sets.append("status = ?")
         params.append(status)
+    if phase is not None:
+        sets.append("phase = ?")
+        params.append(phase)
     if baseline_trace is not None:
         sets.append("baseline_trace = ?")
         params.append(baseline_trace)
@@ -50,6 +58,18 @@ def update_session(
     if candidate_score is not None:
         sets.append("candidate_score = ?")
         params.append(candidate_score)
+    if eval_report_path is not None:
+        sets.append("eval_report_path = ?")
+        params.append(eval_report_path)
+    if design_doc_path is not None:
+        sets.append("design_doc_path = ?")
+        params.append(design_doc_path)
+    if change_log_path is not None:
+        sets.append("change_log_path = ?")
+        params.append(change_log_path)
+    if candidate_eval_path is not None:
+        sets.append("candidate_eval_path = ?")
+        params.append(candidate_eval_path)
     if report is not None:
         sets.append("report_json = ?")
         params.append(json.dumps(report, ensure_ascii=False))

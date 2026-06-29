@@ -279,7 +279,9 @@ class TraceRecorder:
                 tool_calls=_tool_calls_payload(values.get("tool_calls")),
                 tool_call_id=self._optional_str(values.get("tool_call_id")),
                 tool_name=self._optional_str(values.get("tool_name")),
-                tool_args=None,
+                tool_args=_preserve_deliverable_args(
+                    values.get("tool_name"), values.get("tool_args")
+                ),
                 tool_output=_sanitize_tool_call_inputs(values.get("tool_output")),
                 output_anchor_id=output_anchor_id,
                 input_context_range=input_context_range,
@@ -1015,12 +1017,45 @@ class TraceRecorder:
         return str(value)
 
 
+def _is_deliverable_tool(tool_name: str) -> bool:
+    """判断是否为交付物工具（write_file/edit_file，决策 E15/E20）。
+
+    这类工具的 args（含文件 content）需保留进 trace，让评估子代理能从 trace
+    读交付物正文 + 中间版本（不依赖 workspace 文件系统存活）。
+    其余工具（read_file/ls/grep/task 等）的 args 仍清空控制体积。
+
+    体积实测：write_file 全部事件加起来仅占 trace 0.5%（大头是 llm_start 90%），
+    保留正文对总体积影响微乎其微。
+    """
+    return tool_name in {"write_file", "edit_file"}
+
+
+def _preserve_deliverable_args(tool_name: str | None, tool_args: Any) -> Any:
+    """保留交付物工具的 args（write_file/edit_file 的 content）。
+
+    非 write_file/edit_file 返回 None（保持原 sanitize 行为）。
+    write_file/edit_file 返回原 args（含 content + path），让 trace 记录正文。
+    """
+    if not _is_deliverable_tool(str(tool_name or "")):
+        return None
+    return tool_args
+
+
 def _sanitize_event_data(event_data: dict[str, Any]) -> dict[str, Any]:
     event_type = str(event_data.get("type") or "")
     sanitized = dict(event_data)
     if event_type.startswith("llm"):
         pass  # input 保留：包含模型完整输入（系统提示词、注入上下文、对话历史）
-    sanitized.pop("tool_args", None)
+    # 交付物工具的 args 保留（write_file/edit_file 的 content，决策 E15/E20），
+    # 让 trace 含交付物正文 + 中间版本，评估子代理可从 trace 读正文。
+    # 其余工具的 args 仍清空（控制体积，实测 write_file 全部仅占 trace 0.5%）。
+    tool_name = str(sanitized.get("tool_name") or "")
+    if _is_deliverable_tool(tool_name):
+        sanitized["tool_args"] = _preserve_deliverable_args(
+            tool_name, sanitized.get("tool_args")
+        )
+    else:
+        sanitized.pop("tool_args", None)
     if "output" in sanitized:
         sanitized["output"] = _sanitize_tool_call_inputs(sanitized["output"])
     if "tool_output" in sanitized:

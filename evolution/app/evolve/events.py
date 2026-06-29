@@ -57,9 +57,18 @@ class SessionEvents:
             except Exception:
                 pass
 
-    def emit_step(self, tool: str, status: str, **extra: Any) -> None:
-        """便捷方法：推一个 step 事件。"""
-        event = {"type": "step", "tool": tool, "status": status}
+    def emit_step(self, tool: str, status: str, *, phase: str | None = None, **extra: Any) -> None:
+        """便捷方法：推一个 step 事件。
+
+        Args:
+            tool:   工具/阶段名
+            status: running / done / failed / blocked
+            phase:  流水线阶段（D17：eval_baseline/plan/execute/run_candidate/
+                    eval_candidate/report）。None 时不写入（向后兼容旧调用）。
+        """
+        event: dict[str, Any] = {"type": "step", "tool": tool, "status": status}
+        if phase is not None:
+            event["phase"] = phase
         event.update(extra)
         self.emit(event)
 

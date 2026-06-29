@@ -219,19 +219,25 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_ar_session ON adapt_rounds(session_id);
 
-            -- evolve_sessions：单进化 Agent 的 session（替换 adapt_rounds 的多轮语义）
+            -- evolve_sessions：进化流水线 session（驱动器模式，D16）。
+            -- baseline_trace 现为输入（历史 trace 池，D4）；新字段 phase + 文档路径。
             CREATE TABLE IF NOT EXISTS evolve_sessions (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id      TEXT NOT NULL,           -- uuid
-                case_id         TEXT NOT NULL,           -- evalset case 标识
-                status          TEXT NOT NULL,           -- running/done/failed
-                baseline_trace  TEXT,                    -- baseline trace_id
-                candidate_trace TEXT,                    -- candidate trace_id
-                baseline_score  REAL,                    -- verifier 分数（overall 均值）
-                candidate_score REAL,                    -- verifier分数（overall 均值）
-                report_json     TEXT,                    -- Agent 产出的对比报告 JSON
-                created_at      TEXT NOT NULL,
-                updated_at      TEXT
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id         TEXT NOT NULL,           -- uuid
+                case_id            TEXT NOT NULL,           -- evalset case 标识
+                status             TEXT NOT NULL,           -- running/done/failed
+                phase              TEXT,                    -- 当前流水线阶段（D-guard 6 阶段）
+                baseline_trace     TEXT,                    -- baseline trace_id（输入，历史 trace 池）
+                candidate_trace    TEXT,                    -- candidate trace_id（run_test 产）
+                baseline_score     REAL,                    -- verifier 分数（overall 均值）
+                candidate_score    REAL,                    -- verifier分数（overall 均值）
+                eval_report_path   TEXT,                    -- baseline 评估诊断文档路径（D16）
+                design_doc_path    TEXT,                    -- 方案设计文档路径
+                change_log_path    TEXT,                    -- 执行改动记录路径
+                candidate_eval_path TEXT,                   -- candidate 评估诊断文档路径
+                report_json        TEXT,                    -- 对比报告 JSON
+                created_at         TEXT NOT NULL,
+                updated_at         TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_es_session ON evolve_sessions(session_id);
             CREATE INDEX IF NOT EXISTS idx_es_case ON evolve_sessions(case_id);
@@ -272,8 +278,33 @@ def init_db() -> None:
         _migrate_prompt_tables(conn)
         # Phase 8 幂等迁移：harness_snapshots tar→config_json（compose 配置化，决策 #18）
         _migrate_harness_snapshots_config(conn)
+        # 驱动器模式幂等迁移：evolve_sessions 补 phase + 文档路径列（D16）
+        _migrate_evolve_sessions_driver_fields(conn)
         # Phase 1：初始化归因映射（幂等，仅空表时填充）
         _seed_agent_prompt_map(conn)
+
+
+def _migrate_evolve_sessions_driver_fields(conn: sqlite3.Connection) -> None:
+    """幂等迁移：给 evolve_sessions 表补驱动器模式新列（D16）。
+
+    新字段：phase / eval_report_path / design_doc_path / change_log_path /
+    candidate_eval_path。新库建表已含（executescript CREATE），存量库靠此 ALTER 补。
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(evolve_sessions)").fetchall()}
+    new_cols = {
+        "phase": "TEXT",
+        "eval_report_path": "TEXT",
+        "design_doc_path": "TEXT",
+        "change_log_path": "TEXT",
+        "candidate_eval_path": "TEXT",
+    }
+    missing = {c: t for c, t in new_cols.items() if c not in existing}
+    if not missing:
+        return
+    with _lock:
+        for col, coltype in missing.items():
+            conn.execute(f"ALTER TABLE evolve_sessions ADD COLUMN {col} {coltype}")
+        conn.commit()
 
 
 def _migrate_runs_owner_user_id(conn: sqlite3.Connection) -> None:

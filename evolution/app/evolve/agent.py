@@ -120,4 +120,119 @@ async def run_evolve_session(ctx: EvolveContext, user_input: str) -> dict[str, A
         return {"status": "failed", "error": str(e), "report": None}
 
 
-__all__ = ["build_evolve_agent", "run_evolve_session"]
+__all__ = ["build_evolve_agent", "run_evolve_session", "build_evolve_driver", "run_evolve_pipeline"]
+
+
+# ── 驱动器模式（D2/D4/D-guard：6阶段流水线）──────────────────────
+
+
+def build_evolve_driver(ctx: EvolveContext):
+    """构建进化驱动器（DeepAgent + 3 子代理 + PhaseGuard）。
+
+    架构（D2/D4）：
+      create_deep_agent(
+          tools=[task(框架自带), run_test, report],
+          subagents=[evaluate, plan, execute],   # D2: SubAgentSpec 挂载
+          middleware=[PhaseGuardMiddleware()],     # D-guard: 6阶段白名单
+      )
+
+    与一把手 build_evolve_agent 的区别：
+      - 驱动器只持 task + run_test + report，自身不做分析/诊断/写代码。
+      - 评估/方案/执行委托给子代理。
+      - PhaseGuard 强制按 6 阶段定序。
+
+    Args:
+        ctx: 进化上下文（baseline_trace 已作为输入填入）
+
+    Returns:
+        编译后的 CompiledStateGraph（可 ainvoke/astream）
+    """
+    from deepagents import create_deep_agent
+
+    from app.evolve.driver_prompt import driver_system_prompt
+    from app.evolve.evaluate import build_evaluate_subagent
+    from app.evolve.execute import build_execute_subagent
+    from app.evolve.guard import PhaseGuardMiddleware
+    from app.evolve.plan import build_plan_subagent
+    from app.evolve.tools import make_driver_tools
+
+    set_tool_context(ctx)
+
+    model = build_evolve_model(temperature=0.2)
+
+    # 驱动器工具：run_test + report（task 由框架自带）
+    driver_tools = make_driver_tools()
+
+    # 3 子代理（D2）
+    subagents = [
+        build_evaluate_subagent(model),
+        build_plan_subagent(model),
+        build_execute_subagent(model),
+    ]
+
+    system_prompt = driver_system_prompt(
+        session_id=ctx.session_id,
+        case_id=ctx.case_id,
+        baseline_trace=ctx.baseline_trace or "(未提供)",
+    )
+
+    driver = create_deep_agent(
+        model=model,
+        tools=driver_tools,
+        system_prompt=system_prompt,
+        middleware=[PhaseGuardMiddleware()],
+        subagents=subagents,
+        checkpointer=None,
+    )
+    logger.info(
+        "进化驱动器构建完成: session=%s case=%s baseline=%s",
+        ctx.session_id, ctx.case_id, ctx.baseline_trace,
+    )
+    return driver
+
+
+async def run_evolve_pipeline(ctx: EvolveContext, baseline_trace: str) -> dict[str, Any]:
+    """跑一次完整的进化流水线（驱动器模式，6 阶段）。
+
+    Args:
+        ctx: 进化上下文
+        baseline_trace: baseline trace_id（输入，历史 trace 池）
+
+    Returns:
+        {"status": "done"|"failed", "report": ...}
+    """
+    from app.evolve.guard import PHASES
+
+    ctx.baseline_trace = baseline_trace
+    ctx.current_phase = PHASES[0]  # eval_baseline
+    from app.evolve import db as ev_db
+    ev_db.update_session(
+        ctx.session_id, baseline_trace=baseline_trace, phase=ctx.current_phase,
+    )
+
+    driver = build_evolve_driver(ctx)
+    ctx.emit_log("进化驱动器启动，开始 6 阶段流水线...")
+    logger.info("session %s: 驱动器启动 baseline=%s", ctx.session_id, baseline_trace)
+
+    user_input = (
+        f"请开始进化流水线。baseline_trace={baseline_trace}，"
+        f"case_id={ctx.case_id}。按 6 阶段顺序执行："
+        f"评估baseline → 方案 → 执行 → 跑candidate → 评估candidate → 报告。"
+    )
+
+    try:
+        await driver.ainvoke(
+            {"messages": [{"role": "user", "content": user_input}]},
+            config={"recursion_limit": 150},
+        )
+        logger.info("session %s: 驱动器执行完成", ctx.session_id)
+        if ctx.report:
+            ctx.emit_log("进化流水线完成，已产出报告。")
+            return {"status": "done", "report": ctx.report}
+        ctx.emit_log("驱动器结束但未产出完整报告。")
+        return {"status": "incomplete", "report": None}
+    except Exception as e:
+        logger.exception("session %s: 驱动器执行失败", ctx.session_id)
+        if ctx.events:
+            ctx.events.finish("failed", str(e))
+        return {"status": "failed", "error": str(e), "report": None}
