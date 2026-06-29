@@ -4,10 +4,11 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 // 进化端主导航（需求 §4.1）。叙事重心=进化驾驶舱。
-// 四页：进化总览(首页) / Trace追溯 / 配置版本谱系。
+// 五页：进化总览(首页) / 手动测试 / Trace追溯 / 配置版本谱系。
 // 驾驶舱 /sessions/[id] 是从总览/session列表点进去的，不放主导航。
 const NAV_ITEMS = [
   { href: "/", label: "进化总览", exact: true },
+  { href: "/tests", label: "手动测试" },
   { href: "/traces", label: "Trace" },
   { href: "/versions", label: "版本谱系" },
 ];
