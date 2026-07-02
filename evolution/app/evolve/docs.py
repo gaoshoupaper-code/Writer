@@ -1,13 +1,15 @@
 """进化流水线文档落盘 / 读取（决策 D13 / D16 / E23）。
 
-三文档统一格式：markdown + YAML front matter。
+两文档统一格式：markdown + YAML front matter。
   - front matter：结构化字段（机器可解析，yaml.safe_load）。
   - 正文：自然语言诊断 / 详述（人可读，LLM 可消费）。
 
 文档清单：
-  eval_report.md     评估子代理产出（内容分 + 流程指标 + 流程诊断）
   design_doc.md      方案子代理产出（结构化改动列表 + 自然语言详述）
   change_log.md      执行子代理产出（落地了哪些改动 + validate 结果）
+
+（评估报告已改为 DB 交接——eval_agent 写 evaluation_sessions 表，
+不再落 eval_report.md 文件，相关函数已随三功能解耦清理。）
 
 落盘位置：evolution/data/evolve_workspace/<session_id>/（每 session 独立目录）。
 
@@ -83,63 +85,6 @@ def _load_doc(path: Path | str) -> tuple[dict[str, Any], str]:
     meta = yaml.safe_load(parts[1]) or {}
     body = parts[2].strip()
     return meta, body
-
-
-# ── eval_report.md（评估子代理产出）─────────────────────────────
-
-
-def write_eval_report(
-    session_id: str,
-    *,
-    trace_id: str,
-    trace_kind: str,  # "baseline" | "candidate"
-    content_scores: dict[str, Any],  # 内容层分数（复用 evaluation.py）
-    flow_metrics: dict[str, Any],  # 流程硬指标（flow_metrics.py）
-    findings: list[dict[str, str]],  # 流程诊断条目（见下方 schema）
-    summary: str,  # 自然语言总述
-) -> str:
-    """评估子代理产出 eval_report.md。
-
-    findings schema（每条）：
-        {
-          "dimension": "协作拓扑|错误保障|资源消耗|内容质量",
-          "severity": "high|medium|low",
-          "evidence_type": "实证|推断",      # E21：区分实证问题 vs 推断建议
-          "finding": "问题描述",
-          "evidence": "trace 证据（节点/指标）",
-          "suggestion": "改进建议"
-        }
-    """
-    path = session_dir(session_id) / f"eval_report_{trace_kind}.md"
-    meta = {
-        "trace_id": trace_id,
-        "trace_kind": trace_kind,
-        "evaluated_at": datetime.now(UTC).isoformat(),
-        "content_scores": content_scores,
-        "flow_metrics": flow_metrics,
-        "findings_count": len(findings),
-        "findings": findings,
-    }
-    # 正文：自然语言总述 + 诊断条目展开
-    lines = [f"# 评估报告（{trace_kind}）", "", summary, ""]
-    if findings:
-        lines.append("## 流程诊断条目")
-        lines.append("")
-        for i, f in enumerate(findings, 1):
-            lines.append(f"### {i}. [{f.get('severity', '?').upper()}] {f.get('dimension', '?')}")
-            lines.append(f"- **类型**：{f.get('evidence_type', '?')}")
-            lines.append(f"- **发现**：{f.get('finding', '')}")
-            lines.append(f"- **证据**：{f.get('evidence', '')}")
-            lines.append(f"- **建议**：{f.get('suggestion', '')}")
-            lines.append("")
-    body = "\n".join(lines)
-    return _dump_doc(path, meta, body)
-
-
-def read_eval_report(path: str) -> dict[str, Any]:
-    """读 eval_report.md，返回 {meta, body}。"""
-    meta, body = _load_doc(path)
-    return {"meta": meta, "body": body}
 
 
 # ── design_doc.md（方案子代理产出）──────────────────────────────
@@ -241,18 +186,9 @@ def write_change_log(
     return _dump_doc(path, meta, body)
 
 
-def read_change_log(path: str) -> dict[str, Any]:
-    """读 change_log.md，返回 {meta, body}。"""
-    meta, body = _load_doc(path)
-    return {"meta": meta, "body": body}
-
-
 __all__ = [
     "session_dir",
-    "write_eval_report",
-    "read_eval_report",
     "write_design_doc",
     "read_design_doc",
     "write_change_log",
-    "read_change_log",
 ]

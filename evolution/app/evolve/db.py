@@ -11,7 +11,7 @@ from typing import Any
 import app.core.db as db
 
 
-def create_session(session_id: str, case_id: str) -> None:
+def create_session(session_id: str, case_id: str = "") -> None:
     """创建一个 evolve session（启动时调用）。"""
     now = datetime.now(UTC).isoformat()
     db.execute(
@@ -27,17 +27,15 @@ def update_session(
     *,
     status: str | None = None,
     phase: str | None = None,
-    baseline_trace: str | None = None,
-    candidate_trace: str | None = None,
-    baseline_score: float | None = None,
-    candidate_score: float | None = None,
-    eval_report_path: str | None = None,
     design_doc_path: str | None = None,
     change_log_path: str | None = None,
-    candidate_eval_path: str | None = None,
-    report: dict[str, Any] | None = None,
+    eval_ref: str | None = None,
 ) -> None:
-    """更新 session 字段（只更新非 None 的字段）。"""
+    """更新 session 字段（只更新非 None 的字段）。
+
+    三功能解耦后精简：删除 baseline/candidate/score 等废弃字段参数（T9）。
+    新增 eval_ref（关联评估报告 eval_id，S6/T2）。
+    """
     sets: list[str] = []
     params: list[Any] = []
     if status is not None:
@@ -46,33 +44,15 @@ def update_session(
     if phase is not None:
         sets.append("phase = ?")
         params.append(phase)
-    if baseline_trace is not None:
-        sets.append("baseline_trace = ?")
-        params.append(baseline_trace)
-    if candidate_trace is not None:
-        sets.append("candidate_trace = ?")
-        params.append(candidate_trace)
-    if baseline_score is not None:
-        sets.append("baseline_score = ?")
-        params.append(baseline_score)
-    if candidate_score is not None:
-        sets.append("candidate_score = ?")
-        params.append(candidate_score)
-    if eval_report_path is not None:
-        sets.append("eval_report_path = ?")
-        params.append(eval_report_path)
     if design_doc_path is not None:
         sets.append("design_doc_path = ?")
         params.append(design_doc_path)
     if change_log_path is not None:
         sets.append("change_log_path = ?")
         params.append(change_log_path)
-    if candidate_eval_path is not None:
-        sets.append("candidate_eval_path = ?")
-        params.append(candidate_eval_path)
-    if report is not None:
-        sets.append("report_json = ?")
-        params.append(json.dumps(report, ensure_ascii=False))
+    if eval_ref is not None:
+        sets.append("eval_ref = ?")
+        params.append(eval_ref)
 
     if not sets:
         return
