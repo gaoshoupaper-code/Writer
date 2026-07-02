@@ -406,11 +406,21 @@ def ab_status(task_id: str) -> dict[str, Any]:
 
     Returns:
         {status: running/done/failed/cancelled, trace_ids: [...], error: ...}
+
+    注意：只显式挑选可序列化字段。task 字典里还存了 cancel_event
+    （threading.Event，内部含 _thread.lock，不可 JSON 序列化），若直接 return
+    整个 task，jsonable_encoder 会抛异常导致端点 500，进化端轮询永远拿不到
+    trace_id（表现为前端卡在"等待 executor 创建 trace…"）。
     """
     task = _ab_tasks.get(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"task not found: {task_id}")
-    return task
+    # cancel_event 是内部取消标志（threading.Event），不下发
+    return {
+        "status": task.get("status"),
+        "trace_ids": task.get("trace_ids", []),
+        "error": task.get("error"),
+    }
 
 
 @router.post("/ab/stop/{task_id}")

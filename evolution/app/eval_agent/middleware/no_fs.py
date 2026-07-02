@@ -1,0 +1,64 @@
+"""评估 Agent 专用 middleware：过滤掉框架自带的 filesystem 工具（决策 V4）。
+
+create_deep_agent 强制挂 FilesystemMiddleware（_REQUIRED_MIDDLEWARE），无法移除。
+评估 Agent 不需要框架自带的 read_file/write_file/edit_file/glob/grep——
+读源码用评估专属的 read_source_file（按版本读，V1），读 trace 用 read_trace*。
+
+本 middleware 在 wrap_model_call 里把这些 filesystem 工具从 request.tools 过滤掉，
+确保评估 Agent 只能用评估专属工具，不会误用 read_file 读到当前 working 区
+（与按版本对齐的 read_source_file 冲突）。
+"""
+from __future__ import annotations
+
+from typing import Any, Callable
+
+from langchain.agents.middleware.types import AgentMiddleware
+
+# 要过滤的 filesystem 工具名（FilesystemMiddleware 提供的）
+_FILTERED_TOOL_NAMES = frozenset({
+    "read_file",
+    "write_file",
+    "edit_file",
+    "ls",
+    "glob",
+    "grep",
+    # execute 也不需要（评估不跑命令）
+    "execute",
+})
+
+
+class NoFilesystemToolsMiddleware(AgentMiddleware):
+    """过滤掉框架自带的 filesystem 工具，确保评估 Agent 不误用 read_file 等。
+
+    与 PhaseGuard（进化端）不同：这里不是阶段白名单，而是永久移除一批工具。
+    机制：wrap_model_call 里把 _FILTERED_TOOL_NAMES 里的工具从 request.tools 剔除。
+    """
+
+    def wrap_model_call(
+        self,
+        request: Any,
+        handler: Callable[..., Any],
+    ) -> Any:
+        """过滤 filesystem 工具后再调 handler。"""
+        tools = getattr(request, "tools", None)
+        if not tools:
+            return handler(request)
+
+        def _tool_name(t: Any) -> str:
+            if hasattr(t, "name"):
+                return t.name
+            if isinstance(t, dict):
+                return t.get("name", "")
+            return ""
+
+        filtered = [t for t in tools if _tool_name(t) not in _FILTERED_TOOL_NAMES]
+        if len(filtered) == len(tools):
+            # 无需过滤（本就没这些工具）
+            return handler(request)
+
+        # 用 request.override(tools=...) 重建请求（与 FilesystemMiddleware 同模式）
+        request = request.override(tools=filtered)
+        return handler(request)
+
+
+__all__ = ["NoFilesystemToolsMiddleware"]

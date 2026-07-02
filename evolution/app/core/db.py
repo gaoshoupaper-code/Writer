@@ -261,6 +261,26 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_mt_status ON manual_tests(status);
             CREATE INDEX IF NOT EXISTS idx_mt_created ON manual_tests(created_at);
+
+            -- evaluation_sessions：评估 Agent 产出的评估报告（决策 S4/T6）。
+            -- 评估从进化流水线抽离为独立顶层 Agent（T1-T11/S1）。
+            -- 一条评估 = 评估一条 trace 的流程+内容两大维度，产出诊断报告。
+            -- trace_id 是贯穿三功能（测试→评估→进化）的公共外键。
+            -- agent_version_*：冷存被评估 trace 对应的 Agent 版本（从 manual_tests 反查，
+            --   冷存一份避免每次 JOIN，加速进化入口「选已评估 trace」列表查询）。
+            CREATE TABLE IF NOT EXISTS evaluation_sessions (
+                eval_id            TEXT PRIMARY KEY,         -- 评估 session id
+                trace_id           TEXT NOT NULL,            -- 被评估的 trace
+                agent_version_type TEXT,                     -- 'working' | 'snapshot'
+                agent_version_id   INTEGER,                  -- snapshot 版本号；working 时 NULL
+                status             TEXT NOT NULL DEFAULT 'running',  -- running|done|failed
+                scores_json        TEXT,                     -- 内容层评分 + 流程硬指标（JSON）
+                findings_json      TEXT,                     -- 问题清单数组（每条含 dimension/severity/evidence_type/finding/evidence）
+                report_md          TEXT,                     -- 可读报告全文（内联）
+                created_at         TEXT NOT NULL,
+                updated_at         TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_eval_trace ON evaluation_sessions(trace_id);
             """
         )
         conn.commit()
@@ -280,6 +300,8 @@ def init_db() -> None:
         _migrate_harness_snapshots_config(conn)
         # 驱动器模式幂等迁移：evolve_sessions 补 phase + 文档路径列（D16）
         _migrate_evolve_sessions_driver_fields(conn)
+        # 三功能解耦：evolve_sessions 补 eval_ref 列（关联评估报告，决策 S6/T2）
+        _migrate_evolve_sessions_eval_ref(conn)
         # Phase 1：初始化归因映射（幂等，仅空表时填充）
         _seed_agent_prompt_map(conn)
 
@@ -304,6 +326,22 @@ def _migrate_evolve_sessions_driver_fields(conn: sqlite3.Connection) -> None:
     with _lock:
         for col, coltype in missing.items():
             conn.execute(f"ALTER TABLE evolve_sessions ADD COLUMN {col} {coltype}")
+        conn.commit()
+
+
+def _migrate_evolve_sessions_eval_ref(conn: sqlite3.Connection) -> None:
+    """幂等迁移：给 evolve_sessions 表补 eval_ref 列（三功能解耦，决策 S6/T2）。
+
+    eval_ref 关联 evaluation_sessions.eval_id——进化强前置（T2）需先有评估报告。
+    新库建表未含此列（沿用 D16 schema），存量库靠此 ALTER 补。
+    status 字段值域从 running/done/failed 扩展为 4 态（S6）：
+      running / pending_review / published / discarded（沿用同一列，不改类型）。
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(evolve_sessions)").fetchall()}
+    if "eval_ref" in existing:
+        return
+    with _lock:
+        conn.execute("ALTER TABLE evolve_sessions ADD COLUMN eval_ref TEXT")
         conn.commit()
 
 

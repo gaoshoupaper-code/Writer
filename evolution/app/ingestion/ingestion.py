@@ -117,9 +117,8 @@ async def _ingest_async(trace_id: str) -> None:
     tid = await asyncio.to_thread(importer.ingest_events, events, workspace_hint, None, prior_events)
     if tid is None:
         return
-    # 旧 LLM-judge 已解除（不再触发）
-    # 新双层评估：仅终态触发（awaiting_input/running 不评估，防半成品污染）
-    await asyncio.to_thread(_maybe_evaluate, tid, events, prior_events)
+    # 评估已从摄入链路解耦（决策 S6）：不再摄入时自动评估，
+    # 评估统一由 eval_agent 手动触发（POST /eval-agent/start）。
     # 手动测试状态同步：按 trace_id 同步 manual_tests 终态（D-Q3）
     run_row = db.query_one("SELECT status FROM runs WHERE trace_id=?", (tid,))
     if run_row:
@@ -154,63 +153,11 @@ def _sync_status_only(trace_id: str) -> None:
 def _maybe_judge(trace_id: str) -> None:
     """[已解除] 旧 LLM-judge（执行层评估）。
 
-    HITL 改造（需求决策）：不再对单条 trace 实时触发旧 judge。此函数保留为空壳，
-    避免其他调用点报错；调用链已在 _ingest_async 移除。双层评估（_maybe_evaluate）
-    仍是活跃的评估入口。
+    评估已从摄入链路彻底解耦（决策 S6）：不再摄入时触发任何评估，
+    评估统一由 eval_agent 手动触发（POST /eval-agent/start）。
+    此空壳保留避免其他调用点报错。
     """
     return
-
-
-def _maybe_evaluate(trace_id: str, events: list[Any], prior_events: list[Any] | None = None) -> None:
-    """触发双层评估（仅终态）。
-
-    HITL 改造：awaiting_input 是中间态，不评估（防半成品污染评估池）。只有终态
-    （completed/cancelled/failed）才触发。
-    防自指断路（D12）：optimization trace 跳过。
-    合并 prior_events 一起判断（run_start 可能在旧事件里）。
-    """
-    try:
-        from app.diagnosis.evaluation import evaluate_trace
-        from app.core.llm import judge_enabled
-        if not judge_enabled():
-            return
-        # 合并事件判断终态 + run_purpose
-        merged = list(events) + (prior_events or [])
-        if _is_awaiting(merged):
-            logger.info("双层评估跳过 %s：awaiting_input 中间态", trace_id)
-            return
-        if not _is_terminal(merged):
-            logger.info("双层评估跳过 %s：非终态", trace_id)
-            return
-        if _is_optimization_trace(merged):
-            logger.info("双层评估跳过 %s：optimization trace（防自指断路）", trace_id)
-            return
-        evaluate_trace(trace_id)
-    except Exception:
-        logger.exception("双层评估触发失败 %s", trace_id)
-
-
-def _is_awaiting(events: list[Any]) -> bool:
-    """最后一条状态事件是否为 run_awaiting（当前处于 awaiting_input）。"""
-    last = next((e for e in reversed(events) if e.type in ("run_awaiting", "run_end", "run_error", "run_cancelled")), None)
-    return last is not None and last.type == "run_awaiting"
-
-
-def _is_terminal(events: list[Any]) -> bool:
-    """trace 是否已到终态（有 run_end/run_error/run_cancelled）。"""
-    return any(e.type in ("run_end", "run_error", "run_cancelled") for e in events)
-
-
-def _is_optimization_trace(events: list[Any]) -> bool:
-    """判断 trace 是否为优化回放产出（run_purpose=optimization）。
-
-    从 run_start 事件的 input.run_purpose 字段判断。recorder 已在 run_start 埋点（D12）。
-    无法判断时返回 False（安全侧：宁可评估不跳过）。
-    """
-    run_start = next((e for e in events if e.type == "run_start"), None)
-    if run_start is None or not isinstance(run_start.input, dict):
-        return False
-    return str(run_start.input.get("run_purpose", "")) == "optimization"
 
 
 @router.post("/ingestion/notify")
