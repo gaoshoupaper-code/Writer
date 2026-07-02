@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.improvement.increment import reconstruct_full_input
+from app.ingestion.increment import reconstruct_full_input
 
 
 def _msg(role: str, content: str) -> dict:

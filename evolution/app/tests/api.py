@@ -24,8 +24,8 @@ from pydantic import BaseModel
 
 from app.core import db
 from app.core.settings import settings
-from app.evolve import evalset
-from app.improvement.snapshot_repo import list_snapshots
+from app.common import evalset
+from app.versioning.snapshot_repo import list_snapshots
 from app.tests import repo as test_repo
 
 logger = logging.getLogger("evolution.tests.api")
@@ -183,7 +183,7 @@ def _validate_version(version_type: str, version_id: int | None) -> dict[str, An
     # snapshot：必须有 version_id 且快照存在
     if version_id is None:
         raise HTTPException(status_code=400, detail="snapshot 版本必须指定 version_id")
-    from app.improvement.snapshot_repo import get_snapshot
+    from app.versioning.snapshot_repo import get_snapshot
 
     snap = get_snapshot(version_id)
     if snap is None:

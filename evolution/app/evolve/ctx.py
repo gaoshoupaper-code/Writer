@@ -1,17 +1,18 @@
-"""EvolveContext —— 一次进化 session 的上下文（决策 D15）。
+"""EvolveContext —— 一次进化 session 的上下文（三功能解耦，决策 S5/S6）。
 
-从 tools.py 迁出，独立成模块。核心改动（D15）：用 contextvars 替代模块级
-ctx_global，支持多 session 并发 / 子代理嵌套委托时不串台。
+进化 Agent 精简为「方案→执行」两阶段（T9/S3），ctx 同步精简：
+删除 baseline/candidate/score/phase(6阶段)/eval_report_path/candidate_eval_path
+等废弃字段；评估报告改为从 DB 加载到 eval_snapshot（S2）。
 
-机制说明：
-  - 每个进化 session 启动时调 set_tool_context(ctx) 把当前 session 的 ctx
-    绑定到 contextvar。
-  - 所有工具（驱动器/评估/方案/执行子代理的工具）通过 get_tool_context()
-    取"当前协程上下文"绑定的 ctx，而非全局唯一变量。
-  - 多个 session 并发跑时，各自协程上下文有独立的 ctx，互不擦写。
+机制（沿用 D15）：contextvars 绑定，多 session 并发各取各的，互不串台。
+与 eval_agent/ctx.py 的 EvaluationContext 独立，互不干扰。
 
-向后兼容：tools.py 仍 re-export EvolveContext / set_tool_context，旧代码
-`from app.evolve.tools import EvolveContext` 继续有效。
+字段（精简后）：
+  - session_id / case_id / events       会话标识 + 事件总线
+  - trace_id                            进化输入的 trace（被改进对象）
+  - eval_snapshot                       从 DB 加载的评估报告快照（dict，含 scores/findings/report_md）
+  - design_doc_path / change_log_path   各阶段产出文档路径
+  - review_status                       4 态机状态（S6，与 DB status 同步）
 """
 from __future__ import annotations
 
@@ -20,56 +21,48 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from app.evolve import events as ev_events
+    from app.common import events as ev_events
 
 # ── contextvar：当前协程上下文绑定的 EvolveContext ────────────────
-# 默认未设置（None），set_tool_context 时绑定。contextvar 天然按
-# asyncio Task / 线程隔离，多 session 并发各取各的，不会串台。
+# 与 eval_agent/ctx.py 的 _current_eval_ctx 独立。
 _current_ctx: contextvars.ContextVar["EvolveContext | None"] = contextvars.ContextVar(
     "evolve_current_ctx", default=None
 )
 
 
 class EvolveContext:
-    """工具间共享的 session 上下文（一次进化流程的载体）。
+    """工具间共享的进化 session 上下文（一次进化流程的载体）。
 
     每个 session 一个实例。工具闭包通过 get_tool_context() 取当前 ctx，
     实现 session 隔离的状态传递 + 事件推送。
     """
 
-    def __init__(self, session_id: str, case_id: str) -> None:
+    def __init__(self, session_id: str, case_id: str = "") -> None:
         self.session_id = session_id
         self.case_id = case_id
         self.events: "ev_events.SessionEvents | None" = None  # 由 api 启动时注入
 
-        # 流程状态（工具间传递）
-        self.baseline_trace: str = ""
-        self.candidate_trace: str = ""
-        self.baseline_score: float | None = None
-        self.candidate_score: float | None = None
-        self.report: dict[str, Any] = {}
+        # 进化输入（S2：trace + 评估报告，强前置 T2）
+        self.trace_id: str = ""
+        # 评估报告快照（从 evaluation_sessions 表加载，dict：scores/findings/report_md）
+        self.eval_snapshot: dict[str, Any] = {}
 
-        # 当前流水线阶段（D16/D-guard：6 阶段状态机）
-        # eval_baseline → plan → execute → run_candidate → eval_candidate → report
-        self.current_phase: str = ""
-
-        # 各阶段产出文档路径（D16，落盘后存表）
-        self.eval_report_path: str = ""
+        # 各阶段产出文档路径
         self.design_doc_path: str = ""
         self.change_log_path: str = ""
-        self.candidate_eval_path: str = ""
 
-        # 当前 config（run_candidate 用 Agent 改后的）。
-        # 改动检测：Agent 改完源码/edits 后，run_candidate 时重新 build config。
-        self._edits_path = (
-            Path(__file__).resolve().parent.parent.parent
-            / "data" / "evolve_workspace" / "edits.json"
+        # 4 态机状态（S6）：running / pending_review / published / discarded
+        self.review_status: str = "running"
+
+        # 进化工作目录（edits/change_log 存放点，沿用旧路径）
+        self._workspace = (
+            Path(__file__).resolve().parent.parent.parent / "data" / "evolve_workspace"
         )
 
     # ── 事件推送便捷方法 ──
 
     def emit_step(self, tool: str, status: str, *, phase: str | None = None, **extra: Any) -> None:
-        """推一个 step 事件。phase 为 None 时用 ctx.current_phase（D17）。"""
+        """推一个 step 事件。phase 指定阶段（plan/execute）。"""
         if self.events:
             self.events.emit_step(tool, status, phase=phase, **extra)
 

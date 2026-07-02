@@ -20,7 +20,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 
 import app.core.db as db
-from app.improvement import snapshot_repo
+from app.versioning import snapshot_repo
 
 logger = logging.getLogger("evolution.versions_api")
 

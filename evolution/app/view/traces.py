@@ -136,7 +136,7 @@ def _reconstruct_incremental_inputs(events: list[TraceLogEvent]) -> list[TraceLo
 
     range 为空的事件（全量，T8）不受影响。无 llm_start 事件或链断裂时原样返回。
     """
-    from app.improvement.increment import reconstruct_full_input
+    from app.ingestion.increment import reconstruct_full_input
 
     has_llm_start = any(e.type == "llm_start" for e in events)
     if not has_llm_start:

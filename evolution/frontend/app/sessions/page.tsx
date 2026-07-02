@@ -1,14 +1,14 @@
 "use client";
 
 /**
- * 进化运行信息页（/sessions?id=xxx，替换旧 adapt 驾驶舱）。
+ * 进化运行信息页（/sessions?id=xxx）—— 功能③详情（三功能解耦）。
  *
- * 单进化 Agent 的实时执行视图：
- *   顶：session 元数据 + 状态
+ * 精简后（方案→执行两阶段，不自证比分）：
+ *   顶：session 元数据 + 状态（4 态：running/pending_review/published/discarded）
  *   步骤时间线：Agent 调用的每个工具步骤（SSE 实时推送）
- *   报告区：最终对比报告（分数 + 改动 + 是否改进）
+ *   待审操作区：pending_review 时显示发版/丢弃按钮
  *
- * 数据双源：初始 GET /sessions/{id} 拿已落库数据 + SSE 拿实时步骤。
+ * 数据双源：初始 GET /sessions/{id} + SSE 实时步骤。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
@@ -16,12 +16,10 @@ import { Suspense } from "react";
 import {
   fetchSessionDetail,
   subscribeEvolveStream,
+  publishSession,
+  discardSession,
 } from "@/lib/evolve-api";
-import type {
-  EvolveSession,
-  EvolveStreamEvent,
-  EvolveReport,
-} from "@/lib/evolve-api";
+import type { EvolveSession, EvolveStreamEvent } from "@/lib/evolve-api";
 
 interface StepRecord {
   tool: string;
@@ -52,8 +50,9 @@ function EvolveInner() {
   const [status, setStatus] = useState<string>("loading");
   const [steps, setSteps] = useState<StepRecord[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
-  const [report, setReport] = useState<EvolveReport | null>(null);
   const [streamError, setStreamError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [acting, setActing] = useState<"publish" | "discard" | null>(null);
   const cleanRef = useRef<(() => void) | null>(null);
 
   const loadDetail = useCallback(async () => {
@@ -62,7 +61,6 @@ function EvolveInner() {
       const d = await fetchSessionDetail(sessionId);
       setDetail(d);
       setStatus(d.status);
-      if (d.report) setReport(d.report);
     } catch {
       setStatus("failed");
     }
@@ -78,7 +76,7 @@ function EvolveInner() {
     let cancelled = false;
     const timer = setTimeout(() => {
       if (cancelled) return;
-      if (status === "done" || status === "failed") return;
+      if (status === "pending_review" || status === "published" || status === "discarded" || status === "failed") return;
 
       const clean = subscribeEvolveStream(
         sessionId,
@@ -107,12 +105,12 @@ function EvolveInner() {
       case "step": {
         const detailParts: string[] = [];
         if ("trace_id" in evt && evt.trace_id) detailParts.push(`trace=${evt.trace_id}`);
-        if ("overall" in evt && typeof evt.overall === "number")
-          detailParts.push(`score=${evt.overall}`);
-        if ("file_count" in evt && typeof evt.file_count === "number")
-          detailParts.push(`${evt.file_count} 文件`);
         if ("error" in evt && evt.error) detailParts.push(String(evt.error));
-        if ("reason" in evt && evt.reason) detailParts.push(String(evt.reason));
+        if ("path" in evt && evt.path) detailParts.push(String(evt.path));
+        if ("changes" in evt && typeof evt.changes === "number")
+          detailParts.push(`${evt.changes} 改动`);
+        if ("findings" in evt && typeof evt.findings === "number")
+          detailParts.push(`${evt.findings} 诊断`);
         setSteps((prev) => [
           ...prev,
           {
@@ -122,21 +120,51 @@ function EvolveInner() {
             timestamp: Date.now(),
           },
         ]);
+        // write_change_log/write_design_doc 完成后刷新详情
+        if (evt.status === "done") {
+          setTimeout(loadDetail, 500);
+        }
         break;
       }
       case "log":
         setLogs((prev) => [...prev, evt.message]);
         break;
-      case "report":
-        setReport(evt.report);
-        break;
       case "end":
-        setStatus(evt.outcome);
+        setTimeout(loadDetail, 500);
         break;
       case "error":
         setStatus("failed");
         setStreamError(evt.reason);
         break;
+    }
+  };
+
+  const handlePublish = async () => {
+    if (!sessionId) return;
+    setActing("publish");
+    setActionError(null);
+    try {
+      await publishSession(sessionId);
+      await loadDetail();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : "发版失败");
+    } finally {
+      setActing(null);
+    }
+  };
+
+  const handleDiscard = async () => {
+    if (!sessionId) return;
+    if (!confirm("确认丢弃？working 区将回退到上一 production 版本。")) return;
+    setActing("discard");
+    setActionError(null);
+    try {
+      await discardSession(sessionId);
+      await loadDetail();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : "丢弃失败");
+    } finally {
+      setActing(null);
     }
   };
 
@@ -158,23 +186,22 @@ function EvolveInner() {
   }
 
   const isRunning = status === "running";
-  const baselineScore = report?.baseline_score ?? detail?.baseline_score;
-  const candidateScore = report?.candidate_score ?? detail?.candidate_score;
-  const improved = report?.improved;
+  const isPendingReview = status === "pending_review";
 
   return (
     <div className="cockpit">
       {/* 顶栏 */}
       <div className="cockpit-topbar">
         <div className="cockpit-title-block">
-          <a href="/" className="cockpit-back mono text-mute">
-            ← 总览
+          <a href="/evolve" className="cockpit-back mono text-mute">
+            ← 进化
           </a>
           <h1 className="cockpit-title">
             进化 Session <span className="mono">{sessionId}</span>
           </h1>
           <div className="cockpit-meta mono text-dim">
-            case: {detail?.case_id ?? "—"}
+            trace: {detail?.baseline_trace || detail?.trace_id || "—"}
+            {detail?.eval_ref && ` · 评估: ${detail.eval_ref}`}
           </div>
         </div>
         <div className="cockpit-topright">
@@ -188,40 +215,46 @@ function EvolveInner() {
         </div>
       )}
 
-      {/* 分数对比卡 */}
-      {(baselineScore != null || candidateScore != null) && (
-        <div className="card" style={{ marginBottom: 16 }}>
-          <div className="section-head">
-            <h2 className="section-title">分数对比</h2>
+      {actionError && (
+        <div className="error-box" style={{ marginBottom: 16 }}>
+          {actionError}
+        </div>
+      )}
+
+      {/* 待审操作区：pending_review 时显示发版/丢弃按钮 */}
+      {isPendingReview && (
+        <div className="card" style={{ marginBottom: 16, borderLeft: "3px solid var(--accent)" }}>
+          <div style={{ padding: "12px 16px" }}>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>改动已落地，等待 review</div>
+            <div className="text-dim" style={{ fontSize: 13, marginBottom: 12 }}>
+              进化 Agent 已产出代码改动（方案→执行两阶段）。
+              <strong>发版</strong>会固化为新 Agent 版本（git commit + 快照），
+              <strong>丢弃</strong>会回退 working 区到上一版本。
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="btn-primary" onClick={handlePublish} disabled={acting !== null}>
+                {acting === "publish" ? "发版中…" : "✓ 发版"}
+              </button>
+              <button className="btn-ghost" onClick={handleDiscard} disabled={acting !== null}>
+                {acting === "discard" ? "丢弃中…" : "✗ 丢弃"}
+              </button>
+            </div>
           </div>
-          <div style={{ display: "flex", gap: 24, padding: "8px 0" }}>
-            <ScoreBlock label="Baseline" value={baselineScore} />
-            <ScoreBlock label="Candidate" value={candidateScore} highlight={improved === true} />
-            {baselineScore != null && candidateScore != null && (
-              <div style={{ flex: 1, textAlign: "center", alignSelf: "center" }}>
-                <div className="text-mute mono" style={{ fontSize: 11 }}>
-                  Δ
-                </div>
-                <div
-                  className="mono"
-                  style={{
-                    fontSize: 20,
-                    color:
-                      candidateScore > baselineScore
-                        ? "var(--completed)"
-                        : candidateScore < baselineScore
-                          ? "var(--cancelled)"
-                          : "var(--text-dim)",
-                  }}
-                >
-                  {(candidateScore - baselineScore >= 0 ? "+" : "") +
-                    (candidateScore - baselineScore).toFixed(4)}
-                </div>
-                <div className="text-mute" style={{ fontSize: 11 }}>
-                  {improved === true ? "↑ 改进" : improved === false ? "↓ 未改进" : ""}
-                </div>
-              </div>
-            )}
+        </div>
+      )}
+
+      {/* 已发版提示 */}
+      {status === "published" && (
+        <div className="card" style={{ marginBottom: 16, borderLeft: "3px solid var(--completed)" }}>
+          <div style={{ padding: "12px 16px", color: "var(--completed)" }}>
+            ✓ 已发版为新 Agent 版本。可去「版本谱系」查看，或去「手动测试」验证新版本。
+          </div>
+        </div>
+      )}
+      {status === "discarded" && (
+        <div className="card" style={{ marginBottom: 16, borderLeft: "3px solid var(--text-dim)" }}>
+          <div style={{ padding: "12px 16px" }} className="text-dim">
+            已丢弃，working 区已回退到上一版本。
           </div>
         </div>
       )}
@@ -267,55 +300,18 @@ function EvolveInner() {
           </div>
         </div>
       )}
-
-      {/* 最终报告 */}
-      {report && (
-        <div className="card">
-          <div className="section-head">
-            <h2 className="section-title">进化报告</h2>
-            <span
-              className="status-badge"
-              style={{
-                color: report.improved ? "var(--completed)" : "var(--cancelled)",
-                background: report.improved
-                  ? "rgba(63,185,80,.1)"
-                  : "rgba(139,148,158,.1)",
-              }}
-            >
-              {report.improved ? "已改进" : "未改进"}
-            </span>
-          </div>
-          <div className="prose-doc" style={{ padding: "8px 16px" }}>
-            <pre
-              className="landscape-text"
-              style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}
-            >
-              {report.content}
-            </pre>
-          </div>
-          <div
-            style={{
-              padding: "12px 16px",
-              borderTop: "1px solid var(--border)",
-              fontSize: 12,
-            }}
-            className="text-mute"
-          >
-            人 review 后，在工作区执行{" "}
-            <code className="mono">git commit</code> 采纳改动，或{" "}
-            <code className="mono">git reset --hard</code> 丢弃。
-          </div>
-        </div>
-      )}
     </div>
   );
 }
 
 function StatusBadge({ status }: { status: string }) {
   const map: Record<string, { label: string; color: string }> = {
-    running: { label: "运行中", color: "var(--accent)" },
-    done: { label: "完成", color: "var(--completed)" },
+    running: { label: "执行中", color: "var(--accent)" },
+    pending_review: { label: "待审", color: "var(--warn)" },
+    published: { label: "已发版", color: "var(--completed)" },
+    discarded: { label: "已丢弃", color: "var(--text-dim)" },
     failed: { label: "失败", color: "var(--cancelled)" },
+    done: { label: "完成", color: "var(--completed)" },
     loading: { label: "加载中", color: "var(--text-dim)" },
   };
   const cfg = map[status] || { label: status, color: "var(--text-dim)" };
@@ -326,34 +322,6 @@ function StatusBadge({ status }: { status: string }) {
     >
       {cfg.label}
     </span>
-  );
-}
-
-function ScoreBlock({
-  label,
-  value,
-  highlight,
-}: {
-  label: string;
-  value: number | null | undefined;
-  highlight?: boolean;
-}) {
-  return (
-    <div style={{ flex: 1, textAlign: "center" }}>
-      <div className="text-mute mono" style={{ fontSize: 11 }}>
-        {label}
-      </div>
-      <div
-        className="mono"
-        style={{
-          fontSize: 24,
-          color: highlight ? "var(--completed)" : "var(--text)",
-          fontWeight: highlight ? 600 : 400,
-        }}
-      >
-        {value != null ? value.toFixed(4) : "—"}
-      </div>
-    </div>
   );
 }
 

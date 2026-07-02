@@ -32,15 +32,14 @@ from app.core.settings import settings
 from app.ingestion.ingestion import router as ingestion_router
 from app.view.traces import router as traces_router
 from app.view.stats import router as stats_router
-from app.view.evaluation_api import router as evaluation_router
-from app.improvement.snapshot_api import router as snapshot_router
+from app.versioning.snapshot_api import router as snapshot_router
 from app.view.active import router as active_api_router
 from app.view.agent_package import router as agent_package_router
 from app.view.sse_stream import router as sse_router
 from app.evolve.api import router as evolve_router
 from app.tests.api import router as tests_router
+from app.eval_agent.api import router as eval_agent_router
 from app.view.versions_api import router as versions_router
-from app.view.web.router import router as web_router
 from app.ingestion.scan import start_scan_scheduler
 from app.view.active import start_active_poller
 
@@ -72,7 +71,6 @@ app.add_middleware(
 app.include_router(ingestion_router, prefix="/api")
 app.include_router(traces_router, prefix="/api")
 app.include_router(stats_router, prefix="/api")
-app.include_router(evaluation_router, prefix="/api")
 app.include_router(snapshot_router, prefix="/api")
 # 监测前端新增端点（D7 active 富化 / D8 agent-package / D9 SSE stream）
 app.include_router(active_api_router, prefix="/api")
@@ -82,11 +80,10 @@ app.include_router(sse_router, prefix="/api")
 app.include_router(evolve_router, prefix="/api")
 # 手动单次测试入口（数据集选择 + Agent 版本选择 + 独立测试记录，D-Q9）
 app.include_router(tests_router, prefix="/api")
+# 评估 Agent（三功能解耦：评估从进化流水线抽离为独立顶层 Agent，S1/S7）
+app.include_router(eval_agent_router, prefix="/api")
 # 配置版本谱系视图（前端版本谱系页 D8）
 app.include_router(versions_router, prefix="/api")
-# D6：旧 Jinja2 监测前端退到 /legacy 前缀（新 Next.js 前端接管根路径）。
-# 未迁移的页（overview/evaluation/rules/experiments）暂继续用旧前端兜底。
-app.include_router(web_router, prefix="/legacy")
 
 
 @app.get("/health")
@@ -104,9 +101,9 @@ def config() -> dict[str, str]:
     }
 
 
-# D1/D6：StaticFiles 托管新 Next.js 前端静态产物（next build 的 out/）。
+# StaticFiles 托管 Next.js 前端静态产物（next build 的 out/）。
 # 挂在根路径 /，html=True 实现 SPA fallback（未知路由回落 index.html）。
-# 必须在所有 API + /legacy 之后挂（否则会吞掉 /api 和 /legacy 路径）。
+# 必须在所有 API 之后挂（否则会吞掉 /api 路径）。
 # 开发模式（无 out 目录）跳过——dev 用 next dev --port 3457 独立跑。
 from pathlib import Path as _Path
 _frontend_out = _Path(__file__).resolve().parent.parent / "frontend" / "out"
