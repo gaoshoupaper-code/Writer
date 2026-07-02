@@ -102,7 +102,7 @@ model {
       technology 'FastAPI / Python'
       description '写作执行服务. 接前端 HTTP + 接 evolution 的 /internal'
       this -> llm '调用'
-      this -> writer.evolution '①trace 完成通知 / ②被拉取 trace / ⑤被通知 prompt 更新 / ⑥被通知快照发布'
+      this -> writer.evolution '被 evolution 调用 /internal: ab/run(生成) + ab/status(轮询) + snapshot/refreshed(发版通知)'
       this -> writer.db '读写'
 
       // ============= executor 内部分层(L2 Container 内部, 对齐分层铁律 routers->domains->platform->harness) =============
@@ -165,38 +165,59 @@ model {
 
     evolution = container-service 'evolution 进化端' {
       technology 'FastAPI / Python'
-      description '进化服务. 用户不直接用, 在背后观察 executor / 优化 executor'
-      this -> writer.executor '③主动拉取 trace / ④A/B 回放请求 / ⑦推送 prompt 更新 / ⑧推送新快照'
-      this -> llm '调用'
+      description '三功能 + 双 Agent: ①单次测试 ②评估 Agent ③进化 Agent. 用户主导, 人工串联闭环'
+      this -> writer.executor '③拉取 trace / A/B 生成 / ⑦推送快照发布通知'
+      this -> llm '调用 (评估 Agent + 进化 Agent)'
       this -> writer.db '读写'
 
-      // ============= evolution 内部分层(L2 Container 内部, 对齐分层图 L2 evolution 视图) =============
-      // 两套机制并存(项目正从 adapt 四阶段迁向 evolve 单 Agent):
-      //   1. 单进化 Agent(新): app/evolve/ 一个 DeepAgent 跑通全闭环
-      //   2. 分阶段流水线(原有): ingestion -> diagnosis -> improvement
-      evolveApi = layer 'app/evolve/ + app/view/' {
-        description 'HTTP 接口层. 手动进化 / 大盘 / SSE'
-        this -> pipeline '触发流水线'
-        this -> singleAgent '触发单 Agent 进化'
+      // ============= evolution 内部分层(L2 Container 内部, 对齐三功能解耦) =============
+      // 三功能各自独立(决策 T1-T11/S1-S14):
+      //   ① 单次测试: tests/ 选数据集+版本 → 调 executor 跑 → 产 trace
+      //   ② 评估 Agent: eval_agent/ 独立顶层 Agent, 对一条 trace 做诊断
+      //   ③ 进化 Agent: evolve/ 吃评估报告 → 方案→执行 → 产待审改动 → 人工发版
+      evolveApi = layer 'app/evolve/api.py (进化 API)' {
+        description '功能③触发: POST /evolve/start (强前置: trace 必须已评估) + 发版/丢弃'
+        this -> singleAgent '触发进化驱动器'
       }
-      singleAgent = layer 'app/evolve/ (单进化 Agent)' {
-        description '新机制: 一个 DeepAgent 自主跑通 baseline->改 harness->candidate->打分->报告 全闭环'
-        this -> compose '改写 harness 后装配'
+      evalAgentApi = layer 'app/eval_agent/api.py (评估 API)' {
+        description '功能②触发: POST /eval-agent/start (选 trace) + 查询 + SSE'
+        this -> evalAgent '触发评估 Agent'
       }
-      pipeline = layer 'app/ingestion/ · diagnosis/ · improvement/' {
-        description '原有机制: 采集 trace -> 规则/LLM 诊断 -> 改进 prompt 并发版'
-        this -> compose '产出 harness 配置'
-        this -> evoCore '读写'
+      testsApi = layer 'app/tests/ (单次测试)' {
+        description '功能①: 选数据集+Agent版本 → 调 executor /internal/ab/run → 产 trace. 已就绪'
+        this -> writer.executor.routers 'HTTP /internal/ab/run 跑生成'
       }
-      compose = layer 'app/compose/' {
-        description '装配层 (HarnessConfig 构建)'
-        this -> harnessSrc '改写 harness 源码'
+
+      // —— 双 Agent(对等的独立顶层 Agent, 互不依赖, 各自只依赖 core+common) ——
+      evalAgent = layer 'app/eval_agent/ (评估 Agent)' {
+        description '功能②: 独立顶层 DeepAgent. 按要素分层: prompt + tools/(trace·surface·content·report) + middleware/no_fs + skills/(空壳). 读 trace 多层 + 流程硬指标 + 内容评分(scoring+rubrics内含) + LLM 诊断. 只诊断不提方案(T3). 按版本对齐要素(V1-V7)'
+        this -> evoCore '读写 (evaluation_sessions 表)'
+        this -> harnessConfig '读 harness 设计意图 (read_surface, 按版本)'
       }
-      evoCore = layer 'app/core/' {
-        description '公共底座 (DB / LLM / settings)'
+      singleAgent = layer 'app/evolve/ (进化 Agent)' {
+        description '功能③: 按要素分层. driver/(agent+prompt+middleware/phase_guard) 委托 subagents/(plan·execute 各 prompt/tools/build 三件套) + skills/(空壳). 吃评估报告产改动, 不自证比分(T1人工发版)'
+        this -> harnessConfig '执行子代理改 harness 源码'
+        this -> evoCore '读写 (evolve_sessions 表 + eval_ref 关联评估)'
       }
-      harnessSrc = layer 'harnesses/current/' {
-        description 'Agent 包源码 (被 evolve Agent 改写的对象)'
+
+      // —— 公共设施(跨 Agent 共用, 不属任一业务 Agent) ——
+      common = layer 'app/common/ (公共设施)' {
+        description 'events(SSE总线) + flow_metrics(流程指标) + evalset(评估集) + model_factory(LLM模型工厂). eval_agent 与 evolve 平等依赖'
+      }
+
+      // —— 底座(被三功能共用) ——
+      harnessConfig = layer 'app/harness_config/ (装配层)' {
+        description 'HarnessConfig schema+序列化+校验(config) + apply_edits算子(edits) + bootstrap(v1生成). git_ops已归core'
+        this -> harnessSrc '改写/读取 harness 源码'
+      }
+      versioning = layer 'app/versioning/ (版本谱系+发版)' {
+        description 'snapshot_repo(版本快照 config_json+source_commit) + snapshot_publisher(发版通知) + snapshot_api'
+      }
+      evoCore = layer 'app/core/ (底座)' {
+        description 'DB + LLM + settings + models(trace schema) + git_ops(commit/show_file 按版本读源码)'
+      }
+      harnessSrc = layer 'harnesses/current/ (Agent 包源码)' {
+        description '被进化 Agent 改写的对象. git 管理, 发版时 commit+push 到 bare repo'
       }
     }
 
@@ -256,52 +277,59 @@ views {
     include *
   }
 
-  // L4 · 跨端进化闭环(动态视图, 对齐分层图 L4 sequenceDiagram)
-  // 一次完整的「观察→进化→回灌」闭环, 怎么穿过上面的分层
+  // L4 · 跨端进化闭环(动态视图, 对齐三功能解耦)
+  // 三功能各自独立, 人工串联: 测试产 trace → 评估诊断 → 进化产版本 → 人工发版 → 回测试验证
   dynamic view evolutionLoop {
-    title 'L4 · 跨端进化闭环'
+    title 'L4 · 三功能进化闭环'
     description '
-      一次完整的「观察 → 进化 → 回灌」闭环.
-      下次想加进化能力 / 改 trace 回灌机制, 照着这张图定位改哪里.
+      ①单次测试 → ②评估 Agent → ③进化 Agent → 人工发版 → 回①验证.
+      三功能各自独立不串入对方流程, 用户手动串联(T1人工拍板发版).
     '
 
-    // —— 用户侧: 提需求 → 执行端跑流水线 ——
-    author -> writer.frontend '提需求' {
-      notes '用户在网页发起创作请求'
+    // —— 功能① 单次测试: 用户选数据集+版本, 调执行端跑生成 ——
+    author -> writer.evolution.testsApi '选数据集+Agent版本' {
+      notes '功能①: 用户在进化端发起单次测试'
     }
-    writer.frontend -> writer.executor 'HTTP 生成请求' {
-      notes '进入 routers → domains → platform → harness 分层链'
+    writer.evolution.testsApi -> writer.executor.routers 'HTTP /internal/ab/run' {
+      notes '调执行端跑一次生成, 不自动进入进化'
     }
-    writer.executor -> writer.frontend '返回剧本' {
-      notes 'harness 装配 agent 跑完流水线, 剧本 + trace 经由 executor 返回'
+    writer.executor.routers -> writer.evolution.testsApi '返回 trace_id'
+    writer.evolution.testsApi -> writer.evolution.evoCore '存 manual_tests (version+trace_id)'
+
+    // —— 功能② 评估 Agent: 对 trace 做诊断 ——
+    author -> writer.evolution.evalAgentApi '选一条 trace 评估' {
+      notes '功能②: 用户选 trace, 评估 Agent 诊断流程+内容, 只诊断不提方案'
+    }
+    writer.evolution.evalAgentApi -> writer.evolution.evalAgent '启动评估 Agent'
+    writer.evolution.evalAgent -> writer.evolution.evoCore '写 evaluation_sessions (scores+findings+report)' {
+      notes '评估报告落 DB, 作为进化的强前置输入'
     }
 
-    // —— 进化端接管: 观察 ——
-    writer.executor -> writer.evolution.evolveApi '①通知 trace 完成' {
-      notes 'HTTP /internal. 铁律: 两端永远走 HTTP, 绝不互读文件系统'
+    // —— 功能③ 进化 Agent: 吃评估报告产改动 ——
+    author -> writer.evolution.evolveApi '选已评估 trace 进化' {
+      notes '功能③: 强前置(S8) - trace 必须已有评估报告'
     }
-    writer.evolution.evolveApi -> writer.executor.routers '②拉取 trace 内容' {
-      notes 'GET /internal/traces'
+    writer.evolution.evolveApi -> writer.evolution.evoCore '校验: 该 trace 有 done 评估?'
+    writer.evolution.evolveApi -> writer.evolution.singleAgent '启动进化驱动器(方案→执行)'
+    writer.evolution.singleAgent -> writer.evolution.harnessConfig '执行子代理改 harness 源码'
+    writer.evolution.singleAgent -> writer.evolution.evoCore '存 evolve_sessions (status=pending_review)' {
+      notes '产待审改动, working 区锁定'
     }
-    writer.executor.routers -> writer.evolution.evolveApi '返回 trace 数据'
 
-    // —— 进化端接管: 进化(诊断 + 优化 + A/B 验证) ——
-    writer.evolution.pipeline -> writer.evolution.pipeline '③诊断 trace + ④优化 harness 源码' {
-      notes 'ingestion 采集 → diagnosis 诊断 → improvement 改进. 或走 singleAgent 单 Agent 闭环'
+    // —— 人工发版: 用户 review 后固化新版本 ——
+    author -> writer.evolution.evolveApi '发版 / 丢弃' {
+      notes 'T1 人工拍板. 发版=git commit+config快照+通知执行端; 丢弃=git reset'
     }
-    writer.evolution.compose -> writer.evolution.harnessSrc '提交新 harness 版本(git)'
-    writer.evolution.evolveApi -> writer.executor.routers '⑤A/B 验证请求' {
-      notes 'POST /internal/ab/run. 在执行端跑 candidate harness 对比 baseline'
+    writer.evolution.evolveApi -> writer.evolution.evoCore 'publish_config (config_json+source_commit)' {
+      notes '存 harness_snapshots 新 production, 旧 production 降 retired'
     }
-    writer.executor.routers -> writer.evolution.evolveApi '返回 A/B 结果'
+    writer.evolution.evolveApi -> writer.executor.routers 'HTTP 通知快照发布' {
+      notes 'POST /internal/snapshot/refreshed. 执行端下次重载新 harness'
+    }
 
-    // —— 回灌: 推送新快照, 执行端清缓存 ——
-    writer.evolution.evolveApi -> writer.executor.routers '⑥通知快照发布' {
-      notes 'POST /internal/snapshot/refreshed'
-    }
-    writer.executor.routers -> writer.executor.platform '清包缓存'
-    writer.executor.platform -> writer.executor.harness '下次重载新 harness' {
-      notes '下一个用户请求, 自动用上进化后的 harness. 闭环完成.'
+    // —— 回到①验证: 新版本好不好要走测试+评估才知道(T8人工串联) ——
+    author -> writer.evolution.testsApi '拿新版本再测试' {
+      notes '闭环: 发版后用户手动拿新版本跑测试→评估, 对比新旧评估报告'
     }
 
     // 样式: 把 Writer 系统内的元素压暗, 突出跨端交互
