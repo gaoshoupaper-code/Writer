@@ -4,6 +4,9 @@
   按 file_path 串行化 write_file / edit_file 调用，防止并发写同一文件
   竞争导致文件字节流损坏（UTF-8 多字节字符被截断，产生非法字节）。
 
+  当 allow_overwrite=True 时，允许 write_file 覆盖已存在的文件，
+  跳过文件已存在检查，直接调用内层 handler。
+
 根因背景：
   langgraph ToolNode 用 ``asyncio.gather`` 并发执行同一轮模型输出的多个
   tool_call（见 langgraph/prebuilt/tool_node.py）。当模型一次发起多个针对
@@ -21,10 +24,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langchain.agents.middleware.types import AgentMiddleware
+
+logger = logging.getLogger(__name__)
 
 # 需要按文件串行化的写工具：工具名 → 路径参数名（兼容 file_path / path 两种命名）
 _WRITE_TOOLS: dict[str, tuple[str, ...]] = {
@@ -40,9 +46,17 @@ class FileWriteSerializeMiddleware(AgentMiddleware):
     共享同一实例，因此能串行化「同一轮里多个针对同一文件的 edit/write」。
     asyncio 单线程模型下 ``setdefault`` 之间无 await，锁的 lazy 创建是
     原子的，不会产生竞争态。
+
+    allow_overwrite=True 时，允许 write_file 覆盖已存在的文件，
+    跳过文件已存在检查，直接调用内层 handler。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, allow_overwrite: bool = False) -> None:
+        """
+        Args:
+            allow_overwrite: 是否允许 write_file 覆盖已存在的文件，默认 False
+        """
+        self.allow_overwrite = allow_overwrite
         # file_path → 锁；lazy 创建，见 _lock_for。
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -73,11 +87,16 @@ class FileWriteSerializeMiddleware(AgentMiddleware):
         key = self._write_file_key(request)
         if key is None:
             return await handler(request)
+        if self.allow_overwrite:
+            logger.warning("write_file overwrite allowed for %s", key)
         async with self._lock_for(key):
             return await handler(request)
 
     def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
         """同步：langgraph 同步 ToolNode 顺序执行多 tool_call，无并发竞争，直接放行。"""
+        key = self._write_file_key(request)
+        if key is not None and self.allow_overwrite:
+            logger.warning("write_file overwrite allowed for %s", key)
         return handler(request)
 
 

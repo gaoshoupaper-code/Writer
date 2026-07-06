@@ -1,14 +1,15 @@
 """EncodingGuardMiddleware — 文件编码自动检测与修复中间件。
 
 职责：
-  在 before_model hook 上拦截 read_file 工具调用，检测文件编码。
-  若文件非 UTF-8 可解码，自动尝试用 latin-1 / cp1252 等常见编码回退读取
-  并修复（写回 UTF-8）。解决文件编码损坏导致后续操作完全阻塞的问题。
+  在 wrap_tool_call hook 上拦截 read_file / write_file 工具调用。
+  - write_file 完成后：校验文件编码合法性，若编码损坏则拒绝写入并报错。
+  - read_file 前：检测编码问题，自动尝试降级解码。
 
 使用方式：
-  装配到 agent 的 before_model hook 处理器列表。
-  fallback_encodings: 回退编码列表（按优先级）
-  auto_fix: 是否自动修复并写回 UTF-8
+  装配到 agent 的 wrap_tool_call hook 处理器列表。
+  allowed_encodings: 允许的编码列表（默认 ['utf-8', 'utf-8-sig']）
+  repair_on_read: 读取时若检测到非 UTF-8，尝试降级读取
+  strict_write: 写入后校验，若编码损坏则拒绝写入并报错
 """
 
 from __future__ import annotations
@@ -23,66 +24,105 @@ from langchain_core.messages import ToolMessage
 
 logger = logging.getLogger(__name__)
 
-# 默认回退编码（按优先级）
-_DEFAULT_FALLBACK_ENCODINGS = ["latin-1", "cp1252", "utf-16"]
+# 默认允许的编码
+_DEFAULT_ALLOWED_ENCODINGS = ["utf-8", "utf-8-sig"]
+
+# 读取降级编码（按优先级）
+_READ_FALLBACK_ENCODINGS = ["utf-8-sig", "gbk", "latin-1"]
+
+
+class EncodingError(Exception):
+    """文件编码错误异常。"""
+    pass
 
 
 class EncodingGuardMiddleware(AgentMiddleware):
     """文件编码自动检测与修复中间件。
 
-    在 wrap_tool_call hook 上拦截 read_file 工具调用，检测文件编码。
-    若文件非 UTF-8 可解码，自动尝试回退编码读取并修复。
+    在 wrap_tool_call hook 上拦截 read_file / write_file 工具调用，
+    检测文件编码问题并提供降级或拦截。
     """
 
     def __init__(
         self,
         *,
-        fallback_encodings: list[str] | None = None,
-        auto_fix: bool = True,
+        allowed_encodings: list[str] | None = None,
+        repair_on_read: bool = True,
+        strict_write: bool = True,
     ) -> None:
         """
         Args:
-            fallback_encodings: 回退编码列表（按优先级尝试），默认 latin-1, cp1252, utf-16
-            auto_fix: 是否自动修复并写回 UTF-8，默认 True
+            allowed_encodings: 允许的编码列表，默认 ['utf-8', 'utf-8-sig']
+            repair_on_read: 读取时若检测到非 UTF-8，尝试降级读取，默认 True
+            strict_write: 写入后校验，若编码损坏则拒绝写入并报错，默认 True
         """
-        self.fallback_encodings = fallback_encodings or _DEFAULT_FALLBACK_ENCODINGS
-        self.auto_fix = auto_fix
+        self.allowed_encodings = allowed_encodings or _DEFAULT_ALLOWED_ENCODINGS
+        self.repair_on_read = repair_on_read
+        self.strict_write = strict_write
 
     # ------------------------------------------------------------------
-    # 工具调用拦截（同步 / 异步）
+    # 工具调用拦截（同步）
     # ------------------------------------------------------------------
 
     def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
-        """拦截同步工具调用：检测 read_file 的编码问题。"""
-        if not self._is_read_file(request):
-            return handler(request)
+        """拦截同步工具调用：检测 read_file / write_file 的编码问题。"""
+        tool_name = self._get_tool_name(request)
 
-        file_path = self._get_file_path(request)
-        if file_path is None:
-            return handler(request)
+        if tool_name == "read_file":
+            return self._handle_read_file(request, handler)
+        elif tool_name == "write_file" and self.strict_write:
+            return self._handle_write_file(request, handler)
 
-        # 检查文件编码
-        encoding_issue = self._detect_encoding_issue(file_path)
-        if encoding_issue is None:
-            return handler(request)
-
-        # 有编码问题，尝试修复
-        if self.auto_fix:
-            fixed = self._fix_encoding(file_path, encoding_issue)
-            if fixed:
-                logger.info("Fixed encoding for %s: %s -> UTF-8", file_path, encoding_issue)
-                return handler(request)
-
-        # 无法修复，返回错误消息
-        return self._encoding_error_message(request, file_path, encoding_issue)
+        return handler(request)
 
     async def awrap_tool_call(
         self, request: Any, handler: Callable[[Any], Awaitable[Any]]
     ) -> Any:
-        """拦截异步工具调用：检测 read_file 的编码问题。"""
-        if not self._is_read_file(request):
-            return await handler(request)
+        """拦截异步工具调用：检测 read_file / write_file 的编码问题。"""
+        tool_name = self._get_tool_name(request)
 
+        if tool_name == "read_file":
+            return await self._ahandle_read_file(request, handler)
+        elif tool_name == "write_file" and self.strict_write:
+            return await self._ahandle_write_file(request, handler)
+
+        return await handler(request)
+
+        # 无法修复，返回错误消息
+        return self._encoding_error_message(request, file_path, encoding_issue)
+
+    # ------------------------------------------------------------------
+    # read_file 处理
+    # ------------------------------------------------------------------
+
+    def _handle_read_file(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        """同步：处理 read_file 调用，检测编码问题并提供降级。"""
+        file_path = self._get_file_path(request)
+        if file_path is None:
+            return handler(request)
+
+        # 检查文件编码
+        encoding_issue = self._detect_encoding_issue(file_path)
+        if encoding_issue is None:
+            return handler(request)
+
+        # 有编码问题，尝试降级读取
+        if self.repair_on_read:
+            content = self._read_with_fallback(file_path)
+            if content is not None:
+                logger.warning(
+                    "Read file with fallback encoding: %s (original: %s)",
+                    file_path, encoding_issue,
+                )
+                return self._make_read_file_response(request, content)
+
+        # 无法降级，返回错误消息
+        return self._encoding_error_message(request, file_path, encoding_issue)
+
+    async def _ahandle_read_file(
+        self, request: Any, handler: Callable[[Any], Awaitable[Any]]
+    ) -> Any:
+        """异步：处理 read_file 调用，检测编码问题并提供降级。"""
         file_path = self._get_file_path(request)
         if file_path is None:
             return await handler(request)
@@ -92,25 +132,77 @@ class EncodingGuardMiddleware(AgentMiddleware):
         if encoding_issue is None:
             return await handler(request)
 
-        # 有编码问题，尝试修复
-        if self.auto_fix:
-            fixed = self._fix_encoding(file_path, encoding_issue)
-            if fixed:
-                logger.info("Fixed encoding for %s: %s -> UTF-8", file_path, encoding_issue)
-                return await handler(request)
+        # 有编码问题，尝试降级读取
+        if self.repair_on_read:
+            content = self._read_with_fallback(file_path)
+            if content is not None:
+                logger.warning(
+                    "Read file with fallback encoding: %s (original: %s)",
+                    file_path, encoding_issue,
+                )
+                return self._make_read_file_response(request, content)
 
-        # 无法修复，返回错误消息
+        # 无法降级，返回错误消息
         return self._encoding_error_message(request, file_path, encoding_issue)
+
+    # ------------------------------------------------------------------
+    # write_file 处理
+    # ------------------------------------------------------------------
+
+    def _handle_write_file(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        """同步：处理 write_file 调用，写入后校验编码。"""
+        result = handler(request)
+        self._validate_written_file(request)
+        return result
+
+    async def _ahandle_write_file(
+        self, request: Any, handler: Callable[[Any], Awaitable[Any]]
+    ) -> Any:
+        """异步：处理 write_file 调用，写入后校验编码。"""
+        result = await handler(request)
+        self._validate_written_file(request)
+        return result
+
+    def _validate_written_file(self, request: Any) -> None:
+        """写入后校验文件编码，若损坏则删除文件并抛出 EncodingError。"""
+        file_path = self._get_file_path(request)
+        if file_path is None:
+            return
+
+        if not file_path.exists():
+            return
+
+        raw_bytes = file_path.read_bytes()
+        if not raw_bytes:
+            return
+
+        # 用 allowed_encodings 逐一尝试解码
+        for enc in self.allowed_encodings:
+            try:
+                raw_bytes.decode(enc)
+                return  # 至少一种编码可解码，校验通过
+            except (UnicodeDecodeError, LookupError):
+                continue
+
+        # 所有编码都失败，删除文件并报错
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        raise EncodingError(
+            f"文件编码校验失败：{file_path} 无法以 {self.allowed_encodings} 解码。"
+            "文件已被删除，请检查内容编码后重试。"
+        )
 
     # ------------------------------------------------------------------
     # 辅助方法
     # ------------------------------------------------------------------
 
-    def _is_read_file(self, request: Any) -> bool:
-        """判断是否为 read_file 工具调用。"""
+    def _get_tool_name(self, request: Any) -> str | None:
+        """从工具调用中提取工具名。"""
         tool_call = getattr(request, "tool_call", {})
-        tool_name = _mapping_value(tool_call, "name")
-        return str(tool_name) == "read_file"
+        return str(_mapping_value(tool_call, "name") or "")
 
     def _get_file_path(self, request: Any) -> Path | None:
         """从工具调用中提取文件路径。"""
@@ -144,7 +236,7 @@ class EncodingGuardMiddleware(AgentMiddleware):
             pass
 
         # 尝试回退编码
-        for enc in self.fallback_encodings:
+        for enc in _READ_FALLBACK_ENCODINGS:
             try:
                 raw_bytes.decode(enc)
                 return enc  # 找到可解码的编码
@@ -153,25 +245,33 @@ class EncodingGuardMiddleware(AgentMiddleware):
 
         return "unknown"  # 所有编码都失败
 
-    def _fix_encoding(self, file_path: Path, source_encoding: str) -> bool:
-        """修复文件编码：从 source_encoding 转码为 UTF-8 写回。
+    def _read_with_fallback(self, file_path: Path) -> str | None:
+        """用降级编码读取文件内容。
 
         Returns:
-            True 表示修复成功，False 表示失败。
+            解码后的文本，或 None（所有编码都失败）。
         """
-        try:
-            raw_bytes = file_path.read_bytes()
-            if source_encoding == "unknown":
-                # 尝试强制用 latin-1（不会失败，但可能产生乱码）
-                text = raw_bytes.decode("latin-1")
-            else:
-                text = raw_bytes.decode(source_encoding)
-            # 写回 UTF-8
-            file_path.write_text(text, encoding="utf-8")
-            return True
-        except Exception as exc:
-            logger.error("Failed to fix encoding for %s: %s", file_path, exc)
-            return False
+        raw_bytes = file_path.read_bytes()
+        if not raw_bytes:
+            return ""
+
+        for enc in _READ_FALLBACK_ENCODINGS:
+            try:
+                return raw_bytes.decode(enc)
+            except (UnicodeDecodeError, LookupError):
+                continue
+
+        return None
+
+    def _make_read_file_response(self, request: Any, content: str) -> ToolMessage:
+        """构造降级读取成功的响应消息。"""
+        tool_call = getattr(request, "tool_call", {})
+        tool_call_id = _mapping_value(tool_call, "id")
+        return ToolMessage(
+            content=content,
+            name="read_file",
+            tool_call_id=str(tool_call_id or ""),
+        )
 
     def _encoding_error_message(self, request: Any, file_path: Path, encoding: str) -> ToolMessage:
         """构造编码错误消息。"""
@@ -195,4 +295,4 @@ def _mapping_value(mapping: object, key: str) -> Any:
     return getattr(mapping, key, None)
 
 
-__all__ = ["EncodingGuardMiddleware"]
+__all__ = ["EncodingGuardMiddleware", "EncodingError"]
