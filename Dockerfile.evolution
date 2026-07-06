@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────
+# Dockerfile.evolution —— 进化/监测后端（开发者用，仅内网）
+# 端口：7789（不挂 nginx，docker 内网 + SSH 隧道访问）
+# ─────────────────────────────────────────────────────────────
+# 设计要点：
+#   1. 多阶段构建：先 node 阶段 build 监测前端静态产物（out/），
+#      再 python 阶段 COPY 进 evolution/frontend/out/，由 StaticFiles 托管。
+#   2. 共享 contracts 契约包（evolution import contracts.trace 等）。
+#   3. pyproject 未声明 packages.find，COPY 源码 + 工作目录依赖运行。
+#   4. prod 模式 NEXT_PUBLIC_API_BASE_URL 留空（同源）。
+# ─────────────────────────────────────────────────────────────
+
+# ════════════ 阶段 1：构建监测前端静态产物 ════════════
+FROM node:20-alpine AS frontend-builder
+
+WORKDIR /build
+COPY evolution/frontend/package.json evolution/frontend/package-lock.json ./
+RUN npm ci
+
+COPY evolution/frontend/ ./
+# prod 同源：NEXT_PUBLIC_API_BASE_URL 留空（StaticFiles 托管，无跨域）
+ENV NEXT_PUBLIC_API_BASE_URL=""
+RUN npm run build
+# 产物在 /build/out/
+
+# ════════════ 阶段 2：Python 运行时 ════════════
+FROM python:3.11-slim AS base
+
+# 系统依赖：git（harness commit/push）、curl（healthcheck）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ── 装 contracts 共享契约包 ──
+COPY pyproject.toml ./
+COPY contracts/ ./contracts/
+RUN pip install --no-cache-dir -e .
+
+# ── 装 evolution 依赖（不装 app 包，由 COPY 提供）──
+COPY evolution/pyproject.toml ./evolution/
+RUN pip install --no-cache-dir ./evolution \
+    && rm -rf /app/evolution
+
+# ── COPY 业务源码 + 监测前端静态产物 ──
+COPY evolution/ ./evolution/
+# 从阶段 1 拿前端 build 产物（覆盖宿主可能残留的 out/，.dockerignore 已排除）
+COPY --from=frontend-builder /build/out/ ./evolution/frontend/out/
+
+# 容器内工作目录：evolution/（uvicorn app.main:app 定位用）
+WORKDIR /app/evolution
+
+EXPOSE 7789
+
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7789"]

@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────────────────────
+# Dockerfile.frontend —— 写作用户前端（next start，Node 进程）
+# 端口：3456
+# ─────────────────────────────────────────────────────────────
+# 设计要点：
+#   1. 写作前端用了 Next.js rewrites（/api/* → executor），非静态导出，
+#      必须用 next start 跑 Node 进程（不能像监测前端那样 StaticFiles 托管）。
+#   2. nginx 已在容器外接管 /api/* 路由 → executor:7788，
+#      容器内 Next 的 rewrites 实际不会触发（nginx 先截），但保留原配置无副作用。
+#   3. NEXT_PUBLIC_API_BASE_URL 留空：浏览器侧 fetch 走同源（nginx 反代到 executor）。
+# ─────────────────────────────────────────────────────────────
+
+# ════════════ 阶段 1：装依赖 ════════════
+FROM node:20-alpine AS deps
+
+WORKDIR /app
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+
+# ════════════ 阶段 2：构建 ════════════
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY frontend/ ./
+# 同源：API 走 nginx 反代，前端不直连后端
+ENV NEXT_PUBLIC_API_BASE_URL=""
+RUN npm run build
+
+# ════════════ 阶段 3：运行时（精简镜像）════════════
+FROM node:20-alpine AS runner
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV NEXT_PUBLIC_API_BASE_URL=""
+
+# next start 不需要完整源码，只需 .next + package.json + node_modules(生产依赖)
+# 注意：本项目无 public/ 目录，故不 COPY（避免构建失败）
+COPY --from=builder /app/package.json ./
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/.next ./.next
+# Next.js 15 运行时仍需 next.config（本项目为 next.config.ts）
+COPY --from=builder /app/next.config.ts ./
+
+EXPOSE 3456
+
+CMD ["npm", "start"]

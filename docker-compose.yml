@@ -1,0 +1,115 @@
+# ─────────────────────────────────────────────────────────────
+# Writer 生产部署编排
+# 架构：nginx(公网) → executor(7788) + frontend(3456) | evolution(7789 仅 loopback)
+# ─────────────────────────────────────────────────────────────
+# 启动：docker compose up -d
+# 升级：git checkout <tag> && docker compose build && docker compose up -d
+# 回滚：git checkout <上个 tag> && docker compose build && docker compose up -d
+# ─────────────────────────────────────────────────────────────
+
+services:
+  # ── 写作 Agent 执行端（用户用，有鉴权）──
+  executor:
+    build:
+      context: .
+      dockerfile: Dockerfile.executor
+    container_name: writer-executor
+    env_file:
+      - executor/.env
+    environment:
+      # 容器内 evolution 通知地址（用 docker 服务名，非 localhost）
+      - EVOLUTION_NOTIFY_URL=http://evolution:7789/api/ingestion/notify
+      - EVOLUTION_URL=http://evolution:7789
+      # harness 共享路径（容器内绝对路径，与下方 volumes 挂载点一致）
+      - HARNESS_PACKAGE_PATH=/app/evolution/harnesses/current
+      - HARNESS_BARE_REPO=/app/evolution/harness.git
+      - HARNESS_CLONE_DIR=/app/executor/.harness_checkout
+      - TZ=Asia/Shanghai
+    volumes:
+      # 持久化：用户库 + workspace + checkpoints（用户数据，不可丢）
+      - executor_data:/app/executor
+      # 共享 harness 包（evolution 编辑 → executor 同进程 import）
+      - harness_data:/app/evolution/harnesses
+      # 共享 harness bare repo（evolution push → executor pull）
+      - harness_git:/app/evolution/harness.git
+    expose:
+      - "7788"
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7788/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ── 进化/监测后端（开发者用，仅宿主机 loopback → SSH 隧道访问）──
+  evolution:
+    build:
+      context: .
+      dockerfile: Dockerfile.evolution
+    container_name: writer-evolution
+    env_file:
+      - evolution/.env
+    environment:
+      # 容器内 executor 地址（用 docker 服务名）
+      - EXECUTOR_URL=http://executor:7788
+      # 内网 API Key（与 internal_auth 中间件配合；为空则不校验）
+      # 部署时在 evolution/.env 里设 INTERNAL_API_KEY=<强随机>
+      - TZ=Asia/Shanghai
+    volumes:
+      # 持久化：evolution.db（监测数据，不可丢）
+      - evolution_data:/app/evolution
+      # 共享 harness（与 executor 同一份）
+      - harness_data:/app/evolution/harnesses
+      - harness_git:/app/evolution/harness.git
+    ports:
+      # ★ 只绑宿主机 loopback：公网/局域网不可达，仅本机 + SSH 隧道可达。
+      # （纯 expose 会让 SSH 隧道也连不上，因为宿主机 loopback 上没有这个端口；
+      #  绑 127.0.0.1:7789 后，隧道转发目标填 127.0.0.1:7789 即可。）
+      - "127.0.0.1:7789:7789"
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7789/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ── 写作用户前端（next start，Node 进程）──
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: writer-frontend
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_BASE_URL=
+      - TZ=Asia/Shanghai
+    expose:
+      - "3456"
+    restart: always
+    depends_on:
+      - executor
+
+  # ── 公网入口：nginx 反代 + HTTPS ──
+  nginx:
+    image: nginx:alpine
+    container_name: writer-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+      # certbot webroot 验证（若用 certbot 容器签发）
+      - ./certbot:/var/www/certbot:ro
+    depends_on:
+      - executor
+      - frontend
+    restart: always
+
+volumes:
+  executor_data:    # executor/.env 的 db_path / workspace_root / checkpoints 都在此卷内
+  evolution_data:   # evolution 的 evolution.db 在此卷内
+  harness_data:     # evolution/harnesses/ 共享（executor + evolution 双向读写）
+  harness_git:      # evolution/harness.git/ 共享 bare repo

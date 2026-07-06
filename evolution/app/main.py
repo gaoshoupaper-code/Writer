@@ -84,6 +84,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 生产加固：内网 API Key 中间件。
+# 注册在 CORS 之后（FastAPI 洋葱模型：后注册 = 更外层），让 key 校验先于业务执行。
+# key 为空时（开发模式）no-op，不影响现有联调。
+from app.core.internal_auth import InternalKeyMiddleware
+app.add_middleware(InternalKeyMiddleware)
+
 # API 路由统一挂 /api 前缀，避免与页面路由（/、/traces、/rules）冲突
 app.include_router(ingestion_router, prefix="/api")
 app.include_router(traces_router, prefix="/api")

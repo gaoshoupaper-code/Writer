@@ -1,0 +1,45 @@
+# ─────────────────────────────────────────────────────────────
+# Dockerfile.executor —— 写作 Agent 执行端（用户用，有完整鉴权）
+# 端口：7788
+# ─────────────────────────────────────────────────────────────
+# 设计要点：
+#   1. executor 与 evolution 共享 contracts 契约包（同进程 import），必须先装 contracts。
+#   2. executor/pyproject.toml 未声明 [tool.setuptools.packages.find]，
+#      `pip install .` 装不上 app 包；故采用 COPY 源码 + 工作目录依赖运行的方式
+#      （与现有 start-all.ps1 的 `cd executor && uvicorn app.main:app` 一致）。
+#   3. 运行时依赖 git（harness bare repo pull），需装系统包。
+# ─────────────────────────────────────────────────────────────
+
+FROM python:3.11-slim AS base
+
+# 系统依赖：git（harness pull）、curl（healthcheck）
+# ttf 字体供 reportlab 导出 PDF 用
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ── 第一层：先装依赖（利用 Docker 层缓存，源码改动不重装）──
+# 装 contracts 共享契约包（根 pyproject.toml 声明了 packages.find，pip install -e . 可用）
+COPY pyproject.toml ./
+COPY contracts/ ./contracts/
+RUN pip install --no-cache-dir -e .
+
+# 装 executor 依赖（仅装声明的依赖，不装 app 包本身——app 由 COPY 提供）
+COPY executor/pyproject.toml ./executor/
+RUN pip install --no-cache-dir ./executor \
+    && rm -rf /app/executor
+
+# ── 第二层：COPY 业务源码 ──
+COPY executor/ ./executor/
+
+# 容器内工作目录：executor/（与本地开发一致，uvicorn app.main:app 能直接定位）
+WORKDIR /app/executor
+
+EXPOSE 7788
+
+# 生产 CMD：绑 0.0.0.0（容器内），无 --reload
+# uvicorn 走多 worker 不适合 SSE（写作 Agent 流式），保持单进程
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7788"]

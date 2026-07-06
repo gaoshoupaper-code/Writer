@@ -35,6 +35,13 @@ class Settings(BaseSettings):
     judge_api_key: str = ""
     judge_base_url: str = ""
 
+    # ── 内网 API Key（生产加固）──
+    # evolution 无业务鉴权（开发者内部工具），但有 git reset / discard 等破坏性接口。
+    # 生产部署虽不暴露公网（仅 docker 内网），仍加一层 X-Internal-Key 校验防止
+    # 同机其他进程误调。留空则不校验（开发模式兼容）。
+    # 生成：python -c "import secrets; print(secrets.token_urlsafe(32))"
+    internal_api_key: str = ""
+
     # ── compose Git 传输层（Phase 8，决策 D10b/D11a）──
     # harness bare repo 路径（同机阶段本地路径，异机时改 URL）。
     # evolution 工作目录 harnesses/current/ commit → push 到此 bare repo。
