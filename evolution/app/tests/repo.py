@@ -22,15 +22,20 @@ def create_test(
     version_type: str,
     version_id: int | None,
     retry_of: str | None = None,
+    origin_layer: str | None = None,
 ) -> str:
-    """创建一条 pending 测试记录，返回 test_id。"""
+    """创建一条 pending 测试记录，返回 test_id。
+
+    origin_layer（决策 A6）：标记本次测试跑在哪个数据集层（golden|growing），
+    进化 Agent 据此区分验证 vs 探索。None 时由调用方从 evalset 推导后传入。
+    """
     test_id = uuid.uuid4().hex[:16]
     db.execute(
         """INSERT INTO manual_tests
            (test_id, case_id, version_type, version_id, trace_id, task_id,
-            status, error, retry_of, created_at)
-           VALUES (?, ?, ?, ?, NULL, NULL, 'pending', NULL, ?, ?)""",
-        (test_id, case_id, version_type, version_id, retry_of, _now()),
+            status, error, retry_of, created_at, origin_layer)
+           VALUES (?, ?, ?, ?, NULL, NULL, 'pending', NULL, ?, ?, ?)""",
+        (test_id, case_id, version_type, version_id, retry_of, _now(), origin_layer),
     )
     return test_id
 

@@ -27,6 +27,10 @@ TraceEventType = Literal[
     "tool_start",
     "tool_end",
     "tool_error",
+    # 数据闭环 E（隐式反馈信号）：用户行为埋点，promote 闸门判质量用。
+    # copy = 用户复制了内容（正信号）；regenerate = 用户点了重试（负信号）。
+    "user_copy",
+    "user_regenerate",
 ]
 TraceNodeKind = Literal["run", "agent", "llm", "tool", "todo", "error", "skill"]
 TraceAgentRole = Literal["main", "subagent"]

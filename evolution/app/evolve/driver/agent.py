@@ -82,6 +82,7 @@ def build_evolve_driver(ctx: EvolveContext):
         session_id=ctx.session_id,
         trace_id=ctx.trace_id,
         eval_summary=_format_eval_summary(ctx),
+        reflections_summary=_format_reflections(ctx),
     )
 
     # D6：顶层驱动器自身的 TraceMiddleware（记录委托决策 LLM + task 工具调用）。
@@ -121,6 +122,12 @@ def _format_eval_summary(ctx: EvolveContext) -> str:
         f"- trace_id: {snap.get('trace_id', '?')}",
         f"- 诊断条目数: {len(findings)}",
     ]
+    # 数据闭环 F1：数据集层标注（golden 验证 / growing 探索），指导进化模式。
+    if ctx.origin_layer:
+        if ctx.origin_layer == "golden":
+            lines.append("- 数据集层: golden（验证模式——改进后不能在 golden 集上退化）")
+        else:
+            lines.append("- 数据集层: growing（探索模式——用于发现新问题/新方向）")
     # 摘要前几个高 severity finding
     high = [f for f in findings if isinstance(f, dict) and f.get("severity") == "high"]
     if high:
@@ -130,6 +137,47 @@ def _format_eval_summary(ctx: EvolveContext) -> str:
     content = scores.get("content", {})
     if isinstance(content, dict) and content.get("content", {}).get("overall") is not None:
         lines.append(f"- 内容层 overall: {content['content']['overall']}")
+    return "\n".join(lines)
+
+
+def _format_reflections(ctx: EvolveContext) -> str:
+    """从反思库提取与当前评估问题相关的失败模式，格式化为 prompt 摘要（D19）。
+
+    按 eval_snapshot.findings 的 dimension 查相关反思，每类取 top 3。
+    无反思或查询失败返回空串（prompt 里不渲染反思段）。
+    """
+    try:
+        from app.reflection import repo as reflection_repo
+    except ImportError:
+        return ""
+
+    # 从评估 findings 提取问题分类
+    snap = ctx.eval_snapshot
+    if not snap:
+        return ""
+    findings = snap.get("findings") or []
+    categories: list[str] = []
+    for f in findings:
+        if isinstance(f, dict) and f.get("dimension"):
+            dim = f["dimension"]
+            if dim not in categories:
+                categories.append(dim)
+
+    if not categories:
+        # 无 findings 分类：取全部反思 top 5
+        reflections = reflection_repo.list_all(limit=5)
+    else:
+        reflections = reflection_repo.list_by_categories(categories, limit_per_category=3)
+
+    if not reflections:
+        return ""
+
+    lines = [f"（共 {len(reflections)} 条历史失败模式）"]
+    for r in reflections[:10]:  # 最多渲染 10 条
+        hit = r.get("hit_count", 0)
+        lines.append(
+            f"  • [{r['category']}] (命中{hit}次) {r['pattern'][:120]}"
+        )
     return "\n".join(lines)
 
 

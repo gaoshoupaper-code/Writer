@@ -17,6 +17,7 @@ import { TracePanel } from "../components/workspace/TracePanel";
 import { WorldviewPanel } from "../components/workspace/WorldviewPanel";
 import {
   API_BASE_URL,
+  apiFetch,
   activateStyle as activateStyleRequest,
   createStyle as createStyleRequest,
   createThread as createThreadRequest,
@@ -41,6 +42,8 @@ import {
   optimizeStyle as optimizeStyleRequest,
   updateStyle as updateStyleRequest,
   updateThread as updateThreadRequest,
+  trackCopy,
+  trackRegenerate,
   workspaceNovelPdfUrl,
   workspaceNovelWordUrl,
 } from "../lib/api";
@@ -1060,6 +1063,10 @@ export default function Home() {
 
   // 决策9：重试 = 重发最后一条 user prompt（失败/停止后一键恢复）
   function handleRetry() {
+    // 数据闭环 E3：重试 = 负信号（用户对上次结果不满意），埋点后重发。
+    if (liveTraceId) {
+      trackRegenerate(liveTraceId);
+    }
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
     if (lastUser?.content) {
       void performSubmit(lastUser.content);
@@ -1643,6 +1650,7 @@ export default function Home() {
             onSelectChapter={setActiveNovelFilename}
             exportUrl={activeWorkspaceId ? workspaceNovelPdfUrl(activeWorkspaceId) : undefined}
             wordExportUrl={activeWorkspaceId ? workspaceNovelWordUrl(activeWorkspaceId) : undefined}
+            onCopyContent={(text) => liveTraceId && trackCopy(liveTraceId, text)}
           />
         ) : null}
 

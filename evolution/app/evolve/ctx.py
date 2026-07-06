@@ -54,6 +54,11 @@ class EvolveContext:
         # 评估报告快照（从 evaluation_sessions 表加载，dict：scores/findings/report_md）
         self.eval_snapshot: dict[str, Any] = {}
 
+        # 数据闭环 F1：trace 所属的数据集层（golden|growing）。
+        # golden → 验证模式（不能退化）；growing → 探索模式（找新方向）。
+        # 从 manual_tests.origin_layer 推导（evolve_start 时查），None=未知（非测试 trace）。
+        self.origin_layer: str | None = None
+
         # 各阶段产出文档路径
         self.design_doc_path: str = ""
         self.change_log_path: str = ""

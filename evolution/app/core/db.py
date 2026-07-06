@@ -297,6 +297,80 @@ def init_db() -> None:
                 FOREIGN KEY (version) REFERENCES harness_snapshots(version)
             );
             CREATE INDEX IF NOT EXISTS idx_vc_version ON version_changes(version);
+
+            -- ── 数据闭环（设计 20260706）：分层数据集 + promote 闸门 + benchmark 矩阵 + 反思库 ──
+
+            -- dataset_meta：评估集 case 元数据（分层 golden/growing + 版本化）。
+            -- demand.md 内容仍是文件真源；本表只存"文件无法表达"的元数据（决策 A1/A4）。
+            -- layer=golden 的 case 锁定在某 demand_revision（git commit hash），改内容=新 revision。
+            CREATE TABLE IF NOT EXISTS dataset_meta (
+                case_id          TEXT PRIMARY KEY,         -- 与目录名一致（如 case-001）
+                layer            TEXT NOT NULL,            -- golden | growing
+                source_trace_id  TEXT,                     -- 来自哪条生产 trace（growing 才有）
+                demand_revision  TEXT,                     -- demand.md 内容的 git commit hash（golden 锁定用）
+                promoted_at      TEXT,                     -- 入 growing / 升级 golden 的时间
+                created_by       TEXT NOT NULL DEFAULT 'manual',  -- manual | annotator | maintainer
+                status           TEXT NOT NULL DEFAULT 'active',  -- active | archived
+                updated_at       TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dm_layer ON dataset_meta(layer);
+
+            -- promote_tasks：生产 trace → 数据集的标注任务（决策 A2，promote 闸门）。
+            -- judge_scheduler 后台扫描未 judge 的生产 trace → 调 eval_agent/scoring → 写本表。
+            -- 标注者在 UI 上决策（收/丢 + 归类），accept 则入 growing。
+            CREATE TABLE IF NOT EXISTS promote_tasks (
+                task_id        TEXT PRIMARY KEY,           -- uuid
+                trace_id       TEXT NOT NULL,              -- 待标注的生产 trace
+                owner_user_id  TEXT,                       -- trace 的用户来源（从 runs 冷存）
+                status         TEXT NOT NULL DEFAULT 'pending',  -- pending|judging|needs_confirm|annotated|rejected|promoted
+                judge_scores   TEXT,                       -- LLM-judge 打分 JSON（自动填）
+                judge_verdict  TEXT,                       -- auto_promote | needs_human | auto_reject
+                annotator      TEXT,                       -- 标注者（人工填）
+                decision       TEXT,                       -- accept | reject（人工填）
+                target_case_id TEXT,                       -- 归入哪个已有 case（accept 时填）
+                new_case_title TEXT,                       -- 新建 case 的标题（accept 新建时填）
+                created_at     TEXT NOT NULL,
+                decided_at     TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_pt_status ON promote_tasks(status);
+
+            -- benchmark_runs：case × 版本 × 评估 矩阵（决策 A3/D13，跨版本 leaderboard）。
+            -- benchmark runner 手动触发后，对 golden 全 case × 指定版本跑测试 + 评估 → 写本表。
+            -- golden_revision 相同的行之间分数可比（D8 重跑历史保证可比性）。
+            CREATE TABLE IF NOT EXISTS benchmark_runs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id        TEXT NOT NULL,             -- 一次触发（发版/升级）= 一个 batch（uuid）
+                case_id         TEXT NOT NULL,
+                harness_version INTEGER NOT NULL,          -- FK harness_snapshots.version
+                golden_revision TEXT NOT NULL,             -- 跑在哪个 golden revision 上
+                trace_id        TEXT,                      -- 跑出来的 trace（NULL=未完成/失败）
+                eval_id         TEXT,                      -- 关联评估 session（NULL=未评估）
+                scores_json     TEXT,                      -- 评估分数快照（JSON）
+                status          TEXT NOT NULL DEFAULT 'pending',  -- pending|running|evaluating|done|failed
+                retries         INTEGER DEFAULT 0,
+                error           TEXT,
+                ran_at          TEXT NOT NULL,             -- 批次触发时间
+                finished_at     TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_br_batch ON benchmark_runs(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_br_version ON benchmark_runs(harness_version);
+            CREATE INDEX IF NOT EXISTS idx_br_golden_rev ON benchmark_runs(golden_revision);
+
+            -- reflection_library：失败 trace 自动归纳的反思库（决策 A8/D19，Reflexion/ExpeL 式）。
+            -- eval_agent 完成后若 badcase → 归纳失败模式 → 写本表。
+            -- 进化 Agent 启动时按评估问题分类查询，注入上下文。
+            CREATE TABLE IF NOT EXISTS reflection_library (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                category      TEXT NOT NULL,               -- 节奏|人物|AI味|套路|...
+                pattern       TEXT NOT NULL,               -- 失败模式描述
+                symptom       TEXT,                        -- 识别特征（如何发现）
+                suggestion    TEXT,                        -- 改进建议
+                source_traces TEXT,                        -- 来源 trace id 列表 JSON
+                hit_count     INTEGER DEFAULT 0,           -- 被进化引用次数
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_rl_category ON reflection_library(category);
             """
         )
         conn.commit()
@@ -322,6 +396,8 @@ def init_db() -> None:
         _migrate_evolve_sessions_driver_fields(conn)
         # 三功能解耦：evolve_sessions 补 eval_ref 列（关联评估报告，决策 S6/T2）
         _migrate_evolve_sessions_eval_ref(conn)
+        # 数据闭环：manual_tests 补 origin_layer 列（golden|growing，进化区分验证/探索，决策 A6）
+        _migrate_manual_tests_origin_layer(conn)
         # Phase 1：初始化归因映射（幂等，仅空表时填充）
         _seed_agent_prompt_map(conn)
 
@@ -407,6 +483,22 @@ def _migrate_runs_run_purpose(conn: sqlite3.Connection) -> None:
     with _lock:
         conn.execute("ALTER TABLE runs ADD COLUMN run_purpose TEXT NOT NULL DEFAULT 'user_generation'")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_purpose ON runs(run_purpose)")
+        conn.commit()
+
+
+def _migrate_manual_tests_origin_layer(conn: sqlite3.Connection) -> None:
+    """幂等迁移：给 manual_tests 表补 origin_layer 列（数据闭环决策 A6）。
+
+    origin_layer 标记本次测试跑在哪个数据集层上（golden | growing）。
+    start_test 时从 dataset_meta.layer 推导写入；进化 Agent 据此区分
+    验证（golden，不能退化）vs 探索（growing，找新方向）。
+    存量数据回填 NULL（语义未知，不臆测）。
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(manual_tests)").fetchall()}
+    if "origin_layer" in existing:
+        return
+    with _lock:
+        conn.execute("ALTER TABLE manual_tests ADD COLUMN origin_layer TEXT")
         conn.commit()
 
 

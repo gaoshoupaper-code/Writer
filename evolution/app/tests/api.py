@@ -237,12 +237,16 @@ def _start_test_internal(
     # 校验版本
     snapshot = _validate_version(version_type, version_id)
 
+    # 推导 origin_layer（决策 A6）：从 evalset 查 case 所在层，进化 Agent 据此区分验证/探索
+    origin_layer = evalset.resolve_layer(case_id)
+
     # 创建 pending 记录
     test_id = test_repo.create_test(
         case_id=case_id,
         version_type=version_type,
         version_id=version_id,
         retry_of=retry_of,
+        origin_layer=origin_layer,
     )
 
     # 读 demand_md + 调 executor
@@ -297,6 +301,7 @@ def _row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
         "status": row["status"],
         "error": row["error"],
         "retry_of": row["retry_of"],
+        "origin_layer": row.get("origin_layer"),
         "created_at": row["created_at"],
     }
 
