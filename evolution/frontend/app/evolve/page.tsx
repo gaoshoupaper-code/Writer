@@ -113,7 +113,7 @@ function EvolveInner() {
 
       {/* working 区锁定提示（有待审 session 时） */}
       {sessions.some((s) => s.status === "pending_review") && (
-        <div className="warn-banner" style={{ padding: "8px 16px", marginBottom: 16, borderLeft: "3px solid var(--warn)", background: "var(--bg-elev)" }}>
+        <div className="warn-banner">
           ⚠ 当前有待审改动未处理（发版或丢弃后才能启动新进化）
         </div>
       )}

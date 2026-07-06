@@ -16,6 +16,7 @@ import { useSearchParams } from "next/navigation";
 import { Suspense } from "react";
 import { fetchVersionDetail, fetchVersions } from "@/lib/adapt-api";
 import type { AdaptEdit, VersionDetail, VersionListItem } from "@/lib/adapt-types";
+import { VersionDiffPanel } from "@/components/versions/VersionDiffPanel";
 
 export default function VersionsPage() {
   return (
@@ -158,6 +159,17 @@ function VersionDetailPanel({ detail }: { detail: VersionDetail }) {
     detail.reward != null && detail.baseline_reward != null
       ? detail.reward - detail.baseline_reward
       : null;
+  // Tab：概要 | 差异。默认「差异」（本次功能核心，D-T13）。
+  const [tab, setTab] = useState<"diff" | "summary">("diff");
+
+  // 切版本时重置 Tab 为「差异」
+  useEffect(() => {
+    setTab("diff");
+  }, [detail.version]);
+
+  const hasDiffData =
+    detail.changes && (detail.changes.agents.length > 0 || (detail.changes.intent && detail.changes.intent.length > 0));
+
   return (
     <div className="card version-detail-card">
       <div className="version-detail-head">
@@ -176,55 +188,78 @@ function VersionDetailPanel({ detail }: { detail: VersionDetail }) {
         </div>
       </div>
 
-      {detail.change_summary && (
-        <div className="version-change-summary">{detail.change_summary}</div>
-      )}
-
-      {/* reward 变化 */}
-      {(detail.reward != null || detail.baseline_reward != null) && (
-        <div className="version-reward-row">
-          <RewardStat label="baseline" value={detail.baseline_reward} />
-          <RewardStat label="本版" value={detail.reward} accent />
-          {rewardDelta != null && (
-            <div className="reward-delta">
-              <span className="text-mute mono" style={{ fontSize: 11 }}>变化</span>
-              <span
-                className="mono"
-                style={{ color: rewardDelta >= 0 ? "var(--completed)" : "var(--failed)", fontWeight: 650 }}
-              >
-                {rewardDelta >= 0 ? "+" : ""}{rewardDelta.toFixed(3)}
-              </span>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* edits（D11：只展示 edits + manifest）*/}
-      <div className="version-edits-section">
-        <h3 className="section-title">
-          edits（{detail.edits.length}）
-        </h3>
-        {detail.edits.length === 0 ? (
-          <p className="text-dim" style={{ fontSize: 13 }}>
-            {detail.is_bootstrap
-              ? "bootstrap 生成，无 evolver edits。"
-              : "无 edits 数据。"}
-          </p>
-        ) : (
-          <div className="edits-list">
-            {detail.edits.map((e, j) => (
-              <EditDetailRow key={j} edit={e} />
-            ))}
-          </div>
-        )}
+      {/* Tab 切换 */}
+      <div className="detail-tabs">
+        <button
+          className={`detail-tab ${tab === "diff" ? "active" : ""}`}
+          onClick={() => setTab("diff")}
+        >
+          与上版差异
+          {hasDiffData && <span className="tab-badge">{detail.changes.agents.length}</span>}
+        </button>
+        <button
+          className={`detail-tab ${tab === "summary" ? "active" : ""}`}
+          onClick={() => setTab("summary")}
+        >
+          概要
+        </button>
       </div>
 
-      {/* critic verdict（如有）*/}
-      {detail.critic_verdict.feedback && (
-        <div className="version-critic">
-          <h3 className="section-title">critic 反馈</h3>
-          <pre className="landscape-text">{detail.critic_verdict.feedback}</pre>
-        </div>
+      {tab === "summary" ? (
+        <>
+          {detail.change_summary && (
+            <div className="version-change-summary">{detail.change_summary}</div>
+          )}
+
+          {/* reward 变化 */}
+          {(detail.reward != null || detail.baseline_reward != null) && (
+            <div className="version-reward-row">
+              <RewardStat label="baseline" value={detail.baseline_reward} />
+              <RewardStat label="本版" value={detail.reward} accent />
+              {rewardDelta != null && (
+                <div className="reward-delta">
+                  <span className="text-mute mono" style={{ fontSize: 11 }}>变化</span>
+                  <span
+                    className="mono"
+                    style={{ color: rewardDelta >= 0 ? "var(--completed)" : "var(--failed)", fontWeight: 650 }}
+                  >
+                    {rewardDelta >= 0 ? "+" : ""}{rewardDelta.toFixed(3)}
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* edits（D11：只展示 edits + manifest）*/}
+          <div className="version-edits-section">
+            <h3 className="section-title">
+              edits（{detail.edits.length}）
+            </h3>
+            {detail.edits.length === 0 ? (
+              <p className="text-dim" style={{ fontSize: 13 }}>
+                {detail.is_bootstrap
+                  ? "bootstrap 生成，无 evolver edits。"
+                  : "无 edits 数据。"}
+              </p>
+            ) : (
+              <div className="edits-list">
+                {detail.edits.map((e, j) => (
+                  <EditDetailRow key={j} edit={e} />
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* critic verdict（如有）*/}
+          {detail.critic_verdict.feedback && (
+            <div className="version-critic">
+              <h3 className="section-title">critic 反馈</h3>
+              <pre className="landscape-text">{detail.critic_verdict.feedback}</pre>
+            </div>
+          )}
+        </>
+      ) : (
+        <VersionDiffPanel changes={detail.changes} />
       )}
     </div>
   );

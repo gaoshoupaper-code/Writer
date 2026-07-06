@@ -128,6 +128,58 @@ export type NodeOutputPayload = {
   idle_count?: number;
 };
 
+// ── 版本差异展示（version_changes，D-T12）──────────────────
+
+/** prompt 行级 diff 的一个 hunk（equal/insert/delete） */
+export type DiffHunk = {
+  type: "equal" | "insert" | "delete";
+  lines: string[];
+};
+
+/** prompt diff 结果 */
+export type PromptDiff = {
+  hunks: DiffHunk[];
+  summary: { added: number; removed: number };
+};
+
+/** skills 列表 diff */
+export type SkillsDiff = {
+  added: string[];
+  removed: string[];
+  unchanged_count: number;
+};
+
+/** 单个 processor(middleware) 的变化 */
+export type ProcessorChange = {
+  key: { hook: string; group: string };
+  change_type: "added" | "removed" | "modified";
+  class_change: { old: string | null; new: string | null };
+  params_change: { old: Record<string, unknown> | null; new: Record<string, unknown> | null };
+};
+
+/** 单个 agent 的三要素 diff */
+export type AgentDiff = {
+  prompt: PromptDiff | null;
+  skills: SkillsDiff | null;
+  processors: ProcessorChange[];
+  whole_agent?: "added" | "removed";
+};
+
+/** 版本级意图项（来自 design_doc） */
+export type IntentItem = {
+  target: string;
+  change_desc: string;
+  reason: string;
+  expected_up: string;
+  expected_down: string;
+};
+
+/** 某版本的完整 changes（GET /api/versions/{n}.changes） */
+export type VersionChanges = {
+  agents: { agent: string; diff: AgentDiff }[];
+  intent: IntentItem[] | null;
+};
+
 // ── 配置版本谱系（D8）──────────────────────────────────────
 
 export type VersionStatus = "production" | "retired";
@@ -170,6 +222,8 @@ export type VersionDetail = {
   critic_verdict: CriticVerdict;
   source_session: string | null;
   source_round: number | null;
+  // 版本差异展示（D-T12）
+  changes: VersionChanges;
 };
 
 // ── 启动请求（D6 可调参数）─────────────────────────────────

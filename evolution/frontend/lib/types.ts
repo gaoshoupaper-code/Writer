@@ -154,6 +154,7 @@ export type TraceListItem = {
   error: string | null;
   flag_count: number;
   owner_user_id: string;
+  run_purpose: string;
 };
 
 /** 活跃 trace（evolution /api/active-runs 富化返回，D7） */

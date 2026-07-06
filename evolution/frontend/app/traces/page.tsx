@@ -21,6 +21,13 @@ const STATUS_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "failed", label: "失败" },
 ];
 
+const PURPOSE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "", label: "全部来源" },
+  { value: "user_generation", label: "执行端" },
+  { value: "evolution_eval", label: "进化端·评估" },
+  { value: "evolution_evolve", label: "进化端·进化" },
+];
+
 export default function TracePage() {
   return (
     <Suspense fallback={<div className="text-dim" style={{ padding: 48 }}>加载中…</div>}>
@@ -44,19 +51,24 @@ function TraceList() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState("");
+  const [purposeFilter, setPurposeFilter] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const data = await fetchTraces({ status: statusFilter || undefined, limit: 200 });
+      const data = await fetchTraces({
+        status: statusFilter || undefined,
+        runPurpose: purposeFilter || undefined,
+        limit: 200,
+      });
       setTraces(data);
     } catch (e) {
       setError(e instanceof Error ? e.message : "加载失败");
     } finally {
       setLoading(false);
     }
-  }, [statusFilter]);
+  }, [statusFilter, purposeFilter]);
 
   useEffect(() => {
     load();
@@ -78,6 +90,17 @@ function TraceList() {
           onChange={(e) => setStatusFilter(e.target.value)}
         >
           {STATUS_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+        <select
+          className="select-input"
+          value={purposeFilter}
+          onChange={(e) => setPurposeFilter(e.target.value)}
+        >
+          {PURPOSE_OPTIONS.map((o) => (
             <option key={o.value} value={o.value}>
               {o.label}
             </option>

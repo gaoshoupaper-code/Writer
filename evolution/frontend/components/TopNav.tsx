@@ -12,7 +12,9 @@ const NAV_ITEMS = [
   { href: "/evaluation", label: "评估" },
   { href: "/evolve", label: "进化" },
   { href: "/traces", label: "Trace" },
+  { href: "/monitor", label: "监测" },
   { href: "/versions", label: "版本谱系" },
+  { href: "/harness", label: "Agent 要素" },
 ];
 
 // 顶栏导航（全局共享）。沿用 dark technical × Swiss grid。

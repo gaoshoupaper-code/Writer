@@ -36,12 +36,14 @@ async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
 export async function fetchTraces(params?: {
   workspace?: string;
   status?: string;
+  runPurpose?: string;
   limit?: number;
   offset?: number;
 }): Promise<TraceListItem[]> {
   const qs = new URLSearchParams();
   if (params?.workspace) qs.set("workspace", params.workspace);
   if (params?.status) qs.set("status", params.status);
+  if (params?.runPurpose) qs.set("run_purpose", params.runPurpose);
   if (params?.limit) qs.set("limit", String(params.limit));
   if (params?.offset) qs.set("offset", String(params.offset));
   const query = qs.toString();
