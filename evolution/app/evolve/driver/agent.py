@@ -32,6 +32,7 @@ from app.evolve.driver.prompt import driver_system_prompt
 from app.evolve.driver.middleware.phase_guard import PhaseGuardMiddleware, TERMINAL_PHASE
 from app.evolve.subagents.execute.build import build_execute_subagent
 from app.evolve.subagents.plan.build import build_plan_subagent
+from app.trace import TraceMiddleware, TraceCallbackHandler
 
 logger = logging.getLogger("evolution.evolve.agent")
 
@@ -67,10 +68,14 @@ def build_evolve_driver(ctx: EvolveContext):
 
     model = build_agent_model(temperature=0.2)
 
-    # 2 子代理（S3：删 evaluate，评估已独立）
+    # 2 子代理（S3：删 evaluate，评估已独立）。
+    # TraceMiddleware 必须传给每个子代理各自挂一份——DeepAgents 的 middleware
+    # 不从父 agent 传播到子 agent（SubAgentMiddleware._build_subagent_config 只转发
+    # callbacks/tags/configurable），否则子代理内部 LLM/工具调用（read_trace /
+    # apply_edits / write_file 等）不会被记录。推翻旧决策 D10「只挂顶层」。
     subagents = [
-        build_plan_subagent(model),
-        build_execute_subagent(model),
+        build_plan_subagent(model, recorder=ctx.recorder, trace_id_self=ctx.trace_id_self),
+        build_execute_subagent(model, recorder=ctx.recorder, trace_id_self=ctx.trace_id_self),
     ]
 
     system_prompt = driver_system_prompt(
@@ -79,11 +84,22 @@ def build_evolve_driver(ctx: EvolveContext):
         eval_summary=_format_eval_summary(ctx),
     )
 
+    # D6：顶层驱动器自身的 TraceMiddleware（记录委托决策 LLM + task 工具调用）。
+    trace_middleware = TraceMiddleware(
+        recorder=ctx.recorder,
+        trace_id=ctx.trace_id_self,
+        agent_name="evolve-driver",
+    ) if ctx.recorder and ctx.trace_id_self else None
+
+    middleware_list = [PhaseGuardMiddleware()]
+    if trace_middleware:
+        middleware_list.append(trace_middleware)
+
     driver = create_deep_agent(
         model=model,
         tools=[],  # 驱动器自身无工具，靠 task 委托（task 由框架自带）
         system_prompt=system_prompt,
-        middleware=[PhaseGuardMiddleware()],
+        middleware=middleware_list,
         subagents=subagents,
         checkpointer=None,
     )
@@ -133,7 +149,22 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
     ctx.review_status = "running"
     ev_db.update_session(ctx.session_id, status="running")
 
+    # D6/D8：先 create_run 拿自观测 trace_id，再构建 driver（middleware 需要 trace_id）。
+    if ctx.recorder:
+        handle = ctx.recorder.create_run(
+            session_id=ctx.session_id,
+            run_purpose="evolution_evolve",
+            endpoint="evolve-driver.run",
+        )
+        ctx.trace_id_self = handle.trace_id
+
     driver = build_evolve_driver(ctx)
+
+    # D6：config 注入 TraceCallbackHandler（构建调用树）。
+    config: dict[str, Any] = {"recursion_limit": 100}
+    if ctx.recorder and ctx.trace_id_self:
+        config["callbacks"] = [TraceCallbackHandler(ctx.recorder, ctx.trace_id_self)]
+
     ctx.emit_log("进化驱动器启动，开始 方案→执行 两阶段流水线...")
     logger.info("session %s: 驱动器启动 trace=%s", ctx.session_id, trace_id)
 
@@ -147,7 +178,7 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
     try:
         await driver.ainvoke(
             {"messages": [{"role": "user", "content": user_input}]},
-            config={"recursion_limit": 100},
+            config=config,
         )
         logger.info("session %s: 驱动器执行完成", ctx.session_id)
 
@@ -156,17 +187,21 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
             ctx.review_status = "pending_review"
             ev_db.update_session(ctx.session_id, status="pending_review")
             ctx.emit_log("进化流程完成，改动已落地，等待人工 review 发版。")
+            if ctx.recorder and ctx.trace_id_self:
+                ctx.recorder.complete_run(ctx.trace_id_self)
             return {"status": "done", "session_id": ctx.session_id}
         else:
             ctx.emit_log("驱动器结束但未产出 change_log（执行阶段可能未完成）。")
             ev_db.update_session(ctx.session_id, status="failed")
+            if ctx.recorder and ctx.trace_id_self:
+                ctx.recorder.fail_run(ctx.trace_id_self, "未产出 change_log")
             return {"status": "incomplete", "session_id": ctx.session_id}
 
     except Exception as e:
         logger.exception("session %s: 驱动器执行失败", ctx.session_id)
         ev_db.update_session(ctx.session_id, status="failed")
-        if ctx.events:
-            ctx.events.finish("failed", str(e))
+        if ctx.recorder and ctx.trace_id_self:
+            ctx.recorder.fail_run(ctx.trace_id_self, e)
         return {"status": "failed", "error": str(e), "session_id": ctx.session_id}
 
 

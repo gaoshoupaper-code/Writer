@@ -31,18 +31,19 @@ class NoFilesystemToolsMiddleware(AgentMiddleware):
     """过滤掉框架自带的 filesystem 工具，确保评估 Agent 不误用 read_file 等。
 
     与 PhaseGuard（进化端）不同：这里不是阶段白名单，而是永久移除一批工具。
-    机制：wrap_model_call 里把 _FILTERED_TOOL_NAMES 里的工具从 request.tools 剔除。
+    机制：wrap_model_call/awrap_model_call 里把 _FILTERED_TOOL_NAMES 里的工具
+    从 request.tools 剔除。
+
+    注意：评估 Agent 用 ainvoke 异步跑（agent.py），故必须实现 awrap_model_call，
+    否则 langchain 在 async 路径会抛 NotImplementedError（参考 start.log）。
     """
 
-    def wrap_model_call(
-        self,
-        request: Any,
-        handler: Callable[..., Any],
-    ) -> Any:
-        """过滤 filesystem 工具后再调 handler。"""
+    @staticmethod
+    def _filter(request: Any) -> Any:
+        """过滤掉 filesystem 工具，返回（可能重建后的）request；逻辑同步/异步共用。"""
         tools = getattr(request, "tools", None)
         if not tools:
-            return handler(request)
+            return request
 
         def _tool_name(t: Any) -> str:
             if hasattr(t, "name"):
@@ -54,11 +55,26 @@ class NoFilesystemToolsMiddleware(AgentMiddleware):
         filtered = [t for t in tools if _tool_name(t) not in _FILTERED_TOOL_NAMES]
         if len(filtered) == len(tools):
             # 无需过滤（本就没这些工具）
-            return handler(request)
+            return request
 
         # 用 request.override(tools=...) 重建请求（与 FilesystemMiddleware 同模式）
-        request = request.override(tools=filtered)
-        return handler(request)
+        return request.override(tools=filtered)
+
+    def wrap_model_call(
+        self,
+        request: Any,
+        handler: Callable[..., Any],
+    ) -> Any:
+        """过滤 filesystem 工具后再调 handler（同步路径）。"""
+        return handler(self._filter(request))
+
+    async def awrap_model_call(
+        self,
+        request: Any,
+        handler: Callable[..., Any],
+    ) -> Any:
+        """过滤 filesystem 工具后再调 handler（异步路径，ainvoke 时走这里）。"""
+        return await handler(self._filter(request))
 
 
 __all__ = ["NoFilesystemToolsMiddleware"]

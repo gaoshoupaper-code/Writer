@@ -1,4 +1,4 @@
-"""EvolveContext —— 一次进化 session 的上下文（三功能解耦，决策 S5/S6）。
+"""EvolveContext —— 一次进化 session 的上下文（三功能解耦，决策 S5/S6 + D3/D6）。
 
 进化 Agent 精简为「方案→执行」两阶段（T9/S3），ctx 同步精简：
 删除 baseline/candidate/score/phase(6阶段)/eval_report_path/candidate_eval_path
@@ -8,20 +8,23 @@
 与 eval_agent/ctx.py 的 EvaluationContext 独立，互不干扰。
 
 字段（精简后）：
-  - session_id / case_id / events       会话标识 + 事件总线
-  - trace_id                            进化输入的 trace（被改进对象）
-  - eval_snapshot                       从 DB 加载的评估报告快照（dict，含 scores/findings/report_md）
-  - design_doc_path / change_log_path   各阶段产出文档路径
-  - review_status                       4 态机状态（S6，与 DB status 同步）
+  - session_id / case_id               会话标识
+  - trace_id                           进化输入的 trace（被改进对象）
+  - eval_snapshot                      从 DB 加载的评估报告快照
+  - design_doc_path / change_log_path  各阶段产出文档路径
+  - review_status                      4 态机状态（S6）
+  - recorder                           进化端 trace recorder（自观测，D6）
+  - trace_id_self                      自观测 trace id（本次进化的录像）
+
+emit_step/emit_log 改为代理到 recorder.append_business_event（D3：trace 统一接管）。
 """
 from __future__ import annotations
 
 import contextvars
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from app.common import events as ev_events
+    from app.trace.recorder import EvolutionTraceRecorder
 
 # ── contextvar：当前协程上下文绑定的 EvolveContext ────────────────
 # 与 eval_agent/ctx.py 的 _current_eval_ctx 独立。
@@ -40,7 +43,11 @@ class EvolveContext:
     def __init__(self, session_id: str, case_id: str = "") -> None:
         self.session_id = session_id
         self.case_id = case_id
-        self.events: "ev_events.SessionEvents | None" = None  # 由 api 启动时注入
+
+        # D6：recorder 进 ctx，工具闭包通过 ctx 取。
+        self.recorder: "EvolutionTraceRecorder | None" = None
+        # 自观测 trace id（本次进化的录像）。由 api 启动时 create_run 设置。
+        self.trace_id_self: str = ""
 
         # 进化输入（S2：trace + 评估报告，强前置 T2）
         self.trace_id: str = ""
@@ -54,21 +61,30 @@ class EvolveContext:
         # 4 态机状态（S6）：running / pending_review / published / discarded
         self.review_status: str = "running"
 
-        # 进化工作目录（edits/change_log 存放点，沿用旧路径）
-        self._workspace = (
-            Path(__file__).resolve().parent.parent.parent / "data" / "evolve_workspace"
-        )
+        # 配置层改动落地文件（apply_edits/validate_changes 读写点）。
+        # 按 session 隔离：与 design_doc.md / change_log.md 同目录（docs.session_dir），
+        # 避免多 session 并发互相覆盖（此前写到 workspace 根的全局共享 edits.json）。
+        from app.evolve.docs import session_dir
 
-    # ── 事件推送便捷方法 ──
+        self._edits_path = session_dir(session_id) / "edits.json"
+
+    # ── 事件推送便捷方法（D3：代理到 recorder.append_business_event）──
 
     def emit_step(self, tool: str, status: str, *, phase: str | None = None, **extra: Any) -> None:
-        """推一个 step 事件。phase 指定阶段（plan/execute）。"""
-        if self.events:
-            self.events.emit_step(tool, status, phase=phase, **extra)
+        """推一个 step 事件。phase 指定阶段（plan/execute）。
+
+        D3 改造：不再写 SessionEvents，改为 recorder.append_business_event。
+        """
+        if self.recorder and self.trace_id_self:
+            self.recorder.append_business_event(
+                self.trace_id_self, tool, status, phase=phase, **extra
+            )
 
     def emit_log(self, message: str) -> None:
-        if self.events:
-            self.events.emit_log(message)
+        if self.recorder and self.trace_id_self:
+            self.recorder.append_business_event(
+                self.trace_id_self, "log", "running", message=message
+            )
 
 
 # ── contextvar 读写 ─────────────────────────────────────────────

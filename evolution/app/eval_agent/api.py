@@ -1,4 +1,4 @@
-"""eval_agent API —— 评估 Agent 触发 + 查询 + SSE（决策 S7）。
+"""eval_agent API —— 评估 Agent 触发 + 查询 + SSE（决策 S7 + D3/D4）。
 
 端点（/api/eval-agent 前缀，避免与 view/evaluation_api 的 /api/evaluation 撞路径）：
   POST /api/eval-agent/start           启动评估（传 trace_id，异步，返回 eval_id）
@@ -7,9 +7,9 @@
   GET  /api/eval-agent/sessions/{id}/stream   SSE 实时事件流
   GET  /api/eval-agent/evaluated-traces  已评估的 trace 列表（进化入口「选已评估trace」用）
 
-执行模型（沿用 evolve API）：
-  start 时注册事件总线 → 后台 task 跑评估 Agent → emit 到队列 → SSE 消费推前端。
-  进程重启则进行中 session 丢失（单轮手动，已接受）。
+执行模型（D3/D4：trace 统一接管 SSE）：
+  start 时注入 recorder 到 ctx → 后台 task 跑评估 Agent → recorder 产 trace 事件 →
+  SSE 从 recorder 队列消费推前端。SessionEvents 已删除。
 """
 from __future__ import annotations
 
@@ -27,11 +27,21 @@ from pydantic import BaseModel
 from app.eval_agent import repo as eval_repo
 from app.eval_agent.agent import run_eval_session
 from app.eval_agent.ctx import EvaluationContext
-from app.common import events as ev_events
+from app.trace.recorder import EvolutionTraceRecorder
 
 logger = logging.getLogger("evolution.eval_agent.api")
 
 router = APIRouter(prefix="/eval-agent", tags=["eval-agent"])
+
+
+def get_recorder() -> EvolutionTraceRecorder | None:
+    """获取全局 recorder 实例（main.py lifespan 注入到 app.state）。
+
+    D5：recorder 在 lifespan 显式创建。这里从 app.state 取。
+    未启动时返回 None（兼容早期未挂载场景）。
+    """
+    from app.main import app
+    return getattr(app.state, "trace_recorder", None)
 
 
 class EvalStartRequest(BaseModel):
@@ -70,21 +80,20 @@ async def eval_start(
     # 从 manual_tests 反查该 trace 对应的 Agent 版本（T7）
     version_type, version_id = _lookup_agent_version(req.trace_id)
 
-    # 注册事件总线 + 落库
-    events = await ev_events.register(eval_id)
+    # 落库评估 session
     eval_repo.create_session(
         eval_id, req.trace_id,
         agent_version_type=version_type,
         agent_version_id=version_id,
     )
 
-    # 构建评估上下文
+    # 构建评估上下文 + 注入 recorder（D6）
     ctx = EvaluationContext(
         eval_id, req.trace_id,
         agent_version_type=version_type,
         agent_version_id=version_id,
     )
-    ctx.events = events
+    ctx.recorder = get_recorder()
 
     # 后台跑评估 Agent
     background_tasks.add_task(_run_eval_bg, ctx)
@@ -113,20 +122,26 @@ def _lookup_agent_version(trace_id: str) -> tuple[str | None, int | None]:
 
 
 async def _run_eval_bg(ctx: EvaluationContext) -> None:
-    """后台执行评估 Agent。"""
+    """后台执行评估 Agent。
+
+    D3/D4：trace 终态（complete/fail_run）已在 run_eval_session 内处理，
+    这里只管 evaluation_sessions 表的业务状态。
+    """
     try:
         result = await run_eval_session(ctx)
-        if ctx.events:
-            if result["status"] == "done":
-                ctx.events.finish("done")
-            else:
+        if result["status"] == "done":
+            # Agent 正常结束。但「正常结束」≠「产出了报告」：
+            # write_eval_report 工具若被调用，DB 状态已是 done 且写了报告。
+            # 若 Agent 没调报告工具就结束，DB 仍是 running —— 此时报告缺失，
+            # 应视为失败，避免 session 永远停在 running。
+            session = eval_repo.get_session(ctx.eval_id)
+            if session is None or session.get("status") != "done":
                 eval_repo.update_session(ctx.eval_id, status="failed")
-                ctx.events.finish("failed", result.get("error", "评估失败"))
+        else:
+            eval_repo.update_session(ctx.eval_id, status="failed")
     except Exception as e:
         logger.exception("评估 session %s 后台执行异常", ctx.eval_id)
         eval_repo.update_session(ctx.eval_id, status="failed")
-        if ctx.events:
-            ctx.events.finish("failed", str(e))
 
 
 # ── 查询 ────────────────────────────────────────────────────
@@ -163,30 +178,49 @@ def list_evaluated_traces(limit: int = 100) -> dict[str, Any]:
 
 @router.get("/sessions/{eval_id}/stream")
 async def stream_session(eval_id: str) -> StreamingResponse:
-    """SSE 实时推送评估 Agent 的执行步骤。
+    """SSE 实时推送评估 Agent 的执行步骤（D3/D4：从 recorder trace 事件流派生）。
 
-    事件类型：step / log / report / error / end
+    recorder 的 trace 事件（business_step + llm/tool 框架事件）派生为前端可消费的
+    step/log 帧。trace 终态时推送 end/error 帧并关闭流。
     """
-    events = ev_events.get(eval_id)
-    if events is None:
+    recorder = get_recorder()
+    if recorder is None:
+        raise HTTPException(status_code=503, detail="trace recorder 未启动")
+
+    # 按 eval_id（session_id）查自观测 trace_id。
+    trace_id_self = recorder.get_trace_id_by_session(eval_id)
+    if trace_id_self is None:
         raise HTTPException(status_code=404, detail=f"评估 session {eval_id} 事件流不存在")
+
+    queue = recorder.get_active_queue(trace_id_self)
 
     async def event_generator():
         try:
             yield f"data: {json.dumps({'type': 'start', 'eval_id': eval_id}, ensure_ascii=False)}\n\n"
 
             while True:
+                if queue is None:
+                    # trace 已终态，队列已清。推 end 帧结束。
+                    yield f"data: {json.dumps({'type': 'end'}, ensure_ascii=False)}\n\n"
+                    break
                 try:
-                    event = await asyncio.wait_for(events.queue.get(), timeout=1.0)
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
-                    if events.terminal is not None:
+                    if recorder.is_terminal(trace_id_self):
+                        yield f"data: {json.dumps({'type': 'end'}, ensure_ascii=False)}\n\n"
                         break
                     yield f"data: {json.dumps({'type': 'heartbeat'}, ensure_ascii=False)}\n\n"
                     continue
 
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                # trace 事件 → SSE 帧派生（D3.4）。
+                frame = _trace_event_to_sse(event)
+                if frame:
+                    yield f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"
 
-                if event.get("type") in ("end", "error"):
+                # 终态事件 → 推 end 帧并退出。
+                if event.type in ("run_end", "run_error", "run_cancelled"):
+                    end_type = "end" if event.type == "run_end" else "error"
+                    yield f"data: {json.dumps({'type': end_type}, ensure_ascii=False)}\n\n"
                     break
         except asyncio.CancelledError:
             logger.info("评估 session %s SSE 流被取消", eval_id)
@@ -202,6 +236,25 @@ async def stream_session(eval_id: str) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+def _trace_event_to_sse(event: Any) -> dict[str, Any] | None:
+    """trace 事件 → 前端 SSE 帧派生（D3.4）。
+
+    - business_step（run_meta 含 tool/status/phase）→ step 帧
+    - run_meta 含 message → log 帧
+    - llm/tool 框架事件 → 可选细粒度帧（暂不推，避免刷屏）
+    - 终态事件由调用方处理
+    """
+    if event.type == "run_meta" and event.input:
+        data = event.input if isinstance(event.input, dict) else {}
+        if "message" in data and "tool" not in data:
+            # 纯 log 事件（emit_log 产的）
+            return {"type": "log", "message": data["message"]}
+        if "tool" in data:
+            # step 事件（emit_step 产的）
+            return {"type": "step", **data}
+    return None
 
 
 __all__ = ["router"]

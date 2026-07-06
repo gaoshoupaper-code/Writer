@@ -56,10 +56,14 @@ class PhaseGuardMiddleware(AgentMiddleware):
 
     机制：
       - 维护 current_phase（初始 plan，存 EvolveContext）。
-      - wrap_tool_call 拦截驱动器的工具调用，检查是否符合当前阶段白名单。
-        不符合 → 返回拒绝 ToolMessage，不执行工具。
+      - wrap_tool_call/awrap_tool_call 拦截驱动器的工具调用，检查是否符合当前
+        阶段白名单。不符合 → 返回拒绝 ToolMessage，不执行工具。
       - 工具成功执行后，推进到下一阶段（after 工具回调）。
       - after_agent：未到 execute 阶段就结束 → 注入提示继续。
+
+    注意：驱动器用 ainvoke 异步跑（agent.py），langchain 在 async 路径只调
+    awrap_tool_call，故必须同时实现同步与异步两个版本，否则默认实现会抛
+    NotImplementedError（参考 no_fs.py 同款坑 + start.log traceback）。
     """
 
     def __init__(self) -> None:
@@ -85,35 +89,58 @@ class PhaseGuardMiddleware(AgentMiddleware):
             return PHASES[idx + 1]
         return None
 
-    def wrap_tool_call(self, request, handler):
-        """拦截驱动器的工具调用，检查是否符合当前阶段白名单。"""
-        from langchain_core.messages import ToolMessage
+    def _check(self, request: Any) -> tuple[str | None, str, str, dict[str, Any]]:
+        """共享拦截入口：取当前阶段 + 算违规。返回 (violation, tool_name, phase, whitelist)。
 
+        同步/异步路径共用——纯读取 + 校验，无副作用。
+        """
         tool_name = request.tool_call.get("name", "")
         tool_args = request.tool_call.get("args", {})
         phase = self._get_phase()
         whitelist = PHASE_WHITELIST.get(phase, {})
-
-        # 检查白名单
         violation = self._check_whitelist(tool_name, tool_args, whitelist)
-        if violation:
-            return ToolMessage(
-                content=f"[PhaseGuard 拦截] 当前是{phase}阶段，{violation}。"
-                        f"请只做：{whitelist.get('desc', '')}。",
-                tool_call_id=request.tool_call.get("id", ""),
-                name=tool_name,
-            )
+        return violation, tool_name, phase, whitelist
 
-        # 放行执行
-        result = handler(request)
-
-        # 工具执行成功后推进阶段
+    def _advance_if_success(self, result: Any, phase: str) -> None:
+        """工具执行成功后推进到下一阶段。"""
         if self._is_success(result):
             nxt = self._next_phase(phase)
             if nxt:
                 self._set_phase(nxt)
                 logger.info("PhaseGuard: %s → %s", phase, nxt)
 
+    def wrap_tool_call(self, request, handler):
+        """拦截驱动器的工具调用（同步路径，invoke/stream 时走这里）。"""
+        violation, tool_name, phase, whitelist = self._check(request)
+        if violation:
+            from langchain_core.messages import ToolMessage
+            return ToolMessage(
+                content=f"[PhaseGuard 拦截] 当前是{phase}阶段，{violation}。"
+                        f"请只做：{whitelist.get('desc', '')}。",
+                tool_call_id=request.tool_call.get("id", ""),
+                name=tool_name,
+            )
+        result = handler(request)
+        self._advance_if_success(result, phase)
+        return result
+
+    async def awrap_tool_call(self, request, handler):
+        """拦截驱动器的工具调用（异步路径，ainvoke/astream 时走这里）。
+
+        与 wrap_tool_call 逻辑一致，仅 handler 改为 await。驱动器用 ainvoke 跑，
+        只会命中本方法；不实现则 langchain 默认抛 NotImplementedError。
+        """
+        violation, tool_name, phase, whitelist = self._check(request)
+        if violation:
+            from langchain_core.messages import ToolMessage
+            return ToolMessage(
+                content=f"[PhaseGuard 拦截] 当前是{phase}阶段，{violation}。"
+                        f"请只做：{whitelist.get('desc', '')}。",
+                tool_call_id=request.tool_call.get("id", ""),
+                name=tool_name,
+            )
+        result = await handler(request)
+        self._advance_if_success(result, phase)
         return result
 
     def _check_whitelist(self, tool_name: str, tool_args: dict, whitelist: dict) -> str | None:
@@ -145,8 +172,11 @@ class PhaseGuardMiddleware(AgentMiddleware):
             return True
         return True
 
-    def after_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
-        """驱动器想结束时，检查是否到 execute 阶段。没到则注入提示继续。"""
+    def _nudge_if_incomplete(self) -> dict[str, Any] | None:
+        """驱动器想结束时，检查是否到 execute 阶段。没到则注入提示继续。
+
+        同步/异步 after_agent 共用——纯读取 + 构造返回值，无副作用（除 nudge 计数）。
+        """
         phase = self._get_phase()
         # execute 阶段完成才允许结束
         if phase == TERMINAL_PHASE:
@@ -173,6 +203,18 @@ class PhaseGuardMiddleware(AgentMiddleware):
                 ))
             ]
         }
+
+    def after_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        """同步路径：驱动器结束时检查是否到 execute 阶段。"""
+        return self._nudge_if_incomplete()
+
+    async def aafter_agent(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        """异步路径：驱动器用 ainvoke 跑时走这里。逻辑与 after_agent 一致。
+
+        不实现则默认空实现 → 提前结束不会注入"请继续"提示，驱动器可能在 plan
+        后就停。参考 awrap_tool_call 同款 async 缺失坑。
+        """
+        return self._nudge_if_incomplete()
 
 
 __all__ = ["PhaseGuardMiddleware", "PHASES", "PHASE_WHITELIST", "TERMINAL_PHASE"]

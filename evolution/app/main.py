@@ -43,6 +43,7 @@ from app.eval_agent.api import router as eval_agent_router
 from app.view.versions_api import router as versions_router
 from app.ingestion.scan import start_scan_scheduler
 from app.view.active import start_active_poller
+from app.trace.recorder import EvolutionTraceRecorder
 
 
 @asynccontextmanager
@@ -51,8 +52,23 @@ async def lifespan(app: FastAPI):
     db.init_db()
     start_scan_scheduler()
     start_active_poller()
+
+    # D5/D8：创建 recorder 单例 + 崩溃恢复 + 启动 drain。
+    # 顺序保证：init_db 先于 recorder（recorder 写 DB 依赖表已建）。
+    recorder = EvolutionTraceRecorder()
+    recovered = recorder.recover_pending()
+    if recovered:
+        import logging
+        logging.getLogger("evolution.trace.recorder").info(
+            "崩溃恢复：%d 条 running trace 补终态", recovered
+        )
+    recorder.start_drain()
+    app.state.trace_recorder = recorder
+
     yield
-    # 关闭：无特殊清理（SQLite 连接随进程退出释放）
+
+    # 关闭：停 recorder drain + flush 残余事件落盘（D5）。
+    await recorder.aclose()
 
 
 app = FastAPI(title="Writer Evolution", version="0.1.0", lifespan=lifespan)

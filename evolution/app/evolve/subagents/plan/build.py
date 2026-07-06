@@ -5,19 +5,45 @@ system prompt 来自 plan.prompt。
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 
-def build_plan_subagent(model):
-    """构建方案子代理（CompiledSubAgent），挂载到驱动器。"""
+if TYPE_CHECKING:
+    from app.trace.recorder import EvolutionTraceRecorder
+
+
+def build_plan_subagent(
+    model,
+    *,
+    recorder: "EvolutionTraceRecorder | None" = None,
+    trace_id_self: str = "",
+):
+    """构建方案子代理（CompiledSubAgent），挂载到驱动器。
+
+    Args:
+        model:         复用驱动器的模型
+        recorder:      自观测 trace recorder（进化 ctx 注入）
+        trace_id_self: 自观测 trace id（middleware 据此写入事件）
+    """
     from deepagents import CompiledSubAgent, create_deep_agent
 
     from app.evolve.subagents.plan.prompt import PLAN_SYSTEM_PROMPT
     from app.evolve.subagents.plan.tools import make_plan_tools
+    from app.trace import TraceMiddleware
+
+    # DeepAgents 的 middleware 不从父 agent 传播到子 agent
+    # （SubAgentMiddleware._build_subagent_config 只转发 callbacks/tags/configurable），
+    # 故子代理必须各自挂 TraceMiddleware，否则其内部 LLM/工具调用不会被记录。
+    middleware_list = []
+    if recorder and trace_id_self:
+        middleware_list.append(
+            TraceMiddleware(recorder=recorder, trace_id=trace_id_self, agent_name="evolve-plan")
+        )
 
     graph = create_deep_agent(
         model=model,
         tools=make_plan_tools(),
         system_prompt=PLAN_SYSTEM_PROMPT,
-        middleware=[],
+        middleware=middleware_list,
         subagents=None,
         checkpointer=None,
     )
