@@ -84,7 +84,7 @@ def make_execute_tools() -> list:
             base = build_v1_config()
             new_config = edit_ops.apply_edits(base, edits)
 
-            # 写到 edits.json（run_test 时 candidate 会读它）
+            # 写到 edits.json（发版时会回放这些 edits 生成新 config）
             edits_path = Path(ctx._edits_path)
             edits_path.parent.mkdir(parents=True, exist_ok=True)
             edits_path.write_text(
@@ -97,7 +97,7 @@ def make_execute_tools() -> list:
             )
             return (
                 f"已应用 {len(edits)} 个 edit 指令到 config，"
-                f"写入 {edits_path}。candidate 重跑时会用这套配置。"
+                f"写入 {edits_path}。发版时会回放这些 edits 生成新 config。"
             )
         except (json.JSONDecodeError, ValueError) as e:
             ctx.emit_step("apply_edits", "failed", phase="execute", error=str(e))
