@@ -33,6 +33,7 @@ from app.ingestion.ingestion import router as ingestion_router
 from app.view.traces import router as traces_router
 from app.view.stats import router as stats_router
 from app.versioning.snapshot_api import router as snapshot_router
+from app.versioning.elements_api import router as elements_router
 from app.view.active import router as active_api_router
 from app.view.agent_package import router as agent_package_router
 from app.view.sse_stream import router as sse_router
@@ -72,6 +73,8 @@ app.include_router(ingestion_router, prefix="/api")
 app.include_router(traces_router, prefix="/api")
 app.include_router(stats_router, prefix="/api")
 app.include_router(snapshot_router, prefix="/api")
+# 执行端 Agent 要素展示（前端「Agent 要素」页，D1-D7）
+app.include_router(elements_router, prefix="/api")
 # 监测前端新增端点（D7 active 富化 / D8 agent-package / D9 SSE stream）
 app.include_router(active_api_router, prefix="/api")
 app.include_router(agent_package_router, prefix="/api")

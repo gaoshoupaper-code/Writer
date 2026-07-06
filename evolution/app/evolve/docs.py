@@ -141,6 +141,40 @@ def read_design_doc(path: str) -> dict[str, Any]:
     return {"meta": meta, "body": body}
 
 
+def parse_design_doc_intent(path: str) -> list[dict[str, Any]]:
+    """从 design_doc.md 提取改动意图列表（供版本差异展示存 version_changes.intent_json）。
+
+    复用 _load_doc 解析 front matter，取 meta["changes"] 列表。
+    每条保留 target / change_desc / reason / expected_up / expected_down（edit 字段不保留，太长）。
+
+    Args:
+        path: design_doc.md 的路径（evolve_sessions.design_doc_path）。
+
+    Returns:
+        changes 列表；文件不存在/解析失败/无 changes → 返回 []。
+    """
+    try:
+        meta, _ = _load_doc(path)
+    except FileNotFoundError:
+        logger.warning("design_doc 不存在: %s", path)
+        return []
+    except Exception:
+        logger.exception("design_doc 解析失败: %s", path)
+        return []
+
+    changes = meta.get("changes")
+    if not isinstance(changes, list):
+        return []
+
+    # 只保留意图相关字段（丢掉 edit 指令，太长且属于执行细节）
+    keep_fields = ("target", "change_desc", "reason", "expected_up", "expected_down")
+    return [
+        {k: c.get(k, "") for k in keep_fields}
+        for c in changes
+        if isinstance(c, dict)
+    ]
+
+
 # ── change_log.md（执行子代理产出）──────────────────────────────
 
 
@@ -190,5 +224,6 @@ __all__ = [
     "session_dir",
     "write_design_doc",
     "read_design_doc",
+    "parse_design_doc_intent",
     "write_change_log",
 ]

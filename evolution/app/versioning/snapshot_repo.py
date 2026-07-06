@@ -116,6 +116,7 @@ def publish_config(
     source_commit: str | None = None,
     parent_version: int | None = None,
     change_summary: str | None = None,
+    source_session: str | None = None,
 ) -> dict[str, Any]:
     """存 config_json → 发布新 production 快照。
 
@@ -124,12 +125,14 @@ def publish_config(
       2. 取 db._lock（全局写锁）
       3. INSERT 新快照（status=production），旧 production 降 retired
       4. 提交
+      5. 计算 v(parent)→v(new) 的 config diff，写入 version_changes（异常不阻断）
 
     Args:
         config:         HarnessConfig dict（会 validate + 序列化）
         source_commit:  对应 git commit hash（executor pull 源码用，决策 D7a）
         parent_version: 谱系（默认取当前 production 版本号）
         change_summary: 本版改了哪些
+        source_session: 产出该版本的 evolve session_id（建立 session→version 映射）
 
     Returns: 新 production 快照行。
     """
@@ -156,17 +159,58 @@ def publish_config(
         db.execute(
             """INSERT INTO harness_snapshots
                (version, parent_version, config_json, source_commit,
-                change_summary, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                change_summary, source_session, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (next_v, parent_version, config_json, source_commit,
-             change_summary, STATUS_PRODUCTION, _now()),
+             change_summary, source_session, STATUS_PRODUCTION, _now()),
         )
         result = get_snapshot(next_v)
         logger.info(
             "发布 production 配置快照 v%s（config %d 字符, commit=%s）",
             next_v, len(config_json), source_commit or "N/A",
         )
-        return result
+
+    # 计算 config diff 并存库（版本差异展示功能，D-T10）。
+    # 放在锁外，异常不阻断发版（需求 D13）。
+    _compute_and_save_diff(next_v, parent_version, config)
+
+    return result
+
+
+def _compute_and_save_diff(
+    new_version: int,
+    parent_version: int | None,
+    new_config: dict,
+) -> None:
+    """计算 v(parent)→v(new) 的 config diff，写入 version_changes。
+
+    parent 不存在或 config 残缺 → 跳过（需求 D13 异常处理）。
+    计算异常 → 记日志，不阻断发版。
+    """
+    from app.versioning import config_diff, version_changes_repo
+
+    if parent_version is None:
+        logger.info("v%s 无 parent_version，跳过 diff 计算（首版）", new_version)
+        return
+
+    try:
+        parent_config = get_snapshot_config(parent_version)
+        if parent_config is None:
+            logger.warning(
+                "v%s 的 parent v%s 无 config_json，跳过 diff 计算", new_version, parent_version
+            )
+            return
+
+        agent_diffs = config_diff.compute_diff(parent_config, new_config)
+        if config_diff.has_changes(agent_diffs):
+            version_changes_repo.save_agent_diffs(new_version, agent_diffs)
+            logger.info(
+                "v%s diff 计算完成：%d 个 agent 有变化", new_version, len(agent_diffs)
+            )
+        else:
+            logger.info("v%s 与 parent v%s 无 config 差异", new_version, parent_version)
+    except Exception:
+        logger.exception("v%s diff 计算失败（不阻断发版）", new_version)
 
 
 # ── 兼容层（Phase 7 tar 快照查询，供过渡期 ab_runner 用）──────────

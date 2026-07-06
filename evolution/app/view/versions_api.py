@@ -21,6 +21,7 @@ from fastapi import APIRouter, HTTPException
 
 import app.core.db as db
 from app.versioning import snapshot_repo
+from app.versioning import version_changes_repo
 
 logger = logging.getLogger("evolution.versions_api")
 
@@ -141,6 +142,8 @@ def get_version(version: int) -> dict[str, Any]:
         "critic_verdict": critic_verdict,
         "source_session": round_row["session_id"] if round_row else None,
         "source_round": round_row["round"] if round_row else None,
+        # 版本差异展示（version_changes 表，D-T12）
+        "changes": version_changes_repo.get_changes(version),
     }
 
 

@@ -34,6 +34,7 @@ class TraceListItem(BaseModel):
     error: str | None
     flag_count: int = 0   # 命中规则数（标红数）
     owner_user_id: str = "unknown"   # 归属用户（Phase 3 D16）
+    run_purpose: str = "user_generation"   # trace 来源（D2：区分执行端/进化端）
 
 
 @router.get("/traces", response_model=list[TraceListItem])
@@ -42,6 +43,7 @@ def list_traces(
     thread_id: str | None = Query(None, description="按 thread_id 过滤"),
     status: str | None = Query(None, description="按 status 过滤"),
     owner: str | None = Query(None, description="按 owner_user_id 过滤（D16 防串户）"),
+    run_purpose: str | None = Query(None, description="按 run_purpose 过滤（evolution_eval/evolution_evolve/user_generation）"),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> list[TraceListItem]:
@@ -56,6 +58,10 @@ def list_traces(
         params.append(thread_id)
     if status:
         where.append("r.status = ?")
+        params.append(status)
+    if run_purpose:
+        where.append("r.run_purpose = ?")
+        params.append(run_purpose)
         params.append(status)
     if owner:
         where.append("r.owner_user_id = ?")
@@ -75,6 +81,7 @@ def list_traces(
             duration_ms=r["duration_ms"], event_count=r["event_count"] or 0,
             error=r["error"], flag_count=0,
             owner_user_id=r.get("owner_user_id") or "unknown",
+            run_purpose=r.get("run_purpose") or "user_generation",
         )
         for r in rows
     ]

@@ -281,6 +281,22 @@ def init_db() -> None:
                 updated_at         TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_eval_trace ON evaluation_sessions(trace_id);
+
+            -- version_changes：版本间结构化 diff（版本差异展示功能）。
+            -- publish 时算好 v(n-1)→v(n) 的 config diff，按 agent 聚合存库。
+            -- 两种行：
+            --   agent 级行（agent = meta_pipeline/storybuilding/...）：diff_json 存三要素 diff
+            --   版本级行（agent = '__version__'）：intent_json 存 design_doc 意图列表
+            CREATE TABLE IF NOT EXISTS version_changes (
+                version        INTEGER NOT NULL,   -- 版本号（FK→harness_snapshots.version）
+                agent          TEXT    NOT NULL,   -- agent 名；'__version__' = 版本级行
+                diff_json      TEXT,               -- agent 级行：三要素 diff 明细；版本级行：NULL
+                intent_json    TEXT,               -- 版本级行：design_doc 意图列表；agent 级行：NULL
+                computed_at    TEXT    NOT NULL,   -- ISO8601 计算时间
+                PRIMARY KEY (version, agent),
+                FOREIGN KEY (version) REFERENCES harness_snapshots(version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_vc_version ON version_changes(version);
             """
         )
         conn.commit()
@@ -294,10 +310,14 @@ def init_db() -> None:
         _migrate_runs_owner_user_id(conn)
         # HITL 幂等迁移：给 runs 表补 ingested_seq 列（D7 增量高水位）
         _migrate_runs_ingested_seq(conn)
+        # 进化端自观测：给 runs 表补 run_purpose 列（区分 executor/evolution trace）
+        _migrate_runs_run_purpose(conn)
         # Phase 4 幂等迁移：prompt 版本管理表（T9 langfuse 式）
         _migrate_prompt_tables(conn)
         # Phase 8 幂等迁移：harness_snapshots tar→config_json（compose 配置化，决策 #18）
         _migrate_harness_snapshots_config(conn)
+        # 版本差异展示：harness_snapshots 补 source_session 列（建立 session→version 映射）
+        _migrate_harness_snapshots_source_session(conn)
         # 驱动器模式幂等迁移：evolve_sessions 补 phase + 文档路径列（D16）
         _migrate_evolve_sessions_driver_fields(conn)
         # 三功能解耦：evolve_sessions 补 eval_ref 列（关联评估报告，决策 S6/T2）
@@ -370,6 +390,23 @@ def _migrate_runs_ingested_seq(conn: sqlite3.Connection) -> None:
         return
     with _lock:
         conn.execute("ALTER TABLE runs ADD COLUMN ingested_seq INTEGER DEFAULT 0")
+        conn.commit()
+
+
+def _migrate_runs_run_purpose(conn: sqlite3.Connection) -> None:
+    """幂等迁移：给 runs 表补 run_purpose 列（进化端自观测迁移 D2）。
+
+    区分 trace 来源：执行端写入（user_generation/optimization）vs 进化端自产
+    （evolution_eval/evolution_evolve）。存量数据均为执行端摄入，回填
+    user_generation（符合事实）。下游统计面板按 run_purpose 过滤，避免执行端
+    与进化端 trace 串味。
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    if "run_purpose" in existing:
+        return
+    with _lock:
+        conn.execute("ALTER TABLE runs ADD COLUMN run_purpose TEXT NOT NULL DEFAULT 'user_generation'")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_purpose ON runs(run_purpose)")
         conn.commit()
 
 
@@ -470,6 +507,21 @@ def _migrate_harness_snapshots_config(conn: sqlite3.Connection) -> None:
             "harness_snapshots 迁移完成：重建表为 config_json schema（Phase 8 compose，决策 #18）。"
             "老 tar 快照已标 retired（config_json=NULL）。"
         )
+
+
+def _migrate_harness_snapshots_source_session(conn: sqlite3.Connection) -> None:
+    """幂等迁移：给 harness_snapshots 表补 source_session 列（版本差异展示功能）。
+
+    source_session 记录该版本由哪个 evolve session 产出，建立 session→version 映射。
+    用于 publish 后从 design_doc 提取"改动意图"（reason/expected）回填 version_changes。
+    手动发版（无 session）此列为 NULL。
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(harness_snapshots)").fetchall()}
+    if "source_session" in existing:
+        return
+    with _lock:
+        conn.execute("ALTER TABLE harness_snapshots ADD COLUMN source_session TEXT")
+        conn.commit()
 
 
 def _drop_legacy_harness_tables(conn: sqlite3.Connection) -> None:

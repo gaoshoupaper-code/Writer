@@ -100,6 +100,57 @@ def make_skills_slot(paths: list[str]) -> list[str]:
     return list(paths)
 
 
+# ── slot spec 形状校验（apply_edits / validate 共用，决策 8a）──────────
+#
+# slot 有两种形态（与 make_prompt_slot / make_skills_slot 对应）：
+#   - prompt slot：{"class": "prompt", "params": {"body": str}}
+#   - skills slot：list[str]
+# 此前 _apply_to_slots 不校验 spec 形状、_validate_pipeline 不校验 slots，
+# 导致坏 spec（如 {"content": "..."}）能静默通过，写进 edits.json 又进 config。
+# 这两道校验前置后，坏 slot spec 在 apply 阶段即报错（execute 修复），
+# 即便漏网，发版 validate 时也能拦住。
+
+# 已知的 prompt 类 slot 名（spec 必须是 {class:"prompt", params:{body:str}}）
+_PROMPT_SLOTS = frozenset({"system_prompt"})
+# 已知的 skills 类 slot 名（spec 必须是 list[str]）
+_SKILLS_SLOTS = frozenset({"skills"})
+
+
+def validate_slot_spec(slot_name: str, spec: Any) -> None:
+    """校验单个 slot 的 spec 形状，不合法 raise ValueError。
+
+    - system_prompt：必须是 {"class": "prompt", "params": {"body": str}}
+    - skills：必须是 list[str]
+    - 未知 slot 名：放宽（允许自由结构，避免阻塞未来扩展），不报错。
+
+    供 _apply_to_slots（apply 阶段）和 _validate_pipeline（validate 阶段）共用。
+    """
+    if slot_name in _PROMPT_SLOTS:
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"slot {slot_name!r} 的 spec 必须是 dict "
+                f'{{"class": "prompt", "params": {{"body": str}}}}，'
+                f"得到 {type(spec).__name__}"
+            )
+        if spec.get("class") != "prompt":
+            raise ValueError(
+                f"slot {slot_name!r} 的 spec.class 必须是 'prompt'，"
+                f"得到 {spec.get('class')!r}"
+            )
+        params = spec.get("params")
+        if not isinstance(params, dict) or not isinstance(params.get("body"), str):
+            raise ValueError(
+                f"slot {slot_name!r} 的 spec.params.body 必须是 str，"
+                f"得到 {type(params.get('body') if isinstance(params, dict) else None).__name__}"
+            )
+    elif slot_name in _SKILLS_SLOTS:
+        if not isinstance(spec, list) or not all(isinstance(x, str) for x in spec):
+            raise ValueError(
+                f"slot {slot_name!r} 的 spec 必须是 list[str]（路径列表）"
+            )
+    # 未知 slot：放宽，不校验（未来扩展不阻塞）
+
+
 # ── 序列化 ────────────────────────────────────────────────────────
 
 
@@ -194,6 +245,13 @@ def _validate_pipeline(name: str, pipeline: dict) -> None:
             raise ValueError(f"pipeline[{name}].processors[{i}].spec 缺少 class")
         if "params" not in spec or not isinstance(spec["params"], dict):
             raise ValueError(f"pipeline[{name}].processors[{i}].spec 缺少 params dict")
+
+    # slots 校验（此前缺失：只校验 processors 不校验 slots，坏 slot spec 能漏网）。
+    slots = pipeline["slots"]
+    if not isinstance(slots, dict):
+        raise ValueError(f"pipeline[{name}].slots 必须是 dict")
+    for slot_name, slot_spec in slots.items():
+        validate_slot_spec(slot_name, slot_spec)
 
 
 # ── 查询工具（供 adapt/前端用）────────────────────────────────────

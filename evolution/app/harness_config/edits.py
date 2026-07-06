@@ -83,7 +83,16 @@ def _apply_one(config: dict, edit: dict, idx: int) -> None:
         raise ValueError(f"edits[{idx}] target 必须是 [agent, section, key] 三元组")
 
     agent, section, key = target
-    pipeline = cfg.get_agent_pipeline(config, agent)
+    try:
+        pipeline = cfg.get_agent_pipeline(config, agent)
+    except KeyError:
+        # agent 名非法时，列出所有合法名，方便快速定位（plan 子代理常把 meta 写成 meta-agent）
+        valid = ["meta"] + list(config.get("subagents", {}).keys())
+        raise ValueError(
+            f"edits[{idx}] agent {agent!r} 不是合法 config 键名。"
+            f"合法值（必须原样照写）：{valid}。"
+            f"常见错误：把 meta 写成 meta-agent。"
+        )
 
     if section == cfg.SECTION_PROCESSORS:
         _apply_to_processors(pipeline, op, key, edit.get("spec"), idx)
@@ -141,6 +150,9 @@ def _apply_to_slots(
             )
         if spec is None:
             raise ValueError(f"edits[{idx}] replace slot 需要 spec")
+        # 校验 spec 形状（如 system_prompt 必须是 {class:"prompt",params:{body:str}}），
+        # 避免坏 spec（如 {"content":...}）静默写进 config。
+        cfg.validate_slot_spec(slot_name, spec)
         slots[slot_name] = spec
     elif op == "insert":
         if slot_name in slots:
@@ -149,6 +161,7 @@ def _apply_to_slots(
             )
         if spec is None:
             raise ValueError(f"edits[{idx}] insert slot 需要 spec")
+        cfg.validate_slot_spec(slot_name, spec)
         slots[slot_name] = spec
     elif op == "remove":
         if slot_name not in slots:
