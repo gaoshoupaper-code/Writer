@@ -41,8 +41,12 @@ from app.evolve.api import router as evolve_router
 from app.tests.api import router as tests_router
 from app.eval_agent.api import router as eval_agent_router
 from app.view.versions_api import router as versions_router
+from app.dataset.api import router as dataset_router
 from app.ingestion.scan import start_scan_scheduler
 from app.view.active import start_active_poller
+from app.promote.api import router as promote_router
+from app.promote.scheduler import start_judge_scheduler
+from app.benchmark.api import router as benchmark_router
 from app.trace.recorder import EvolutionTraceRecorder
 
 
@@ -52,6 +56,8 @@ async def lifespan(app: FastAPI):
     db.init_db()
     start_scan_scheduler()
     start_active_poller()
+    # 数据闭环：启动 promote judge 调度器（后台定时扫描生产 trace → judge）
+    start_judge_scheduler()
 
     # D5/D8：创建 recorder 单例 + 崩溃恢复 + 启动 drain。
     # 顺序保证：init_db 先于 recorder（recorder 写 DB 依赖表已建）。
@@ -109,6 +115,12 @@ app.include_router(tests_router, prefix="/api")
 app.include_router(eval_agent_router, prefix="/api")
 # 配置版本谱系视图（前端版本谱系页 D8）
 app.include_router(versions_router, prefix="/api")
+# 数据集管理（数据闭环设计：分层数据集 golden/growing + revision 锁定）
+app.include_router(dataset_router, prefix="/api")
+# Promote 闸门（数据闭环设计：生产 trace → 数据集的清洗 + 标注流水线）
+app.include_router(promote_router, prefix="/api")
+# Benchmark 矩阵 + Runner（数据闭环设计：跨版本对比 + golden 升级重跑）
+app.include_router(benchmark_router, prefix="/api")
 
 
 @app.get("/health")

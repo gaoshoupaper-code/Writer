@@ -25,6 +25,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.eval_agent import repo as eval_repo
+from app.core import db
 from app.evolve import db as ev_db
 from app.evolve.driver.agent import run_evolve_session
 from app.evolve.ctx import EvolveContext
@@ -104,6 +105,8 @@ async def evolve_start(
     ctx = EvolveContext(session_id=session_id)
     ctx.recorder = get_recorder()
     ctx.trace_id = req.trace_id
+    # 数据闭环 F1：查 trace 所属数据集层（golden验证/growing探索），注入进化上下文。
+    ctx.origin_layer = _resolve_origin_layer(req.trace_id)
     ctx.eval_snapshot = {
         "eval_id": eval_session["eval_id"],
         "trace_id": eval_session.get("trace_id"),
@@ -135,6 +138,19 @@ def _find_pending_review_session() -> str | None:
         if isinstance(s, dict) and s.get("status") == "pending_review":
             return s.get("session_id")
     return None
+
+
+def _resolve_origin_layer(trace_id: str) -> str | None:
+    """查 trace 所属的数据集层（数据闭环 F1，golden|growing）。
+
+    通过 manual_tests.origin_layer 反查（测试发起时写入）。
+    非 benchmark/测试 trace（如用户原始 trace）返回 None。
+    """
+    row = db.query_one(
+        "SELECT origin_layer FROM manual_tests WHERE trace_id=? AND origin_layer IS NOT NULL LIMIT 1",
+        (trace_id,),
+    )
+    return row["origin_layer"] if row else None
 
 
 async def _run_evolve_bg(ctx: EvolveContext, trace_id: str) -> None:

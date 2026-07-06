@@ -1,5 +1,6 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { useState } from "react";
 import type { NovelChapter } from "../../lib/types";
 
 type NovelPanelProps = {
@@ -9,6 +10,8 @@ type NovelPanelProps = {
   onSelectChapter: (filename: string) => void;
   exportUrl?: string;
   wordExportUrl?: string;
+  /** 复制内容回调（数据闭环 E3：复制埋点，传当前章节文本） */
+  onCopyContent?: (text: string) => void;
 };
 
 export function NovelPanel({
@@ -18,9 +21,24 @@ export function NovelPanel({
   onSelectChapter,
   exportUrl,
   wordExportUrl,
+  onCopyContent,
 }: NovelPanelProps) {
+  const [copied, setCopied] = useState(false);
   const activeChapter = chapters.find((ch) => ch.filename === activeFilename) ?? chapters[0];
   const hasContent = chapters.some((ch) => ch.markdown.trim().length > 0);
+
+  const handleCopy = async () => {
+    const text = activeChapter?.markdown ?? "";
+    if (!text.trim()) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      onCopyContent?.(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // 剪贴板 API 不可用（HTTP 环境或权限拒绝），静默降级
+    }
+  };
 
   return (
     <section className="panel-surface content-panel" aria-label="小说正文">
@@ -31,6 +49,16 @@ export function NovelPanel({
         </div>
         <div className="panel-heading-actions">
           {loading ? <span className="outline-state">加载中</span> : null}
+          {activeChapter?.markdown.trim() && onCopyContent ? (
+            <button
+              type="button"
+              className={`export-button ${copied ? "copied" : ""}`}
+              onClick={handleCopy}
+              aria-label="复制本章内容"
+            >
+              {copied ? "已复制" : "复制"}
+            </button>
+          ) : null}
           <a
             className={`export-button ${hasContent && exportUrl ? "" : "disabled"}`}
             href={hasContent && exportUrl ? exportUrl : undefined}

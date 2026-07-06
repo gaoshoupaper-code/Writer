@@ -72,6 +72,15 @@ def evaluate_trace(trace_id: str) -> dict[str, Any] | None:
             (datetime.now(UTC).isoformat(), trace_id),
         )
 
+        # 6. 反思归纳（数据闭环 D2/D19）：badcase 时自动归纳失败模式入 reflection_library。
+        #    异常不阻断评估返回（反思是副产品）。
+        if badcase.get("is_badcase"):
+            try:
+                from app.reflection.extractor import extract_from_eval
+                extract_from_eval(trace_id, {"badcase": badcase})
+            except Exception:
+                logger.warning("反思归纳异常（不阻断评估）trace=%s", trace_id, exc_info=True)
+
         return {
             "content": content_result,
             "subagent": subagent_results,

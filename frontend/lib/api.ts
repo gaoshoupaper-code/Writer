@@ -545,3 +545,31 @@ export async function generateCharacter(payload: CharacterGenerateRequest) {
 
   return parseJsonResponse<CharacterGenerateResponse>(response);
 }
+
+// ── 数据闭环 E3：隐式反馈信号埋点（fire-and-forget，失败静默） ──
+
+/**
+ * 记录"用户复制了内容"信号（正信号）。
+ * fire-and-forget：失败不影响用户操作，不抛异常。
+ */
+export function trackCopy(traceId: string, contentPreview = ""): void {
+  if (!traceId) return;
+  apiFetch(`${API_BASE_URL}/api/screenplay/copy`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ trace_id: traceId, content_preview: contentPreview.slice(0, 200) }),
+  }).catch(() => { /* fire-and-forget */ });
+}
+
+/**
+ * 记录"用户点了重试/重新生成"信号（负信号）。
+ * fire-and-forget：失败不影响用户操作，不抛异常。
+ */
+export function trackRegenerate(traceId: string, contentPreview = ""): void {
+  if (!traceId) return;
+  apiFetch(`${API_BASE_URL}/api/screenplay/regenerate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ trace_id: traceId, content_preview: contentPreview.slice(0, 200) }),
+  }).catch(() => { /* fire-and-forget */ });
+}

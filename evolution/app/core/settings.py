@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     # 生成：python -c "import secrets; print(secrets.token_urlsafe(32))"
     internal_api_key: str = ""
 
+    # ── 数据集维护者令牌（数据闭环设计 D17）──
+    # growing→golden 升级需维护者校验。留空则不校验（开发模式兼容）。
+    maintainer_token: str = ""
+
     # ── compose Git 传输层（Phase 8，决策 D10b/D11a）──
     # harness bare repo 路径（同机阶段本地路径，异机时改 URL）。
     # evolution 工作目录 harnesses/current/ commit → push 到此 bare repo。

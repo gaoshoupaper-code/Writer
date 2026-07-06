@@ -293,11 +293,18 @@ docker compose logs -f --tail=100   # 全部最近 100 行
 
 ### 数据备份（🔴 重要，SQLite 无自动备份）
 
+> ⚠️ **注意**：容器内**没有 sqlite3 命令行工具**（Dockerfile 只装了 git+curl），
+> 旧版文档里 `docker exec ... sqlite3 ... ".backup"` **跑不通**。
+> 请用 `scripts/backup-prod.sh`（内部用 Python `sqlite3` 模块的 `conn.backup()` 做安全热备）。
+
 ```bash
-# 加 cron 定时备份
+# 手动备份
+bash scripts/backup-prod.sh
+
+# deploy 用户加 cron（deploy-prod.sh 部署脚本会自动配置）
 crontab -e
 # 每天凌晨 3 点备份
-0 3 * * * docker exec writer-evolution sqlite3 /app/evolution/evolution.db ".backup '/app/evolution/evolution.db.bak.$(date +\%Y\%m\%d)'" && docker exec writer-executor sqlite3 /app/executor/app.platform.core.db ".backup '/app/executor/app.platform.core.db.bak.$(date +\%Y\%m\%d)'"
+0 3 * * * /home/deploy/Writer/scripts/backup-prod.sh >> /home/deploy/backup.log 2>&1
 # 建议再加一步：rsync 到异地/对象存储
 ```
 
@@ -345,3 +352,115 @@ docker compose exec evolution bash
 
 ### evolution 调 executor 拉取 trace 失败
 检查 executor 的 `EVOLUTION_URL` 是否被 compose 正确注入（应为 `http://evolution:7789`），executor 的 `EVOLUTION_NOTIFY_URL` 同理。
+
+---
+
+## 九、从旧版架构切换部署（一键脚本）
+
+> 本节适用于：服务器上**已有旧版 Writer 在运行**（单体架构：backend+frontend+系统 nginx），
+> 需切换到新版三服务 Docker 架构。**旧数据丢弃**。
+>
+> 如果你是一台干净服务器，跳过本节，直接用第一~三节的流程。
+
+### 9.1 旧版清理范围（脚本自动处理）
+
+旧版以 root 跑 systemd 服务，残留如下，`deploy-prod.sh` 会逐一清理：
+
+| 残留 | 位置 | 处理 |
+|---|---|---|
+| writer-backend.service | /etc/systemd/system/ | stop + disable + 删 unit |
+| writer-frontend.service | /etc/systemd/system/ | stop + disable + 删 unit |
+| 旧 nginx 站点 | /etc/nginx/sites-enabled/writer | 删站点，**保留 nginx 二进制** |
+| 旧代码目录 | /root/Writer（838M） | rm -rf |
+| 旧备份脚本 | /usr/local/bin/writer-backup.sh | rm |
+| 旧 cron | root crontab | crontab -r |
+| 旧备份归档 | /root/backup/ | rm -rf |
+
+### 9.2 一键部署脚本用法
+
+```bash
+# 本地：push 代码 + 打 tag
+git push origin main
+git tag v0.1.0 && git push origin v0.1.0
+
+# 上传脚本到服务器（或服务器 clone 后直接有）
+scp scripts/*.sh root@111.228.4.165:/root/
+
+# 服务器：以 root 跑全流程
+ssh root@111.228.4.165
+bash scripts/deploy-prod.sh
+
+# 断点恢复（某 Phase 失败后从该 Phase 继续）
+bash scripts/deploy-prod.sh --from 2
+
+# dry-run（只打印不执行，先预览）
+bash scripts/deploy-prod.sh --dry-run
+```
+
+### 9.3 脚本执行的 5 个 Phase
+
+```
+Phase 0  装 Docker + 建 deploy 用户 + 上传 deploy 公钥
+Phase 1  停旧服务 → 删 systemd → 删旧 nginx 站点 → 删 /root/Writer → 清 cron
+Phase 2  certbot standalone 签 siyen.site 证书（80 已空出）
+Phase 3  deploy 用户 clone + 配 .env(生成密钥) + compose build/up + 激活 harness
+Phase 4  SSH 禁 root + 证书续期 hook + 备份 cron + 验证
+```
+
+### 9.4 harness 首次激活（重要！）
+
+新版用共享 Docker 卷 + bare repo 同步 harness 源码。**首次启动时这些卷是空的**，
+executor 无法 pull 到 harness 包 → 写作功能不可用。
+
+`deploy-prod.sh` 会在 Phase 3 末尾自动调用 `activate-harness.sh`，它做的事：
+1. 把宿主 `evolution/harnesses/current/` 初始源码 `docker cp` 进容器共享卷
+2. 调 `init_work_repo()` 创建 bare repo + git init 工作目录
+3. commit + push 初始 harness
+4. 触发 executor `pull_production()` 拉取
+
+> 如果脚本没自动跑成功，手动执行：
+> ```bash
+> bash scripts/activate-harness.sh
+> ```
+
+> **为什么需要这一步？** `.dockerignore` 把 `evolution/harnesses/` 排除出镜像
+> （挂卷管理），而 `git_ops.init_work_repo()` 虽然存在但**代码里没有调用点**，
+> 所以首次必须外部触发。
+
+### 9.5 SSH 加固（保守方案）
+
+本次采用**保守加固**（旧版已有 fail2ban + 密码已禁）：
+
+```bash
+# 只改一项：PermitRootLogin no（端口 22 不动，避免锁死风险）
+# ★ 改之前必须确认 deploy 密钥能登录！
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)
+sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+sshd -t && systemctl restart sshd
+```
+
+> 若不慎锁死：京东云控制台 VNC 进系统 → 改回 `PermitRootLogin yes` → restart sshd。
+
+### 9.6 证书续期
+
+新版 nginx 跑在 Docker 容器里。证书续期后需重启容器加载新证书：
+
+```bash
+# 续期 hook（deploy-prod.sh 自动配置）
+cat /etc/letsencrypt/renewal-hooks/deploy/restart-nginx.sh
+# → docker restart writer-nginx
+
+# 测试续期
+certbot renew --dry-run
+```
+
+### 9.7 部署后验证清单
+
+| # | 验证项 | 命令 | 期望 |
+|---|---|---|---|
+| 1 | 4 容器健康 | `docker compose ps` | 全 Up (healthy) |
+| 2 | HTTPS 可达 | `curl -sI https://siyen.site` | 200/302 |
+| 3 | HTTP 跳转 | `curl -sI http://siyen.site` | 301 |
+| 4 | evolution 隔离 | `curl 111.228.4.165:7789` | 拒绝连接 |
+| 5 | evolution 隧道 | SSH 隧道后 `curl localhost:7789/health` | ok |
+| 6 | harness 已激活 | `docker exec writer-evolution git -C /app/evolution/harness.git log` | 有 commit |
