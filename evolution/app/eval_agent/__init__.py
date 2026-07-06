@@ -16,7 +16,7 @@
       report.py           write_eval_report
   - middleware/           评估 Agent middleware 池：
       no_fs.py            NoFilesystemToolsMiddleware（过滤框架自带 fs 工具）
-  - scoring.py            双层打分（内容6维 + subagent4维，judge 调用编排）
+  - scoring.py            双层打分（内容8维 + subagent4维，judge 调用编排）
   - eval_extractor.py     评估输入提取（按 subagent 从 trace 提取交付物）
   - rubrics/              评估维度 rubric（按品类，先聚焦玄幻/修仙）
   - skills/               可复用片段（空壳占位）

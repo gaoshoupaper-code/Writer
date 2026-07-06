@@ -38,9 +38,14 @@ def _start_content_eval(trace_id: str) -> asyncio.Task:
 
 
 async def _run_content_eval(trace_id: str) -> dict[str, Any]:
-    """后台跑 evaluate_trace（复用现有内容评估引擎）。"""
+    """后台跑 evaluate_trace（复用现有内容评估引擎）。
+
+    evaluate_trace 内含 5 次同步 httpx 阻塞的 LLM 调用，直接在事件循环里跑
+    会阻塞整个循环（SSE 心跳、其他请求全卡）。用 asyncio.to_thread 丢到
+    线程池执行，事件循环保持响应。
+    """
     try:
-        result = scoring.evaluate_trace(trace_id)
+        result = await asyncio.to_thread(scoring.evaluate_trace, trace_id)
         return result or {"skipped": True, "reason": "无 writing 正文或 LLM 未配置"}
     except Exception as exc:
         logger.exception("内容评估失败 %s", trace_id)
@@ -48,7 +53,13 @@ async def _run_content_eval(trace_id: str) -> dict[str, Any]:
 
 
 def clear_content_tasks() -> None:
-    """清理后台任务引用（评估 session 结束时调）。"""
+    """清理后台任务引用（评估 session 结束时调）。
+
+    取消尚未完成的后台评估任务（如总超时强制结束时），避免任务悬挂。
+    """
+    for task in _content_tasks.values():
+        if not task.done():
+            task.cancel()
     _content_tasks.clear()
 
 
@@ -75,7 +86,7 @@ def make_content_tools() -> list:
 
     @tool
     async def get_content_score() -> str:
-        """获取内容质量层评估分数（内容6维 + subagent4维）。
+        """获取内容质量层评估分数（内容8维 + subagent4维）。
 
         内容评估在后台异步跑（5 次 LLM-judge，较慢），本工具 await 它拿结果。
         如果还没跑完会等待。建议在流程诊断做完、写报告前调用。

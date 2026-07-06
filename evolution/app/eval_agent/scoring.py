@@ -1,7 +1,7 @@
 """双层评估打分（决策 D2/D3/D4，从原 evaluation_engine 并入 eval_agent）。
 
 编排（5 次 judge 调用，异源模型）：
-  - 内容维度 1 次：取 writing 正文 → 6 内容指标打分
+  - 内容维度 1 次：取 writing 正文 → 8 内容指标打分
   - subagent 维度 4 次：各取该 subagent 文件交付物 → 各能力维度打分
 
 每次调用：rubric prompt + 交付物文本 → 异源 LLM → 解析 JSON 分数。
@@ -89,7 +89,7 @@ def evaluate_trace(trace_id: str) -> dict[str, Any] | None:
 def _evaluate_content_layer(
     trace_id: str, deliveries: dict[str, dict[str, str]]
 ) -> dict[str, Any]:
-    """内容维度：取 writing 正文 → 6 内容指标打分。"""
+    """内容维度：取 writing 正文 → 8 内容指标打分。"""
     content_text = eval_extractor.get_content_layer_text(trace_id)
     if not content_text:
         logger.warning("内容维度评估跳过 %s：无 writing 交付物", trace_id)
