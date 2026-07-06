@@ -57,6 +57,15 @@ evolution/**/*.db.bak
 evolution/start.log
 evolution/.pytest_cache/
 
+# 监测前端构建产物（由容器内 npm run build 产生，或本地构建）
+evolution/frontend/out/
+evolution/frontend/.next/
+
+# evolution 运行时产物（traces/evolve_workspace 等，由服务运行时生成）
+# evalset/ 已跟踪的测试数据集不受影响（git 对已跟踪文件优先于 ignore）
+evolution/data/traces/
+evolution/data/evolve_workspace/
+
 # evolution adapt 运行时产物（bare repo + checkout 缓存，动态生成）
 evolution/harness.git/
 .harness_checkout/
