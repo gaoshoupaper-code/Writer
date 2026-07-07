@@ -269,7 +269,7 @@ phase3() {
     # 3.2 root 侧：生成密钥（强随机）
     log "生成密钥（若 .env 未配置）..."
     echo ""
-    warn "★ 接下来需要你填写 .env。密钥已自动生成，OPENAI_API_KEY 需手动填。"
+    warn "★ 接下来生成系统密钥。LLM API Key 不进服务器（用户各自在客户端填）。"
     echo ""
 
     GEN_MASTER_KEY=""
@@ -287,22 +287,27 @@ phase3() {
     fi
 
     # 3.3 配置 executor/.env
-    log "配置 executor/.env..."
+    # 架构说明：普通用户写作时用各自在客户端填的 key（DB 加密存储，MASTER_KEY 解密），
+    # 不依赖服务器全局 OPENAI_API_KEY。故此处置空，key 永不集中存服务器。
+    # 仅保留默认 base_url/model（用户未自定义 model 时的兜底，可后续按需改）。
+    log "配置 executor/.env（LLM key 置空——用户各自填）..."
     if ! $DRY_RUN; then
         su - "$DEPLOY_USER" -c "cp ${DEPLOY_DIR}/executor/.env.production.example ${DEPLOY_DIR}/executor/.env"
         # 注入生成的密钥
         sed -i "s|^MASTER_KEY=.*|MASTER_KEY=${GEN_MASTER_KEY}|" "${DEPLOY_DIR}/executor/.env"
         sed -i "s|^ADMIN_PASSWORD=.*|ADMIN_PASSWORD=${GEN_ADMIN_PWD}|" "${DEPLOY_DIR}/executor/.env"
-        # 预填已知值（来自旧版实测）
-        sed -i 's|^WRITER_MODEL=.*|WRITER_MODEL=glm-4.6|' "${DEPLOY_DIR}/executor/.env"
+        # 预填已知值
         sed -i 's|^WRITER_AGENT_MODE=.*|WRITER_AGENT_MODE=live|' "${DEPLOY_DIR}/executor/.env"
-        sed -i 's|^OPENAI_BASE_URL=.*|OPENAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4|' "${DEPLOY_DIR}/executor/.env"
+        # 默认模型/base_url（兜底，用户写作时若没填自己的 model 才用到）
+        sed -i 's|^WRITER_MODEL=.*|WRITER_MODEL=deepseek-chat|' "${DEPLOY_DIR}/executor/.env"
+        sed -i 's|^OPENAI_BASE_URL=.*|OPENAI_BASE_URL=https://api.deepseek.com|' "${DEPLOY_DIR}/executor/.env"
+        # OPENAI_API_KEY 显式置空（代码已改为可空，用户各自填）
+        sed -i 's|^OPENAI_API_KEY=.*|OPENAI_API_KEY=|' "${DEPLOY_DIR}/executor/.env"
         echo ""
-        warn "★ 手动步骤：请编辑 ${DEPLOY_DIR}/executor/.env，填入 OPENAI_API_KEY："
-        echo "    su - ${DEPLOY_USER} -c 'nano ${DEPLOY_DIR}/executor/.env'"
-        echo "    （找到 OPENAI_API_KEY= 这行，填入你的 GLM API Key）"
+        ok "executor/.env 已配置（OPENAI_API_KEY 留空）"
+        echo "  → 写作时每个用户在客户端/设置页填自己的 DeepSeek key"
+        echo "  → 服务器不存储任何 LLM 明文 key（MASTER_KEY 加密的用户 key 除外）"
         echo ""
-        confirm "OPENAI_API_KEY 已填入 executor/.env？"
     fi
 
     # 3.4 配置 evolution/.env

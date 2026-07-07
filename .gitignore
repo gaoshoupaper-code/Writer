@@ -12,6 +12,9 @@ venv/
 *.db-shm
 *.db-wal
 
+# git 历史清除脚本生成的备份（含被清的敏感数据，仅本地保留）
+backup-*.bundle
+
 # 环境变量（.env* 通配会误伤 .env.production.example，需显式放行模板）
 executor/.env
 executor/.env.local
