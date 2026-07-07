@@ -1,0 +1,9 @@
+# 强制 shell 脚本用 LF 行尾（跨平台一致，避免 Windows CRLF 导致 Linux 执行报错）
+*.sh text eol=lf
+
+# Dockerfile 类似处理
+Dockerfile* text eol=lf
+*.conf text eol=lf
+
+# 默认：文本文件由 git 自动处理
+* text=auto
