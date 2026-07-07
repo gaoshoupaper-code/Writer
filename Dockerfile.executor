@@ -12,6 +12,11 @@
 
 FROM python:3.11-slim AS base
 
+# 国内镜像加速：换阿里云 Debian 源（默认 deb.debian.org 国内极慢/超时）
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null \
+    || sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list 2>/dev/null \
+    || true
+
 # 系统依赖：git（harness pull）、curl（healthcheck）
 # ttf 字体供 reportlab 导出 PDF 用
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -22,6 +27,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # ── 第一层：先装依赖（利用 Docker 层缓存，源码改动不重装）──
+# pip 换阿里云源（国内服务器拉 PyPI 快 10 倍+）
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ \
+    && pip config set global.trusted-host mirrors.aliyun.com
+
 # 装 contracts 共享契约包（根 pyproject.toml 声明了 packages.find，pip install -e . 可用）
 COPY pyproject.toml ./
 COPY contracts/ ./contracts/

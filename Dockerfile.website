@@ -12,6 +12,9 @@
 # Astro 要求 Node >= 22.12（旧 node:20 构建会报 "not supported"）
 FROM node:22-alpine AS builder
 
+# npm 换淘宝镜像（国内服务器加速）
+RUN npm config set registry https://registry.npmmirror.com
+
 WORKDIR /app
 COPY website/package.json website/package-lock.json ./
 RUN npm ci
