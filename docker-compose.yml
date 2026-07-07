@@ -107,7 +107,8 @@ services:
       - "443:443"
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./certs:/etc/nginx/certs:ro
+      # 证书：直接挂 letsencrypt 真实目录（宿主 certs/ 里的软链接容器内 follow 不到）
+      - /etc/letsencrypt:/etc/letsencrypt:ro
       # certbot webroot 验证（若用 certbot 容器签发）
       - ./certbot:/var/www/certbot:ro
       # 桌面端更新分发：latest.json + .msi + .sig（publish.sh 上传到此目录）

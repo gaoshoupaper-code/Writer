@@ -384,7 +384,8 @@ def _build_synopsis(storylines: list[Storyline]) -> str:
     parts = []
     for sl in storylines:
         direction = sl.direction or "（暂无全局走向）"
-        parts.append(f"**{sl.id} {sl.name}（{sl.type or "未分类"}）**：{direction}")
+        type_label = sl.type or "未分类"
+        parts.append(f"**{sl.id} {sl.name}（{type_label}）**：{direction}")
     return "\n\n".join(parts) if parts else "（未解析到故事线）"
 
 
