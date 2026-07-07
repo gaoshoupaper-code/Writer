@@ -32,6 +32,9 @@ services:
       - TZ=Asia/Shanghai
     volumes:
       # 持久化：用户库 + workspace + checkpoints（用户数据，不可丢）
+      # ⚠️ 注意：整个 /app/executor 挂卷，源码也在里面。rebuild 后必须清空此卷，
+      #    否则 volume 里的旧源码会覆盖镜像里的新源码（部署脚本/升级流程已含清卷步骤）。
+      #    清卷命令：docker volume rm writer_executor_data（数据会丢，仅首次部署/重建时执行）
       - executor_data:/app/executor
       # 共享 harness 包（evolution 编辑 → executor 同进程 import）
       - harness_data:/app/evolution/harnesses
