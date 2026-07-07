@@ -5,9 +5,13 @@ __pycache__/
 .venv/
 venv/
 
-# 环境变量
+# 环境变量（.env* 通配会误伤 .env.production.example，需显式放行模板）
 executor/.env
-executor/.env*
+executor/.env.local
+executor/.env.*.local
+# 模板文件可入 git（无敏感值）
+!executor/.env.production.example
+!executor/.env.example
 
 # 运行时数据
 executor/workspace/
