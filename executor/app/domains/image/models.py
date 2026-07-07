@@ -50,6 +50,10 @@ def build_image_model(
     effective_key = api_key if api_key is not None else settings.openai_api_key
     effective_base = base_url if base_url is not None else settings.openai_base_url
 
+    # 多用户隔离 + 启动安全：全局 key 留空时传占位（见 writing/models.py 同款注释）
+    if not effective_key:
+        effective_key = "placeholder-key-set-per-user-at-runtime"
+
     # image 用标准 ChatOpenAI（不需要 DeepSeek thinking 适配——文生图无需推理链）
     return ChatOpenAI(
         model=model_name,

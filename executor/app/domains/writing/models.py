@@ -49,6 +49,13 @@ def build_writer_model(
     effective_key = api_key if api_key is not None else settings.openai_api_key
     effective_base = base_url if base_url is not None else settings.openai_base_url
 
+    # 多用户隔离 + 启动安全：全局 OPENAI_API_KEY 可能留空（key 不集中存服务器）。
+    # 但 langchain ChatOpenAI 构造时强制要求 key（pydantic validate_environment），
+    # 空 key 会导致容器启动崩溃。启动/兜底场景传占位 key 让构造通过，
+    # 真正写作时用户各自的 key 会重建 client（见 _build_model_with_key）。
+    if not effective_key:
+        effective_key = "placeholder-key-set-per-user-at-runtime"
+
     return model_class(
         model=model_name,
         api_key=effective_key,
