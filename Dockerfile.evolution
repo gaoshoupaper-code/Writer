@@ -40,6 +40,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
+# git 配置：harness 卷挂载触发 dubious ownership，预先放行 + 配 commit 身份
+RUN git config --global --add safe.directory /app/evolution/harnesses/current \
+    && git config --global --add safe.directory /app/evolution/harness.git \
+    && git config --global user.email deploy@siyen.site \
+    && git config --global user.name deploy \
+    && git config --global init.defaultBranch main
+
 WORKDIR /app
 
 # pip 换阿里云源
