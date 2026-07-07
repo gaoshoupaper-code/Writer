@@ -1,10 +1,15 @@
 # ─────────────────────────────────────────────────────────────
 # Writer 生产部署编排
-# 架构：nginx(公网) → executor(7788) + frontend(3456) | evolution(7789 仅 loopback)
+# 架构：nginx(公网) → executor(7788 /api) + website(80 官网&下载) | evolution(7789 仅 loopback)
 # ─────────────────────────────────────────────────────────────
 # 启动：docker compose up -d
 # 升级：git checkout <tag> && docker compose build && docker compose up -d
 # 回滚：git checkout <上个 tag> && docker compose build && docker compose up -d
+#
+# 桌面端改造（S7/S9/S12）：
+#   - 移除原 frontend 容器（Next.js，已废弃，UI 迁入 desktop/）
+#   - 新增 website 容器（Astro 静态官网 + 下载页）
+#   - nginx: /api/* → executor, /download/* → 静态发布目录, / → website
 # ─────────────────────────────────────────────────────────────
 
 services:
@@ -75,21 +80,15 @@ services:
       retries: 3
       start_period: 30s
 
-  # ── 写作用户前端（next start，Node 进程）──
-  frontend:
+  # ── 官网 + 下载页（Astro 静态站，nginx 托管）──
+  website:
     build:
       context: .
-      dockerfile: Dockerfile.frontend
-    container_name: writer-frontend
-    environment:
-      - NODE_ENV=production
-      - NEXT_PUBLIC_API_BASE_URL=
-      - TZ=Asia/Shanghai
+      dockerfile: Dockerfile.website
+    container_name: writer-website
     expose:
-      - "3456"
+      - "80"
     restart: always
-    depends_on:
-      - executor
 
   # ── 公网入口：nginx 反代 + HTTPS ──
   nginx:
@@ -103,9 +102,11 @@ services:
       - ./certs:/etc/nginx/certs:ro
       # certbot webroot 验证（若用 certbot 容器签发）
       - ./certbot:/var/www/certbot:ro
+      # 桌面端更新分发：latest.json + .msi + .sig（publish.sh 上传到此目录）
+      - ./releases:/var/www/releases:ro
     depends_on:
       - executor
-      - frontend
+      - website
     restart: always
 
 volumes:

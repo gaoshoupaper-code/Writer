@@ -10,8 +10,13 @@
 
 ## 一句话定位
 
-**Writer 是一个"AI 帮人写剧本"的系统。** 用户在网页里提需求，后端跑一条 AI 流水线，
-把需求一步步加工成完整的剧本。
+**Writer 是一个"AI 帮人写小说/剧本"的系统。** 用户在桌面端 App 里提需求，
+后端跑一条 AI 流水线，把需求一步步加工成完整的作品。
+
+> **桌面端改造说明**：用户入口已从浏览器 Web（原 `frontend/` Next.js）迁移为
+> Windows 桌面端 App（`desktop/` Tauri 2 + React）。原 `frontend/` 已废弃，
+> UI 代码迁入 `desktop/src/`。新增 `website/`（Astro 官网 + 下载页，由 executor 服务器托管）。
+> 桌面端是**纯远程客户端**——不携带后端代码，通过 Rust 中继连服务器 executor。
 
 ---
 
@@ -50,8 +55,14 @@
               └──────┐         ┌──────┘
             executor/         evolution/
 
-scripts/  = 工具脚本(分层检查器，守 executor+evolution+contracts 三端)
+scripts/  = 工具脚本(分层检查器 + 桌面端发布 publish.sh + 管理 CLI manage.py)
 docs/     = 你正在看的这套文档
+
+desktop/  = 桌面端 App（Tauri 2 + Vite + React）—— 用户操作入口
+           纯远程客户端：通过 Rust reqwest 中继连服务器 executor
+           UI 代码从原 frontend/ 迁入（含离线缓存、自动更新）
+website/  = 官网（Astro 静态站）—— 项目介绍 + 桌面端下载页
+           由 executor 服务器 nginx 顺带托管，内容用 Content Collections 管理
 ```
 
 **executor 和 evolution 的联动（进化闭环）**：

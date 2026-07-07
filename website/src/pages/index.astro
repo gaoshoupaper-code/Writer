@@ -1,0 +1,102 @@
+---
+import { getCollection } from "astro:content";
+
+/// 官网首页（D5/D6/D18）。
+/// 功能介绍内容来自 Content Collections（src/content/features/*.md），
+/// 改内容 = 改 md 文件 + 重新构建，无需 CMS 后台。
+
+const features = (await getCollection("features")).sort(
+  (a, b) => a.data.order - b.data.order
+);
+---
+
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="generator" content={Astro.generator} />
+    <meta name="description" content="Writer — AI 驱动的智能写作桌面端" />
+    <title>Writer — AI 智能写作</title>
+  </head>
+  <body>
+    <header class="hero">
+      <div class="container">
+        <h1>Writer</h1>
+        <p class="tagline">AI 驱动的智能写作桌面端</p>
+        <p class="subtitle">
+          多 Agent 协作创作，从大纲到章节全自动生成。下载桌面端，离线缓存，自动更新。
+        </p>
+        <a href="/download" class="btn-primary">下载桌面端</a>
+      </div>
+    </header>
+
+    <section class="features">
+      <div class="container">
+        <h2>核心特性</h2>
+        <div class="feature-grid">
+          {features.map((feature) => (
+            <article class="feature-card">
+              <h3>{feature.data.title}</h3>
+              <p class="feature-desc">{feature.data.description}</p>
+              <div class="feature-body" set:html={feature.body}></div>
+            </article>
+          ))}
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <div class="container">
+        <p>© 2026 Writer · <a href="/download">下载</a></p>
+      </div>
+    </footer>
+
+    <style>
+      :global(*) { margin: 0; padding: 0; box-sizing: border-box; }
+      :global(body) { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #1a1a1a; line-height: 1.6; }
+      .container { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+      .hero {
+        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+        color: #fff;
+        padding: 96px 0 80px;
+        text-align: center;
+      }
+      .hero h1 { font-size: 56px; font-weight: 800; letter-spacing: -1px; }
+      .tagline { font-size: 22px; opacity: 0.9; margin-top: 8px; }
+      .subtitle { font-size: 16px; opacity: 0.7; margin-top: 16px; max-width: 560px; margin-left: auto; margin-right: auto; }
+      .btn-primary {
+        display: inline-block;
+        margin-top: 32px;
+        padding: 14px 36px;
+        background: #fff;
+        color: #0f172a;
+        text-decoration: none;
+        font-weight: 600;
+        border-radius: 8px;
+        font-size: 16px;
+        transition: transform 0.15s;
+      }
+      .btn-primary:hover { transform: translateY(-2px); }
+
+      .features { padding: 80px 0; }
+      .features h2 { font-size: 36px; text-align: center; margin-bottom: 48px; }
+      .feature-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 32px; }
+      .feature-card {
+        padding: 32px;
+        background: #f8fafc;
+        border-radius: 12px;
+        border: 1px solid #e2e8f0;
+      }
+      .feature-card h3 { font-size: 20px; margin-bottom: 8px; }
+      .feature-desc { color: #64748b; font-size: 14px; margin-bottom: 16px; }
+      .feature-body :global(p) { font-size: 14px; color: #475569; }
+      .feature-body :global(ul) { padding-left: 20px; margin-top: 8px; }
+      .feature-body :global(li) { font-size: 14px; color: #475569; margin-top: 4px; }
+
+      footer { padding: 32px 0; border-top: 1px solid #e2e8f0; text-align: center; color: #64748b; font-size: 14px; }
+      footer a { color: #0f172a; }
+    </style>
+  </body>
+</html>
