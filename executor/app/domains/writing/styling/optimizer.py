@@ -53,7 +53,15 @@ VALID_STYLE_TYPES = set(STYLE_OPTIMIZER_PROMPTS.keys())
 
 class StyleOptimizer:
     def __init__(self, settings: Settings) -> None:
-        self.model = build_writer_model(settings)
+        # 懒加载：不在 import/启动时构造 LLM client（全局 key 可能留空，
+        # 多用户隔离下 key 在请求时按用户注入）。首次 optimize 才构造。
+        self._settings = settings
+        self._model = None
+
+    def _get_model(self):
+        if self._model is None:
+            self._model = build_writer_model(self._settings)
+        return self._model
 
     async def optimize(self, style_type: str, content: str) -> str:
         if style_type not in VALID_STYLE_TYPES:
@@ -64,5 +72,5 @@ class StyleOptimizer:
             SystemMessage(content=system_prompt),
             HumanMessage(content=f"请优化以下风格描述：\n\n{content}"),
         ]
-        response = await self.model.ainvoke(messages)
+        response = await self._get_model().ainvoke(messages)
         return response.content if hasattr(response, "content") else str(response)
