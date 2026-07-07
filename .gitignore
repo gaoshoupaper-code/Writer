@@ -9,6 +9,8 @@ venv/
 executor/.env
 executor/.env.local
 executor/.env.*.local
+executor/.env*备份
+executor/.env*联调*
 # 模板文件可入 git（无敏感值）
 !executor/.env.production.example
 !executor/.env.example
@@ -81,3 +83,10 @@ nul
 
 # Claude Code 本地权限配置（含个人路径，不入库）
 .claude/settings.local.json
+
+# 桌面端改造（S7/S8）：releases 只跟踪 .gitkeep，安装包/签名/latest.json 不上库
+releases/*
+!releases/.gitkeep
+
+# 桌面端 Tauri 运行时生成的 schema（构建产物）
+desktop/src-tauri/gen/

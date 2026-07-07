@@ -1,0 +1,94 @@
+---
+/// 下载页（D5/S7）。
+/// 安装包托管在 executor 服务器的 nginx /download/ 静态目录。
+/// 版本号硬编码（发版时改这里 + Content Collections），避免构建时 fetch 失败。
+
+const VERSION = "0.1.0";
+const DOWNLOAD_URL = `https://siyen.site/download/writer-${VERSION}-windows.msi`;
+---
+
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width" />
+    <title>下载 Writer</title>
+  </head>
+  <body>
+    <header class="page-header">
+      <div class="container">
+        <h1>下载 Writer</h1>
+        <p>当前版本 <span class="version">v{VERSION}</span></p>
+      </div>
+    </header>
+
+    <main class="container">
+      <section class="download-card">
+        <h2>Windows</h2>
+        <p class="platform-info">支持 Windows 10 / 11（64 位）</p>
+        <a href={DOWNLOAD_URL} class="btn-download">下载安装包（.msi）</a>
+        <p class="note">
+          下载后双击运行即可安装。需要 WebView2 运行时
+          （Windows 11 已内置，Windows 10 安装程序会自动引导下载）。
+        </p>
+      </section>
+
+      <section class="requirements">
+        <h2>系统要求</h2>
+        <ul>
+          <li>Windows 10 64 位 或 Windows 11</li>
+          <li>WebView2 运行时（Windows 11 内置）</li>
+          <li>需要联网（写作功能依赖云端 AI 服务）</li>
+        </ul>
+      </section>
+    </main>
+
+    <footer>
+      <div class="container">
+        <p><a href="/">← 返回首页</a></p>
+      </div>
+    </footer>
+
+    <style>
+      :global(*) { margin: 0; padding: 0; box-sizing: border-box; }
+      :global(body) { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #1a1a1a; line-height: 1.6; }
+      .container { max-width: 720px; margin: 0 auto; padding: 0 24px; }
+
+      .page-header { background: #0f172a; color: #fff; padding: 64px 0; text-align: center; }
+      .page-header h1 { font-size: 40px; font-weight: 800; }
+      .version { color: #94a3b8; font-weight: 600; }
+
+      .download-card {
+        margin: 48px 0;
+        padding: 40px;
+        background: #f8fafc;
+        border-radius: 12px;
+        border: 1px solid #e2e8f0;
+        text-align: center;
+      }
+      .download-card h2 { font-size: 24px; margin-bottom: 8px; }
+      .platform-info { color: #64748b; margin-bottom: 24px; }
+      .btn-download {
+        display: inline-block;
+        padding: 14px 36px;
+        background: #0f172a;
+        color: #fff;
+        text-decoration: none;
+        font-weight: 600;
+        border-radius: 8px;
+        font-size: 16px;
+        transition: transform 0.15s;
+      }
+      .btn-download:hover { transform: translateY(-2px); }
+      .note { font-size: 13px; color: #64748b; margin-top: 16px; }
+
+      .requirements { margin: 48px 0; }
+      .requirements h2 { font-size: 22px; margin-bottom: 16px; }
+      .requirements ul { padding-left: 20px; }
+      .requirements li { color: #475569; margin-top: 8px; }
+
+      footer { padding: 32px 0; border-top: 1px solid #e2e8f0; text-align: center; }
+      footer a { color: #0f172a; }
+    </style>
+  </body>
+</html>
