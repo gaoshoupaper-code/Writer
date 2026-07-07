@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # ════════════════════════════════════════════════════════════════════════════
-# Writer 生产部署主脚本（一键，5 Phase 幂等）
+# Writer 生产部署主脚本（一键，5 Phase 幂等）—— 入侵后安全重建版
 # ════════════════════════════════════════════════════════════════════════════
-# 适用场景：siyen.site（111.228.4.165, Ubuntu 24.04）从旧版单体架构切换到新版三服务 Docker 架构。
+# 适用场景：
+#   A) 重做系统后的干净服务器（推荐，Phase 1 清理步骤会幂等跳过）
+#   B) 从旧版单体架构切换到新版三服务 Docker 架构
 # 详见设计文档：.claude/md/20260707_003000_deploy_execution_design.md
 #
 # 用法（以 root 登录服务器后）：
@@ -11,9 +13,13 @@
 #   bash scripts/deploy-prod.sh --dry-run    # 只打印命令不执行
 #
 # 前置条件：
-#   1. 本地已 push main + 打 tag v0.1.0
-#   2. 以 root 登录服务器（端口 22，密钥）
-#   3. 旧版 Writer 正在跑（本脚本会停掉它）
+#   1. 本地已 push main + 打 tag v0.1.0（历史已清除 monitoring.db 等敏感残留）
+#   2. 以 root 登录服务器（重做系统后默认端口 22）
+#   3. DNS 已把 siyen.site 指向当前服务器 IP（重做系统后 IP 可能变，核对 SERVER_IP）
+#
+# 安全加固（本脚本自动执行，区别于旧版「保守加固」）：
+#   Phase 0  系统更新 + unattended-upgrades 自动安全补丁 + ufw 防火墙 + fail2ban
+#   Phase 4  SSH 改端口 22222 + 禁 root + 禁密码 + AllowUsers + 加固 fail2ban sshd jail
 # ════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -25,6 +31,8 @@ readonly CERTBOT_EMAIL="17699237427@163.com"
 readonly DEPLOY_USER="deploy"
 readonly REPO_URL="https://github.com/gaoshoupaper-code/Writer.git"
 readonly DEPLOY_DIR="/home/${DEPLOY_USER}/Writer"
+# SSH 安全：新端口（避开 22 端口默认爆破扫描），旧版 22 在 Phase 4 加固后关闭
+readonly SSH_NEW_PORT="${SSH_NEW_PORT:-22222}"
 
 # ── 运行模式 ──────────────────────────────────────────────────────────────────
 DRY_RUN=false
@@ -81,12 +89,31 @@ phase_header() {
 }
 
 # ════════════════════════════════════════════════════════════════════════════
-# Phase 0: 基线准备（装 Docker + 建 deploy 用户）
+# Phase 0: 基线准备（系统加固 + 装 Docker + 建 deploy 用户 + 防火墙）
 # ════════════════════════════════════════════════════════════════════════════
 phase0() {
-    phase_header 0 "基线准备（装 Docker + 建 deploy 用户）" || return 0
+    phase_header 0 "基线准备（系统加固 + Docker + deploy 用户 + 防火墙）" || return 0
 
-    # 0.1 装 Docker + Compose 插件（幂等）
+    # 0.1 系统更新（重做系统后首要：补齐所有已知 CVE）
+    log "系统更新（apt upgrade，修补已知漏洞）..."
+    run 'apt-get update -qq'
+    run 'apt-get upgrade -y'
+    run 'apt-get install -y ca-certificates curl gnupg ufw fail2ban unattended-upgrades'
+
+    # 0.2 启用自动安全补丁（每日自动安装安全更新，防再次因未打补丁被入侵）
+    log "启用 unattended-upgrades 自动安全补丁..."
+    if ! $DRY_RUN; then
+        dpkg-reconfigure -fnoninteractive unattended-upgrades >/dev/null 2>&1 || true
+        # 确保配置允许安全更新
+        cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+        ok "自动安全补丁已启用"
+    fi
+
+    # 0.3 装 Docker + Compose 插件（幂等）
     if ! command -v docker &>/dev/null; then
         log "安装 Docker..."
         run 'curl -fsSL https://get.docker.com | sh'
@@ -95,14 +122,14 @@ phase0() {
         ok "Docker 已安装: $(docker --version)"
     fi
 
-    # 0.2 验证
+    # 0.4 验证 Docker
     if ! $DRY_RUN; then
         docker --version || { err "Docker 安装失败"; exit 1; }
         docker compose version || { err "Compose 插件缺失"; exit 1; }
     fi
     ok "Docker 就绪"
 
-    # 0.3 建 deploy 用户（幂等）
+    # 0.5 建 deploy 用户（幂等）
     if ! id "$DEPLOY_USER" &>/dev/null; then
         log "创建 deploy 用户..."
         run "useradd -m -s /bin/bash $DEPLOY_USER"
@@ -111,7 +138,23 @@ phase0() {
     fi
     run "usermod -aG docker $DEPLOY_USER"
 
-    # 0.4 上传 deploy 公钥（需本地操作，这里只提示）
+    # 0.6 配置 UFW 防火墙（默认拒绝，只放行 SSH/HTTP/HTTPS）
+    log "配置 UFW 防火墙..."
+    if ! $DRY_RUN; then
+        # 默认策略
+        ufw --force reset >/dev/null 2>&1
+        ufw default deny incoming
+        ufw default allow outgoing
+        # 放行端口（注意：此时 SSH 还是 22 端口，先放行 22 防锁死，Phase 4 加固后再放行 22222 并删 22）
+        ufw allow 22/tcp comment 'SSH (temp, will switch to 22222 in Phase 4)'
+        ufw allow 80/tcp comment 'HTTP'
+        ufw allow 443/tcp comment 'HTTPS'
+        ufw --force enable
+        ufw status verbose
+        ok "UFW 已启用（放行 22/80/443）"
+    fi
+
+    # 0.7 上传 deploy 公钥（需本地操作，这里只提示）
     echo ""
     warn "★ 手动步骤：请在本机（新终端）执行，上传 deploy 公钥："
     echo "    # 本地先生成密钥（若没有）："
@@ -316,34 +359,108 @@ phase3() {
 }
 
 # ════════════════════════════════════════════════════════════════════════════
-# Phase 4: 上线后加固（SSH 禁 root + 证书续期 hook + 备份 cron）
+# Phase 4: 上线后加固（SSH 最强加固 + 防火墙切端口 + fail2ban + 证书续期 + 备份）
 # ════════════════════════════════════════════════════════════════════════════
 phase4() {
-    phase_header 4 "上线后加固（SSH 禁 root + 证书续期 + 备份 cron）" || return 0
+    phase_header 4 "上线后加固（SSH 最强 + ufw 切端口 + fail2ban + 续期 + 备份）" || return 0
 
-    # 4.1 SSH 加固（保守方案：仅禁 root 登录）
+    # 4.1 SSH 最强加固（高危！必须先开第二终端验证密钥）
     echo ""
-    warn "★ SSH 加固高危操作：即将禁止 root 登录。"
-    echo "  请先在本机开第二终端，确认 deploy 密钥能登录："
-    echo "    ssh -i ~/.ssh/writer_deploy deploy@${SERVER_IP}"
+    warn "★ SSH 加固高危操作：即将改端口 ${SSH_NEW_PORT} + 禁 root + 禁密码登录。"
+    echo "  一旦生效，旧 22 端口、密码、root 全部失效。"
+    echo "  必须先在本机开第二终端，用 deploy 密钥验证能登录："
+    echo "    ssh -i ~/.ssh/writer_deploy deploy@${SERVER_IP}   # 旧 22 端口先验证一次"
     echo ""
-    confirm "已验证 deploy 密钥能登录？（没验证就别继续！）"
+    echo "  验证通过后再继续。验证不通过 = 密钥没配好，继续会锁死！"
+    echo ""
+    confirm "已用 deploy 密钥通过 22 端口验证登录成功？（没验证就别继续！）"
 
-    log "配置 SSH（仅禁 root 登录，端口/密码不动）..."
+    log "备份并改写 sshd_config..."
     if ! $DRY_RUN; then
         cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)
-        # 注释掉旧值，追加新值（幂等：先检查是否已改）
-        if ! grep -q "^PermitRootLogin no" /etc/ssh/sshd_config; then
-            sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
-            grep -q "^PermitRootLogin no" /etc/ssh/sshd_config \
-                || echo "PermitRootLogin no" >> /etc/ssh/sshd_config
-        fi
-        ok "sshd_config 已修改（备份: sshd_config.bak.*）"
-    fi
-    run 'sshd -t && systemctl restart sshd'
-    warn "sshd 已重启。当前 root 终端可能仍是活的，但新 root 连接将被拒绝。"
 
-    # 4.2 证书续期 hook（certbot renew → restart writer-nginx）
+        # 用 drop-in 配置（Ubuntu 24.04 推荐），不动主配置，幂等且干净
+        mkdir -p /etc/ssh/sshd_config.d
+        cat > /etc/ssh/sshd_config.d/99-writer-hardening.conf <<EOF
+# Writer 安全加固（drop-in，覆盖主配置）
+Port ${SSH_NEW_PORT}
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+AllowUsers ${DEPLOY_USER}
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+X11Forwarding no
+AllowTcpForwarding no
+AllowAgentForwarding no
+EOF
+        # 确保主配置加载 drop-in（Ubuntu 默认已加载，保险起见）
+        grep -q "Include /etc/ssh/sshd_config.d/\*.conf" /etc/ssh/sshd_config \
+            || echo "Include /etc/ssh/sshd_config.d/*.conf" >> /etc/ssh/sshd_config
+
+        # 语法校验（失败就回滚，绝不让无效配置生效）
+        if ! sshd -t 2>/dev/null; then
+            err "sshd 配置语法校验失败！已回滚，不会重启 sshd"
+            rm -f /etc/ssh/sshd_config.d/99-writer-hardening.conf
+            exit 1
+        fi
+        ok "sshd drop-in 已写入（备份: sshd_config.bak.*）"
+    fi
+
+    # 4.2 先放行新端口，再重启 sshd，最后删旧端口（严格顺序防锁死）
+    log "UFW 放行新 SSH 端口 ${SSH_NEW_PORT}..."
+    if ! $DRY_RUN; then
+        ufw allow ${SSH_NEW_PORT}/tcp comment 'SSH hardened'
+        # 不立刻删 22，等 4.3 双终端验证通过后再删
+    fi
+
+    log "重启 sshd 生效（新端口 ${SSH_NEW_PORT}，旧 22 暂时仍开）..."
+    run 'systemctl restart sshd'
+
+    # 4.3 双终端验证（关键防锁死步骤）
+    echo ""
+    warn "★ sshd 已重启。现在用新端口验证 deploy 密钥登录："
+    echo "    ssh -i ~/.ssh/writer_deploy -p ${SSH_NEW_PORT} deploy@${SERVER_IP}"
+    echo ""
+    echo "  验证通过后，本脚本会关闭旧 22 端口。"
+    echo "  若验证失败：当前 root 终端仍可用，可回滚 →"
+    echo "    rm /etc/ssh/sshd_config.d/99-writer-hardening.conf && systemctl restart sshd"
+    echo ""
+    confirm "已用新端口 ${SSH_NEW_PORT} + deploy 密钥登录成功？"
+
+    log "关闭旧 22 端口..."
+    if ! $DRY_RUN; then
+        ufw delete allow 22/tcp 2>/dev/null || true
+        ufw status numbered
+        ok "旧 22 端口已关闭，仅 ${SSH_NEW_PORT} 可达"
+    fi
+
+    # 4.4 fail2ban 加固 sshd jail（防爆破，即便改了端口仍会扫到）
+    log "配置 fail2ban sshd jail..."
+    if ! $DRY_RUN; then
+        cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+[sshd]
+enabled = true
+port = ${SSH_NEW_PORT}
+filter = sshd
+backend = systemd
+maxretry = 4
+findtime = 10m
+bantime = 1h
+bantime.increment = true
+bantime.maxtime = 1w
+EOF
+        systemctl enable --now fail2ban
+        systemctl restart fail2ban
+        fail2ban-client status sshd 2>/dev/null || warn "fail2ban 状态查询失败（不影响部署）"
+        ok "fail2ban sshd jail 已启用"
+    fi
+
+    # 4.5 证书续期 hook（certbot renew → restart writer-nginx）
     log "配置证书续期 hook..."
     if ! $DRY_RUN; then
         mkdir -p /etc/letsencrypt/renewal-hooks/deploy
@@ -356,14 +473,14 @@ EOF
         ok "续期 hook 已配置"
     fi
 
-    # 4.3 系统级 certbot renew cron（Ubuntu 24.04 certbot 用 systemd timer，但确保有）
+    # 4.6 系统级 certbot renew cron（Ubuntu 24.04 certbot 用 systemd timer，但确保有）
     if ! $DRY_RUN; then
         if ! systemctl list-timers 2>/dev/null | grep -q certbot; then
             echo "0 3 * * * certbot renew --quiet" | crontab - 2>/dev/null || true
         fi
     fi
 
-    # 4.4 备份 cron（deploy 用户）
+    # 4.7 备份 cron（deploy 用户）
     log "配置备份 cron（deploy 用户，每天 3 点）..."
     if ! $DRY_RUN; then
         chmod +x "${DEPLOY_DIR}/scripts/backup-prod.sh"
@@ -403,9 +520,11 @@ main() {
     echo "下一步验证："
     echo "  1. 浏览器访问 https://${DOMAIN}"
     echo "  2. curl -sI https://${DOMAIN}"
-    echo "  3. SSH 隧道访问 evolution 面板："
-    echo "     ssh -L 7789:127.0.0.1:7789 -i ~/.ssh/writer_deploy deploy@${SERVER_IP}"
+    echo "  3. SSH 隧道访问 evolution 面板（注意新端口 ${SSH_NEW_PORT}）："
+    echo "     ssh -L 7789:127.0.0.1:7789 -p ${SSH_NEW_PORT} -i ~/.ssh/writer_deploy deploy@${SERVER_IP}"
     echo "     然后本地浏览器访问 http://localhost:7789"
+    echo "  4. 验证旧 22 端口已封：ssh -p 22 deploy@${SERVER_IP}（应超时/拒绝）"
+    echo "  5. 验证防火墙：ufw status"
 }
 
 main "$@"

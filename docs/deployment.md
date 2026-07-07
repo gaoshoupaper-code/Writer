@@ -73,27 +73,71 @@ usermod -aG docker deploy
 su - deploy
 ```
 
-### 1.3 SSH 加固（🔴 必做）
+### 1.3 SSH 加固（🔴 必做，防再次被入侵的核心）
+
+> **重要**：`deploy-prod.sh` 的 Phase 0 + Phase 4 会自动执行本节全部操作，无需手动。
+> 此处仅作说明，便于排查和单独执行。
+
+新版采用**最强加固**（2026-07 入侵后重建）：
 
 ```bash
-# 编辑 /etc/ssh/sshd_config，至少改这几项：
-#   PermitRootLogin no              # 禁 root 直登
-#   Port 22222                      # 改非默认端口（防爆破扫描）
-#   PasswordAuthentication no       # 仅密钥登录（先确保密钥已配好！）
+# 用 drop-in 配置（Ubuntu 24.04 推荐），不动主配置
+mkdir -p /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/99-writer-hardening.conf <<'EOF'
+Port 22222                       # 改非默认端口（防 22 端口爆破扫描）
+PermitRootLogin no               # 禁 root 直登
+PasswordAuthentication no        # 仅密钥登录（先确保密钥已配好！）
+PubkeyAuthentication yes
+AllowUsers deploy                # 白名单：只有 deploy 能登录
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+X11Forwarding no
+AllowTcpForwarding no
+AllowAgentForwarding no
+EOF
+sshd -t && systemctl restart sshd
+```
 
-# 先在本地生成密钥并上传（本地执行）：
-ssh-keygen -t ed25519 -f ~/.ssh/writer_deploy
-ssh-copy-id -i ~/.ssh/writer_deploy.pub -p 22 deploy@111.228.4.165
+UFW 防火墙（默认拒绝，只放行新 SSH/HTTP/HTTPS）：
+```bash
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22222/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw --force enable
+```
 
-# 确认密钥能登录后，再重启 sshd 生效：
-systemctl restart sshd
-
-# 装 fail2ban（防爆破）
-apt install -y fail2ban
+fail2ban（即便改了端口仍会扫到，配合防爆破）：
+```bash
+cat > /etc/fail2ban/jail.d/sshd.local <<'EOF'
+[sshd]
+enabled = true
+port = 22222
+backend = systemd
+maxretry = 4
+findtime = 10m
+bantime = 1h
+bantime.increment = true
+bantime.maxtime = 1w
+EOF
 systemctl enable --now fail2ban
 ```
 
-> ⚠️ 改 SSH 端口/禁密码前，**先开第二个终端确认密钥能登录**，否则会把自己锁在外面。
+本地密钥生成与上传（**先做这步，再改 sshd**）：
+```bash
+# 本地执行
+ssh-keygen -t ed25519 -f ~/.ssh/writer_deploy -N ''
+# 重做系统后 IP 可能变，先核对 DNS/控制台 IP
+ssh-copy-id -i ~/.ssh/writer_deploy.pub -p 22 deploy@111.228.4.165
+```
+
+> ⚠️ 改 SSH 端口/禁密码前，**必须先开第二个终端用 deploy 密钥 + 新端口验证能登录**，
+> 否则会把自己锁在外面。`deploy-prod.sh` Phase 4 内置双终端验证 + 自动回滚保护。
 
 ### 1.4 拉代码
 
@@ -330,12 +374,18 @@ docker compose exec evolution bash
 |---|---|---|---|
 | 1 | evolution 不暴露公网 | ✅ 本方案 | `ports` 仅绑 `127.0.0.1`，公网/局域网不可达 |
 | 2 | evolution 内网 API Key | ✅ 本方案 | `internal_auth.py` 中间件 |
-| 3 | HTTPS | ✅ 本方案 | Let's Encrypt + 强制跳转 |
+| 3 | HTTPS | ✅ 本方案 | Let's Encrypt + 强制跳转 + HSTS |
 | 4 | 进程守护 | ✅ 本方案 | `restart: always` |
-| 5 | SSH 加固 | ⚠️ 你执行 | 禁 root / 改端口 / 密钥 / fail2ban |
-| 6 | 数据备份 | ⚠️ 你执行 | 见第六节 cron |
-| 7 | MASTER_KEY 强度 | ⚠️ 你执行 | 用 token_hex(32) 生成 |
-| 8 | ADMIN_PASSWORD 强度 | ⚠️ 你执行 | 用 token_urlsafe(16) 生成 |
+| 5 | 容器权限收敛 | ✅ 本方案 | 所有容器 `no-new-privileges`；nginx `read_only`+tmpfs |
+| 6 | nginx 加固 | ✅ 本方案 | `server_tokens off` + 强 TLS cipher + OCSP 装订 |
+| 7 | 防火墙 UFW | ✅ 本方案 | 默认拒绝，仅放行 22222/80/443（Phase 0+4） |
+| 8 | fail2ban | ✅ 本方案 | sshd jail，递增封禁（Phase 0 装，Phase 4 配 jail） |
+| 9 | 自动安全补丁 | ✅ 本方案 | unattended-upgrades 每日（Phase 0） |
+| 10 | SSH 加固 | ✅ 本方案 | 禁 root + 改端口 22222 + 禁密码 + AllowUsers（Phase 4） |
+| 11 | 数据备份 | ⚠️ 你执行 | 见第六节 cron |
+| 12 | MASTER_KEY 强度 | ✅ 本方案 | 部署脚本用 token_hex(32) 生成 |
+| 13 | ADMIN_PASSWORD 强度 | ✅ 本方案 | 部署脚本用 token_urlsafe(16) 生成 |
+| 14 | git 历史无敏感数据 | ⚠️ 你执行 | 见第十节「入侵后安全重建」用 purge-history.sh 清除 |
 
 ---
 
@@ -427,19 +477,26 @@ executor 无法 pull 到 harness 包 → 写作功能不可用。
 > （挂卷管理），而 `git_ops.init_work_repo()` 虽然存在但**代码里没有调用点**，
 > 所以首次必须外部触发。
 
-### 9.5 SSH 加固（保守方案）
+### 9.5 SSH 加固（最强方案，Phase 4 自动执行）
 
-本次采用**保守加固**（旧版已有 fail2ban + 密码已禁）：
+新版（2026-07 入侵后重建）采用**最强加固**，与文档 1.3 节一致：
+
+- 改端口 22222（避开 22 默认爆破）
+- 禁 root 直登
+- 禁密码登录（仅密钥）
+- `AllowUsers deploy` 白名单
+- UFW 防火墙（默认拒绝 + 只放行 22222/80/443）
+- fail2ban sshd jail（递增封禁）
 
 ```bash
-# 只改一项：PermitRootLogin no（端口 22 不动，避免锁死风险）
-# ★ 改之前必须确认 deploy 密钥能登录！
-cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)
-sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
-sshd -t && systemctl restart sshd
+# deploy-prod.sh Phase 4 自动执行，含双终端验证防锁死：
+#   1. 先放行新端口 22222（旧 22 仍开）
+#   2. 重启 sshd
+#   3. ★ 提示你开第二终端验证 deploy@新端口 能登录
+#   4. 验证通过后才删旧 22 端口
 ```
 
-> 若不慎锁死：京东云控制台 VNC 进系统 → 改回 `PermitRootLogin yes` → restart sshd。
+> 若不慎锁死：京东云控制台 VNC 进系统 → 删 `/etc/ssh/sshd_config.d/99-writer-hardening.conf` → `systemctl restart sshd`。
 
 ### 9.6 证书续期
 
@@ -464,3 +521,88 @@ certbot renew --dry-run
 | 4 | evolution 隔离 | `curl 111.228.4.165:7789` | 拒绝连接 |
 | 5 | evolution 隧道 | SSH 隧道后 `curl localhost:7789/health` | ok |
 | 6 | harness 已激活 | `docker exec writer-evolution git -C /app/evolution/harness.git log` | 有 commit |
+| 7 | 旧 22 端口已封 | `ssh -p 22 deploy@siyen.site` | 超时/拒绝 |
+| 8 | 新 SSH 端口通 | `ssh -p 22222 -i ~/.ssh/writer_deploy deploy@siyen.site` | 登录成功 |
+| 9 | 防火墙生效 | `ufw status` | 22222/80/443 only |
+| 10 | fail2ban 运行 | `fail2ban-client status sshd` | jail active |
+
+---
+
+## 十、入侵后安全重建（2026-07，本次场景专用）
+
+> 本节针对：云主机被挖矿木马入侵 → 重做系统 → 安全重新部署。
+> 核心原则：**假设旧密钥/旧数据全部已泄漏，全部轮换，绝不复用**。
+
+### 10.1 入侵根因分析
+
+旧版 `deploy-prod.sh` 的 SSH 加固是「保守方案」——**只禁了 root 登录，端口仍是 22、密码登录未禁、无 fail2ban**。这是被挖矿木马爆破入侵的典型入口。新版已改为最强加固（见 1.3 / 9.5）。
+
+### 10.2 重建顺序（必须严格按序）
+
+```
+①  本地清理凭据    ②  git 历史清除    ③  DNS 指向新机    ④  跑 deploy-prod.sh
+        │                │                 │                    │
+   吊销 DeepSeek key   purge-history.sh   DNS 后台改 A 记录   root@新机 执行
+   开发机 .env 清空    force push         指向新 IP           含 Phase 0-4 全加固
+```
+
+### 10.3 凭据轮换清单（本地，部署前做）
+
+| 凭据 | 操作 | 原因 |
+|---|---|---|
+| DeepSeek API Key (`sk-2c884ebb...`) | 去 DeepSeek 控制台**删除旧 key + 生成新 key** | 开发机本地 .env 明文存过，且同时用于 executor 主模型 + evolution judge |
+| 智谱/千问/GPT/MiniMax key | 暂不动（当前未启用，注释保留） | 按需轮换，当前无生产用途 |
+| MASTER_KEY | 部署脚本 Phase 3 用 `token_hex(32)` 重新生成 | 用户数据因重做系统已无，新密钥加密新库 |
+| ADMIN_PASSWORD | 部署脚本 Phase 3 用 `token_urlsafe(16)` 重新生成 | — |
+| INTERNAL_API_KEY | 部署脚本 Phase 3 用 `token_urlsafe(32)` 重新生成 | — |
+| GitHub PAT（若有） | 若开发机被木马接触过，GitHub Settings → 吊销重发 | 防 push 恶意代码 |
+| SSH 密钥 | 全新生成 `~/.ssh/writer_deploy`，**不复用旧密钥** | 旧密钥可能已泄漏 |
+
+### 10.4 git 历史清除（公开仓库必做）
+
+`monitoring.db` 曾在 commit `3018ff4` 误入 git，因仓库公开，已暴露在公网历史。
+
+```bash
+# 1. 装 filter-repo
+pip install git-filter-repo
+
+# 2. 预览会清什么
+bash scripts/purge-history.sh --dry-run
+
+# 3. 真正执行（含备份 + force push）
+bash scripts/purge-history.sh
+
+# 4. 所有机器重新 clone（旧 clone 含泄漏数据）
+# 5. GitHub 网页确认 monitoring.db 在历史中已消失
+```
+
+> `monitoring.db` 是历史监测数据（非密钥），清除后无需吊销任何凭据，
+> 但因仓库公开，清除历史能让它不再出现在公网。
+
+### 10.5 重做系统后的首次部署
+
+```bash
+# 0. 确认 DNS 已把 siyen.site 指向新机 IP（若 IP 变了，改 deploy-prod.sh 的 SERVER_IP）
+
+# 1. 用重做系统后的 root + 密码登录新机（京东云控制台 VNC 或临时 SSH）
+ssh root@<新机IP>
+
+# 2. 跑部署脚本（Phase 1 清理步骤会幂等跳过——重做系统后没旧服务可清）
+bash scripts/deploy-prod.sh --dry-run   # 先预览
+bash scripts/deploy-prod.sh             # 正式执行
+
+# 3. Phase 3 会提示你填 OPENAI_API_KEY（新 DeepSeek key），填服务器本地 .env
+# 4. Phase 4 双终端验证 deploy 密钥 + 新端口 22222
+# 5. 验证清单（见 9.7）
+```
+
+### 10.6 持续安全（部署后）
+
+| 项 | 方式 |
+|---|---|
+| 自动补丁 | Phase 0 装的 unattended-upgrades 每日自动安全更新 |
+| 爆破防护 | Phase 4 装的 fail2ban sshd jail |
+| 防火墙 | Phase 0+4 装的 UFW，默认拒绝 |
+| 数据备份 | Phase 4 配的 deploy cron，每天 3 点 |
+| 监控入侵迹象 | 定期看 `journalctl -u fail2ban`、`docker compose logs`、`ufw status`、`last` |
+| 凭据最小化 | 服务器只放当前在用的 1 个 LLM key，其余全空 |

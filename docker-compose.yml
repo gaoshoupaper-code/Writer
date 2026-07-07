@@ -40,6 +40,9 @@ services:
     expose:
       - "7788"
     restart: always
+    # 安全加固：禁止容器内进程通过 setuid 等提权
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7788/health"]
       interval: 30s
@@ -73,6 +76,9 @@ services:
       #  绑 127.0.0.1:7789 后，隧道转发目标填 127.0.0.1:7789 即可。）
       - "127.0.0.1:7789:7789"
     restart: always
+    # 安全加固
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7789/health"]
       interval: 30s
@@ -89,6 +95,8 @@ services:
     expose:
       - "80"
     restart: always
+    security_opt:
+      - no-new-privileges:true
 
   # ── 公网入口：nginx 反代 + HTTPS ──
   nginx:
@@ -108,6 +116,15 @@ services:
       - executor
       - website
     restart: always
+    # 安全加固：nginx 是唯一公网入口，最严格限制
+    security_opt:
+      - no-new-privileges:true
+    # 只读根文件系统 + 临时写目录（nginx 需要 /var/cache /var/run /tmp）
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
 
 volumes:
   executor_data:    # executor/.env 的 db_path / workspace_root / checkpoints 都在此卷内

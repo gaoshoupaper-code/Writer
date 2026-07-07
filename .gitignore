@@ -5,6 +5,13 @@ __pycache__/
 .venv/
 venv/
 
+# 运行时数据库（任何位置的 *.db 都不入库——曾误提交 monitoring.db 导致历史泄漏）
+*.db
+*.db-*
+*.db.bak.*
+*.db-shm
+*.db-wal
+
 # 环境变量（.env* 通配会误伤 .env.production.example，需显式放行模板）
 executor/.env
 executor/.env.local
