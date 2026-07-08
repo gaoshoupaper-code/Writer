@@ -14,5 +14,9 @@
   "dependencies": {
     "astro": "^7.0.6",
     "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@fontsource/noto-serif-sc": "^5.2.9",
+    "cn-font-split": "^7.4.3"
   }
 }

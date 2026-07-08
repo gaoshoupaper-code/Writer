@@ -53,6 +53,8 @@ const steps = [
     hint: "随下载量积累，该警告会逐步消失。购买正式代码签名证书后可彻底消除。",
   },
 ];
+
+/// 排版体系（token + body 基底）放 public/styles/base.css，两页 <link> 引入。
 ---
 
 <html lang="zh-CN">
@@ -65,12 +67,12 @@ const steps = [
     <meta name="viewport" content="width=device-width" />
     <meta name="description" content="下载思衍桌面端 — Windows 10 / 11，自动更新，离线缓存。" />
     <title>下载思衍 — Windows</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      rel="stylesheet"
-      href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;900&display=swap"
-    />
+    {/* 共享基底：颜色 token + 排版 scale + body reset */}
+    <link rel="stylesheet" href="/styles/base.css" />
+    {/* 本地子集字体：cn-font-split 切成 68 个 unicode-range 分片，
+        浏览器按页用字按需拉取（首屏 <100KB），取代外网 Google Fonts。 */}
+    <link rel="stylesheet" href="/fonts/noto-serif-sc/regular/index.css" />
+    <link rel="stylesheet" href="/fonts/noto-serif-sc/semibold/index.css" />
   </head>
   <body>
     <header class="topbar">
@@ -206,31 +208,14 @@ const steps = [
     </footer>
 
     <style>
-      /* ---------- 全局基底（与首页一致）---------- */
-      :global(*) { margin: 0; padding: 0; box-sizing: border-box; }
-      :global(html) { scroll-behavior: smooth; }
-      :global(body) {
-        font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
-        color: var(--ink);
-        background: var(--paper);
-        line-height: 1.65;
-        -webkit-font-smoothing: antialiased;
-        text-rendering: optimizeLegibility;
-      }
-      :global(::selection) { background: var(--vermilion); color: var(--paper); }
+      /* ---------- 全局基底 & token：见 src/styles/base.css ---------- */
 
+      /* 本页独有 token：安全提示色板 + 更窄容器（下载页内容少于首页）。
+         颜色 / 字体 / 排版 scale 都在 base.css，这里只补差异。 */
       :root {
-        --paper:   #f6f3ec;
-        --paper-2: #efeae0;
-        --ink:     #1a1612;
-        --ink-2:   #4a4239;
-        --ink-3:   #8b8174;
-        --rule:    #d8d0c1;
-        --vermilion: #9a2f2f;
         --warn-bg: #fbf3e0;
         --warn-bd: #e6d4a8;
         --warn-ink: #6b4f12;
-        --serif: "Noto Serif SC", "Songti SC", "STSong", "Source Han Serif SC", "SimSun", serif;
         --maxw: 1080px;
       }
 
@@ -244,17 +229,18 @@ const steps = [
       }
       .brand { display: inline-flex; align-items: center; gap: 9px; text-decoration: none; color: var(--ink); }
       .brand__mark { width: 26px; height: 26px; }
-      .brand__name { font-family: var(--serif); font-weight: 900; font-size: 21px; letter-spacing: 0.01em; }
+      .brand__name { font-family: var(--font-serif); font-weight: var(--fw-semibold); font-size: var(--fs-brand); letter-spacing: var(--tracking-cn); }
       .topbar__nav { display: flex; align-items: center; gap: 28px; }
       .topbar__nav a {
-        text-decoration: none; color: var(--ink-2); font-size: 15px;
+        text-decoration: none; color: var(--ink-2);
+        font-family: var(--font-sans); font-size: var(--fs-body);
         transition: color .2s;
       }
       .topbar__nav a:hover { color: var(--ink); }
-      .topbar__cta { color: var(--ink) !important; font-weight: 600; }
+      .topbar__cta { color: var(--ink) !important; font-weight: var(--fw-semibold); }
       /* 当前页：朱砂短下划线标识 */
       .topbar__nav a.is-active {
-        position: relative; color: var(--ink); font-weight: 600;
+        position: relative; color: var(--ink); font-weight: var(--fw-semibold);
       }
       .topbar__nav a.is-active::after {
         content: ""; position: absolute; left: 0; right: 0; bottom: -6px;
@@ -271,19 +257,20 @@ const steps = [
       }
       .kicker {
         display: inline-flex; align-items: center; gap: 9px;
-        font-size: 13px; color: var(--ink-3); letter-spacing: 0.04em;
+        font-family: var(--font-sans); font-size: var(--fs-kicker);
+        color: var(--ink-3); letter-spacing: var(--tracking-cn-body);
         margin-bottom: 26px;
       }
       .kicker__dot { width: 6px; height: 6px; background: var(--vermilion); border-radius: 50%; }
       .hero__title {
-        font-family: var(--serif); font-weight: 900;
-        font-size: clamp(40px, 6vw, 72px);
-        line-height: 1.06; letter-spacing: -0.01em; color: var(--ink);
+        font-family: var(--font-serif); font-weight: var(--fw-semibold);
+        font-size: var(--fs-display);
+        line-height: var(--lh-tight); letter-spacing: var(--tracking-cn-tight); color: var(--ink);
       }
       .hero__title em { font-style: italic; color: var(--vermilion); }
       .hero__sub {
         margin-top: 28px; max-width: 30em;
-        font-size: 17px; color: var(--ink-2); line-height: 1.7;
+        font-size: var(--fs-body-lg); color: var(--ink-2); line-height: var(--lh-body);
       }
 
       /* HERO 右栏：事实表 */
@@ -296,11 +283,12 @@ const steps = [
       }
       .facts__row:last-child { border-bottom: none; }
       .facts dt {
-        font-size: 12px; color: var(--ink-3); letter-spacing: 0.1em;
+        font-family: var(--font-sans); font-size: var(--fs-meta);
+        color: var(--ink-3); letter-spacing: var(--tracking-label);
         text-transform: uppercase; padding-top: 3px;
       }
-      .facts dd { font-size: 15px; color: var(--ink); font-variant-numeric: tabular-nums; }
-      .facts__hint { display: block; font-size: 12px; color: var(--ink-3); margin-top: 2px; }
+      .facts dd { font-family: var(--font-serif); font-size: var(--fs-body); line-height: var(--lh-body); letter-spacing: var(--tracking-cn-body); color: var(--ink); font-variant-numeric: tabular-nums; }
+      .facts__hint { display: block; font-family: var(--font-sans); font-size: var(--fs-meta); color: var(--ink-3); margin-top: 2px; }
 
       /* ---------- 下载卡片 ---------- */
       .downloads { padding: 88px 0 72px; border-bottom: 1px solid var(--rule); }
@@ -309,15 +297,17 @@ const steps = [
         align-items: start; margin-bottom: 48px; max-width: 720px;
       }
       .section-num {
-        font-family: var(--serif); font-size: 15px; font-weight: 600;
+        font-family: var(--font-serif); font-size: var(--fs-body);
+        font-weight: var(--fw-semibold);
         color: var(--vermilion); padding-top: 10px;
       }
       .section-title {
-        font-family: var(--serif); font-weight: 900;
-        font-size: clamp(28px, 3.8vw, 44px); line-height: 1.08; color: var(--ink);
+        font-family: var(--font-serif); font-weight: var(--fw-semibold);
+        font-size: var(--fs-h3); line-height: var(--lh-tight);
+        letter-spacing: var(--tracking-cn); color: var(--ink);
       }
       .section-title em { font-style: italic; color: var(--vermilion); }
-      .section-lead { margin-top: 14px; font-size: 16px; color: var(--ink-2); max-width: 34em; }
+      .section-lead { margin-top: 14px; font-size: var(--fs-body); line-height: var(--lh-body); letter-spacing: var(--tracking-cn-body); color: var(--ink-2); max-width: 34em; }
       .section-lead strong { color: var(--ink); }
 
       .dl-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
@@ -341,24 +331,29 @@ const steps = [
       .dl-card__icon :global(svg) { width: 100%; height: 100%; }
       .dl-card__main { display: flex; flex-direction: column; min-width: 0; }
       .dl-card__label {
-        font-family: var(--serif); font-weight: 600; font-size: 18px; color: var(--ink);
+        font-family: var(--font-serif); font-weight: var(--fw-semibold);
+        font-size: var(--fs-body-lg); line-height: var(--lh-tight);
+        letter-spacing: var(--tracking-cn); color: var(--ink);
       }
-      .dl-card__label em { font-style: normal; color: var(--ink-3); font-size: 14px; font-weight: 400; margin-left: 4px; }
-      .dl-card__note { font-size: 13px; color: var(--ink-3); margin-top: 3px; }
+      .dl-card__label em { font-style: normal; color: var(--ink-3); font-family: var(--font-sans); font-size: var(--fs-small); font-weight: var(--fw-regular); margin-left: 4px; }
+      .dl-card__note { font-family: var(--font-sans); font-size: var(--fs-small); line-height: var(--lh-body); color: var(--ink-3); margin-top: 3px; }
       .dl-card__meta { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
       .dl-card__size {
-        font-size: 13px; color: var(--ink-2); font-variant-numeric: tabular-nums;
+        font-family: var(--font-mono); font-size: var(--fs-small); color: var(--ink-2); font-variant-numeric: tabular-nums;
         background: var(--paper-2); padding: 3px 8px; border-radius: 3px;
       }
       .dl-card__cta {
-        font-size: 14px; font-weight: 600; color: var(--ink);
+        font-family: var(--font-sans); font-size: var(--fs-small);
+        font-weight: var(--fw-semibold); color: var(--ink);
         transition: transform .25s ease;
       }
       .dl-card:hover .dl-card__cta { transform: translateX(3px); }
 
       .post-note {
-        margin-top: 24px; font-size: 14px; color: var(--ink-3);
-        max-width: 50em; line-height: 1.7;
+        margin-top: 24px; font-family: var(--font-serif);
+        font-size: var(--fs-body); line-height: var(--lh-body);
+        letter-spacing: var(--tracking-cn-body); color: var(--ink-3);
+        max-width: 50em;
       }
 
       /* ---------- 安全提示 ---------- */
@@ -372,19 +367,23 @@ const steps = [
       .step:first-child { border-top: none; padding-top: 0; }
       .step:last-child { padding-bottom: 0; }
       .step__num {
-        font-family: var(--serif); font-size: clamp(22px, 2.6vw, 30px);
-        font-weight: 900; color: var(--vermilion); line-height: 1;
+        font-family: var(--font-serif); font-size: var(--fs-h4);
+        font-weight: var(--fw-semibold); color: var(--vermilion);
+        line-height: var(--lh-tight);
       }
       .step__body { max-width: 44em; }
       .step__title {
-        font-family: var(--serif); font-weight: 600;
-        font-size: 20px; color: var(--ink); margin-bottom: 8px;
+        font-family: var(--font-serif); font-weight: var(--fw-semibold);
+        font-size: var(--fs-h5); line-height: var(--lh-tight);
+        letter-spacing: var(--tracking-cn); color: var(--ink); margin-bottom: 8px;
       }
-      .step__desc { font-size: 15px; color: var(--ink-2); margin-bottom: 12px; }
+      .step__desc { font-family: var(--font-serif); font-size: var(--fs-body); line-height: var(--lh-body); letter-spacing: var(--tracking-cn-body); color: var(--ink-2); margin-bottom: 12px; }
       .step__list { list-style: none; padding: 0; }
       .step__list li {
         position: relative; padding-left: 18px;
-        font-size: 14.5px; color: var(--ink-2); margin-top: 8px; line-height: 1.6;
+        font-family: var(--font-serif); font-size: var(--fs-body);
+        line-height: var(--lh-body); letter-spacing: var(--tracking-cn-body);
+        color: var(--ink-2); margin-top: 8px;
       }
       .step__list li::before {
         content: ""; position: absolute; left: 0; top: 0.7em;
@@ -393,7 +392,8 @@ const steps = [
       .step__hint {
         margin-top: 14px; padding: 12px 16px;
         background: var(--warn-bg); border-left: 3px solid var(--vermilion);
-        font-size: 13.5px; color: var(--warn-ink); line-height: 1.6;
+        font-family: var(--font-sans); font-size: var(--fs-small);
+        line-height: var(--lh-body); color: var(--warn-ink);
       }
 
       /* ---------- FOOTER（同首页）---------- */
@@ -402,16 +402,17 @@ const steps = [
         display: flex; align-items: center; justify-content: space-between;
         height: 76px; gap: 24px;
       }
-      .foot__copy { font-size: 13px; color: var(--ink-3); }
+      .foot__copy { font-family: var(--font-sans); font-size: var(--fs-small); color: var(--ink-3); }
       .foot__seal {
-        font-family: var(--serif); font-weight: 900; font-size: 13px;
+        font-family: var(--font-serif); font-weight: var(--fw-semibold);
+        font-size: var(--fs-meta);
         color: var(--paper); background: var(--vermilion);
         width: 26px; height: 26px;
         display: inline-flex; align-items: center; justify-content: center;
-        border-radius: 3px;
+        border-radius: 3px; letter-spacing: 0;
       }
       .foot__nav { display: flex; gap: 24px; }
-      .foot__nav a { text-decoration: none; color: var(--ink-2); font-size: 14px; transition: color .2s; }
+      .foot__nav a { text-decoration: none; font-family: var(--font-sans); font-size: var(--fs-small); color: var(--ink-2); transition: color .2s; }
       .foot__nav a:hover { color: var(--ink); }
 
       /* ---------- 响应式 ---------- */
@@ -428,8 +429,6 @@ const steps = [
       }
       @media (max-width: 480px) {
         .topbar__nav { gap: 16px; }
-        .topbar__nav a { font-size: 14px; }
-        .hero__title { font-size: 40px; }
         .section-head { grid-template-columns: 1fr; }
         .dl-card { grid-template-columns: auto 1fr; }
         .dl-card__meta { grid-column: 1 / -1; flex-direction: row; align-items: center; justify-content: space-between; padding-top: 4px; border-top: 1px dashed var(--rule); }

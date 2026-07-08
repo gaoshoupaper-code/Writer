@@ -161,7 +161,29 @@ before implementation rather than after mistakes.
 使用中文思考回答
 
 ## 云服务器
-111.228.4.165
+ssh writer
+
+
+## 官网字体排版（website/）
+
+官网用**本地子集化的 Noto Serif SC**（思源宋体），不是 Google Fonts 外链。
+
+**字体是怎么工作的**：
+- `public/fonts/noto-serif-sc/{regular,semibold}/` —— cn-font-split 切成的 68 个
+  unicode-range 分片（每片 ~100KB），浏览器只按页面实际用到的字按需拉取。
+- `public/styles/base.css` —— 整站排版 token（字号/字重/字距/行高）+ 颜色 + body reset，
+  两个页面（index / download）用 `<link>` 引入。**改字号/排版只改这一个文件。**
+- `scripts/split-font.mjs` —— 子集化脚本，读 `@fontsource/noto-serif-sc` 的完整 woff2，
+  切成分片输出到 public/fonts/。
+
+**改了文案 / 加了新中文字后**：可能出现某些字 fallback 到系统字体（混字体）。
+这时重跑 `node scripts/split-font.mjs`（约 10 秒），重新生成分片即可。
+源字体在 `node_modules/@fontsource/noto-serif-sc/files/`，由 devDependency 提供。
+
+**排版 token 体系**（都在 base.css）：
+- 字号 scale 用 Major Third 1.2 模数：`--fs-meta`(12) → `--fs-body`(16) → `--fs-display`(clamp 48~69)
+- 字重只有 400/500/600，**不用 900**（中文衬线 900 发死）
+- 字距：标题用零或正字距，**不用负字距**（负字距压方块字，是原"不好看"的主因）
 
 
 ## Coding & Interaction Style

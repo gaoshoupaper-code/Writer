@@ -1,0 +1,131 @@
+/**
+ * base.css — 思衍官网共享基底
+ *
+ * 放 public/styles/ 下，两页 <link> 引入，原样直出不经过 Astro scoped 处理。
+ *
+ * 统一管理两个页面（index / download）的：
+ *   1. 颜色 token（墨纸色板）
+ *   2. 排版 scale（字号 / 字重 / 字距 / 行高，Major Third 1.2 模数）
+ *   3. 字体家族（正文衬线 + 小字无衬线回退）
+ *   4. 全局 reset + body 基底
+ *
+ * 改字号 / 字距 / 行高，只改这里，两页同步生效。
+ */
+
+/* ============================================================
+ * 颜色 —— 墨纸色板（原两页复制，现统一）
+ * ============================================================ */
+:root {
+  --paper:   #f6f3ec;
+  --paper-2: #efeae0;
+  --ink:     #1a1612;
+  --ink-2:   #4a4239;
+  --ink-3:   #8b8174;
+  --rule:    #d8d0c1;
+  --vermilion: #9a2f2f;
+}
+
+/* ============================================================
+ * 字体家族
+ *
+ * --font-serif: Noto Serif SC，≥14px 正文与标题统一衬线（墨纸气质）
+ * --font-sans:  系统无衬线，≤13px 辅助小字回退（中文衬线小字发虚，D6）
+ * --font-mono:  等宽，版本号 / 尺寸数字配套
+ * ============================================================ */
+:root {
+  --font-serif: "Noto Serif SC", "Songti SC", "Source Han Serif SC", serif;
+  --font-sans: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei",
+    "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+}
+
+/* ============================================================
+ * 排版 scale —— 字号（Major Third, ratio = 1.2, base = 16px）
+ *
+ * 桌面端全 px 化，不引入 rem 复杂度（静态站无需缩放）。
+ * 档差等比平滑，取代原 14.5/15/16/17 四档含糊 & 78→48→32 断裂。
+ * ============================================================ */
+:root {
+  --fs-meta: 12px;        /* 版权、rail 序号 */
+  --fs-kicker: 13px;      /* hero kicker、版本号 */
+  --fs-small: 13px;       /* 辅助说明（≤13 回退无衬线） */
+  --fs-body: 16px;        /* 卡片描述、正文 p/li */
+  --fs-body-lg: 17px;     /* hero 副标题、步骤说明 */
+  --fs-h5: 19px;          /* 卡片标题（非主卡） */
+  --fs-h4: 23px;          /* 下载卡 label、closing line */
+  --fs-h3: 28px;          /* section title（下载页） */
+  --fs-h2: 33px;          /* section title（首页） */
+  --fs-h1: 40px;          /* hero 标题最小值 */
+  --fs-display: clamp(48px, 7vw, 69px); /* hero 标题，全站视觉峰值 */
+  --fs-brand: 22px;       /* 品牌名 */
+}
+
+/* ============================================================
+ * 字重体系 —— 废除 900 滥用，统一 400/500/600
+ *
+ * 中文衬线 900 视觉接近黑体，发死；600 兼顾力度与笔锋。
+ * ============================================================ */
+:root {
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+}
+
+/* ============================================================
+ * 字距体系 —— 核心修复：废除负字距
+ *
+ * 原字母距 -0.01em 是拉丁字母排法，方块字被挤压成坨。
+ * 中文用零字距或正字距，越小的字越松以助读。
+ * ============================================================ */
+:root {
+  --tracking-cn-tight: 0;       /* 中文大标题（≥48px），零字距 */
+  --tracking-cn: 0.02em;        /* 中文标题（28~40px），微张 */
+  --tracking-cn-body: 0.04em;   /* 中文正文（≤23px），松一点助读 */
+  --tracking-label: 0.12em;     /* 全大写 label（rail-label、section-num） */
+}
+
+/* ============================================================
+ * 行高体系 —— 5 值散落 → 2 档收敛
+ *
+ * 标题档 1.15（原 1.06/1.08 过紧，方块字上下贴边）；
+ * 正文档 1.75（原 1.6/1.65/1.7 散落，中文衬线需更松）。
+ * ============================================================ */
+:root {
+  --lh-tight: 1.15;
+  --lh-body: 1.75;
+}
+
+/* ============================================================
+ * 布局 —— 容器宽度（两页原 --maxw 不同，各自在页面内覆盖）
+ * ============================================================ */
+:root {
+  --maxw: 1120px;
+}
+
+/* ============================================================
+ * 全局 reset + body 基底
+ * ============================================================ */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+
+body {
+  /* 正文统一衬线（D1），取代原 system-ui */
+  font-family: var(--font-serif);
+  font-size: var(--fs-body);
+  line-height: var(--lh-body);
+  letter-spacing: var(--tracking-cn-body);
+  font-weight: var(--fw-regular);
+  color: var(--ink);
+  background: var(--paper);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: var(--vermilion);
+  color: var(--paper);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+}
