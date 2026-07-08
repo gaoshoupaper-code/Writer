@@ -371,6 +371,18 @@ def init_db() -> None:
                 updated_at    TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_rl_category ON reflection_library(category);
+
+            -- llm_config：全局大模型 API 配置（桌面化改造，2026-07-07）。
+            -- 单人/全局场景，永远只有 id=1 一行。桌面端填 → HTTP → AES-256-GCM 加密存。
+            -- llm.py (httpx judge) + model_factory.py (langchain agent) 从此表读 key。
+            CREATE TABLE IF NOT EXISTS llm_config (
+                id          INTEGER PRIMARY KEY DEFAULT 1,  -- 永远只有 id=1 这一行
+                name        TEXT,                            -- 配置名（可选，默认 "default"）
+                api_key_enc TEXT,                            -- AES-256-GCM 加密（nonce||ciphertext+tag, urlsafe-b64）
+                base_url    TEXT,                            -- 如 https://api.deepseek.com
+                model       TEXT,                            -- 如 deepseek-chat
+                updated_at  TEXT                             -- ISO 时间戳
+            );
             """
         )
         conn.commit()
@@ -689,3 +701,99 @@ def query_one(sql: str, params: tuple[Any, ...] | list[Any] = ()) -> dict[str, A
     """查询单行。"""
     rows = query_all(sql, params)
     return rows[0] if rows else None
+
+
+# ════════════════════════════════════════════════════════════
+#  LLM 配置访问层（桌面化改造，2026-07-07）
+# ════════════════════════════════════════════════════════════
+
+# master_key 进程内缓存（启动时加载一次，避免每次解密都解析）。
+_master_key_cache: bytes | None = None
+
+
+def get_master_key() -> bytes:
+    """获取 evolution AES 主密钥（懒加载，进程内缓存）。
+
+    从 settings.evolution_master_key 加载。首次调用时解析并缓存。
+    未配置时抛 RuntimeError（启动检查应在 settings 层拦截）。
+    """
+    global _master_key_cache
+    if _master_key_cache is not None:
+        return _master_key_cache
+    from app.core.security import load_master_key
+    from app.core.settings import settings
+    if not settings.evolution_master_key:
+        raise RuntimeError(
+            "evolution_master_key 未配置。请在 evolution/.env 设置 "
+            "EVOLUTION_MASTER_KEY（生成：python -c \"import secrets; print(secrets.token_hex(32))\"）"
+        )
+    _master_key_cache = load_master_key(settings.evolution_master_key)
+    return _master_key_cache
+
+
+class LlmConfigRepository:
+    """全局 LLM 配置访问层（单人/全局，单行表 id=1）。
+
+    api_key 加密存储（AES-256-GCM），读取时解密返回明文。
+    llm.py + model_factory.py 调 get_active() 拿运行时 key。
+    桌面端配置接口调 save()/get_safe()（不回显 key）。
+    """
+
+    @staticmethod
+    def get_active() -> tuple[str, str, str] | None:
+        """读取当前 LLM 配置（解密后的明文）。
+
+        Returns:
+            (api_key, base_url, model) 三元组；未配置（表空或 key 为空）返回 None。
+        """
+        row = query_one("SELECT api_key_enc, base_url, model FROM llm_config WHERE id = 1")
+        if not row or not row["api_key_enc"]:
+            return None
+        from app.core.security import decrypt_secret
+        api_key = decrypt_secret(row["api_key_enc"], get_master_key())
+        base_url = row["base_url"] or ""
+        model = row["model"] or ""
+        return api_key, base_url, model
+
+    @staticmethod
+    def get_safe() -> dict[str, Any]:
+        """读取配置（不回显 key，供桌面端 GET 用）。
+
+        Returns:
+            {has_key, name, base_url, model, updated_at}
+        """
+        row = query_one(
+            "SELECT name, api_key_enc, base_url, model, updated_at FROM llm_config WHERE id = 1"
+        )
+        if not row or not row["api_key_enc"]:
+            return {"has_key": False, "name": None, "base_url": "", "model": "", "updated_at": None}
+        return {
+            "has_key": True,
+            "name": row["name"] or "default",
+            "base_url": row["base_url"] or "",
+            "model": row["model"] or "",
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def save(*, api_key: str, base_url: str, model: str, name: str = "default") -> None:
+        """保存配置（加密 key），单行 UPSERT（id=1）。"""
+        from app.core.security import encrypt_secret
+        encrypted = encrypt_secret(api_key, get_master_key())
+        now = datetime.now(UTC).isoformat()
+        execute(
+            """INSERT INTO llm_config (id, name, api_key_enc, base_url, model, updated_at)
+               VALUES (1, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   name = excluded.name,
+                   api_key_enc = excluded.api_key_enc,
+                   base_url = excluded.base_url,
+                   model = excluded.model,
+                   updated_at = excluded.updated_at""",
+            (name, encrypted, base_url, model, now),
+        )
+
+    @staticmethod
+    def clear() -> None:
+        """清空配置（删单行）。"""
+        execute("DELETE FROM llm_config WHERE id = 1")

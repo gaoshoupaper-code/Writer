@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     # 留空则不通知（evolution 靠兜底扫描补）。
     evolution_notify_url: str = ""
 
+    # evolution 内网通知 token（桌面化改造 2026-07-07）：
+    # executor POST 到 evolution /api/ingestion/notify 时带 X-Notify-Token 头。
+    # 与 evolution 的 settings.notify_token 必须一致。留空则不带（evolution 开发模式兼容）。
+    evolution_notify_token: str = ""
+
     # evolution 服务基址（Phase 5 T10）：执行端 prompt loader 从 evolution 拉 prompt。
     # 形如 http://localhost:7789。留空则 loader 降级为读本地 .md 文件（兼容）。
     evolution_url: str = ""

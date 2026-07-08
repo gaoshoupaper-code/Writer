@@ -90,11 +90,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 生产加固：内网 API Key 中间件。
-# 注册在 CORS 之后（FastAPI 洋葱模型：后注册 = 更外层），让 key 校验先于业务执行。
-# key 为空时（开发模式）no-op，不影响现有联调。
-from app.core.internal_auth import InternalKeyMiddleware
-app.add_middleware(InternalKeyMiddleware)
+# 鉴权中间件（桌面化改造，2026-07-07）：
+# 1. NotifyTokenMiddleware：executor → evolution 内网通知（/api/ingestion/*）的 token 校验。
+#    最外层（后注册），先于 SSO 处理内网通知路径。
+# 2. SSOAuthMiddleware：公网请求（桌面端）的鉴权——回调 executor /api/auth/me 验证
+#    session + user_id 白名单。替换旧 InternalKeyMiddleware。
+#    SSO 内部对 /api/ingestion/ 前缀放行，交由 NotifyToken 处理，避免双重校验冲突。
+from app.core.notify_auth import NotifyTokenMiddleware
+from app.core.sso_auth import SSOAuthMiddleware
+app.add_middleware(SSOAuthMiddleware)
+app.add_middleware(NotifyTokenMiddleware)
 
 # API 路由统一挂 /api 前缀，避免与页面路由（/、/traces、/rules）冲突
 app.include_router(ingestion_router, prefix="/api")
@@ -121,6 +126,9 @@ app.include_router(dataset_router, prefix="/api")
 app.include_router(promote_router, prefix="/api")
 # Benchmark 矩阵 + Runner（数据闭环设计：跨版本对比 + golden 升级重跑）
 app.include_router(benchmark_router, prefix="/api")
+# 大模型 API 配置（桌面化改造，2026-07-07：桌面端唯一 key 配置入口）
+from app.config.api import router as config_router
+app.include_router(config_router, prefix="/api")
 
 
 @app.get("/health")

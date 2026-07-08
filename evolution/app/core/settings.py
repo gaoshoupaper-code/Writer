@@ -25,22 +25,31 @@ class Settings(BaseSettings):
     executor_workspace: str = "executor/workspace"
     # SQLite 数据库文件路径
     evolution_db: str = "evolution.db"
-    # 执行端服务地址（Phase 3：HTTP 拉取 trace 内容 + 活跃大盘轮询）
+    # 执行端服务地址（Phase 3：HTTP 拉取 trace 内容 + 活跃大盘轮询）。
+    # 桌面化后双重用途：内网 trace 拉取 + SSO 回调 /api/auth/me 验证。
     executor_url: str = "http://localhost:7788"
 
-    # ── LLM-judge 评估配置（第二期）──
-    # 评估用模型（建议用便宜小模型，如 deepseek-chat / gpt-4o-mini）。
-    # 留空则禁用 LLM-judge（仅规则标红）。
-    judge_model: str = ""
-    judge_api_key: str = ""
-    judge_base_url: str = ""
+    # ── 大模型 API 配置（桌面化改造，2026-07-07）──
+    # LLM key/base_url/model 不再从 env 读（删 judge_* 字段），改从 llm_config 表读
+    # （桌面端填 → HTTP → evolution 加密存）。见 app/core/security.py + db.py。
 
-    # ── 内网 API Key（生产加固）──
-    # evolution 无业务鉴权（开发者内部工具），但有 git reset / discard 等破坏性接口。
-    # 生产部署虽不暴露公网（仅 docker 内网），仍加一层 X-Internal-Key 校验防止
-    # 同机其他进程误调。留空则不校验（开发模式兼容）。
+    # AES-256-GCM 主密钥（hex 64 字符 或 urlsafe-base64）。
+    # 用于加密 llm_config 表里的 api_key。生成：python -c "import secrets; print(secrets.token_hex(32))"
+    # ⚠️ 设定后不可更改（历史加密 key 依赖它）。
+    evolution_master_key: str = ""
+
+    # SSO 白名单：允许访问 evolution 的 executor user_id（逗号分隔）。
+    # 桌面端登录 executor → cookie 传给 evolution → evolution 回调 executor 验证 →
+    # 校验 user_id ∈ 此白名单 → 放行/403。
+    allowed_user_ids: str = ""
+
+    # SSO 回调结果进程内缓存 TTL（秒）。避免每个请求都内网往返 executor。
+    sso_cache_ttl_seconds: int = 60
+
+    # 内网通知 token（executor → evolution /api/ingestion/notify 的鉴权）。
+    # 替换旧 InternalKeyMiddleware 的 X-Internal-Key 机制。
     # 生成：python -c "import secrets; print(secrets.token_urlsafe(32))"
-    internal_api_key: str = ""
+    notify_token: str = ""
 
     # ── 数据集维护者令牌（数据闭环设计 D17）──
     # growing→golden 升级需维护者校验。留空则不校验（开发模式兼容）。

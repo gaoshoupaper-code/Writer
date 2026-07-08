@@ -1,6 +1,7 @@
 # ─────────────────────────────────────────────────────────────
 # Writer 生产部署编排
-# 架构：nginx(公网) → executor(7788 /api) + website(80 官网&下载) | evolution(7789 仅 loopback)
+# 架构：nginx(公网) → executor(7788 /api) + evolution(7789 /evolution-api) + website(80 官网&下载)
+# 桌面化改造（2026-07-07）：evolution 从"仅 loopback + SSH 隧道"改为 nginx 反代 + SSO 鉴权
 # ─────────────────────────────────────────────────────────────
 # 启动：docker compose up -d
 # 升级：git checkout <tag> && docker compose build && docker compose up -d
@@ -30,6 +31,9 @@ services:
       - HARNESS_BARE_REPO=/app/evolution/harness.git
       - HARNESS_CLONE_DIR=/app/executor/.harness_checkout
       - TZ=Asia/Shanghai
+      # 桌面化改造（2026-07-07）：内网通知 token，与 evolution NOTIFY_TOKEN 一致。
+      # 部署时在 executor/.env 里设 EVOLUTION_NOTIFY_TOKEN=<同 evolution 的 NOTIFY_TOKEN>。
+      # - EVOLUTION_NOTIFY_TOKEN=<强随机 token>
     volumes:
       # 持久化：用户库 + workspace + checkpoints（用户数据，不可丢）
       # ⚠️ 注意：整个 /app/executor 挂卷，源码也在里面。rebuild 后必须清空此卷，
@@ -53,7 +57,7 @@ services:
       retries: 3
       start_period: 30s
 
-  # ── 进化/监测后端（开发者用，仅宿主机 loopback → SSH 隧道访问）──
+  # ── 进化/监测后端（桌面化改造，2026-07-07：挂公网，nginx 反代 + SSO 鉴权）──
   evolution:
     build:
       context: .
@@ -62,22 +66,25 @@ services:
     env_file:
       - evolution/.env
     environment:
-      # 容器内 executor 地址（用 docker 服务名）
+      # 容器内 executor 地址（用 docker 服务名）：trace 拉取 + SSO 回调 /api/auth/me
       - EXECUTOR_URL=http://executor:7788
-      # 内网 API Key（与 internal_auth 中间件配合；为空则不校验）
-      # 部署时在 evolution/.env 里设 INTERNAL_API_KEY=<强随机>
       - TZ=Asia/Shanghai
+      # 桌面化鉴权（2026-07-07）：SSO 白名单 + 内网通知 token + 加密主密钥。
+      # 这三项是安全关键，不写在 .env（避免随源码泄露），由 compose environment 注入。
+      # 部署时在 evolution/.env 里设真实值，或用 Docker secrets。
+      # - ALLOWED_USER_IDS=<你的 executor user_id>
+      # - NOTIFY_TOKEN=<强随机 token>
+      # - EVOLUTION_MASTER_KEY=<hex 64 字符>
     volumes:
-      # 持久化：evolution.db（监测数据，不可丢）
+      # 持久化：evolution.db（监测数据 + llm_config 加密 key，不可丢）
       - evolution_data:/app/evolution
       # 共享 harness（与 executor 同一份）
       - harness_data:/app/evolution/harnesses
       - harness_git:/app/evolution/harness.git
-    ports:
-      # ★ 只绑宿主机 loopback：公网/局域网不可达，仅本机 + SSH 隧道可达。
-      # （纯 expose 会让 SSH 隧道也连不上，因为宿主机 loopback 上没有这个端口；
-      #  绑 127.0.0.1:7789 后，隧道转发目标填 127.0.0.1:7789 即可。）
-      - "127.0.0.1:7789:7789"
+    # 桌面化改造：改用 expose（不出宿主机端口），让 nginx 反代访问。
+    # 对齐 executor 模式（expose + nginx location）。
+    expose:
+      - "7789"
     restart: always
     # 安全加固
     security_opt:
@@ -118,6 +125,7 @@ services:
       - ./releases:/var/www/releases:ro
     depends_on:
       - executor
+      - evolution
       - website
     restart: always
     # 安全加固：nginx 是唯一公网入口，最严格限制

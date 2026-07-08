@@ -62,7 +62,6 @@ def list_traces(
     if run_purpose:
         where.append("r.run_purpose = ?")
         params.append(run_purpose)
-        params.append(status)
     if owner:
         where.append("r.owner_user_id = ?")
         params.append(owner)

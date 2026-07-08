@@ -273,24 +273,30 @@ phase3() {
     echo ""
 
     GEN_MASTER_KEY=""
-    GEN_INTERNAL_KEY=""
+    GEN_EVOLUTION_MASTER_KEY=""
+    GEN_NOTIFY_TOKEN=""
     GEN_ADMIN_PWD=""
     if ! $DRY_RUN; then
         GEN_MASTER_KEY=$(python3 -c "import secrets;print(secrets.token_hex(32))")
-        GEN_INTERNAL_KEY=$(python3 -c "import secrets;print(secrets.token_urlsafe(32))")
+        GEN_EVOLUTION_MASTER_KEY=$(python3 -c "import secrets;print(secrets.token_hex(32))")
+        GEN_NOTIFY_TOKEN=$(python3 -c "import secrets;print(secrets.token_urlsafe(32))")
         GEN_ADMIN_PWD=$(python3 -c "import secrets;print(secrets.token_urlsafe(16))")
-        echo -e "  ${C_GREEN}MASTER_KEY${C_RESET}       = ${GEN_MASTER_KEY}"
-        echo -e "  ${C_GREEN}INTERNAL_API_KEY${C_RESET} = ${GEN_INTERNAL_KEY}"
-        echo -e "  ${C_GREEN}ADMIN_PASSWORD${C_RESET}   = ${GEN_ADMIN_PWD}"
+        echo -e "  ${C_GREEN}MASTER_KEY (executor)${C_RESET}       = ${GEN_MASTER_KEY}"
+        echo -e "  ${C_GREEN}EVOLUTION_MASTER_KEY${C_RESET}        = ${GEN_EVOLUTION_MASTER_KEY}"
+        echo -e "  ${C_GREEN}NOTIFY_TOKEN${C_RESET}                = ${GEN_NOTIFY_TOKEN}"
+        echo -e "  ${C_GREEN}ADMIN_PASSWORD${C_RESET}              = ${GEN_ADMIN_PWD}"
         echo ""
-        warn "请立即保存以上密钥！MASTER_KEY 一旦设定不可更改。"
+        warn "请立即保存以上密钥！MASTER_KEY / EVOLUTION_MASTER_KEY 一旦设定不可更改。"
+        echo ""
+        warn "★ 还需手动配置 ALLOWED_USER_IDS（你的 executor user_id，逗号分隔）。"
+        echo "  获取方式：登录 executor 后访问 GET /api/auth/me，取 user_id 字段。"
     fi
 
     # 3.3 配置 executor/.env
     # 架构说明：普通用户写作时用各自在客户端填的 key（DB 加密存储，MASTER_KEY 解密），
     # 不依赖服务器全局 OPENAI_API_KEY。故此处置空，key 永不集中存服务器。
-    # 仅保留默认 base_url/model（用户未自定义 model 时的兜底，可后续按需改）。
-    log "配置 executor/.env（LLM key 置空——用户各自填）..."
+    # 桌面化改造（2026-07-07）：删掉硬编码默认 model/base_url（清理项，需求决策）。
+    log "配置 executor/.env（LLM key + 默认值全置空——用户各自填）..."
     if ! $DRY_RUN; then
         su - "$DEPLOY_USER" -c "cp ${DEPLOY_DIR}/executor/.env.production.example ${DEPLOY_DIR}/executor/.env"
         # 注入生成的密钥
@@ -298,23 +304,27 @@ phase3() {
         sed -i "s|^ADMIN_PASSWORD=.*|ADMIN_PASSWORD=${GEN_ADMIN_PWD}|" "${DEPLOY_DIR}/executor/.env"
         # 预填已知值
         sed -i 's|^WRITER_AGENT_MODE=.*|WRITER_AGENT_MODE=live|' "${DEPLOY_DIR}/executor/.env"
-        # 默认模型/base_url（兜底，用户写作时若没填自己的 model 才用到）
-        sed -i 's|^WRITER_MODEL=.*|WRITER_MODEL=deepseek-chat|' "${DEPLOY_DIR}/executor/.env"
-        sed -i 's|^OPENAI_BASE_URL=.*|OPENAI_BASE_URL=https://api.deepseek.com|' "${DEPLOY_DIR}/executor/.env"
-        # OPENAI_API_KEY 显式置空（代码已改为可空，用户各自填）
+        # 桌面化改造：不再注入硬编码默认 model/base_url，全留空（用户各自在桌面端填）
         sed -i 's|^OPENAI_API_KEY=.*|OPENAI_API_KEY=|' "${DEPLOY_DIR}/executor/.env"
+        sed -i 's|^OPENAI_BASE_URL=.*|OPENAI_BASE_URL=|' "${DEPLOY_DIR}/executor/.env"
+        sed -i 's|^WRITER_MODEL=.*|WRITER_MODEL=|' "${DEPLOY_DIR}/executor/.env"
         echo ""
-        ok "executor/.env 已配置（OPENAI_API_KEY 留空）"
-        echo "  → 写作时每个用户在客户端/设置页填自己的 DeepSeek key"
-        echo "  → 服务器不存储任何 LLM 明文 key（MASTER_KEY 加密的用户 key 除外）"
+        ok "executor/.env 已配置（LLM 默认值全清空——用户在桌面端各自填）"
         echo ""
     fi
 
-    # 3.4 配置 evolution/.env
+    # 3.4 配置 evolution/.env（桌面化改造 2026-07-07）
     log "配置 evolution/.env..."
     if ! $DRY_RUN; then
         su - "$DEPLOY_USER" -c "cp ${DEPLOY_DIR}/evolution/.env.production.example ${DEPLOY_DIR}/evolution/.env"
-        sed -i "s|^INTERNAL_API_KEY=.*|INTERNAL_API_KEY=${GEN_INTERNAL_KEY}|" "${DEPLOY_DIR}/evolution/.env"
+        # 桌面化鉴权三项（替换旧 INTERNAL_API_KEY 机制）
+        sed -i "s|^EVOLUTION_MASTER_KEY=.*|EVOLUTION_MASTER_KEY=${GEN_EVOLUTION_MASTER_KEY}|" "${DEPLOY_DIR}/evolution/.env"
+        sed -i "s|^NOTIFY_TOKEN=.*|NOTIFY_TOKEN=${GEN_NOTIFY_TOKEN}|" "${DEPLOY_DIR}/evolution/.env"
+        # ALLOWED_USER_IDS 需手动填（脚本无法自动获取 user_id，提示用户）
+        echo ""
+        warn "★ 请手动编辑 ${DEPLOY_DIR}/evolution/.env 填入 ALLOWED_USER_IDS"
+        echo "  （你的 executor user_id，逗号分隔多个）"
+        echo ""
     fi
 
     # 3.5 挂证书（软链接）

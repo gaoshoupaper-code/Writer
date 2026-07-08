@@ -386,6 +386,10 @@ def _notify_evolution_task_failed(task_id: str, error: str) -> None:
             return
         import httpx
 
+        # 桌面化改造（2026-07-07）：内网通知带 X-Notify-Token（evolution NotifyTokenMiddleware 校验）
+        notify_token = get_settings().evolution_notify_token
+        headers = {"X-Notify-Token": notify_token} if notify_token else None
+
         httpx.post(
             url,
             json={
@@ -394,6 +398,7 @@ def _notify_evolution_task_failed(task_id: str, error: str) -> None:
                 "status": "failed",
                 "error": error,
             },
+            headers=headers,
             timeout=_EVOLUTION_NOTIFY_TIMEOUT,
         )
     except Exception:

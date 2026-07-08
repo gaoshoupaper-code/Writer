@@ -1,16 +1,18 @@
 """Agent 的 LLM 模型工厂（D7：复用 judge 配置）。
 
-evolution 端引入 langchain ChatOpenAI，指向现有 judge 配置
-（judge_model / judge_api_key / judge_base_url），供 create_deep_agent 使用。
+evolution 端引入 langchain ChatOpenAI，供 create_deep_agent 使用。
 evolve / eval_agent 两个 Agent 都用本工厂构建模型，复用同一套
-deepseek/openai 兼容端点 + API key，不新增配置。
+deepseek/openai 兼容端点 + API key。
+
+桌面化改造（2026-07-07）：配置不再从 settings.judge_* 读，改从 llm_config 表读
+（桌面端填 → HTTP → evolution 加密存）。judge 与 agent 共用同一套配置（合一）。
 """
 from __future__ import annotations
 
 from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 
-from app.core.settings import settings
+from app.core import db
 
 # 禁用 deepagents 自动注入的 general-purpose 子代理。
 #
@@ -49,7 +51,7 @@ def _ensure_gp_disabled() -> None:
 
 
 def build_agent_model(*, temperature: float = 0.2) -> BaseChatModel:
-    """构建 Agent 用的 ChatModel（复用 judge 配置，D7）。
+    """构建 Agent 用的 ChatModel（从 llm_config 表读配置）。
 
     Args:
         temperature: 温度（Agent 决策需要一定探索性，默认 0.2）
@@ -58,28 +60,26 @@ def build_agent_model(*, temperature: float = 0.2) -> BaseChatModel:
         BaseChatModel 实例（给 create_deep_agent）
 
     Raises:
-        RuntimeError: judge 配置缺失
+        RuntimeError: LLM 未配置（llm_config 表无 key）
     """
-    if not (settings.judge_model and settings.judge_api_key):
+    config = db.LlmConfigRepository.get_active()
+    if config is None:
         raise RuntimeError(
-            "Agent 模型未配置：需设置 JUDGE_MODEL / JUDGE_API_KEY"
-            "（复用 judge 配置，D7）"
+            "Agent 模型未配置：请在桌面端「配置」页填写大模型 API"
+            "（base_url / api_key / model）"
         )
+    api_key, base_url_raw, model_raw = config
 
     # 关闭 deepagents 默认注入的 general-purpose 子代理（详见模块顶部说明）。
     _ensure_gp_disabled()
 
-    base_url = (
-        settings.judge_base_url.rstrip("/")
-        if settings.judge_base_url
-        else "https://api.openai.com/v1"
-    )
+    base_url = base_url_raw.rstrip("/")
     # model 可能是 "openai:gpt-4o-mini" 或 "gpt-4o-mini"，去掉 provider 前缀
-    model = settings.judge_model.split(":", 1)[-1]
+    model = model_raw.split(":", 1)[-1]
 
     return ChatOpenAI(
         model=model,
-        api_key=settings.judge_api_key,
+        api_key=api_key,
         base_url=base_url,
         temperature=temperature,
         # DeepSeek-chat 的单次输出硬上限为 8192 token，无法靠调大突破。

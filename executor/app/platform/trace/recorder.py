@@ -1116,6 +1116,10 @@ def _notify_evolution(
             return  # 未配置 evolution，不通知
         import httpx
 
+        # 桌面化改造（2026-07-07）：内网通知带 X-Notify-Token（evolution NotifyTokenMiddleware 校验）
+        notify_token = get_settings().evolution_notify_token
+        headers = {"X-Notify-Token": notify_token} if notify_token else None
+
         httpx.post(
             url,
             json={
@@ -1124,6 +1128,7 @@ def _notify_evolution(
                 # 改调 GET /internal/traces/{trace_id} 拉内容）。
                 "status": status,
             },
+            headers=headers,
             timeout=_EVOLUTION_NOTIFY_TIMEOUT,
         )
     except Exception:
