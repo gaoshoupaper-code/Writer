@@ -53,7 +53,8 @@ const icon = (name?: string) => (name && icons[name] ? icons[name] : icons.pen);
           </svg>
           <span class="brand__name">Writer</span>
         </a>
-        <nav class="topbar__nav">
+        <nav class="topbar__nav" aria-label="主导航">
+          <a href="/" class="is-active" aria-current="page">首页</a>
           <a href="#features">特性</a>
           <a href="/download" class="topbar__cta">下载 <span aria-hidden="true">→</span></a>
         </nav>
@@ -191,6 +192,15 @@ const icon = (name?: string) => (name && icons[name] ? icons[name] : icons.pen);
       }
       .topbar__nav a:hover { color: var(--ink); }
       .topbar__cta { color: var(--ink) !important; font-weight: 600; }
+      /* 当前页：朱砂短下划线标识（不抢 CTA 视觉） */
+      .topbar__nav a.is-active {
+        position: relative; color: var(--ink); font-weight: 600;
+      }
+      .topbar__nav a.is-active::after {
+        content: ""; position: absolute; left: 0; right: 0; bottom: -6px;
+        height: 2px; background: var(--vermilion);
+      }
+      .topbar__cta.is-active::after { display: none; }
 
       /* ---------- HERO ---------- */
       .hero { padding: 88px 0 104px; border-bottom: 1px solid var(--rule); }
