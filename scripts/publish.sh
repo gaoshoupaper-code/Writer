@@ -41,8 +41,8 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 # ── 1. 检查环境变量 ──────────────────────────────────────────
 if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
   error "未设置 TAURI_SIGNING_PRIVATE_KEY 环境变量。
-  生成密钥：cd desktop && npx tauri signer generate -w ~/.tauri/writer.key
-  然后设置：export TAURI_SIGNING_PRIVATE_KEY=\$(cat ~/.tauri/writer.key)
+  生成密钥：cd desktop && npx tauri signer generate -w ~/.tauri/siyen.key --force --ci -p \"\"
+  然后设置：export TAURI_SIGNING_PRIVATE_KEY=\$(cat ~/.tauri/siyen.key)
   密钥私钥个人保管，绝不上 git（D17）。"
 fi
 
