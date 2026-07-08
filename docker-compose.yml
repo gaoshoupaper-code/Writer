@@ -76,8 +76,10 @@ services:
       # - NOTIFY_TOKEN=<强随机 token>
       # - EVOLUTION_MASTER_KEY=<hex 64 字符>
     volumes:
-      # 持久化：evolution.db（监测数据 + llm_config 加密 key，不可丢）
-      - evolution_data:/app/evolution
+      # 持久化：evolution.db（监测数据 + llm_configs 加密 key，不可丢）
+      # 只挂 data/ 子目录（2026-07-08）：源码不挂卷，增量更新 build+up 即生效，
+      # 避免 volume 旧源码覆盖镜像新源码。db 路径 = data/evolution.db。
+      - evolution_data:/app/evolution/data
       # 共享 harness（与 executor 同一份）
       - harness_data:/app/evolution/harnesses
       - harness_git:/app/evolution/harness.git

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { fetchMeOrNull, logout, type AuthMe } from "@/lib/api";
+import UpdateBanner from "@/components/UpdateBanner";
 
 /**
  * Evolution 桌面端主布局（桌面化改造 2026-07-07）。
@@ -94,6 +95,7 @@ export default function Shell() {
         </div>
       </aside>
       <main className="shell-main">
+        <UpdateBanner />
         <Outlet />
       </main>
     </div>

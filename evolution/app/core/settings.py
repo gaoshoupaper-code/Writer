@@ -23,8 +23,10 @@ class Settings(BaseSettings):
     # Phase 3 重构后：trace 摄入不再读这里（改走 HTTP），仅 eval_extractor
     # 读生成产物（deliverable）时用。后续 eval_extractor 解耦后可移除此配置。
     executor_workspace: str = "executor/workspace"
-    # SQLite 数据库文件路径
-    evolution_db: str = "evolution.db"
+    # SQLite 数据库文件路径。
+    # 默认放 data/ 子目录（2026-07-08）：与源码分离，便于 docker volume 只挂 data/
+    # 做增量更新（源码不挂卷，避免旧源码覆盖镜像新源码）。旧库迁移见 update-evolution.sh。
+    evolution_db: str = "data/evolution.db"
     # 执行端服务地址（Phase 3：HTTP 拉取 trace 内容 + 活跃大盘轮询）。
     # 桌面化后双重用途：内网 trace 拉取 + SSO 回调 /api/auth/me 验证。
     executor_url: str = "http://localhost:7788"
@@ -86,11 +88,17 @@ class Settings(BaseSettings):
 
     @property
     def db_path(self) -> Path:
-        """SQLite 数据库文件的绝对路径。相对路径基于 evolution/ 目录。"""
+        """SQLite 数据库文件的绝对路径。相对路径基于 evolution/ 目录。
+
+        自动创建父目录（data/ 子目录在 docker volume 挂载时需确保存在）。
+        """
         path = Path(self.evolution_db)
         if not path.is_absolute():
             path = self._evolution_root / path
-        return path.resolve()
+        path = path.resolve()
+        # 确保父目录存在（首次挂载空 volume 时 data/ 可能不存在）
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def harness_bare_repo_path(self) -> Path:

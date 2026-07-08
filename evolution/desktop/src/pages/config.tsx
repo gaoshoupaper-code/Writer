@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import {
   listLlmConfigs,
@@ -51,6 +52,9 @@ export default function ConfigPage() {
   const [draftTesting, setDraftTesting] = useState(false);
   const [draftTestResult, setDraftTestResult] = useState<LlmConfigTestResult | null>(null);
 
+  // 手动检查更新
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+
   useEffect(() => {
     refresh();
   }, []);
@@ -66,6 +70,25 @@ export default function ConfigPage() {
     }
   }
 
+  async function handleCheckUpdate() {
+    setCheckingUpdate(true);
+    try {
+      const info = await invoke<{
+        available: boolean;
+        current_version: string;
+        version: string | null;
+      }>("check_update");
+      if (info.available) {
+        toast.success(`发现新版本 v${info.version}，请看顶部提示更新`);
+      } else {
+        toast.success(`已是最新版本（v${info.current_version}）`);
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "检查更新失败");
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
   function openCreate() {
     setForm({ ...EMPTY_FORM });
     setDraftTestResult(null);
@@ -400,6 +423,21 @@ export default function ConfigPage() {
             </div>
           ))
         )}
+      </section>
+
+      {/* 应用更新（手动检查） */}
+      <section className="config-update-section">
+        <div className="config-update-info">
+          <span className="config-label">应用更新</span>
+          <span className="config-hint">检查是否有新版本，有则可在顶部提示条一键更新</span>
+        </div>
+        <button
+          className="config-button secondary"
+          onClick={handleCheckUpdate}
+          disabled={checkingUpdate}
+        >
+          {checkingUpdate ? "检查中…" : "检查更新"}
+        </button>
       </section>
     </div>
   );
