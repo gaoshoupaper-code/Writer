@@ -1,0 +1,27 @@
+[package]
+name = "evolution-desktop"
+version = "0.1.0"
+description = "Writer Evolution 桌面端（进化/监测/评估）"
+authors = ["siyen"]
+edition = "2021"
+
+[lib]
+# _lib 后缀避免 lib 名与 bin 名冲突（Windows 下已知问题）
+name = "evolution_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-store = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP 中继：绕 WebView CORS/SameSite，cookie jar 自动带 session（SSO 必需）
+reqwest = { version = "0.12", features = ["json", "stream", "cookies", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+futures-util = "0.3"
+url = "2"
