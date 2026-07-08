@@ -175,33 +175,91 @@ export interface LlmConfigOut {
   updated_at: string | null;
 }
 
+/** 配置列表项（不回显 key 明文，附 key_hint 尾 4 位脱敏）。 */
+export interface LlmConfigItem {
+  id: number;
+  name: string;
+  base_url: string;
+  model: string;
+  has_key: boolean;
+  key_hint: string | null;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface LlmConfigTestResult {
   ok: boolean;
   latency_ms: number;
   error: string | null;
 }
 
+/** 读取激活配置安全视图（旧契约，首页 status 用）。 */
 export async function getLlmConfig(): Promise<LlmConfigOut> {
   return evoJson<LlmConfigOut>("/api/config/llm", { method: "GET" });
 }
 
-export async function putLlmConfig(payload: {
-  name?: string;
+/** 读取所有配置列表。 */
+export async function listLlmConfigs(): Promise<LlmConfigItem[]> {
+  return evoJson<LlmConfigItem[]>("/api/config/llm/list", { method: "GET" });
+}
+
+/** 新建配置。首条自动激活。 */
+export async function createLlmConfig(payload: {
+  name: string;
   api_key: string;
   base_url: string;
   model: string;
-}): Promise<{ ok: boolean }> {
-  return evoJson<{ ok: boolean }>("/api/config/llm", {
+}): Promise<LlmConfigItem> {
+  return evoJson<LlmConfigItem>("/api/config/llm", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+/** 更新配置。api_key 传空串=不改 key。 */
+export async function updateLlmConfig(
+  id: number,
+  payload: {
+    name?: string;
+    api_key?: string;
+    base_url?: string;
+    model?: string;
+  },
+): Promise<LlmConfigItem> {
+  return evoJson<LlmConfigItem>(`/api/config/llm/${id}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 }
 
+/** 删除配置。删激活项会自动激活剩余中 id 最小的一条。 */
+export async function deleteLlmConfig(id: number): Promise<{ ok: boolean }> {
+  return evoJson<{ ok: boolean }>(`/api/config/llm/${id}`, {
+    method: "DELETE",
+  });
+}
+
+/** 设为激活（全局唯一）。 */
+export async function activateLlmConfig(id: number): Promise<LlmConfigItem> {
+  return evoJson<LlmConfigItem>(`/api/config/llm/${id}/activate`, {
+    method: "POST",
+  });
+}
+
+/**
+ * 测试连通性。两条路径二选一：
+ * - 测已存配置：传 { id }，后端读库解密。
+ * - 测草稿：传 { api_key, base_url, model }。
+ * 同时传时 id 优先。
+ */
 export async function testLlmConfig(payload: {
-  api_key: string;
-  base_url: string;
-  model: string;
+  id?: number;
+  api_key?: string;
+  base_url?: string;
+  model?: string;
 }): Promise<LlmConfigTestResult> {
   return evoJson<LlmConfigTestResult>("/api/config/llm/test", {
     method: "POST",

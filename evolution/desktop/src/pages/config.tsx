@@ -1,73 +1,124 @@
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import {
-  getLlmConfig,
-  putLlmConfig,
+  listLlmConfigs,
+  createLlmConfig,
+  updateLlmConfig,
+  deleteLlmConfig,
+  activateLlmConfig,
   testLlmConfig,
-  type LlmConfigOut,
+  type LlmConfigItem,
   type LlmConfigTestResult,
 } from "@/lib/api";
 
 /**
- * 大模型 API 配置页（桌面化改造核心落地点，2026-07-07）。
+ * 大模型 API 配置页（多配置管理，2026-07-08）。
  *
- * 桌面端唯一配置入口：填 base_url / api_key / model → PUT evolution 加密存。
- * GET 不回显 key（安全），编辑时 key 留空=不改。
- * 支持连通性测试（POST /test，不落库）。
+ * 支持保存多个配置（deepseek/glm/openai 等），列表展示（name/base_url/model/尾4位 key 脱敏），
+ * 选一个激活（runtime 读激活项），可改/删，可对任意一条做连通性测试（后端读库解密，无需重输 key）。
  */
+
+/** 编辑表单的状态：editingId=null=新建，否则=编辑该 id。 */
+interface FormState {
+  editingId: number | null;
+  name: string;
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+}
+
+const EMPTY_FORM: FormState = {
+  editingId: null,
+  name: "",
+  apiKey: "",
+  baseUrl: "",
+  model: "",
+};
+
 export default function ConfigPage() {
-  const [config, setConfig] = useState<LlmConfigOut | null>(null);
+  const [configs, setConfigs] = useState<LlmConfigItem[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // 表单字段
-  const [baseUrl, setBaseUrl] = useState("");
-  const [apiKey, setApiKey] = useState("");
-  const [model, setModel] = useState("");
-  // 编辑态：key 留空表示不改（GET 不回显，编辑时若不改 key 则提交时用占位）
-  const [keyDirty, setKeyDirty] = useState(false);
-
+  // 编辑/新建表单：null=隐藏，对象=显示
+  const [form, setForm] = useState<FormState | null>(null);
   const [saving, setSaving] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<LlmConfigTestResult | null>(null);
+
+  // 每条配置独立的测试状态（id → 结果 + loading）
+  const [testingIds, setTestingIds] = useState<Set<number>>(new Set());
+  const [testResults, setTestResults] = useState<Record<number, LlmConfigTestResult>>({});
+
+  // 草稿测试（新建表单里点测试）
+  const [draftTesting, setDraftTesting] = useState(false);
+  const [draftTestResult, setDraftTestResult] = useState<LlmConfigTestResult | null>(null);
 
   useEffect(() => {
-    getLlmConfig()
-      .then((c) => {
-        setConfig(c);
-        setBaseUrl(c.base_url);
-        setModel(c.model);
-      })
-      .catch((err) => toast.error(err instanceof Error ? err.message : "读取配置失败"))
-      .finally(() => setLoading(false));
+    refresh();
   }, []);
 
+  async function refresh() {
+    try {
+      const list = await listLlmConfigs();
+      setConfigs(list);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "读取配置失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function openCreate() {
+    setForm({ ...EMPTY_FORM });
+    setDraftTestResult(null);
+  }
+
+  function openEdit(item: LlmConfigItem) {
+    setForm({
+      editingId: item.id,
+      name: item.name,
+      apiKey: "", // 编辑时不回显 key
+      baseUrl: item.base_url,
+      model: item.model,
+    });
+    setDraftTestResult(null);
+  }
+
+  function closeForm() {
+    setForm(null);
+    setDraftTestResult(null);
+  }
+
   async function handleSave() {
-    if (!baseUrl.trim() || !model.trim()) {
-      toast.error("base_url 和 model 不能为空");
+    if (!form) return;
+    if (!form.name.trim() || !form.baseUrl.trim() || !form.model.trim()) {
+      toast.error("名称 / Base URL / Model 不能为空");
       return;
     }
-    if (config?.has_key && !keyDirty && !apiKey) {
-      toast.error("请填写 api_key（编辑时不回显，需重新输入）");
-      return;
-    }
-    if (!config?.has_key && !apiKey) {
-      toast.error("首次配置必须填写 api_key");
+    // 新建必须填 key；编辑时 key 留空=不改
+    if (form.editingId === null && !form.apiKey) {
+      toast.error("首次配置必须填写 API Key");
       return;
     }
     setSaving(true);
     try {
-      await putLlmConfig({
-        api_key: apiKey,
-        base_url: baseUrl.trim(),
-        model: model.trim(),
-      });
-      toast.success("配置已保存");
-      // 刷新状态
-      const fresh = await getLlmConfig();
-      setConfig(fresh);
-      setApiKey("");
-      setKeyDirty(false);
-      setTestResult(null);
+      if (form.editingId === null) {
+        await createLlmConfig({
+          name: form.name.trim(),
+          api_key: form.apiKey,
+          base_url: form.baseUrl.trim(),
+          model: form.model.trim(),
+        });
+        toast.success("配置已新建");
+      } else {
+        await updateLlmConfig(form.editingId, {
+          name: form.name.trim(),
+          api_key: form.apiKey || undefined, // 空=不改
+          base_url: form.baseUrl.trim(),
+          model: form.model.trim(),
+        });
+        toast.success("配置已更新");
+      }
+      closeForm();
+      await refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "保存失败");
     } finally {
@@ -75,28 +126,79 @@ export default function ConfigPage() {
     }
   }
 
-  async function handleTest() {
-    if (!baseUrl.trim() || !model.trim()) {
-      toast.error("请先填写 base_url 和 model");
-      return;
-    }
-    // 测试：有已存 key 且未改 key → 用已存的（后端读库）；否则必须填了新 key
-    const keyForTest = apiKey;
-    if (!keyForTest && !config?.has_key) {
-      toast.error("请先填写 api_key");
-      return;
-    }
-    setTesting(true);
-    setTestResult(null);
+  async function handleDelete(item: LlmConfigItem) {
+    if (!confirm(`确认删除配置「${item.name}」？此操作不可撤销。`)) return;
     try {
-      // 若 key 留空（用已存的），传占位让后端 test 接口知道用库里的
-      // 但 test 接口设计是"用提交的临时 key"，不读库。所以留空时提示填。
-      const result = await testLlmConfig({
-        api_key: keyForTest || "__use_stored__",
-        base_url: baseUrl.trim(),
-        model: model.trim(),
+      await deleteLlmConfig(item.id);
+      toast.success("已删除");
+      await refresh();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "删除失败");
+    }
+  }
+
+  async function handleActivate(item: LlmConfigItem) {
+    try {
+      await activateLlmConfig(item.id);
+      toast.success(`已激活「${item.name}」`);
+      await refresh();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "激活失败");
+    }
+  }
+
+  /** 测试已保存配置：后端读库解密，无需 key。 */
+  async function handleTestSaved(item: LlmConfigItem) {
+    setTestingIds((s) => new Set(s).add(item.id));
+    setTestResults((r) => {
+      const next = { ...r };
+      delete next[item.id];
+      return next;
+    });
+    try {
+      const result = await testLlmConfig({ id: item.id });
+      setTestResults((r) => ({ ...r, [item.id]: result }));
+      if (result.ok) {
+        toast.success(`「${item.name}」连通正常（${result.latency_ms}ms）`);
+      } else {
+        toast.error(`「${item.name}」连通失败：${result.error}`);
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "测试失败");
+    } finally {
+      setTestingIds((s) => {
+        const next = new Set(s);
+        next.delete(item.id);
+        return next;
       });
-      setTestResult(result);
+    }
+  }
+
+  /** 测试草稿（表单里填的临时值，不落库）。 */
+  async function handleTestDraft() {
+    if (!form) return;
+    if (!form.baseUrl.trim() || !form.model.trim()) {
+      toast.error("请先填写 Base URL 和 Model");
+      return;
+    }
+    // 编辑态若没重填 key，又要点测试 → 提示先保存或重填
+    if (form.editingId !== null && !form.apiKey) {
+      toast.error("编辑态测试需重填 API Key（或保存后用列表的测试按钮，读库免输入）");
+      return;
+    }
+    if (!form.apiKey) {
+      toast.error("请填写 API Key 后测试");
+      return;
+    }
+    setDraftTesting(true);
+    setDraftTestResult(null);
+    try {
+      const result = await testLlmConfig({
+        api_key: form.apiKey,
+        base_url: form.baseUrl.trim(),
+        model: form.model.trim(),
+      });
+      setDraftTestResult(result);
       if (result.ok) {
         toast.success(`连通正常（${result.latency_ms}ms）`);
       } else {
@@ -105,7 +207,7 @@ export default function ConfigPage() {
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "测试失败");
     } finally {
-      setTesting(false);
+      setDraftTesting(false);
     }
   }
 
@@ -113,99 +215,191 @@ export default function ConfigPage() {
     return <div className="page-loading">加载配置…</div>;
   }
 
+  const activeItem = configs.find((c) => c.is_active);
+
   return (
     <div className="config-page">
       <header className="page-header">
         <h1>大模型 API 配置</h1>
         <p className="page-desc">
-          进化端的 LLM 配置（judge 评分 + 进化 Agent 共用一套）。填完后加密存储在服务器，
-          运行时解密调用。
+          进化端的 LLM 配置（judge 评分 + 进化 Agent 共用一套）。可保存多个配置，
+          选一个激活——运行时读激活项。API Key 加密存储在服务器，运行时解密调用。
         </p>
       </header>
 
-      <section className="config-form">
-        <div className="config-status">
-          {config?.has_key ? (
-            <span className="status-badge ok">● 已配置</span>
-          ) : (
-            <span className="status-badge warn">○ 未配置</span>
-          )}
-          {config?.updated_at && (
-            <span className="status-time">
-              更新于 {new Date(config.updated_at).toLocaleString()}
+      {/* 激活状态条 */}
+      <section className="config-status">
+        {activeItem ? (
+          <>
+            <span className="status-badge ok">● 已激活：{activeItem.name}</span>
+            <span className="status-meta">
+              {activeItem.model} · {activeItem.base_url}
             </span>
-          )}
-        </div>
-
-        <label className="config-field">
-          <span className="config-label">Base URL</span>
-          <input
-            className="config-input"
-            value={baseUrl}
-            onChange={(e) => setBaseUrl(e.target.value)}
-            placeholder="https://api.deepseek.com"
-            disabled={saving || testing}
-          />
-          <span className="config-hint">OpenAI 兼容端点</span>
-        </label>
-
-        <label className="config-field">
-          <span className="config-label">API Key</span>
-          <input
-            className="config-input"
-            type="password"
-            value={apiKey}
-            onChange={(e) => {
-              setApiKey(e.target.value);
-              setKeyDirty(true);
-            }}
-            placeholder={config?.has_key ? "已配置（编辑时重新输入）" : "sk-..."}
-            disabled={saving || testing}
-            autoComplete="off"
-          />
-          <span className="config-hint">
-            {config?.has_key
-              ? "已加密存储，编辑时需重新填写（安全起见不回显）"
-              : "加密存储，不会明文返回"}
-          </span>
-        </label>
-
-        <label className="config-field">
-          <span className="config-label">Model</span>
-          <input
-            className="config-input"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            placeholder="deepseek-chat"
-            disabled={saving || testing}
-          />
-          <span className="config-hint">模型名（如 deepseek-chat / glm-4.6 / gpt-4o）</span>
-        </label>
-
-        {testResult && (
-          <div className={`config-test-result ${testResult.ok ? "ok" : "fail"}`}>
-            {testResult.ok
-              ? `✓ 连通正常，延迟 ${testResult.latency_ms}ms`
-              : `✗ 连通失败：${testResult.error}`}
-          </div>
+          </>
+        ) : (
+          <span className="status-badge warn">○ 暂无激活配置</span>
         )}
+      </section>
 
-        <div className="config-actions">
-          <button
-            className="config-button primary"
-            onClick={handleSave}
-            disabled={saving || testing}
-          >
-            {saving ? "保存中…" : "保存配置"}
-          </button>
-          <button
-            className="config-button secondary"
-            onClick={handleTest}
-            disabled={saving || testing}
-          >
-            {testing ? "测试中…" : "测试连通性"}
-          </button>
-        </div>
+      {/* 新建按钮 */}
+      <div className="config-toolbar">
+        <button className="config-button primary" onClick={openCreate} disabled={!!form}>
+          + 新建配置
+        </button>
+      </div>
+
+      {/* 编辑/新建表单 */}
+      {form && (
+        <section className="config-form">
+          <div className="config-form-title">
+            {form.editingId === null ? "新建配置" : "编辑配置"}
+          </div>
+          <label className="config-field">
+            <span className="config-label">名称</span>
+            <input
+              className="config-input"
+              value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })}
+              placeholder="如 deepseek-主力"
+              disabled={saving || draftTesting}
+            />
+          </label>
+          <label className="config-field">
+            <span className="config-label">API Key</span>
+            <input
+              className="config-input"
+              type="password"
+              value={form.apiKey}
+              onChange={(e) => setForm({ ...form, apiKey: e.target.value })}
+              placeholder={form.editingId !== null ? "留空=不修改" : "sk-..."}
+              disabled={saving || draftTesting}
+              autoComplete="off"
+            />
+            <span className="config-hint">
+              {form.editingId !== null
+                ? "加密存储，编辑时留空表示不改 key"
+                : "加密存储，不会明文返回"}
+            </span>
+          </label>
+          <label className="config-field">
+            <span className="config-label">Base URL</span>
+            <input
+              className="config-input"
+              value={form.baseUrl}
+              onChange={(e) => setForm({ ...form, baseUrl: e.target.value })}
+              placeholder="https://api.deepseek.com"
+              disabled={saving || draftTesting}
+            />
+            <span className="config-hint">OpenAI 兼容端点</span>
+          </label>
+          <label className="config-field">
+            <span className="config-label">Model</span>
+            <input
+              className="config-input"
+              value={form.model}
+              onChange={(e) => setForm({ ...form, model: e.target.value })}
+              placeholder="deepseek-chat / glm-4.6 / gpt-4o"
+              disabled={saving || draftTesting}
+            />
+          </label>
+
+          {draftTestResult && (
+            <div className={`config-test-result ${draftTestResult.ok ? "ok" : "fail"}`}>
+              {draftTestResult.ok
+                ? `✓ 连通正常，延迟 ${draftTestResult.latency_ms}ms`
+                : `✗ 连通失败：${draftTestResult.error}`}
+            </div>
+          )}
+
+          <div className="config-actions">
+            <button
+              className="config-button primary"
+              onClick={handleSave}
+              disabled={saving || draftTesting}
+            >
+              {saving ? "保存中…" : "保存"}
+            </button>
+            <button
+              className="config-button secondary"
+              onClick={handleTestDraft}
+              disabled={saving || draftTesting}
+            >
+              {draftTesting ? "测试中…" : "测试连通性"}
+            </button>
+            <button className="config-button ghost" onClick={closeForm} disabled={saving}>
+              取消
+            </button>
+          </div>
+        </section>
+      )}
+
+      {/* 配置列表 */}
+      <section className="config-list">
+        {configs.length === 0 ? (
+          <div className="config-empty">
+            还没有配置。点击「+ 新建配置」添加你的第一个大模型 API。
+          </div>
+        ) : (
+          configs.map((item) => (
+            <div key={item.id} className={`config-card ${item.is_active ? "active" : ""}`}>
+              <div className="config-card-head">
+                <span className="config-card-name">
+                  {item.is_active && <span className="config-active-dot" />}
+                  {item.name}
+                </span>
+                {item.is_active && <span className="config-active-tag">当前激活</span>}
+              </div>
+              <div className="config-card-meta">
+                <span title={item.model}>{item.model}</span>
+                <span className="config-card-sep">·</span>
+                <span title={item.base_url}>{item.base_url}</span>
+              </div>
+              <div className="config-card-key">
+                API Key：
+                {item.has_key
+                  ? `••••${item.key_hint ?? ""}`
+                  : <span className="config-key-missing">未填写</span>}
+              </div>
+              {testResults[item.id] && (
+                <div
+                  className={`config-test-result ${
+                    testResults[item.id].ok ? "ok" : "fail"
+                  }`}
+                >
+                  {testResults[item.id].ok
+                    ? `✓ 连通正常，延迟 ${testResults[item.id].latency_ms}ms`
+                    : `✗ 连通失败：${testResults[item.id].error}`}
+                </div>
+              )}
+              <div className="config-card-actions">
+                <button
+                  className="config-button small"
+                  onClick={() => handleTestSaved(item)}
+                  disabled={testingIds.has(item.id)}
+                >
+                  {testingIds.has(item.id) ? "测试中…" : "测试"}
+                </button>
+                <button className="config-button small" onClick={() => openEdit(item)}>
+                  编辑
+                </button>
+                {!item.is_active && (
+                  <button
+                    className="config-button small"
+                    onClick={() => handleActivate(item)}
+                  >
+                    设为激活
+                  </button>
+                )}
+                <button
+                  className="config-button small danger"
+                  onClick={() => handleDelete(item)}
+                >
+                  删除
+                </button>
+              </div>
+            </div>
+          ))
+        )}
       </section>
     </div>
   );

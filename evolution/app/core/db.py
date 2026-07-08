@@ -372,17 +372,21 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_rl_category ON reflection_library(category);
 
-            -- llm_config：全局大模型 API 配置（桌面化改造，2026-07-07）。
-            -- 单人/全局场景，永远只有 id=1 一行。桌面端填 → HTTP → AES-256-GCM 加密存。
-            -- llm.py (httpx judge) + model_factory.py (langchain agent) 从此表读 key。
-            CREATE TABLE IF NOT EXISTS llm_config (
-                id          INTEGER PRIMARY KEY DEFAULT 1,  -- 永远只有 id=1 这一行
-                name        TEXT,                            -- 配置名（可选，默认 "default"）
-                api_key_enc TEXT,                            -- AES-256-GCM 加密（nonce||ciphertext+tag, urlsafe-b64）
-                base_url    TEXT,                            -- 如 https://api.deepseek.com
-                model       TEXT,                            -- 如 deepseek-chat
-                updated_at  TEXT                             -- ISO 时间戳
+            -- llm_configs：大模型 API 配置（多配置管理，2026-07-08）。
+            -- 可保存多个配置（deepseek/glm/openai 各一条），其中 is_active=1 的唯一一条
+            -- 被 runtime 读取（llm.py judge + model_factory.py agent）。api_key AES-256-GCM 加密。
+            -- 桌面端配置页 CRUD，测试连通性时按 id 读库解密。
+            CREATE TABLE IF NOT EXISTS llm_configs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL,                   -- 配置名（用户起，如 "deepseek-主力"）
+                api_key_enc TEXT,                             -- AES-256-GCM 加密（nonce||ciphertext+tag, urlsafe-b64）；空=待填
+                base_url    TEXT NOT NULL,                    -- 如 https://api.deepseek.com
+                model       TEXT NOT NULL,                    -- 如 deepseek-chat
+                is_active    INTEGER NOT NULL DEFAULT 0,      -- 1=当前激活，全局唯一（事务保证）
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_llm_configs_active ON llm_configs(is_active);
             """
         )
         conn.commit()
@@ -412,6 +416,8 @@ def init_db() -> None:
         _migrate_manual_tests_origin_layer(conn)
         # Phase 1：初始化归因映射（幂等，仅空表时填充）
         _seed_agent_prompt_map(conn)
+        # 多配置管理：llm_config（单数，单行）→ llm_configs（复数，多行 + is_active）
+        _migrate_llm_configs_multi(conn)
 
 
 def _migrate_evolve_sessions_driver_fields(conn: sqlite3.Connection) -> None:
@@ -552,6 +558,67 @@ def _seed_agent_prompt_map(conn: sqlite3.Connection) -> None:
             [(a, p, r) for a, p, r in _AGENT_PROMPT_SEED],
         )
         conn.commit()
+
+
+def _migrate_llm_configs_multi(conn: sqlite3.Connection) -> None:
+    """幂等迁移：llm_config（单数，单行）→ llm_configs（复数，多行 + is_active）。
+
+    多配置管理（2026-07-08）：从"全局唯一一行"升级为"可保存多个配置"。
+    迁移逻辑（4 种情况）：
+      1. 新表已有数据 → 已迁移过，return（幂等）
+      2. 旧表存在且有数据 → 把 id=1 那行迁到新表（is_active=1），密文原样拷贝，
+         然后 DROP 旧表
+      3. 新表空 + 旧表空（或旧表不存在）→ 仅靠 CREATE TABLE IF NOT EXISTS 建新表，无需搬运
+      4. 旧表不存在（全新库）→ 同 3
+
+    注意：密文（api_key_enc）直接拷贝，无需解密再加密——加密格式未变，主密钥未变。
+    """
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+
+    new_exists = "llm_configs" in tables
+    old_exists = "llm_config" in tables
+
+    # 情况 1：新表已有数据 → 已迁移
+    if new_exists:
+        cnt = conn.execute("SELECT count(*) FROM llm_configs").fetchone()[0]
+        if cnt > 0:
+            # 新表有数据，若旧表还在（异常残留）则清掉
+            if old_exists:
+                with _lock:
+                    conn.execute("DROP TABLE IF EXISTS llm_config")
+                    conn.commit()
+            return
+
+    # 走到这里：新表为空（可能刚 CREATE）。搬运旧表数据（若有）
+    if old_exists:
+        row = conn.execute(
+            "SELECT name, api_key_enc, base_url, model, updated_at FROM llm_config WHERE id = 1"
+        ).fetchone()
+        if row:
+            name = row[0] or "default"
+            api_key_enc = row[1]  # 可能为 NULL（占位未填）
+            base_url = row[2] or ""
+            model = row[3] or ""
+            updated_at = row[4] or datetime.now(UTC).isoformat()
+            created_at = updated_at  # 旧表无 created_at，用 updated_at 兜底
+            with _lock:
+                conn.execute(
+                    """INSERT INTO llm_configs
+                       (id, name, api_key_enc, base_url, model, is_active, created_at, updated_at)
+                       VALUES (1, ?, ?, ?, ?, 1, ?, ?)""",
+                    (name, api_key_enc, base_url, model, created_at, updated_at),
+                )
+                conn.execute("DROP TABLE llm_config")
+                conn.commit()
+            logger.info("llm_config → llm_configs 迁移完成（搬运 1 行，is_active=1）。")
+        else:
+            # 旧表存在但空：直接 DROP
+            with _lock:
+                conn.execute("DROP TABLE llm_config")
+                conn.commit()
+    # 情况 3/4：新表空 + 旧表空/不存在 → 新表已由 CREATE TABLE IF NOT EXISTS 建好，无需动作
 
 
 def _migrate_harness_snapshots_config(conn: sqlite3.Connection) -> None:
@@ -731,22 +798,45 @@ def get_master_key() -> bytes:
     return _master_key_cache
 
 
-class LlmConfigRepository:
-    """全局 LLM 配置访问层（单人/全局，单行表 id=1）。
+class LlmConfigsRepository:
+    """LLM 配置访问层（多配置管理，2026-07-08）。
 
-    api_key 加密存储（AES-256-GCM），读取时解密返回明文。
-    llm.py + model_factory.py 调 get_active() 拿运行时 key。
-    桌面端配置接口调 save()/get_safe()（不回显 key）。
+    支持 save 多个配置（deepseek/glm/openai 各一条），其中 is_active=1 的唯一一条
+    被 runtime 读取。api_key AES-256-GCM 加密存储。
+
+    不变量：is_active=1 全局唯一（activate/自动激活均用事务保证）。
+
+    消费方：
+      - llm.py + model_factory.py → get_active()（解密明文，运行时用）
+      - config/api.py → list_all()/get_active_safe()/create/update/delete/activate/get_decrypted
     """
 
     @staticmethod
-    def get_active() -> tuple[str, str, str] | None:
-        """读取当前 LLM 配置（解密后的明文）。
+    def list_all() -> list[dict[str, Any]]:
+        """返回所有配置（不回显 key 明文）。
 
         Returns:
-            (api_key, base_url, model) 三元组；未配置（表空或 key 为空）返回 None。
+            [{id, name, base_url, model, has_key, key_hint, is_active, created_at, updated_at}, ...]
+            key_hint 为 key 尾 4 位脱敏（供用户辨识），无 key 时为 None。
+            按 is_active DESC, created_at ASC 排序（激活项置顶）。
         """
-        row = query_one("SELECT api_key_enc, base_url, model FROM llm_config WHERE id = 1")
+        rows = query_all(
+            """SELECT id, name, api_key_enc, base_url, model, is_active, created_at, updated_at
+               FROM llm_configs
+               ORDER BY is_active DESC, created_at ASC"""
+        )
+        return [_row_to_safe(r) for r in rows]
+
+    @staticmethod
+    def get_active() -> tuple[str, str, str] | None:
+        """读取激活配置（解密后的明文）。
+
+        Returns:
+            (api_key, base_url, model) 三元组；未配置（无激活行或 key 为空）返回 None。
+        """
+        row = query_one(
+            "SELECT api_key_enc, base_url, model FROM llm_configs WHERE is_active = 1 LIMIT 1"
+        )
         if not row or not row["api_key_enc"]:
             return None
         from app.core.security import decrypt_secret
@@ -756,14 +846,15 @@ class LlmConfigRepository:
         return api_key, base_url, model
 
     @staticmethod
-    def get_safe() -> dict[str, Any]:
-        """读取配置（不回显 key，供桌面端 GET 用）。
+    def get_active_safe() -> dict[str, Any]:
+        """读取激活配置（不回显 key，供桌面端 GET /config/llm 用）。
 
         Returns:
-            {has_key, name, base_url, model, updated_at}
+            {has_key, name, base_url, model, updated_at}；无激活配置时 has_key=False 兜底。
         """
         row = query_one(
-            "SELECT name, api_key_enc, base_url, model, updated_at FROM llm_config WHERE id = 1"
+            """SELECT name, api_key_enc, base_url, model, updated_at
+               FROM llm_configs WHERE is_active = 1 LIMIT 1"""
         )
         if not row or not row["api_key_enc"]:
             return {"has_key": False, "name": None, "base_url": "", "model": "", "updated_at": None}
@@ -776,24 +867,199 @@ class LlmConfigRepository:
         }
 
     @staticmethod
-    def save(*, api_key: str, base_url: str, model: str, name: str = "default") -> None:
-        """保存配置（加密 key），单行 UPSERT（id=1）。"""
+    def get_decrypted(id: int) -> tuple[str, str, str] | None:
+        """按 id 读取配置（解密明文），供测试连通性用。
+
+        Returns:
+            (api_key, base_url, model)；不存在或 key 为空返回 None。
+        """
+        row = query_one(
+            "SELECT api_key_enc, base_url, model FROM llm_configs WHERE id = ?",
+            (id,),
+        )
+        if not row or not row["api_key_enc"]:
+            return None
+        from app.core.security import decrypt_secret
+        api_key = decrypt_secret(row["api_key_enc"], get_master_key())
+        return api_key, row["base_url"] or "", row["model"] or ""
+
+    @staticmethod
+    def create(*, name: str, api_key: str, base_url: str, model: str) -> int:
+        """新建配置（加密 key）。若表为空则自动设为激活。
+
+        Returns:
+            新行 id。
+        """
         from app.core.security import encrypt_secret
         encrypted = encrypt_secret(api_key, get_master_key())
         now = datetime.now(UTC).isoformat()
-        execute(
-            """INSERT INTO llm_config (id, name, api_key_enc, base_url, model, updated_at)
-               VALUES (1, ?, ?, ?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET
-                   name = excluded.name,
-                   api_key_enc = excluded.api_key_enc,
-                   base_url = excluded.base_url,
-                   model = excluded.model,
-                   updated_at = excluded.updated_at""",
-            (name, encrypted, base_url, model, now),
-        )
+        conn = get_conn()
+        with _lock:
+            # 是否首条 → 自动激活
+            cnt = conn.execute("SELECT count(*) FROM llm_configs").fetchone()[0]
+            is_active = 1 if cnt == 0 else 0
+            cur = conn.execute(
+                """INSERT INTO llm_configs
+                   (name, api_key_enc, base_url, model, is_active, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (name, encrypted, base_url, model, is_active, now, now),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    @staticmethod
+    def update(
+        id: int,
+        *,
+        name: str | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+    ) -> bool:
+        """部分更新配置。api_key 为 None/空字符串表示不改 key。
+
+        Returns:
+            True 表示命中行已更新；False 表示 id 不存在。
+        """
+        sets: list[str] = []
+        params: list[Any] = []
+        if name is not None:
+            sets.append("name = ?")
+            params.append(name)
+        if api_key:  # 非空才改 key
+            from app.core.security import encrypt_secret
+            sets.append("api_key_enc = ?")
+            params.append(encrypt_secret(api_key, get_master_key()))
+        if base_url is not None:
+            sets.append("base_url = ?")
+            params.append(base_url)
+        if model is not None:
+            sets.append("model = ?")
+            params.append(model)
+        if not sets:
+            # 无字段可改，检查行是否存在
+            row = query_one("SELECT id FROM llm_configs WHERE id = ?", (id,))
+            return row is not None
+        sets.append("updated_at = ?")
+        params.append(datetime.now(UTC).isoformat())
+        params.append(id)
+        conn = get_conn()
+        with _lock:
+            cur = conn.execute(
+                f"UPDATE llm_configs SET {', '.join(sets)} WHERE id = ?",
+                tuple(params),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    @staticmethod
+    def delete(id: int) -> bool:
+        """删除配置。若删的是激活项且还有其它行 → 自动激活 id 最小的一条。
+
+        Returns:
+            True 表示命中行已删；False 表示 id 不存在。
+        """
+        conn = get_conn()
+        with _lock:
+            row = conn.execute(
+                "SELECT is_active FROM llm_configs WHERE id = ?", (id,)
+            ).fetchone()
+            if not row:
+                return False
+            was_active = row[0] == 1
+            conn.execute("DELETE FROM llm_configs WHERE id = ?", (id,))
+            if was_active:
+                # 自动激活剩余中 id 最小的一条
+                nxt = conn.execute(
+                    "SELECT id FROM llm_configs ORDER BY id ASC LIMIT 1"
+                ).fetchone()
+                if nxt:
+                    conn.execute("UPDATE llm_configs SET is_active = 1 WHERE id = ?", (nxt[0],))
+            conn.commit()
+            return True
+
+    @staticmethod
+    def activate(id: int) -> bool:
+        """设为激活（事务内先全置 0 再置 1，保证 is_active 全局唯一）。
+
+        Returns:
+            True 表示命中行已激活；False 表示 id 不存在。
+        """
+        conn = get_conn()
+        with _lock:
+            row = conn.execute("SELECT id FROM llm_configs WHERE id = ?", (id,)).fetchone()
+            if not row:
+                return False
+            conn.execute("UPDATE llm_configs SET is_active = 0")
+            conn.execute("UPDATE llm_configs SET is_active = 1 WHERE id = ?", (id,))
+            conn.commit()
+            return True
+
+
+def _row_to_safe(row: dict[str, Any]) -> dict[str, Any]:
+    """把 llm_configs 行转为安全视图（不回显 key 明文，附 key_hint 脱敏）。
+
+    key_hint：key 明文尾 4 位（供用户辨识不同 key），无 key 时 None。
+    解密失败（如主密钥变更）时 key_hint=None、has_key=False，不抛错。
+    """
+    has_key = bool(row.get("api_key_enc"))
+    key_hint = None
+    if has_key:
+        try:
+            from app.core.security import decrypt_secret
+            plain = decrypt_secret(row["api_key_enc"], get_master_key())
+            key_hint = plain[-4:] if len(plain) >= 4 else plain
+        except Exception:
+            # 解密失败：密钥可能已变更。标 has_key=False 让用户重新填。
+            has_key = False
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "base_url": row["base_url"] or "",
+        "model": row["model"] or "",
+        "has_key": has_key,
+        "key_hint": key_hint,
+        "is_active": bool(row["is_active"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+class LlmConfigRepository:
+    """[已废弃] 旧单行配置访问层（2026-07-08 多配置管理改造）。
+
+    保留为薄包装，委托 LlmConfigsRepository，避免遗漏旧调用点。
+    新代码请直接用 LlmConfigsRepository。
+    """
+
+    @staticmethod
+    def get_active() -> tuple[str, str, str] | None:
+        """读激活配置（委托新仓库）。"""
+        return LlmConfigsRepository.get_active()
+
+    @staticmethod
+    def get_safe() -> dict[str, Any]:
+        """读激活配置安全视图（委托新仓库）。"""
+        return LlmConfigsRepository.get_active_safe()
+
+    @staticmethod
+    def save(*, api_key: str, base_url: str, model: str, name: str = "default") -> None:
+        """保存配置（向后兼容：若已存在激活项则更新它，否则新建并激活）。"""
+        conn = get_conn()
+        with _lock:
+            row = conn.execute(
+                "SELECT id FROM llm_configs WHERE is_active = 1 LIMIT 1"
+            ).fetchone()
+        if row:
+            LlmConfigsRepository.update(
+                row[0], api_key=api_key, base_url=base_url, model=model, name=name
+            )
+        else:
+            LlmConfigsRepository.create(
+                api_key=api_key, base_url=base_url, model=model, name=name
+            )
 
     @staticmethod
     def clear() -> None:
-        """清空配置（删单行）。"""
-        execute("DELETE FROM llm_config WHERE id = 1")
+        """清空所有配置。"""
+        execute("DELETE FROM llm_configs")

@@ -5732,6 +5732,156 @@ html[data-theme="dark"] {
   border-color: var(--teal, #3a9a7e);
 }
 
+/* ghost / danger / small 变体（多配置管理 UI） */
+.config-button.ghost {
+  background: transparent;
+  color: var(--muted-foreground, #94a3b8);
+  border: 1px solid var(--border, #2a3142);
+}
+
+.config-button.ghost:hover:not(:disabled) {
+  color: var(--foreground, #e2e8f0);
+}
+
+.config-button.danger {
+  background: transparent;
+  color: var(--coral, #c9794e);
+  border: 1px solid var(--border, #2a3142);
+}
+
+.config-button.danger:hover:not(:disabled) {
+  border-color: var(--coral, #c9794e);
+  background: rgba(201, 121, 78, 0.08);
+}
+
+.config-button.small {
+  padding: 6px 14px;
+  font-size: 13px;
+  background: var(--surface-hover, #242b3d);
+  color: var(--foreground, #e2e8f0);
+  border: 1px solid var(--border, #2a3142);
+}
+
+.config-button.small:hover:not(:disabled) {
+  border-color: var(--teal, #3a9a7e);
+}
+
+.config-button.small.danger {
+  color: var(--coral, #c9794e);
+}
+
+/* 多配置管理新增样式（2026-07-08） */
+.config-status .status-meta {
+  font-size: 12px;
+  color: var(--muted-foreground, #94a3b8);
+  word-break: break-all;
+}
+
+.config-toolbar {
+  margin-bottom: 16px;
+}
+
+.config-form-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--foreground, #e2e8f0);
+}
+
+.config-empty {
+  padding: 32px;
+  text-align: center;
+  color: var(--muted-foreground, #64748b);
+  font-size: 14px;
+  background: var(--surface, #1a1f2e);
+  border-radius: 12px;
+  border: 1px dashed var(--border, #2a3142);
+}
+
+.config-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.config-card {
+  padding: 16px 18px;
+  background: var(--surface, #1a1f2e);
+  border: 1px solid var(--border, #2a3142);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: border-color 0.15s;
+}
+
+.config-card.active {
+  border-color: var(--teal, #3a9a7e);
+  background: rgba(58, 154, 126, 0.06);
+}
+
+.config-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.config-card-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--foreground, #e2e8f0);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.config-active-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--teal, #3a9a7e);
+  box-shadow: 0 0 6px var(--teal, #3a9a7e);
+}
+
+.config-active-tag {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(58, 154, 126, 0.15);
+  color: var(--teal, #3a9a7e);
+}
+
+.config-card-meta {
+  font-size: 13px;
+  color: var(--muted-foreground, #94a3b8);
+  word-break: break-all;
+  line-height: 1.5;
+}
+
+.config-card-sep {
+  margin: 0 6px;
+  opacity: 0.6;
+}
+
+.config-card-key {
+  font-size: 12px;
+  color: var(--muted-foreground, #64748b);
+  font-family: var(--mono, ui-monospace, monospace);
+}
+
+.config-key-missing {
+  color: var(--coral, #c9794e);
+}
+
+.config-card-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
 /* ── 监测页 ── */
 .monitor-page {
   max-width: 960px;
