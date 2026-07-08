@@ -58,7 +58,7 @@ export default function Shell() {
       <aside className="shell-sidebar">
         <div className="shell-brand">
           <span className="shell-brand-icon">🧬</span>
-          <span className="shell-brand-text">Writer 进化</span>
+          <span className="shell-brand-text">思衍进化</span>
         </div>
         <nav className="shell-nav">
           {NAV_ITEMS.map((item) =>

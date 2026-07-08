@@ -28,7 +28,7 @@ export default function LoginPage() {
   return (
     <main className="auth-page">
       <section className="auth-card">
-        <h1 className="auth-title">Writer Agent</h1>
+        <h1 className="auth-title">思衍</h1>
         <p className="auth-subtitle">登录到你的创作工作区</p>
         <form className="auth-form" onSubmit={handleSubmit}>
           <label className="auth-field">

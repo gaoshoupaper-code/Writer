@@ -1,9 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <!-- Writer brand mark: fountain pen nib in vermilion seal square. -->
-  <rect width="64" height="64" rx="11" fill="#9a2f2f" />
-  <g fill="none" stroke="#f6f3ec" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M16 48s8-2 15-8 10-12 10-12l-5-5s-4 6-11 13-9 12-9 12Z" />
-    <path d="m33 24 5 5" />
-  </g>
-  <path d="M41 18.5a3.5 3.5 0 0 1 5 5L43 26.5l-5-5Z" fill="#f6f3ec" />
-</svg>
