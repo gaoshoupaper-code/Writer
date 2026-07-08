@@ -251,18 +251,11 @@ a {
 }
 
 .brand-mark {
-  display: grid;
-  place-items: center;
-  width: 44px;
-  height: 44px;
-  border-radius: 12px;
-  color: #fff;
-  background:
-    linear-gradient(135deg, rgba(255, 255, 255, 0.18), transparent 42%),
-    linear-gradient(135deg, var(--teal), var(--blue));
-  font-size: 19px;
-  font-weight: 950;
-  box-shadow: 0 10px 24px rgba(34, 166, 153, 0.22);
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  object-fit: contain;
+  flex-shrink: 0;
 }
 
 .brand strong,

@@ -20,8 +20,12 @@
 set -euo pipefail
 
 # 配置（按需修改）
-DEPLOY_HOST="${DEPLOY_HOST:-root@siyen.site}"
-REMOTE_DIR="${REMOTE_DIR:-/var/www/releases}"
+# DEPLOY_HOST：用 ~/.ssh/config 里的 Host 别名 "writer"（deploy@111.228.4.165:22222）。
+#   不要用 root@siyen.site —— 服务器 22 端口已封，只能走 22222 的 deploy 账号。
+# REMOTE_DIR：宿主真实路径（nginx 把它以 :ro 挂成容器内 /var/www/releases）。
+#   publish 上传到宿主路径，nginx 容器读同一份文件 → /download/ 即可访问。
+DEPLOY_HOST="${DEPLOY_HOST:-writer}"
+REMOTE_DIR="${REMOTE_DIR:-/home/deploy/Writer/releases}"
 SERVER_URL="${SERVER_URL:-https://siyen.site}"
 
 # 颜色输出
@@ -51,33 +55,83 @@ npm run tauri build 2>&1 | tail -5
 VERSION=$(grep -oP '"version":\s*"\K[^"]+' src-tauri/tauri.conf.json | head -1)
 info "当前版本：v${VERSION}"
 
-# Tauri 2 Windows 产物路径：src-tauri/target/release/bundle/msi/*.msi
-BUNDLE_DIR="src-tauri/target/release/bundle/msi"
-MSI_FILE=$(ls "${BUNDLE_DIR}"/*.msi 2>/dev/null | head -1) || error "未找到 .msi 产物"
-SIG_FILE="${MSI_FILE}.sig"
+# Tauri 2 Windows 产物路径
+MSI_DIR="src-tauri/target/release/bundle/msi"
+NSIS_DIR="src-tauri/target/release/bundle/nsis"
 
-if [ ! -f "${SIG_FILE}" ]; then
-  error "未找到签名文件 ${SIG_FILE}。确认 TAURI_SIGNING_PRIVATE_KEY 正确。"
-fi
+# ── 3.1 定位 + 签名 + 重命名（MSI + NSIS 双格式）─────────────
+# 发布两种格式：
+#   .msi  → 企业批量部署
+#   .exe  → 普通用户下载（体积更小，SmartScreen 信誉更易积累）
+# latest.json 的 updater url 指向 .nsis exe（Tauri 2 updater 默认格式）。
+# 统一约定名（download.astro 必须用同一组名字）：
+#   siyen-<version>-windows.msi
+#   siyen-<version>-windows-setup.exe
+TMP_DIR=$(mktemp -d)
+UPLOAD_FILES=()
 
-MSI_NAME=$(basename "${MSI_FILE}")
-info "产物：${MSI_NAME}"
+# 处理单个产物：定位 → 显式签名兜底 → 复制为约定名
+# 用法：process_bundle <bundle_dir> <ext> <canonical_name> <sig_var_name>
+process_bundle() {
+  local bdir="$1" ext="$2" canonical="$3"
+  local src sigfile
+  src=$(ls "${bdir}"/*."${ext}" 2>/dev/null | head -1)
+  [ -z "${src}" ] && { warn "未找到 .${ext} 产物（${bdir}），跳过"; return 1; }
+  sigfile="${src}.sig"
+  info "Tauri 产物：$(basename "${src}")"
+
+  # 显式签名兜底：tauri build 在某些配置下不会自动签名
+  if [ ! -f "${sigfile}" ]; then
+    info "未检测到自动生成的 .sig，显式签名中..."
+    npx tauri signer sign "${src}" >/dev/null || error "签名失败，检查 TAURI_SIGNING_PRIVATE_KEY"
+    info "签名完成：${sigfile}"
+  fi
+
+  cp "${src}" "${TMP_DIR}/${canonical}"
+  UPLOAD_FILES+=("${TMP_DIR}/${canonical}")
+  info "发布文件名（约定）：${canonical}"
+  return 0
+}
+
+# NSIS .exe（自动更新 + 推荐下载）
+EXE_CANONICAL="siyen-${VERSION}-windows-setup.exe"
+process_bundle "${NSIS_DIR}" exe "${EXE_CANONICAL}" && NSIS_OK=1 || NSIS_OK=0
+
+# MSI（备选下载）
+MSI_CANONICAL="siyen-${VERSION}-windows.msi"
+process_bundle "${MSI_DIR}" msi "${MSI_CANONICAL}" && MSI_OK=1 || MSI_OK=0
+
+# 两种都没发布 = 失败
+[ ${NSIS_OK} -eq 0 ] && [ ${MSI_OK} -eq 0 ] && error "MSI 和 NSIS 产物均未找到"
 
 # ── 4. 生成 latest.json ──────────────────────────────────────
-TMP_DIR=$(mktemp -d)
+# updater url 优先用 NSIS exe（Tauri 2 updater 原生格式），
+# 若只有 MSI 则回退到 MSI。
 LATEST_JSON="${TMP_DIR}/latest.json"
-SIG_CONTENT=$(cat "${SIG_FILE}")
+if [ ${NSIS_OK} -eq 1 ]; then
+  UPDATER_BINARY="${NSIS_DIR}/$(ls "${NSIS_DIR}" | grep -E '\.exe$' | head -1)"
+else
+  UPDATER_BINARY="${MSI_DIR}/$(ls "${MSI_DIR}" | grep -E '\.msi$' | head -1)"
+fi
+SIG_CONTENT=$(cat "${UPDATER_BINARY}.sig")
+UPDATER_NAME=$(basename "${UPDATER_BINARY}")
+# latest.json 里的 url 用约定名（和 download.astro 一致）
+if [ ${NSIS_OK} -eq 1 ]; then
+  UPDATER_URL_NAME="${EXE_CANONICAL}"
+else
+  UPDATER_URL_NAME="${MSI_CANONICAL}"
+fi
 
 # latest.json 格式（Tauri 2 updater 规范）
 cat > "${LATEST_JSON}" <<EOF
 {
   "version": "${VERSION}",
-  "notes": "Writer v${VERSION}",
+  "notes": "思衍 v${VERSION}",
   "pub_date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
   "platforms": {
     "windows-x86_64": {
       "signature": "${SIG_CONTENT}",
-      "url": "${SERVER_URL}/download/${MSI_NAME}"
+      "url": "${SERVER_URL}/releases/${UPDATER_URL_NAME}"
     }
   }
 }
@@ -88,11 +142,13 @@ cat "${LATEST_JSON}"
 # ── 5. 上传到服务器 ──────────────────────────────────────────
 info "上传到 ${DEPLOY_HOST}:${REMOTE_DIR}/ ..."
 ssh "${DEPLOY_HOST}" "mkdir -p ${REMOTE_DIR}" || error "SSH 连接失败，检查 DEPLOY_HOST 和密钥配置"
-scp "${MSI_FILE}" "${LATEST_JSON}" "${DEPLOY_HOST}:${REMOTE_DIR}/"
+scp "${UPLOAD_FILES[@]}" "${LATEST_JSON}" "${DEPLOY_HOST}:${REMOTE_DIR}/"
 
 info "发布完成！"
-info "  下载页：${SERVER_URL}/download/"
-info "  updater endpoint：${SERVER_URL}/download/latest.json"
+info "  下载页：${SERVER_URL}/download"
+[ ${MSI_OK}   -eq 1 ] && info "  MSI 安装包：${SERVER_URL}/releases/${MSI_CANONICAL}"
+[ ${NSIS_OK}  -eq 1 ] && info "  EXE 安装包：${SERVER_URL}/releases/${EXE_CANONICAL}"
+info "  updater endpoint：${SERVER_URL}/releases/latest.json"
 info "  版本：v${VERSION}"
 
 # 清理临时文件

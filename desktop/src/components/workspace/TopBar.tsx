@@ -50,9 +50,9 @@ export function TopBar({
   return (
     <header className="dashboard-topbar">
       <div className="brand">
-        <span className="brand-mark">W</span>
+        <img className="brand-mark" src="/favicon-256.png" alt="" />
         <span>
-          <strong>Writer Agent</strong>
+          <strong>思衍</strong>
           <small>AI writing workspace</small>
         </span>
       </div>

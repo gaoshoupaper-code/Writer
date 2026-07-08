@@ -37,7 +37,7 @@ export default function LoginPage() {
   return (
     <main className="auth-page">
       <section className="auth-card">
-        <h1 className="auth-title">Writer 进化</h1>
+        <h1 className="auth-title">思衍进化</h1>
         <p className="auth-subtitle">登录到进化控制台</p>
         <form className="auth-form" onSubmit={handleSubmit}>
           <label className="auth-field">
