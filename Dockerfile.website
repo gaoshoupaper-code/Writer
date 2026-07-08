@@ -17,7 +17,10 @@ RUN npm config set registry https://registry.npmmirror.com
 
 WORKDIR /app
 COPY website/package.json website/package-lock.json ./
-RUN npm ci
+# --omit=dev：只装 dependencies（astro + zod）。
+# devDeps 里的 cn-font-split / @fontsource 是本地子集化工具，容器构建不需要；
+# 且 @fontsource 在淘宝镜像可能 404，跳过 devDeps 避免装包失败。
+RUN npm ci --omit=dev
 
 COPY website/ ./
 RUN npm run build
