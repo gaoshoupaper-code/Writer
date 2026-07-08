@@ -16,9 +16,12 @@
     python scripts/manage.py revoke-invite <code>
 
 约束：
-    - 必须在 executor 所在机器跑（读 executor/.env 的 DB 路径）。
-    - 从 executor 目录运行（cwd 含 app/ 包），否则 import 失败。
-    - 典型用法：cd /app/executor && python ../scripts/manage.py list-users
+    - 必须在 executor 容器内、WORKDIR=/app/executor 下运行（读 executor/.env 的 DB 路径）。
+    - 镜像里没 COPY scripts/，需先 docker cp 进容器：
+        docker cp scripts/manage.py writer-executor:/app/manage.py
+        docker exec -w /app/executor writer-executor python /app/manage.py <command>
+    - create-invite 的 created_by 自动取数据库中第一个启用管理员的真实 user_id
+      （invite_codes.created_by 有外键约束，不能用 "cli" 这种虚拟标记）。
 """
 from __future__ import annotations
 
@@ -61,11 +64,36 @@ def _resolve_db():
     return db, InviteCodeRepository(db), UserRepository(db), WorkspaceRepository(db)
 
 
+def _resolve_creator(db) -> str:
+    """查一个真实 user_id 作为 invite_codes.created_by。
+
+    invite_codes.created_by 有外键约束 REFERENCES users(user_id)，
+    不能用 "cli" 这种虚拟标记（会触发 FOREIGN KEY constraint failed）。
+    优先取第一个启用中的管理员；无管理员则取第一个用户。
+    """
+    row = db.conn.execute(
+        "SELECT user_id FROM users WHERE is_admin = 1 AND disabled = 0 "
+        "ORDER BY created_at LIMIT 1"
+    ).fetchone()
+    if row is None:
+        row = db.conn.execute(
+            "SELECT user_id FROM users ORDER BY created_at LIMIT 1"
+        ).fetchone()
+    if row is None:
+        print(
+            "ERROR: 数据库中没有任何用户。"
+            "至少需要 bootstrap 创建的管理员账号才能发码。",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return row["user_id"]
+
+
 def cmd_create_invite(args: argparse.Namespace) -> None:
     db, invites, *_ = _resolve_db()
-    # CLI 没有登录用户，created_by 用固定标记 "cli"
+    creator = _resolve_creator(db)
     codes = invites.create(
-        created_by="cli",
+        created_by=creator,
         count=args.count,
         is_admin_code=args.admin,
     )
