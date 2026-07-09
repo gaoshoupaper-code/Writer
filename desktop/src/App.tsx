@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { HashRouter, Routes, Route, Navigate, useNavigate, useLocation } from "react-router-dom";
 import { Toaster } from "@/components/ui/sonner";
+import UpdateBanner from "@/components/UpdateBanner";
 import { setUnauthorizedHandler } from "@/lib/api";
 import Home from "@/pages/home";
 import Login from "@/pages/login";
@@ -31,6 +32,8 @@ function App() {
   return (
     <HashRouter>
       <UnauthorizedHandler />
+      {/* 自动更新提示条（全局钉顶，所有页面可见；无更新时不渲染） */}
+      <UpdateBanner />
       <Routes>
         <Route path="/" element={<Home />} />
         <Route path="/login" element={<Login />} />

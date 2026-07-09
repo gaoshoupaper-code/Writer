@@ -42,6 +42,9 @@ export default function SettingsPage() {
   const [serverUrlInput, setServerUrlInput] = useState("");
   const [serverUrlSaving, setServerUrlSaving] = useState(false);
 
+  // 应用更新（手动检查；启动时 Rust 已自动检查一次并 emit 顶部提示条）
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+
   async function reload() {
     try {
       const [profile, list] = await Promise.all([fetchMyProfile(), listProviderConfigs()]);
@@ -88,6 +91,28 @@ export default function SettingsPage() {
       toast.error(err instanceof Error ? err.message : "保存服务器地址失败。");
     } finally {
       setServerUrlSaving(false);
+    }
+  }
+
+  /// 手动检查更新：调 Rust check_update，有新版提示看顶部横条。
+  async function handleCheckUpdate() {
+    if (checkingUpdate) return;
+    setCheckingUpdate(true);
+    try {
+      const info = await invoke<{
+        available: boolean;
+        current_version: string;
+        version: string | null;
+      }>("check_update");
+      if (info.available) {
+        toast.success(`发现新版本 v${info.version}，请看顶部提示更新`);
+      } else {
+        toast.success(`已是最新版本（v${info.current_version}）`);
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "检查更新失败");
+    } finally {
+      setCheckingUpdate(false);
     }
   }
 
@@ -386,6 +411,30 @@ export default function SettingsPage() {
             {serverUrlSaving ? "保存中…" : "保存并重新登录"}
           </button>
         </form>
+      </section>
+
+      {/* 应用更新（手动检查；启动时已自动检查一次） */}
+      <section className="admin-card" style={{ maxWidth: 880, marginTop: 24 }}>
+        <header className="admin-header">
+          <h1 className="auth-title">应用更新</h1>
+        </header>
+        <div className="config-update-section">
+          <div className="config-update-info">
+            <strong style={{ fontSize: 15 }}>检查新版本</strong>
+            <p className="auth-hint" style={{ margin: 0 }}>
+              有新版本时顶部会显示提示条，点「立即更新」即可下载安装并重启。应用启动时也会自动检查一次。
+            </p>
+          </div>
+          <button
+            className="auth-button"
+            type="button"
+            onClick={handleCheckUpdate}
+            disabled={checkingUpdate}
+            style={{ marginTop: 0, width: "auto", whiteSpace: "nowrap" }}
+          >
+            {checkingUpdate ? "检查中…" : "检查更新"}
+          </button>
+        </div>
       </section>
     </main>
   );
