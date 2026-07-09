@@ -8,6 +8,7 @@ import Monitor from "@/pages/monitor";
 import Evolve from "@/pages/evolve";
 import Evaluation from "@/pages/evaluation";
 import Harness from "@/pages/harness";
+import Dataset from "@/pages/dataset";
 import Tests from "@/pages/tests";
 import TraceDetail from "@/pages/trace-detail";
 import Shell from "@/components/Shell";
@@ -39,6 +40,7 @@ function App() {
           <Route path="/evolve" element={<Evolve />} />
           <Route path="/evaluation" element={<Evaluation />} />
           <Route path="/harness" element={<Harness />} />
+          <Route path="/dataset" element={<Dataset />} />
           <Route path="/tests" element={<Tests />} />
           <Route path="/config" element={<Config />} />
           <Route path="/traces/:traceId" element={<TraceDetail />} />

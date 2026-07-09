@@ -14,6 +14,7 @@ const NAV_ITEMS = [
   { to: "/evaluation", label: "评估", end: false, icon: "📝" },
   { to: "/evolve", label: "进化", end: false, icon: "🧬" },
   { to: "/harness", label: "Agent 要素", end: false, icon: "🔧" },
+  { to: "/dataset", label: "数据集", end: false, icon: "🗂️" },
   { to: "/tests", label: "单次测试", end: false, icon: "🧪" },
   { to: "/config", label: "配置", end: false, icon: "⚙️" },
 ];

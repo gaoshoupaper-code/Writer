@@ -59,6 +59,43 @@ def list_cases(
     return {"cases": cases, "total": len(cases)}
 
 
+# ── 单 case 内容 ─────────────────────────────────────────────
+
+
+@router.get("/cases/{case_id}")
+def get_case_content(
+    case_id: str,
+    layer: str | None = Query(None, description="golden|growing|空=自动推导"),
+) -> dict[str, Any]:
+    """读取单个 case 的 demand.md + reference.md 内容。
+
+    供前端详情侧滑面板展示（列表接口只返回元数据，不返回文件内容）。
+    """
+    ly = layer or evalset.resolve_layer(case_id) or evalset.DEFAULT_LAYER
+    if not evalset.case_exists(case_id, layer=ly):
+        raise HTTPException(status_code=404, detail=f"case {case_id} 不存在")
+
+    demand_md = evalset.load_case_demand(case_id, layer=ly)
+    title = evalset.parse_title(demand_md, case_id)
+
+    ref_path = evalset.reference_path(case_id, layer=ly)
+    reference_md = ref_path.read_text(encoding="utf-8") if ref_path.exists() else None
+
+    meta = dataset_repo.get(case_id) or {}
+    return {
+        "case_id": case_id,
+        "title": title,
+        "layer": ly,
+        "demand_md": demand_md,
+        "reference_md": reference_md,
+        "source_trace_id": meta.get("source_trace_id"),
+        "demand_revision": meta.get("demand_revision"),
+        "promoted_at": meta.get("promoted_at"),
+        "created_by": meta.get("created_by", "manual"),
+        "status": meta.get("status", "active"),
+    }
+
+
 # ── golden revision ─────────────────────────────────────────
 
 

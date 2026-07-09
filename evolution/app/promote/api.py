@@ -172,7 +172,7 @@ def decide(task_id: str, req: DecideRequest) -> dict[str, Any]:
 
 
 def _row_to_summary(row: dict[str, Any]) -> dict[str, Any]:
-    return {
+    summary = {
         "task_id": row["task_id"],
         "trace_id": row["trace_id"],
         "owner_user_id": row["owner_user_id"],
@@ -181,6 +181,16 @@ def _row_to_summary(row: dict[str, Any]) -> dict[str, Any]:
         "created_at": row["created_at"],
         "decided_at": row["decided_at"],
     }
+    # judge 分数（数据集页待标注 Tab 徽章用，避免前端逐条调 detail）
+    scores_raw = row.get("judge_scores")
+    if scores_raw:
+        try:
+            summary["judge_scores"] = json.loads(scores_raw)
+        except (json.JSONDecodeError, TypeError):
+            summary["judge_scores"] = {"raw": scores_raw}
+    else:
+        summary["judge_scores"] = None
+    return summary
 
 
 def _row_to_detail(row: dict[str, Any]) -> dict[str, Any]:

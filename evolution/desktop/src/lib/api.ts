@@ -589,3 +589,151 @@ export async function getProductionSnapshot(): Promise<Snapshot> {
 export async function getElements(version: number): Promise<ElementsView> {
   return evoJson<ElementsView>(`/api/snapshots/${version}/elements`, { method: "GET" });
 }
+
+// ════════════════════════════════════════════════════════════
+//  数据集（dataset）— golden/growing 评估集
+// ════════════════════════════════════════════════════════════
+
+export interface DatasetCase {
+  case_id: string;
+  title: string;
+  layer: "golden" | "growing";
+  source_trace_id: string | null;
+  demand_revision: string | null;
+  promoted_at: string | null;
+  created_by: string;
+  has_reference: boolean;
+}
+
+export interface GoldenRevision {
+  revision: string;
+  locked: boolean;
+  intact: boolean;
+  case_count: number;
+  cases: string[];
+}
+
+/** 列出数据集 case（按 layer 过滤，不传=全部）。 */
+export async function getDatasetCases(
+  layer?: "golden" | "growing",
+): Promise<{ cases: DatasetCase[]; total: number }> {
+  const q = layer ? `?layer=${layer}` : "";
+  return evoJson(`/api/dataset/cases${q}`, { method: "GET" });
+}
+
+/** 单 case 内容（demand.md + reference.md 全文 + 元数据）。 */
+export async function getCaseContent(
+  caseId: string,
+  layer?: "golden" | "growing",
+): Promise<{
+  case_id: string;
+  title: string;
+  layer: string;
+  demand_md: string;
+  reference_md: string | null;
+  source_trace_id: string | null;
+  demand_revision: string | null;
+  promoted_at: string | null;
+  created_by: string;
+  status: string;
+}> {
+  const q = layer ? `?layer=${layer}` : "";
+  return evoJson(`/api/dataset/cases/${caseId}${q}`, { method: "GET" });
+}
+
+/** 当前 golden 集锁定的 revision + 完整性状态。 */
+export async function getGoldenRevision(): Promise<GoldenRevision> {
+  return evoJson<GoldenRevision>("/api/dataset/golden-revision", { method: "GET" });
+}
+
+/** 升级 growing→golden（维护者独占，开发模式不校验 token）。 */
+export async function promoteCaseToGolden(caseId: string): Promise<{
+  case_id: string;
+  layer: string;
+  demand_revision: string;
+  golden_case_count: number;
+}> {
+  return evoJson(`/api/dataset/cases/${caseId}/promote`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+}
+
+// ════════════════════════════════════════════════════════════
+//  标注队列（promote）— 生产 trace → growing 的标注闸门
+// ════════════════════════════════════════════════════════════
+
+/** judge 打分摘要（存 promote_tasks.judge_scores，结构见 judge._extract_scores_summary）。 */
+export interface JudgeScores {
+  content_overall: number;
+  content_scores: Record<string, any>;
+  subagent_scores: Record<string, number>;
+  is_badcase: boolean;
+  flagged_count: number;
+  [k: string]: any;
+}
+
+export interface PromoteTask {
+  task_id: string;
+  trace_id: string;
+  owner_user_id: string | null;
+  status: string; // pending|judging|needs_confirm|rejected|promoted
+  judge_verdict: string | null; // auto_promote|needs_human|auto_reject
+  judge_scores: JudgeScores | null;
+  created_at: string;
+  decided_at: string | null;
+}
+
+export interface PromoteTaskDetail extends PromoteTask {
+  trace?: {
+    trace_id: string;
+    status: string;
+    owner_user_id: string;
+    started_at: string | null;
+    ended_at: string | null;
+    duration_ms: number | null;
+    session_name: string | null;
+  };
+  deliveries?: Record<string, any>;
+  annotator?: string | null;
+  decision?: string | null;
+  target_case_id?: string | null;
+}
+
+/** 标注队列列表（默认只看活跃态 pending/judging/needs_confirm）。 */
+export async function getPromoteTasks(params?: {
+  status?: string;
+  page?: number;
+  page_size?: number;
+}): Promise<{ tasks: PromoteTask[]; total: number; page: number; page_size: number }> {
+  const qs = new URLSearchParams();
+  if (params?.status) qs.set("status", params.status);
+  qs.set("page", String(params?.page ?? 1));
+  qs.set("page_size", String(params?.page_size ?? 50));
+  return evoJson(`/api/promote/tasks?${qs.toString()}`, { method: "GET" });
+}
+
+/** 标注详情（trace 摘要 + judge 分数 + 交付物概要）。 */
+export async function getPromoteTaskDetail(taskId: string): Promise<PromoteTaskDetail> {
+  return evoJson<PromoteTaskDetail>(`/api/promote/tasks/${taskId}`, { method: "GET" });
+}
+
+/** 提交标注决策。accept 必须二选一：target_case_id（归入）或 new_case_title（新建）。 */
+export async function decidePromoteTask(
+  taskId: string,
+  payload: {
+    decision: "accept" | "reject";
+    annotator?: string;
+    target_case_id?: string;
+    new_case_title?: string;
+    demand_md?: string;
+    reference_output?: string;
+  },
+): Promise<{ task_id: string; status: string; case_id?: string; has_reference?: boolean }> {
+  return evoJson(`/api/promote/tasks/${taskId}/decide`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
