@@ -5,48 +5,64 @@
 
 ## 架构总览
 
+> **桌面化改造（2026-07-07）后**：用户入口从浏览器 Web（原 `frontend/` Next.js）迁移为
+> Windows 桌面端 App（`desktop/`）。原 `frontend/` 已废弃，新增 `website/`（Astro 官网 + 下载页）。
+> evolution 从「仅 loopback + SSH 隧道」改为「nginx 反代 `/evolution-api/*` + SSO 鉴权」，
+> 进化端 App（`evolution/desktop/`）直连公网使用。
+
 ```
                 Internet (443/80, siyen.site)
                      │
                 ┌────┴────┐
                 │  nginx  │  ← 唯一公网入口，HTTPS 终止 + SSE 反代
                 └────┬────┘
-          ┌──────────┴───────────┐
-          │ /api/*               │ / (其余)
-          ▼                      ▼
-    ┌──────────┐            ┌───────────┐
-    │ executor │:7788       │ frontend  │:3456 (next start)
-    │ (有鉴权) │            │ 写作前端  │
-    └────┬─────┘            └───────────┘
-         │ 共享 volume
-         ▼
-    ┌──────────┐
-    │evolution │:7789  ← ★ 不挂 nginx，仅宿主机 loopback
-    │ (内网Key) │       SSH 隧道：ssh -L 7789:127.0.0.1:7789
-    └──────────┘
+      ┌──────────┬───┴───────┬──────────────┐
+      │ /api/*   │ /evolution-api/* │ /releases/* │ / (其余)
+      ▼          ▼                  ▼             ▼
+┌──────────┐ ┌──────────┐    ┌──────────┐  ┌──────────┐
+│ executor │ │evolution │    │ 静态文件  │  │ website  │:80
+│ :7788    │ │ :7789    │    │ (安装包)  │  │ Astro官网│
+│ (session)│ │ (SSO)    │    └──────────┘  └──────────┘
+└────┬─────┘ └────┬─────┘
+     │             │ ① trace 完成通知 / ② SSO 回调 /api/auth/me
+     └─────┬───────┘ ③ 共享 harness 卷（git push/pull）
+           ▼
+     docker 内网（不读对方文件系统）
 ```
+
+- **桌面端 App**（`desktop/`）→ 经 `/api/*` 连 executor，用户写作用。
+- **进化端 App**（`evolution/desktop/`）→ 经 `/evolution-api/*` 连 evolution，管理员诊断/优化用。
+- 两个桌面端登录都走 executor 的 `/api/auth/login`（SSO 同域 cookie 共享）。
 
 | 服务 | 容器 | 端口 | 对外 | 鉴权 |
 |---|---|---|---|---|
 | nginx | writer-nginx | 80, 443 | ✅ 公网 | — |
-| executor | writer-executor | 7788 | 经 nginx `/api` | ✅ session+master_key |
-| frontend | writer-frontend | 3456 | 经 nginx `/` | — |
-| evolution | writer-evolution | 7789 | ❌ 仅 loopback | ✅ X-Internal-Key |
+| executor | writer-executor | 7788（expose） | 经 nginx `/api` | ✅ session cookie + master_key |
+| evolution | writer-evolution | 7789（expose） | 经 nginx `/evolution-api` | ✅ SSO（回调 executor 验 session + user_id 白名单） |
+| website | writer-website | 80（expose） | 经 nginx `/` | — |
+| desktop（写作端 App） | 用户本机 | — | 连 `https://siyen.site/api` | executor session |
+| evolution/desktop（进化端 App） | 管理员本机 | — | 连 `https://siyen.site/evolution-api` | executor session（SSO） |
 
 ## 文件清单（本次新增/修改）
 
-**部署配置**（新增）：
-- `Dockerfile.executor` / `Dockerfile.evolution` / `Dockerfile.frontend`
-- `docker-compose.yml` — 编排
-- `nginx.conf` — 反代 + HTTPS + SSE
+**部署配置**：
+- `Dockerfile.executor` / `Dockerfile.evolution` / `Dockerfile.website`
+- `docker-compose.yml` — 编排（executor + evolution + website + nginx 四服务）
+- `nginx.conf` — 反代 + HTTPS + SSE（`/api` → executor，`/evolution-api` → evolution，`/releases` 静态，`/` → website）
 - `.dockerignore`
 - `executor/.env.production.example` / `evolution/.env.production.example`
 
-**代码改动**（加固）：
-- `evolution/app/core/internal_auth.py`（新）— 内网 API Key 中间件
-- `evolution/app/core/settings.py` — 加 `internal_api_key` 字段
-- `evolution/app/main.py` — 挂载中间件
-- `.gitignore` — 加 `evolution/frontend/out/`
+**evolution 鉴权改造**（桌面化，2026-07-07）：
+- `evolution/app/core/sso_auth.py`（新）— SSO 中间件：回调 executor 验 session + user_id 白名单
+- `evolution/app/core/notify_auth.py`（新）— 内网通知 token 中间件（替换旧 InternalKeyMiddleware）
+- `evolution/app/core/security.py`（新）— AES-256-GCM 加解密 llm_config 的 api_key
+- `evolution/app/core/settings.py` — 加 `evolution_master_key` / `allowed_user_ids` / `notify_token` 字段（删旧 `internal_api_key` / `judge_*`）
+- `evolution/app/main.py` — 挂载 SSOAuthMiddleware + NotifyTokenMiddleware
+
+**桌面端 App**（纯远程客户端，不含后端代码）：
+- `desktop/` — 写作端（Tauri 2 + React），连 `/api`
+- `evolution/desktop/` — 进化端（Tauri 2 + React），连 `/evolution-api`
+- `website/` — Astro 官网 + 下载页，由 nginx `/` 托管
 
 ---
 
@@ -157,7 +173,7 @@ nano executor/.env   # 填 OPENAI_API_KEY / MASTER_KEY / ADMIN_PASSWORD 等
 
 # evolution
 cp evolution/.env.production.example evolution/.env
-nano evolution/.env   # 填 INTERNAL_API_KEY / JUDGE_*（可选）
+nano evolution/.env   # 填 EVOLUTION_MASTER_KEY / ALLOWED_USER_IDS / NOTIFY_TOKEN
 ```
 
 生成强随机值：
@@ -165,12 +181,22 @@ nano evolution/.env   # 填 INTERNAL_API_KEY / JUDGE_*（可选）
 # MASTER_KEY（hex，executor 加密用）
 python3 -c "import secrets; print(secrets.token_hex(32))"
 
-# INTERNAL_API_KEY（urlsafe，evolution 内网校验）
+# EVOLUTION_MASTER_KEY（hex，evolution 加密 llm_config 的 api_key 用）
+# ⚠️ 设定后不可更改（历史加密 key 依赖它）
+python3 -c "import secrets; print(secrets.token_hex(32))"
+
+# NOTIFY_TOKEN（urlsafe，executor→evolution 内网通知校验）
 python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 
 # ADMIN_PASSWORD
 python3 -c "import secrets; print(secrets.token_urlsafe(16))"
 ```
+
+**查 ALLOWED_USER_IDS（你的 executor user_id）**：
+```bash
+docker exec writer-executor python -c "import sqlite3;print([r[0] for r in sqlite3.connect('/app/executor/app.platform.core.db').execute('SELECT user_id,username FROM users')])"
+```
+把允许进进化端的 user_id（逗号分隔）填入 `ALLOWED_USER_IDS`。留空 = 全放行（不安全，仅本地开发）。
 
 ---
 
@@ -249,7 +275,8 @@ docker compose logs -f --tail=50
 
 验证：
 - `curl -k https://siyen.site/health` → 经 nginx，但 /health 在 executor，应返回 ok
-- 浏览器访问 `https://siyen.site` → 写作前端
+- 浏览器访问 `https://siyen.site` → 官网（Astro 静态站，含下载页）
+- `curl -k https://siyen.site/evolution-api/api/stats` → 401（evolution 反代通，未登录）
 
 ---
 
@@ -295,32 +322,55 @@ docker compose up -d
 
 ---
 
-## 五、访问 evolution 监测面板
+## 五、使用进化端（访问 evolution 面板）
 
-evolution 只绑定**宿主机 loopback**（`127.0.0.1:7789`），公网和局域网都连不上，nginx 也不反代它。只有能 SSH 登录服务器的人（即只有你）才能通过隧道访问。
+> **桌面化改造（2026-07-07）后**：evolution 接入 nginx 反代（`/evolution-api/*`），
+> 通过 SSO 鉴权（回调 executor 验 session + user_id 白名单）。
+> 不再用 SSH 隧道，直接用**进化端桌面 App**访问。
 
-### 方式 1：SSH 隧道（推荐，日常看面板）
+### 方式 1：进化端桌面 App（推荐，日常使用）
+
+进化端 App（`evolution/desktop/`，Tauri 2 + React）是访问 evolution 面板的正式入口：
 
 ```bash
-# 本地执行：把服务器宿主机的 127.0.0.1:7789 转发到本地 7789
-ssh -L 7789:127.0.0.1:7789 -p 22222 deploy@siyen.site
-# 保持这个终端不关，本地浏览器访问 http://localhost:7789
+# 本地构建（Windows 开发机）
+cd evolution/desktop
+npm install
+npm run tauri dev      # 开发模式，连本地 evolution（127.0.0.1:7789）
+npm run tauri build    # 打包发布版，连线上 https://siyen.site
 ```
 
-> 为什么目标填 `127.0.0.1` 而不是容器名 `writer-evolution`？
-> SSH 隧道的目标地址由**宿主机**解析，宿主机不认识 docker 内部的服务名，
-> 但能访问自己 loopback 上 docker 映射的端口（compose 里 `127.0.0.1:7789:7789`）。
+release 构建默认连 `https://siyen.site`，登录用 **executor 账号**（SSO 同域 cookie 共享）。
+登录后 session cookie 随 nginx 反代传给 evolution，evolution 回调 executor `/api/auth/me`
+验证 → 校验 `user_id ∈ ALLOWED_USER_IDS` 白名单 → 放行/403。
+
+**打包注意事项**：
+- `productName` 必须用 ASCII（如 `Siyen Evolution`），**不能用中文**——
+  WiX 的 `light.exe`（打 MSI）不支持中文，会导致打包失败。
+- 窗口标题（`app.windows[].title`）可保持中文，运行时显示不受影响。
 
 ### 方式 2：服务器上 docker exec（仅 API 调试）
 
+不开桌面端时，进容器调（容器内 localhost:7789 永远通）：
+
 ```bash
-# 不开隧道时，进容器调（容器内 localhost:7789 永远通）
 docker exec -it writer-evolution curl http://localhost:7789/health
-docker exec -it writer-evolution curl -H "X-Internal-Key: <key>" http://localhost:7789/api/traces
+# /api/* 走 SSO 鉴权，无 cookie 时返回 401（未登录）
+docker exec -it writer-evolution curl http://localhost:7789/api/stats/overview
 ```
 
-> 注：若 `INTERNAL_API_KEY` 非空，`/api/*` 会要求 `X-Internal-Key` 头（否则 401）。
-> 监测前端页面（`/`）和 `/health` 不受影响。
+> 注：`/health` 和静态根 `/` 放行（无需鉴权）；`/api/*` 必须带有效 session cookie
+> 且 `user_id ∈ ALLOWED_USER_IDS` 才放行。白名单为空 = 开发模式全放行（不安全）。
+
+### 方式 3：SSH 隧道（已废弃，仅紧急回退用）
+
+桌面化前用 SSH 隧道访问。改造后 evolution 用 `expose`（不映射宿主端口），
+**默认无法 SSH 隧道**。若需紧急调试，临时改 docker-compose.yml 的 evolution 段加 `ports: ["127.0.0.1:7789:7789"]`，再：
+
+```bash
+ssh -L 7789:127.0.0.1:7789 -p 22222 deploy@siyen.site
+# 本地浏览器访问 http://localhost:7789
+```
 
 ---
 
@@ -372,8 +422,8 @@ docker compose exec evolution bash
 
 | # | 项 | 状态 | 说明 |
 |---|---|---|---|
-| 1 | evolution 不暴露公网 | ✅ 本方案 | `ports` 仅绑 `127.0.0.1`，公网/局域网不可达 |
-| 2 | evolution 内网 API Key | ✅ 本方案 | `internal_auth.py` 中间件 |
+| 1 | evolution 经 nginx 反代 + SSO | ✅ 本方案 | evolution 用 `expose`（不映射宿主端口），仅经 nginx `/evolution-api` 反代可达；SSOAuthMiddleware 回调 executor 验 session + user_id 白名单 |
+| 2 | evolution 访问白名单 | ✅ 本方案 | `ALLOWED_USER_IDS` 限定能进进化端的 user_id；留空 = 开发模式全放行（生产禁止留空） |
 | 3 | HTTPS | ✅ 本方案 | Let's Encrypt + 强制跳转 + HSTS |
 | 4 | 进程守护 | ✅ 本方案 | `restart: always` |
 | 5 | 容器权限收敛 | ✅ 本方案 | 所有容器 `no-new-privileges`；nginx `read_only`+tmpfs |
@@ -384,8 +434,9 @@ docker compose exec evolution bash
 | 10 | SSH 加固 | ✅ 本方案 | 禁 root + 改端口 22222 + 禁密码 + AllowUsers（Phase 4） |
 | 11 | 数据备份 | ⚠️ 你执行 | 见第六节 cron |
 | 12 | MASTER_KEY 强度 | ✅ 本方案 | 部署脚本用 token_hex(32) 生成 |
-| 13 | ADMIN_PASSWORD 强度 | ✅ 本方案 | 部署脚本用 token_urlsafe(16) 生成 |
-| 14 | git 历史无敏感数据 | ⚠️ 你执行 | 见第十节「入侵后安全重建」用 purge-history.sh 清除 |
+| 13 | EVOLUTION_MASTER_KEY 强度 | ✅ 本方案 | token_hex(32)，加密 llm_config 的 api_key；设定后不可改 |
+| 14 | ADMIN_PASSWORD 强度 | ✅ 本方案 | 部署脚本用 token_urlsafe(16) 生成 |
+| 15 | git 历史无敏感数据 | ⚠️ 你执行 | 见第十节「入侵后安全重建」用 purge-history.sh 清除 |
 
 ---
 
@@ -402,6 +453,50 @@ docker compose exec evolution bash
 
 ### evolution 调 executor 拉取 trace 失败
 检查 executor 的 `EVOLUTION_URL` 是否被 compose 正确注入（应为 `http://evolution:7789`），executor 的 `EVOLUTION_NOTIFY_URL` 同理。
+
+### 进化端 App 闪跳循环（登录 ↔ 首页反复横跳）
+**根因**：App 探测 executor 登录态成功（跳首页），但调 evolution 接口 401（触发跳回登录），死循环。
+排查链路（逐段验证）：
+```bash
+# 1. nginx 是否反代到 evolution（应 401 未登录，不是 405/200假象）
+curl -k -o /dev/null -w "%{http_code}" -X POST https://siyen.site/evolution-api/api/evolve/start
+# 405 = nginx 没配 /evolution-api/（落到了静态站），重启 nginx 加载新配置
+# 401 = 链路通，继续查 SSO
+
+# 2. evolution 容器是否新版代码（应有 sso_auth.py）
+docker exec writer-evolution test -f /app/evolution/app/core/sso_auth.py && echo "新版" || echo "旧版"
+# 旧版 = 见下条「容器内仍是旧代码」
+
+# 3. SSO 白名单是否含你的 user_id
+docker exec writer-evolution python -c "from app.core.settings import settings;print(settings.allowed_user_ids)"
+# 空 = 开发模式全放行；有值但不含你 = 403 无权访问
+```
+
+### 容器内仍是旧代码（rebuild 后代码没更新）⚠️ 重点
+**根因**：`evolution_data`（及 `executor_data`）volume 挂载到 `/app/evolution`，
+**遮蔽了镜像 COPY 进去的源码**。rebuild 镜像后，volume 里的旧代码会覆盖新镜像的代码。
+（docker-compose.yml 第 40-41 行有 executor 的警告，evolution 同理。）
+
+**判断**：镜像里有新文件，但 `docker exec` 看到的是旧文件（时间戳/大小对不上）。
+```bash
+# 容器内 vs 仓库源码对比
+docker exec writer-evolution stat -c "%s %y" /app/evolution/app/core/settings.py
+stat -c "%s %y" /home/deploy/Writer/evolution/app/core/settings.py
+```
+
+**修复**：停容器 → 用新镜像把源码同步进 volume（保留 evolution.db）→ 启容器。
+详见本次部署记录（2026-07-08）：备份 evolution.db → cp 镜像内 app/ 到 volume → 替换旧 app/。
+
+### nginx 启动失败：unknown directive
+**根因**：nginx.conf 写了不存在的指令。曾踩坑 `proxy_pass_request_cookies on;`
+（nginx 透传 cookie 默认就随 proxy_pass 带请求头，无此指令）。
+排查：`docker logs writer-nginx` 看 `[emerg] unknown directive "xxx"`，删掉该行即可。
+
+### nginx 配置改了但没生效
+**根因**：nginx 容器在配置更新前已创建，进程内存里还是旧配置（`:ro` 挂载虽实时，
+但 nginx 读配置只在启动/reload 时）。`nginx -t` 测的也是内存旧配置，会误判 OK。
+**修复**：`docker restart writer-nginx`（不是 `nginx -s reload`），强制重读磁盘配置。
+验证：`docker exec writer-nginx grep -c evolution-api /etc/nginx/conf.d/default.conf`。
 
 ---
 
@@ -515,16 +610,17 @@ certbot renew --dry-run
 
 | # | 验证项 | 命令 | 期望 |
 |---|---|---|---|
-| 1 | 4 容器健康 | `docker compose ps` | 全 Up (healthy) |
+| 1 | 4 容器健康 | `docker compose ps` | executor/evolution/website/nginx 全 Up (healthy) |
 | 2 | HTTPS 可达 | `curl -sI https://siyen.site` | 200/302 |
 | 3 | HTTP 跳转 | `curl -sI http://siyen.site` | 301 |
-| 4 | evolution 隔离 | `curl 111.228.4.165:7789` | 拒绝连接 |
-| 5 | evolution 隧道 | SSH 隧道后 `curl localhost:7789/health` | ok |
-| 6 | harness 已激活 | `docker exec writer-evolution git -C /app/evolution/harness.git log` | 有 commit |
-| 7 | 旧 22 端口已封 | `ssh -p 22 deploy@siyen.site` | 超时/拒绝 |
-| 8 | 新 SSH 端口通 | `ssh -p 22222 -i ~/.ssh/writer_deploy deploy@siyen.site` | 登录成功 |
-| 9 | 防火墙生效 | `ufw status` | 22222/80/443 only |
-| 10 | fail2ban 运行 | `fail2ban-client status sshd` | jail active |
+| 4 | evolution 反代通 | `curl -k -o /dev/null -w "%{http_code}" https://siyen.site/evolution-api/api/stats` | 401（未登录，链路通） |
+| 5 | evolution 容器内直连 | `docker exec writer-evolution curl -o /dev/null -w "%{http_code}" localhost:7789/health` | 200 ok |
+| 6 | evolution 新版代码 | `docker exec writer-evolution test -f /app/evolution/app/core/sso_auth.py && echo ok` | ok |
+| 7 | harness 已激活 | `docker exec writer-evolution git -C /app/evolution/harness.git log` | 有 commit |
+| 8 | 旧 22 端口已封 | `ssh -p 22 deploy@siyen.site` | 超时/拒绝 |
+| 9 | 新 SSH 端口通 | `ssh -p 22222 -i ~/.ssh/writer_deploy deploy@siyen.site` | 登录成功 |
+| 10 | 防火墙生效 | `ufw status` | 22222/80/443 only |
+| 11 | fail2ban 运行 | `fail2ban-client status sshd` | jail active |
 
 ---
 
@@ -553,8 +649,9 @@ certbot renew --dry-run
 | DeepSeek API Key (`sk-2c884ebb...`) | 去 DeepSeek 控制台**删除旧 key + 生成新 key** | 开发机本地 .env 明文存过，且同时用于 executor 主模型 + evolution judge |
 | 智谱/千问/GPT/MiniMax key | 暂不动（当前未启用，注释保留） | 按需轮换，当前无生产用途 |
 | MASTER_KEY | 部署脚本 Phase 3 用 `token_hex(32)` 重新生成 | 用户数据因重做系统已无，新密钥加密新库 |
+| EVOLUTION_MASTER_KEY | 部署脚本 Phase 3 用 `token_hex(32)` 重新生成 | evolution 加密 llm_config 的 api_key；设定后不可改 |
 | ADMIN_PASSWORD | 部署脚本 Phase 3 用 `token_urlsafe(16)` 重新生成 | — |
-| INTERNAL_API_KEY | 部署脚本 Phase 3 用 `token_urlsafe(32)` 重新生成 | — |
+| NOTIFY_TOKEN | 部署脚本 Phase 3 用 `token_urlsafe(32)` 重新生成 | executor→evolution 内网通知鉴权（替换旧 INTERNAL_API_KEY） |
 | GitHub PAT（若有） | 若开发机被木马接触过，GitHub Settings → 吊销重发 | 防 push 恶意代码 |
 | SSH 密钥 | 全新生成 `~/.ssh/writer_deploy`，**不复用旧密钥** | 旧密钥可能已泄漏 |
 

@@ -88,6 +88,51 @@ phase_header() {
     return 0
 }
 
+# ── Phase 4 专用：只读状态探针（dry-run 也可安全调用）──────────────────────────
+# drop-in 配置文件路径（与 phase4 内写入路径一致，改一处即可）
+readonly SSH_DROPIN="/etc/ssh/sshd_config.d/99-writer-hardening.conf"
+
+# sshd_listening_on <port>：sshd 是否正在监听指定端口（只读）
+sshd_listening_on() {
+    local port="$1"
+    ss -H -tlnp 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"
+}
+
+# ufw_allows <port>：ufw 是否放行了指定 tcp 端口（只读）
+ufw_allows() {
+    local port="$1"
+    ufw status 2>/dev/null | grep -qE "(^|[^0-9])${port}/tcp"
+}
+
+# dropin_exists：本次加固 drop-in 文件是否存在（只读）
+dropin_exists() {
+    [[ -f "$SSH_DROPIN" ]]
+}
+
+# dropin_has_port：drop-in 是否已声明目标新端口（只读，用于幂等判断）
+dropin_has_port() {
+    dropin_exists && grep -qE "^Port\s+${SSH_NEW_PORT}\s*$" "$SSH_DROPIN"
+}
+
+# rollback_sshd_hardening <did_write>：删本次写入的 drop-in 并重启 sshd 恢复 22
+#   <did_write> = 1 表示本次确实 cat 写过 drop-in，才允许删；=0 不删（防误删他人配置）
+rollback_sshd_hardening() {
+    local did_write="${1:-0}"
+    err "sshd 加固失败，启动自动回滚…"
+    if [[ "$did_write" == "1" ]]; then
+        rm -f "$SSH_DROPIN"
+        warn "已删除本次写入的 drop-in: $SSH_DROPIN"
+    fi
+    # sshd 可能因新配置起不来，restart 让它在旧配置（22 端口）上恢复
+    systemctl restart sshd 2>/dev/null || true
+    sleep 2
+    if sshd_listening_on 22; then
+        warn "已回滚：sshd 在 22 端口监听。请用 ssh -p 22 root@${SERVER_IP} 重连后排查"
+    else
+        err "sshd 回滚后 22 端口仍无监听——可能需要云控制台 VNC 救场"
+    fi
+}
+
 # ════════════════════════════════════════════════════════════════════════════
 # Phase 0: 基线准备（系统加固 + 装 Docker + 建 deploy 用户 + 防火墙）
 # ════════════════════════════════════════════════════════════════════════════
@@ -379,24 +424,77 @@ phase3() {
 phase4() {
     phase_header 4 "上线后加固（SSH 最强 + ufw 切端口 + fail2ban + 续期 + 备份）" || return 0
 
-    # 4.1 SSH 最强加固（高危！必须先开第二终端验证密钥）
+    # 4.0 状态探针（纯只读，断点恢复时让用户看清当前在哪一步）
+    log "Phase 4 当前状态探针："
+    if ! $DRY_RUN; then
+        echo -n "  sshd 监听端口: "; ss -H -tlnp 2>/dev/null | grep -oE 'sshd' >/dev/null \
+            && ss -H -tlnp 2>/dev/null | awk '{print $4}' | grep -oE '[0-9]+$' | sort -u | tr '\n' ' ' \
+            || echo "(未检测到 sshd)"
+        echo ""
+        echo -n "  drop-in 已写入: "; dropin_exists && echo "是（$(dropin_has_port && echo "Port=$SSH_NEW_PORT" || echo "内容不符)")" || echo "否"
+        echo -n "  ufw 放行 22:   "; ufw_allows 22    && echo "是" || echo "否"
+        echo -n "  ufw 放行 ${SSH_NEW_PORT}: "; ufw_allows "${SSH_NEW_PORT}" && echo "是" || echo "否"
+    fi
+
+    # 4.1 SSH 加固（原子 + 幂等 + 自动回滚；高危！需先开第二终端验证密钥）
+    #
+    # 不变量：在 22222 端到端人工验证通过前，绝不动 22 的可达性。
+    # 这样哪怕中途 sshd 切端口失败 + drop-in 回滚，22 这条退路始终通。
+
+    # ① 先确认密钥已就绪（前置守卫，dry-run 跳过）
     echo ""
     warn "★ SSH 加固高危操作：即将改端口 ${SSH_NEW_PORT} + 禁 root + 禁密码登录。"
     echo "  一旦生效，旧 22 端口、密码、root 全部失效。"
-    echo "  必须先在本机开第二终端，用 deploy 密钥验证能登录："
+    echo "  必须先在本机开第二终端，用 deploy 密钥通过当前端口验证能登录："
     echo "    ssh -i ~/.ssh/writer_deploy deploy@${SERVER_IP}   # 旧 22 端口先验证一次"
     echo ""
     echo "  验证通过后再继续。验证不通过 = 密钥没配好，继续会锁死！"
     echo ""
     confirm "已用 deploy 密钥通过 22 端口验证登录成功？（没验证就别继续！）"
 
-    log "备份并改写 sshd_config..."
+    # ② 备份 sshd_config（幂等：用固定标记名，避免每次重跑堆时间戳备份）
+    log "备份 sshd_config（幂等，仅首次）..."
     if ! $DRY_RUN; then
-        cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)
+        if [[ ! -f /etc/ssh/sshd_config.bak.writer ]]; then
+            cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.writer
+            ok "已备份 → /etc/ssh/sshd_config.bak.writer"
+        else
+            ok "备份已存在，跳过（/etc/ssh/sshd_config.bak.writer）"
+        fi
+    fi
 
-        # 用 drop-in 配置（Ubuntu 24.04 推荐），不动主配置，幂等且干净
+    # ③ 放行新端口 22222（幂等）
+    log "UFW 放行新 SSH 端口 ${SSH_NEW_PORT}（幂等）..."
+    if ! $DRY_RUN; then
+        if ufw_allows "${SSH_NEW_PORT}"; then
+            ok "${SSH_NEW_PORT}/tcp 已放行，跳过"
+        else
+            ufw allow "${SSH_NEW_PORT}/tcp" comment 'SSH hardened'
+            ok "${SSH_NEW_PORT}/tcp 已放行"
+        fi
+    fi
+
+    # ④ 安全网：确认旧端口 22 仍放行（幂等）
+    #    切换全程保持 22 可达——这是 drop-in 回滚后 sshd 回 22 时的救生通道
+    log "安全网：确认 22/tcp 仍放行（切端口期间的救生通道）..."
+    if ! $DRY_RUN; then
+        if ufw_allows 22; then
+            ok "22/tcp 已放行（安全网就位）"
+        else
+            ufw allow 22/tcp comment 'SSH safety-net until 22222 verified'
+            ok "22/tcp 已补放行（安全网）"
+        fi
+    fi
+
+    # ⑤ 写 drop-in（幂等：内容已匹配则跳过；否则写入并标记本次改动）
+    log "写 sshd drop-in 加固配置（幂等）..."
+    DID_WRITE_DROPIN=0
+    if ! $DRY_RUN; then
         mkdir -p /etc/ssh/sshd_config.d
-        cat > /etc/ssh/sshd_config.d/99-writer-hardening.conf <<EOF
+        if dropin_has_port; then
+            ok "drop-in 已存在且 Port=${SSH_NEW_PORT}，跳过"
+        else
+            cat > "$SSH_DROPIN" <<EOF
 # Writer 安全加固（drop-in，覆盖主配置）
 Port ${SSH_NEW_PORT}
 PermitRootLogin no
@@ -413,52 +511,73 @@ X11Forwarding no
 AllowTcpForwarding no
 AllowAgentForwarding no
 EOF
-        # 确保主配置加载 drop-in（Ubuntu 默认已加载，保险起见）
-        grep -q "Include /etc/ssh/sshd_config.d/\*.conf" /etc/ssh/sshd_config \
-            || echo "Include /etc/ssh/sshd_config.d/*.conf" >> /etc/ssh/sshd_config
+            DID_WRITE_DROPIN=1
+            # 确保主配置加载 drop-in（Ubuntu 默认已加载，保险起见）
+            grep -q "Include /etc/ssh/sshd_config.d/\*.conf" /etc/ssh/sshd_config \
+                || echo "Include /etc/ssh/sshd_config.d/*.conf" >> /etc/ssh/sshd_config
+            ok "drop-in 已写入"
+        fi
+    fi
 
-        # 语法校验（失败就回滚，绝不让无效配置生效）
+    # ⑥ sshd 语法校验（失败：仅当本次写了 drop-in 才回滚）
+    log "sshd -t 语法校验..."
+    if ! $DRY_RUN; then
         if ! sshd -t 2>/dev/null; then
-            err "sshd 配置语法校验失败！已回滚，不会重启 sshd"
-            rm -f /etc/ssh/sshd_config.d/99-writer-hardening.conf
+            err "sshd 配置语法校验失败！"
+            if [[ "$DID_WRITE_DROPIN" == "1" ]]; then
+                rollback_sshd_hardening "$DID_WRITE_DROPIN"
+            else
+                warn "drop-in 非本次写入，未自动删除——请人工检查 $SSH_DROPIN"
+            fi
             exit 1
         fi
-        ok "sshd drop-in 已写入（备份: sshd_config.bak.*）"
+        ok "sshd 语法校验通过"
     fi
 
-    # 4.2 先放行新端口，再重启 sshd，最后删旧端口（严格顺序防锁死）
-    log "UFW 放行新 SSH 端口 ${SSH_NEW_PORT}..."
-    if ! $DRY_RUN; then
-        ufw allow ${SSH_NEW_PORT}/tcp comment 'SSH hardened'
-        # 不立刻删 22，等 4.3 双终端验证通过后再删
-    fi
-
-    log "重启 sshd 生效（新端口 ${SSH_NEW_PORT}，旧 22 暂时仍开）..."
+    # ⑦ 重启 sshd 生效
+    log "重启 sshd（切换到 ${SSH_NEW_PORT}）..."
     run 'systemctl restart sshd'
 
-    # 4.3 双终端验证（关键防锁死步骤）
+    # ⑧ 本地自测：机器级验证 22222 真的在监听（失败自动回滚）
+    if ! $DRY_RUN; then
+        sleep 2
+        if sshd_listening_on "${SSH_NEW_PORT}"; then
+            ok "本地自测通过：sshd 已监听 ${SSH_NEW_PORT}"
+        else
+            err "本地自测失败：sshd 未在 ${SSH_NEW_PORT} 监听（可能起不来）"
+            rollback_sshd_hardening "$DID_WRITE_DROPIN"
+            exit 1
+        fi
+    fi
+
+    # ⑨ 人工双终端验证（最后一道防线：外部可达性）
     echo ""
-    warn "★ sshd 已重启。现在用新端口验证 deploy 密钥登录："
+    warn "★ sshd 已在 ${SSH_NEW_PORT} 监听。现在开第二终端验证 deploy 密钥登录："
     echo "    ssh -i ~/.ssh/writer_deploy -p ${SSH_NEW_PORT} deploy@${SERVER_IP}"
     echo ""
     echo "  验证通过后，本脚本会关闭旧 22 端口。"
-    echo "  若验证失败：当前 root 终端仍可用，可回滚 →"
-    echo "    rm /etc/ssh/sshd_config.d/99-writer-hardening.conf && systemctl restart sshd"
+    echo "  若验证失败：当前 root 终端仍可用，可手动回滚 →"
+    echo "    rm ${SSH_DROPIN} && systemctl restart sshd"
     echo ""
     confirm "已用新端口 ${SSH_NEW_PORT} + deploy 密钥登录成功？"
 
-    log "关闭旧 22 端口..."
+    # ⑩ 删旧端口 22（仅 ⑨ 通过后；幂等）
+    log "关闭旧 22 端口（幂等）..."
     if ! $DRY_RUN; then
-        ufw delete allow 22/tcp 2>/dev/null || true
+        if ufw_allows 22; then
+            ufw delete allow 22/tcp 2>/dev/null || true
+            ok "22/tcp 已关闭，仅 ${SSH_NEW_PORT} 可达"
+        else
+            ok "22/tcp 本就未放行，跳过"
+        fi
         ufw status numbered
-        ok "旧 22 端口已关闭，仅 ${SSH_NEW_PORT} 可达"
     fi
 
-    # 4.4 fail2ban 加固 sshd jail（防爆破，即便改了端口仍会扫到）
-    log "配置 fail2ban sshd jail..."
+    # 4.2 fail2ban 加固 sshd jail（防爆破，即便改了端口仍会扫到；幂等）
+    log "配置 fail2ban sshd jail（幂等）..."
     if ! $DRY_RUN; then
-        cat > /etc/fail2ban/jail.d/sshd.local <<EOF
-[sshd]
+        local jail_file="/etc/fail2ban/jail.d/sshd.local"
+        local jail_content="[sshd]
 enabled = true
 port = ${SSH_NEW_PORT}
 filter = sshd
@@ -467,46 +586,55 @@ maxretry = 4
 findtime = 10m
 bantime = 1h
 bantime.increment = true
-bantime.maxtime = 1w
-EOF
-        systemctl enable --now fail2ban
-        systemctl restart fail2ban
-        fail2ban-client status sshd 2>/dev/null || warn "fail2ban 状态查询失败（不影响部署）"
-        ok "fail2ban sshd jail 已启用"
+bantime.maxtime = 1w"
+        if [[ -f "$jail_file" ]] && [[ "$(cat "$jail_file")" == "$jail_content" ]]; then
+            ok "jail 配置已是目标内容，跳过"
+        else
+            echo "$jail_content" > "$jail_file"
+            systemctl enable --now fail2ban
+            systemctl restart fail2ban
+            fail2ban-client status sshd 2>/dev/null || warn "fail2ban 状态查询失败（不影响部署）"
+            ok "fail2ban sshd jail 已启用"
+        fi
     fi
 
-    # 4.5 证书续期 hook（certbot renew → restart writer-nginx）
-    log "配置证书续期 hook..."
+    # 4.3 证书续期 hook（certbot renew → restart writer-nginx；幂等）
+    log "配置证书续期 hook（幂等）..."
     if ! $DRY_RUN; then
         mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-        cat > /etc/letsencrypt/renewal-hooks/deploy/restart-nginx.sh <<'EOF'
-#!/bin/bash
+        local hook_file="/etc/letsencrypt/renewal-hooks/deploy/restart-nginx.sh"
+        local hook_content='#!/bin/bash
 # 证书续期后重启 nginx 容器加载新证书
-docker restart writer-nginx 2>/dev/null || true
-EOF
-        chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-nginx.sh
-        ok "续期 hook 已配置"
+docker restart writer-nginx 2>/dev/null || true'
+        if [[ -f "$hook_file" ]] && [[ "$(cat "$hook_file")" == "$hook_content" ]]; then
+            ok "续期 hook 已是目标内容，跳过"
+        else
+            echo "$hook_content" > "$hook_file"
+            chmod +x "$hook_file"
+            ok "续期 hook 已配置"
+        fi
     fi
 
-    # 4.6 系统级 certbot renew cron（Ubuntu 24.04 certbot 用 systemd timer，但确保有）
+    # 4.4 系统级 certbot renew cron（已幂等，保持）
     if ! $DRY_RUN; then
         if ! systemctl list-timers 2>/dev/null | grep -q certbot; then
             echo "0 3 * * * certbot renew --quiet" | crontab - 2>/dev/null || true
         fi
     fi
 
-    # 4.7 备份 cron（deploy 用户）
+    # 4.5 备份 cron（deploy 用户，已幂等；加存在性提示）
     log "配置备份 cron（deploy 用户，每天 3 点）..."
     if ! $DRY_RUN; then
         chmod +x "${DEPLOY_DIR}/scripts/backup-prod.sh"
-        su - "$DEPLOY_USER" -c "(crontab -l 2>/dev/null; echo '0 3 * * * ${DEPLOY_DIR}/scripts/backup-prod.sh >> /home/${DEPLOY_USER}/backup.log 2>&1') | sort -u | crontab -"
-        ok "备份 cron 已配置"
+        local cron_line="0 3 * * * ${DEPLOY_DIR}/scripts/backup-prod.sh >> /home/${DEPLOY_USER}/backup.log 2>&1"
+        su - "$DEPLOY_USER" -c "(crontab -l 2>/dev/null; echo '${cron_line}') | sort -u | crontab -"
+        ok "备份 cron 已配置（重复行自动去重）"
     fi
 
     ok "Phase 4 完成"
 }
 
-# ═══════════════════════════════════════════════════════填════════════════════
+# ════════════════════════════════════════════════════════════════════════════
 # 主流程
 # ════════════════════════════════════════════════════════════════════════════
 main() {
