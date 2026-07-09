@@ -31,15 +31,20 @@ services:
       - HARNESS_BARE_REPO=/app/evolution/harness.git
       - HARNESS_CLONE_DIR=/app/executor/.harness_checkout
       - TZ=Asia/Shanghai
+      # 数据目录指向 volume 挂载点（源码不挂卷，根治旧方案源码被覆盖问题）
+      - DB_PATH=/app/executor/data/app.platform.core.db
+      - WORKSPACE_ROOT=/app/executor/data/workspace
       # 桌面化改造（2026-07-07）：内网通知 token，与 evolution NOTIFY_TOKEN 一致。
       # 部署时在 executor/.env 里设 EVOLUTION_NOTIFY_TOKEN=<同 evolution 的 NOTIFY_TOKEN>。
       # - EVOLUTION_NOTIFY_TOKEN=<强随机 token>
+      # 积分制（2026-07-09）：平台代付 key + base_url（优先于 OPENAI_API_KEY）
+      - PLATFORM_API_KEY=${PLATFORM_API_KEY:-}
+      - PLATFORM_BASE_URL=${PLATFORM_BASE_URL:-}
     volumes:
       # 持久化：用户库 + workspace + checkpoints（用户数据，不可丢）
-      # ⚠️ 注意：整个 /app/executor 挂卷，源码也在里面。rebuild 后必须清空此卷，
-      #    否则 volume 里的旧源码会覆盖镜像里的新源码（部署脚本/升级流程已含清卷步骤）。
-      #    清卷命令：docker volume rm writer_executor_data（数据会丢，仅首次部署/重建时执行）
-      - executor_data:/app/executor
+      # 源码不挂卷——留在镜像里，rebuild 自动更新（根治旧方案源码被 volume 覆盖的问题）。
+      # db_path/workspace_root/checkpoints 都指向 data/ 子目录。
+      - executor_data:/app/executor/data
       # 共享 harness 包（evolution 编辑 → executor 同进程 import）
       - harness_data:/app/evolution/harnesses
       # 共享 harness bare repo（evolution push → executor pull）
