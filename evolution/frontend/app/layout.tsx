@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Inter, JetBrains_Mono } from "next/font/google";
 import { TopNav } from "@/components/TopNav";
+import { AppToaster } from "@/components/AppToaster";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -29,6 +30,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body>
         <TopNav />
         <main style={{ maxWidth: 1440, margin: "0 auto", padding: "32px 28px" }}>{children}</main>
+        <AppToaster />
       </body>
     </html>
   );

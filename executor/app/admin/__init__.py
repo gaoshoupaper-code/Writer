@@ -21,7 +21,7 @@ import secrets as _secrets
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from app.auth import CurrentUser, current_user, require_admin
+from app.auth import CurrentUser, current_user, require_super_admin
 from app.platform.core.settings import get_settings
 from app.platform.core.db import (
     InviteCodeRepository,
@@ -183,6 +183,7 @@ class InviteCodeSummary(BaseModel):
     code: str
     created_at: str
     is_admin_code: bool
+    granted_credits: int = 0
     used: bool
     used_by: str | None
     used_at: str | None
@@ -191,17 +192,19 @@ class InviteCodeSummary(BaseModel):
 
 class CreateInviteCodesRequest(BaseModel):
     count: int = Field(default=1, ge=1, le=50)
+    granted_credits: int = Field(default=0, ge=0, description="每个邀请码携带的积分额度（D10）")
     note: str | None = None  # 备注暂不入库，预留
 
 
 @admin_router.get("/invite-codes", response_model=list[InviteCodeSummary])
-def list_invite_codes(admin: CurrentUser = Depends(require_admin)) -> list[InviteCodeSummary]:
+def list_invite_codes(admin: CurrentUser = Depends(require_super_admin)) -> list[InviteCodeSummary]:
     rows = InviteCodeRepository(get_database()).list_all()
     return [
         InviteCodeSummary(
             code=r["code"],
             created_at=r["created_at"],
             is_admin_code=bool(r["is_admin_code"]),
+            granted_credits=int(r.get("granted_credits", 0)),
             used=r["used_by"] is not None,
             used_by=r["used_by"],
             used_at=r["used_at"],
@@ -214,15 +217,16 @@ def list_invite_codes(admin: CurrentUser = Depends(require_admin)) -> list[Invit
 @admin_router.post("/invite-codes", response_model=list[str])
 def create_invite_codes(
     payload: CreateInviteCodesRequest,
-    admin: CurrentUser = Depends(require_admin),
+    admin: CurrentUser = Depends(require_super_admin),
 ) -> list[str]:
     return InviteCodeRepository(get_database()).create(
-        created_by=admin.user_id, count=payload.count, is_admin_code=False,
+        created_by=admin.user_id, count=payload.count,
+        is_admin_code=False, granted_credits=payload.granted_credits,
     )
 
 
 @admin_router.delete("/invite-codes/{code}")
-def revoke_invite_code(code: str, admin: CurrentUser = Depends(require_admin)) -> dict:
+def revoke_invite_code(code: str, admin: CurrentUser = Depends(require_super_admin)) -> dict:
     ok = InviteCodeRepository(get_database()).revoke(code)
     if not ok:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "邀请码不存在或已吊销")
@@ -237,8 +241,10 @@ class AdminUserSummary(BaseModel):
     user_id: str
     username: str
     is_admin: bool
+    is_super_admin: bool = False
     disabled: bool
     has_api_key: bool
+    credits_balance: int = 0
     workspace_count: int
     created_at: str
 
@@ -253,15 +259,17 @@ def _random_password() -> str:
 
 
 @admin_router.get("/users", response_model=list[AdminUserSummary])
-def list_users(admin: CurrentUser = Depends(require_admin)) -> list[AdminUserSummary]:
+def list_users(admin: CurrentUser = Depends(require_super_admin)) -> list[AdminUserSummary]:
     users = UserRepository(get_database())
     return [
         AdminUserSummary(
             user_id=r["user_id"],
             username=r["username"],
             is_admin=bool(r["is_admin"]),
+            is_super_admin=bool(r.get("is_super_admin", 0)),
             disabled=bool(r["disabled"]),
             has_api_key=bool(r["encrypted_api_key"]),
+            credits_balance=int(r.get("credits_balance", 0)),
             workspace_count=users.workspace_count(r["user_id"]),
             created_at=r["created_at"],
         )
@@ -273,7 +281,7 @@ def list_users(admin: CurrentUser = Depends(require_admin)) -> list[AdminUserSum
 def update_user(
     user_id: str,
     payload: UpdateUserRequest,
-    admin: CurrentUser = Depends(require_admin),
+    admin: CurrentUser = Depends(require_super_admin),
 ) -> dict:
     users = UserRepository(get_database())
     target = users.get_by_id(user_id)
@@ -303,7 +311,7 @@ def update_user(
 @admin_router.post("/users/{user_id}/reset-password")
 def reset_user_password_auto(
     user_id: str,
-    admin: CurrentUser = Depends(require_admin),
+    admin: CurrentUser = Depends(require_super_admin),
 ) -> dict:
     """生成一个随机临时密码并重置。管理员把临时密码私下发给用户。"""
     users = UserRepository(get_database())
@@ -329,7 +337,7 @@ class AdminWorkspaceSummary(BaseModel):
 @admin_router.get("/users/{user_id}/workspaces", response_model=list[AdminWorkspaceSummary])
 def list_user_workspaces(
     user_id: str,
-    admin: CurrentUser = Depends(require_admin),
+    admin: CurrentUser = Depends(require_super_admin),
 ) -> list[AdminWorkspaceSummary]:
     """管理员查看某用户的所有作品（只读列表）。"""
     users = UserRepository(get_database())
@@ -352,7 +360,7 @@ def list_user_workspaces(
 def read_user_workspace_outline(
     user_id: str,
     workspace_id: str,
-    admin: CurrentUser = Depends(require_admin),
+    admin: CurrentUser = Depends(require_super_admin),
 ) -> dict:
     """管理员代访问：读取某用户作品的 outline（只读）。"""
     from app.platform.state.thread_store import ThreadStore
@@ -372,3 +380,103 @@ def read_user_workspace_outline(
         except UnicodeDecodeError:
             markdown = outline_path.read_text(encoding="gb18030", errors="replace")
     return {"workspace_id": workspace_id, "title": ws.get("title", ws.get("outline_name", "")), "markdown": markdown}
+
+
+# ════════════════════════════════════════════════════════════
+#  /api/admin — 积分管理（D8/D18/D19）
+# ════════════════════════════════════════════════════════════
+
+
+class AdjustCreditsRequest(BaseModel):
+    amount: int = Field(description="调整额度（正=充值，负=扣减）")
+    note: str = Field(default="", max_length=200)
+
+
+@admin_router.post("/users/{user_id}/credits")
+def adjust_user_credits(
+    user_id: str,
+    payload: AdjustCreditsRequest,
+    admin: CurrentUser = Depends(require_super_admin),
+) -> dict:
+    """管理员手动调整用户积分（D8）。"""
+    users = UserRepository(get_database())
+    if users.get_by_id(user_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "用户不存在")
+
+    from app.platform.credits.service import get_credits_service
+    balance = get_credits_service().admin_adjust(
+        user_id=user_id, amount=payload.amount,
+        note=payload.note or "管理员调整", admin_id=admin.user_id,
+    )
+    return {"status": "ok", "balance": balance}
+
+
+@admin_router.get("/users/{user_id}/credits/transactions")
+def list_user_credit_transactions(
+    user_id: str,
+    limit: int = 50,
+    admin: CurrentUser = Depends(require_super_admin),
+) -> list[dict]:
+    """查某用户积分流水（D18-F/G）。"""
+    users = UserRepository(get_database())
+    if users.get_by_id(user_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "用户不存在")
+
+    from app.platform.credits.service import get_credits_service
+    return get_credits_service().list_user_transactions(user_id, limit)
+
+
+@admin_router.get("/credits/transactions")
+def list_all_credit_transactions(
+    limit: int = 100,
+    admin: CurrentUser = Depends(require_super_admin),
+) -> list[dict]:
+    """全局积分流水（D18-G）。"""
+    from app.platform.credits.service import get_credits_service
+    return get_credits_service().list_all_transactions(limit)
+
+
+# ════════════════════════════════════════════════════════════
+#  /api/me/credits — 写作端查积分余额（D11）
+# ════════════════════════════════════════════════════════════
+
+
+@me_router.get("/credits")
+def get_my_credits(user: CurrentUser = Depends(current_user)) -> dict:
+    """当前用户的积分余额（D11 写作端展示用）。"""
+    try:
+        from app.platform.credits.service import get_credits_service
+        balance = get_credits_service().get_balance(user.user_id)
+    except Exception:
+        balance = 0
+    return {"balance": balance}
+
+
+# ════════════════════════════════════════════════════════════
+#  /api/admin — 积分暗调参数管理（AD11）
+# ════════════════════════════════════════════════════════════
+
+
+@admin_router.get("/credits/config")
+def get_credits_config(admin: CurrentUser = Depends(require_super_admin)) -> dict:
+    """获取积分暗调参数（管理页展示）。"""
+    from app.platform.credits.service import get_credits_service
+    svc = get_credits_service()
+    return svc._config.get_all_for_display()
+
+
+class UpdateConfigRequest(BaseModel):
+    value: str = Field(min_length=1)
+
+
+@admin_router.put("/credits/config/{key}")
+def update_credits_config(
+    key: str,
+    payload: UpdateConfigRequest,
+    admin: CurrentUser = Depends(require_super_admin),
+) -> dict:
+    """修改积分暗调参数（AD11：在线改，不重启，自动刷新缓存）。"""
+    from app.platform.credits.service import get_credits_service
+    svc = get_credits_service()
+    svc._config.set(key, payload.value)
+    return {"status": "ok", "key": key, "value": payload.value}

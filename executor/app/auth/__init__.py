@@ -36,6 +36,7 @@ class CurrentUser:
     user_id: str
     username: str
     is_admin: bool
+    is_super_admin: bool = False
 
 
 # ── Schemas ────────────────────────────────────────────────
@@ -55,6 +56,7 @@ class AuthMeResponse(BaseModel):
     user_id: str
     username: str
     is_admin: bool
+    is_super_admin: bool = False
     has_api_key: bool
 
 
@@ -103,6 +105,7 @@ def current_user(
         user_id=user["user_id"],
         username=user["username"],
         is_admin=bool(user["is_admin"]),
+        is_super_admin=bool(user.get("is_super_admin", 0)),
     )
 
 
@@ -110,6 +113,16 @@ def require_admin(user: CurrentUser = Depends(current_user)) -> CurrentUser:
     """管理员鉴权依赖。403 若非管理员。"""
     if not user.is_admin:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "需要管理员权限")
+    return user
+
+
+def require_super_admin(user: CurrentUser = Depends(current_user)) -> CurrentUser:
+    """超级管理员鉴权依赖（D24/D28）。403 若非超级管理员。
+
+    管理后台所有接口统一要求 is_super_admin=1（AD8）。
+    """
+    if not user.is_super_admin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "需要超级管理员权限")
     return user
 
 
@@ -139,6 +152,18 @@ def register(payload: RegisterRequest, response: Response) -> RegisterResponse:
         workspace_quota=quota,
     )
     invites.mark_used(payload.code, user["user_id"])
+
+    # AD10：邀请码积分到账（D8/D10）。granted_credits > 0 时发积分。
+    granted = invite.get("granted_credits", 0) if invite else 0
+    if granted > 0:
+        try:
+            from app.platform.credits.service import get_credits_service
+            get_credits_service().grant_invite_credits(
+                user_id=user["user_id"], amount=granted, invite_code=payload.code,
+            )
+        except Exception:
+            # 积分系统不可用时注册仍成功（降级：不发积分，管理员可后续手动补）
+            pass
 
     session_id = SessionRepository(db).create(
         user_id=user["user_id"], ttl_days=settings.session_ttl_days,
@@ -189,6 +214,7 @@ def me(user: CurrentUser = Depends(current_user)) -> AuthMeResponse:
         user_id=user.user_id,
         username=user.username,
         is_admin=user.is_admin,
+        is_super_admin=user.is_super_admin,
         has_api_key=users.has_api_key(user.user_id),
     )
 

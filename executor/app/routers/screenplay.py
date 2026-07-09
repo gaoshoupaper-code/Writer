@@ -59,7 +59,14 @@ async def _event_generator(payload: ScreenplayGenerateRequest, thread: ThreadSum
 
 
 @router.post("/screenplay/generate/stream")
-async def stream_screenplay(payload: ScreenplayGenerateRequest, user: CurrentUser = Depends(current_user)):
+async def stream_screenplay(
+    payload: ScreenplayGenerateRequest,
+    user: CurrentUser = Depends(current_user),
+):
+    # AD12：冻结拦截（D16/D26）——余额≤0 不可触发创作
+    from app.platform.credits.dependencies import check_credits_frozen
+    check_credits_frozen(user)
+
     thread = get_thread_store().get_thread(user.user_id, payload.thread_id)
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")

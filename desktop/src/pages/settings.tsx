@@ -10,6 +10,7 @@ import {
   createProviderConfig,
   deleteProviderConfig,
   fetchMeOrNull,
+  fetchMyCredits,
   fetchMyProfile,
   listProviderConfigs,
   updateProviderConfig,
@@ -25,6 +26,7 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
   const [configs, setConfigs] = useState<ProviderConfig[]>([]);
   const [quota, setQuota] = useState<{ count: number; quota: number } | null>(null);
+  const [credits, setCredits] = useState<number | null>(null);
   const [activeConfigId, setActiveConfigId] = useState<string | null>(null);
   const [mode, setMode] = useState<FormMode>({ kind: "new" });
   const [submitting, setSubmitting] = useState(false);
@@ -50,6 +52,13 @@ export default function SettingsPage() {
       const [profile, list] = await Promise.all([fetchMyProfile(), listProviderConfigs()]);
       setQuota({ count: profile.workspace_count, quota: profile.workspace_quota });
       setConfigs(list);
+      // D11：加载积分余额
+      try {
+        const c = await fetchMyCredits();
+        setCredits(c.balance);
+      } catch {
+        setCredits(null);
+      }
       const active = list.find((c) => c.is_active);
       setActiveConfigId(active?.config_id ?? null);
     } catch (err) {
@@ -94,18 +103,23 @@ export default function SettingsPage() {
     }
   }
 
-  /// 手动检查更新：调 Rust check_update，有新版提示看顶部横条。
+  /// 手动检查更新：调 Rust check_update，凭 status 精确区分三种结果。
   async function handleCheckUpdate() {
     if (checkingUpdate) return;
     setCheckingUpdate(true);
     try {
       const info = await invoke<{
         available: boolean;
+        status: string;
         current_version: string;
         version: string | null;
+        body: string | null;
       }>("check_update");
-      if (info.available) {
+      // 不再只看 available——status 精确区分「已是最新」与「检查失败」，避免谎报。
+      if (info.status === "update_available") {
         toast.success(`发现新版本 v${info.version}，请看顶部提示更新`);
+      } else if (info.status === "check_failed") {
+        toast.error(info.body ?? "检查更新失败");
       } else {
         toast.success(`已是最新版本（v${info.current_version}）`);
       }
@@ -254,8 +268,19 @@ export default function SettingsPage() {
           <Link to="/" className="admin-back">← 返回工作区</Link>
         </header>
 
-        {quota ? (
-          <div className="settings-quota">作品配额：{quota.count} / {quota.quota}</div>
+        {/* D21：workspace_quota 废弃，改为展示积分余额（D11） */}
+        {credits !== null ? (
+          <div className="settings-quota">
+            积分余额：
+            <strong style={{ marginLeft: 6, color: credits <= 0 ? "#ef4444" : "#22c55e" }}>
+              {credits}
+            </strong>
+            {credits <= 0 && (
+              <span style={{ marginLeft: 8, color: "#ef4444", fontSize: 13 }}>
+                （已冻结，请联系管理员补充积分）
+              </span>
+            )}
+          </div>
         ) : null}
 
         <div className="settings-key-status">

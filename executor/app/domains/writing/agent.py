@@ -114,6 +114,15 @@ class MetaAgentService(BaseAgentService):
         from app.platform.agent.loader import load_current_package
         from app.domains.writing.models import build_writer_model
         from app.platform.agent.middleware import TraceMiddleware
+        from app.platform.credits.middleware import CreditsMiddleware
+
+        # 积分制：尝试取全局 CreditsService（AD2）。失败/A/B 路径传 None（不计费）。
+        credits_service = None
+        try:
+            from app.platform.credits.service import get_credits_service
+            credits_service = get_credits_service()
+        except Exception:
+            pass
 
         if model is None:
             model = build_writer_model(self.settings)
@@ -154,6 +163,8 @@ class MetaAgentService(BaseAgentService):
             styles=styles,
             trace_recorder=self.trace_recorder,
             trace_middleware_cls=TraceMiddleware,  # T2：类由执行端注入，包内实例化
+            credits_service=credits_service,  # AD2：积分制服务，None 不计费
+            credits_middleware_cls=CreditsMiddleware,  # AD6：类由执行端注入，包内实例化
         )
 
         pkg = load_current_package()
@@ -284,6 +295,9 @@ class MetaAgentService(BaseAgentService):
             for trace_update in self._trace_updates(trace_queue):
                 yield trace_update
 
+            # T6.2：正常完成时结算预扣（多退少补 + 落流水 D23）
+            self._settle_credits_if_any(thread.thread_id, force_stopped=False)
+
             if result.pending_interrupt is not None:
                 iv = result.pending_interrupt
                 # HITL：interrupt 命中 → 标记 trace awaiting_input 并落盘（D1）。
@@ -320,12 +334,28 @@ class MetaAgentService(BaseAgentService):
             # - 否则：running 期间连接断开 → cancelled（agent 被 finally 真中止不可恢复）
             if self.trace_recorder.is_user_stop_requested(trace.trace_id):
                 self.trace_recorder.cancel_run(thread, trace.trace_id, reason="user_stop")
+                # 用户停止也要结算预扣（已消耗的 token 不退）
+                self._settle_credits_if_any(thread.thread_id, force_stopped=False)
             elif self.trace_recorder.is_awaiting_input(trace.trace_id):
                 pass  # interrupt 期间断连：保持 awaiting_input，等用户 resume
             else:
                 self.trace_recorder.cancel_run(thread, trace.trace_id, reason="client_disconnect")
+                self._settle_credits_if_any(thread.thread_id, force_stopped=False)
             raise
-        except BaseException as exc:
+        except Exception as exc:
+            # T6.1/T6.3：CreditExhaustedError 专门处理（D27 强停）
+            from app.platform.credits.exceptions import CreditExhaustedError
+            if isinstance(exc, CreditExhaustedError):
+                self.trace_recorder.cancel_run(thread, trace.trace_id, reason="credit_stop")
+                # T6.2：强停时结算预扣（force_stopped=True）
+                self._settle_credits_if_any(thread.thread_id, force_stopped=True)
+                for trace_update in self._trace_updates(trace_queue):
+                    yield trace_update
+                yield _sse("credit_exhausted", {
+                    "message": str(exc),
+                    "thread_id": thread.thread_id,
+                })
+                return
             self.trace_recorder.fail_run(thread, trace.trace_id, exc)
             for trace_update in self._trace_updates(trace_queue):
                 yield trace_update
@@ -336,6 +366,24 @@ class MetaAgentService(BaseAgentService):
         if not trace_events:
             return []
         return [_sse("trace_event", trace_event) for trace_event in trace_events]
+
+    def _settle_credits_if_any(self, thread_id: str, *, force_stopped: bool) -> None:
+        """T6.2：结算当前 thread 的活跃预扣（如有）。
+
+        正常完成 / 用户停止 / 客户端断连时调 force_stopped=False。
+        CreditExhaustedError 强停时调 force_stopped=True。
+        无活跃预扣时静默跳过（interview 阶段 / 非计费路径）。
+        """
+        try:
+            from app.platform.credits.service import get_credits_service
+            svc = get_credits_service()
+            hold = svc.get_active_hold(thread_id)
+            if hold:
+                svc.settle_hold(hold["hold_id"], force_stopped=force_stopped)
+        except RuntimeError:
+            pass  # CreditsService 未初始化（A/B 测试 / 管理员路径），跳过
+        except Exception:
+            pass  # 结算失败不影响创作主流程（已落盘的内容不丢失）
 
     def _build_user_prompt(self, payload: ScreenplayGenerateRequest, thread: ThreadSummary) -> str:
         context_lines = [

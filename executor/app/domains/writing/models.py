@@ -27,9 +27,8 @@ def build_writer_model(
 ) -> ChatOpenAI:
     """构建写作模型。
 
-    多用户隔离（D9）：普通用户调用时传入其解密后的 api_key + base_url + model，
-    覆盖 settings 里的全局值（全局值现仅作管理员兜底）。
-    所有参数为 None 时回退到 settings（保留旧行为）。
+    平台代付模式（D1/D22/AD9）：所有用户统一使用平台 key，不再读用户自带 key。
+    api_key/base_url 参数保留仅为向后兼容（测试/旧路径），优先级低于平台配置。
     """
     effective_model = model_name_override if model_name_override else settings.writer_model
     provider, model_name = parse_writer_model(effective_model)
@@ -46,13 +45,21 @@ def build_writer_model(
     else:
         model_class = ChatOpenAI
 
-    effective_key = api_key if api_key is not None else settings.openai_api_key
-    effective_base = base_url if base_url is not None else settings.openai_base_url
+    # AD9：平台代付——优先用 PLATFORM_API_KEY（积分制专用），其次兼容旧 OPENAI_API_KEY。
+    # api_key 参数仅为测试/旧路径保留，生产路径不再传用户 key（D22 一刀切）。
+    effective_key = (
+        api_key
+        or getattr(settings, "platform_api_key", "")
+        or settings.openai_api_key
+    )
+    effective_base = (
+        base_url
+        or getattr(settings, "platform_base_url", "")
+        or settings.openai_base_url
+    )
 
-    # 多用户隔离 + 启动安全：全局 OPENAI_API_KEY 可能留空（key 不集中存服务器）。
-    # 但 langchain ChatOpenAI 构造时强制要求 key（pydantic validate_environment），
-    # 空 key 会导致容器启动崩溃。启动/兜底场景传占位 key 让构造通过，
-    # 真正写作时用户各自的 key 会重建 client（见 _build_model_with_key）。
+    # 启动安全：key 可能留空（未配置）。langchain ChatOpenAI 构造时强制要求 key
+    # （pydantic validate_information），空 key 会崩溃。传占位 key 让构造通过。
     if not effective_key:
         effective_key = "placeholder-key-set-per-user-at-runtime"
 
@@ -61,6 +68,9 @@ def build_writer_model(
         api_key=effective_key,
         base_url=effective_base,
         request_timeout=120,
-        stream_usage=provider != DEEPSEEK_PROVIDER,
+        # AD5：deepseek 也开启 stream_usage——流式模式下需要 usage 做积分计费（D3）。
+        # ChatOpenAI 的 stream_usage=True 会传 stream_options={"include_usage": true}，
+        # deepseek 兼容 OpenAI 协议会返回 usage。
+        stream_usage=True,
         **provider_options,
     )

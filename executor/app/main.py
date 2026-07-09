@@ -54,6 +54,11 @@ _master_key = load_master_key(settings.master_key)
 _database = Database(settings.db_path, _master_key)
 init_database(_database)
 
+# 积分制（D1-D28）：初始化 CreditsService 单例（在 init_database 之后）
+from app.platform.credits.config_service import CreditConfigService
+from app.platform.credits.service import CreditsService, init_credits_service
+init_credits_service(CreditsService(_database, CreditConfigService(_database)))
+
 _checkpoints_root = Path(__file__).resolve().parents[1] / "checkpoints"
 _checkpoint_pool = CheckpointPool(_checkpoints_root)
 init_checkpoint_pool(_checkpoint_pool)

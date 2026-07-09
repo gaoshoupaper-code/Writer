@@ -144,6 +144,18 @@ def assemble(ctx: RuntimeContext, config: dict | None = None, source_root: Path 
             ctx.trace_recorder, ctx.trace_id, "meta-agent",
         ))
 
+    # CreditsMiddleware 挂载（AD2/AD6：积分制，类由 ctx 注入，包内实例化）
+    # 仅在有 owner_id（用户创作）且有 credits_service 时挂载。
+    # meta agent 挂载：负责预扣触发（tool_call 检测 storybuilding）+ model_call 计费。
+    if ctx.credits_service is not None and ctx.credits_middleware_cls and ctx.owner_id:
+        meta_middleware.insert(
+            1,
+            ctx.credits_middleware_cls(
+                ctx.credits_service, ctx.trace_id, ctx.owner_id,
+                ctx.workspace_path, "meta-agent",
+            ),
+        )
+
     # ── meta skills backend 组合 ──
     effective_backend, skill_sources = compose_skills_backend(ctx.backend, meta_skills)
 
@@ -162,6 +174,17 @@ def assemble(ctx: RuntimeContext, config: dict | None = None, source_root: Path 
         if ctx.trace_recorder is not None and ctx.trace_id and ctx.trace_middleware_cls:
             mw.insert(1, ctx.trace_middleware_cls(
                 ctx.trace_recorder, ctx.trace_id, agent_name,
+            ))
+        # CreditsMiddleware 挂载到创作类子代理（AD6），不挂 interview（访谈免费）。
+        if (
+            ctx.credits_service is not None
+            and ctx.credits_middleware_cls
+            and ctx.owner_id
+            and agent_name != "interview-subagent"
+        ):
+            mw.insert(1, ctx.credits_middleware_cls(
+                ctx.credits_service, ctx.trace_id, ctx.owner_id,
+                ctx.workspace_path, agent_name,
             ))
         return mw
 

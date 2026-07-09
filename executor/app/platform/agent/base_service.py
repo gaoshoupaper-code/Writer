@@ -59,23 +59,13 @@ class BaseAgentService:
     # ── 多用户隔离：model / checkpointer 解析 ────────────────
 
     def _resolve_model(self, owner_id: str | None):
-        """按 owner 解密其 API key 构建 model；无 owner 或无 key 回退全局 settings。
+        """构建 model。
 
-        子类可通过覆盖 ``_build_model_with_key`` 钩子定制 model 构建（如 image
-        domain 用视觉模型）。默认走写作的 build_writer_model。
+        平台代付模式（D1/D22/AD9）：所有用户统一用平台 key，不再读用户自带 key。
+        无论有无 owner_id，都走 _build_model_default（内部用 PLATFORM_API_KEY）。
+        owner_id 保留参数仅为签名兼容。
         """
-        if not owner_id:
-            return self._build_model_default()
-        try:
-            from app.platform.core.db import get_database, UserRepository
-            users = UserRepository(get_database())
-            key, base_url, model = users.get_api_key_plain(owner_id)
-            if key is None:
-                # 用户未填 key：回退全局（管理员兜底）
-                return self._build_model_default()
-            return self._build_model_with_key(key, base_url, model)
-        except Exception:
-            return self._build_model_default()
+        return self._build_model_default()
 
     def _build_model_default(self):
         """无 owner/key 时构建 model。子类必须覆盖（提供各自领域的默认模型）。

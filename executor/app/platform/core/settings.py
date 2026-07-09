@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_base_url: str = ""
 
+    # AD9 平台代付专用 key（D1/D22 积分制）：所有用户统一用此 key，花积分创作。
+    # 留空时 build_writer_model 回退到 openai_api_key（兼容过渡）。
+    platform_api_key: str = ""
+    platform_base_url: str = ""
+
     # ── 多用户隔离（Phase 1 新增）──────────────────────────────
     # API key 加密主密钥：32 字节，hex 或 base64 编码。AES-256-GCM 用。
     # 生成方式：python -c "import secrets; print(secrets.token_hex(32))"

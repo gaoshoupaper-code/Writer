@@ -62,6 +62,11 @@ class RuntimeContext:
             执行端从 styling store 解析后填充；包内 assemble 读此字段把对应
             suffix 注入各 subagent 的 system_prompt（via apply_style_suffix）。
             None 或缺 key = 该 scope 无风格注入（用裸 prompt）。
+        credits_service: CreditsService 实例（积分制 D1-D28）。None 时包不挂 CreditsMiddleware。
+            类型用 object 避免 contracts 硬依赖执行端模块。
+        credits_middleware_cls: CreditsMiddleware 类（执行端定义，ctx 传入，包内实例化）。
+            None 时包不挂载计费中间件（A/B 测试/管理员/interview 路径）。
+            与 credits_service 配合，复用 TraceMiddleware 的 T2 注入模式。
     """
 
     # 请求级（每次 assemble 新建）
@@ -75,6 +80,9 @@ class RuntimeContext:
     # 平台级（进程内复用）
     trace_recorder: object | None = None
     trace_middleware_cls: object | None = None  # TraceMiddleware 类，执行端注入
+    # 积分制（AD2/AD6：复用 T2 注入模式）
+    credits_service: object | None = None  # CreditsService 实例，None 不计费
+    credits_middleware_cls: object | None = None  # CreditsMiddleware 类，执行端注入
 
 
 __all__ = ["RuntimeContext"]

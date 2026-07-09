@@ -193,6 +193,12 @@ export async function fetchMyProfile() {
   return apiJson<MyProfile>(`${API_BASE_URL}/api/me`);
 }
 
+// ── 积分余额（D11 写作端展示）──────────────────────────────
+
+export async function fetchMyCredits(): Promise<{ balance: number }> {
+  return apiJson<{ balance: number }>(`${API_BASE_URL}/api/me/credits`);
+}
+
 // ── Provider 配置历史（多条，可切换）──────────────────────
 
 export type ProviderConfig = {

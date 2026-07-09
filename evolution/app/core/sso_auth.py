@@ -49,8 +49,8 @@ class SSOAuthMiddleware(BaseHTTPMiddleware):
             if uid.strip()
         }
         self._cache_ttl = settings.sso_cache_ttl_seconds
-        # session_id → (user_id, expires_ts)
-        self._cache: dict[str, tuple[str, float]] = {}
+        # session_id → (user_id, is_super_admin, expires_ts)
+        self._cache: dict[str, tuple[str, bool, float]] = {}
         # master_key 未配/白名单空时的降级标记（开发模式兼容）
         self._dev_mode = not settings.allowed_user_ids
 
@@ -59,6 +59,8 @@ class SSOAuthMiddleware(BaseHTTPMiddleware):
 
         # 开发模式（白名单空）：放行全部，等价于旧 internal_api_key 留空
         if self._dev_mode:
+            request.state.user_id = "dev"
+            request.state.is_super_admin = True
             return await call_next(request)
 
         # 放行：健康检查、诊断、静态根
@@ -75,34 +77,37 @@ class SSOAuthMiddleware(BaseHTTPMiddleware):
             return _unauthorized("未登录")
 
         # 查缓存
-        user_id = self._cache_get(session)
+        user_id, is_super_admin = self._cache_get(session)
         if user_id is None:
             # 缓存 miss/过期 → 回调 executor 验证
-            user_id = await self._verify_with_executor(session)
+            user_id, is_super_admin = await self._verify_with_executor(session)
             if user_id is None:
                 return _unauthorized("session 无效或已过期")
-            self._cache_set(session, user_id)
+            self._cache_set(session, user_id, is_super_admin)
 
         # 白名单校验
         if user_id not in self._allowed:
             logger.warning("evolution 拒绝非白名单用户访问：user_id=%s path=%s", user_id, path)
             return _forbidden("无权访问进化端")
 
+        # 写入 request.state 供 handler 读取（admin_proxy 用）
+        request.state.user_id = user_id
+        request.state.is_super_admin = is_super_admin
         return await call_next(request)
 
-    def _cache_get(self, session: str) -> str | None:
-        """查缓存，命中且未过期返回 user_id，否则 None。"""
+    def _cache_get(self, session: str) -> tuple[str, bool] | tuple[None, None]:
+        """查缓存，命中且未过期返回 (user_id, is_super_admin)，否则 (None, None)。"""
         cached = self._cache.get(session)
-        if cached and cached[1] > time.time():
-            return cached[0]
-        return None
+        if cached and cached[2] > time.time():
+            return cached[0], cached[1]
+        return None, None
 
-    def _cache_set(self, session: str, user_id: str) -> None:
+    def _cache_set(self, session: str, user_id: str, is_super_admin: bool) -> None:
         """写缓存。无淘汰策略（单人场景缓存条目极少，不必清理）。"""
-        self._cache[session] = (user_id, time.time() + self._cache_ttl)
+        self._cache[session] = (user_id, is_super_admin, time.time() + self._cache_ttl)
 
-    async def _verify_with_executor(self, session: str) -> str | None:
-        """内网回调 executor /api/auth/me 验证 session，返回 user_id 或 None。
+    async def _verify_with_executor(self, session: str) -> tuple[str, bool] | tuple[None, None]:
+        """内网回调 executor /api/auth/me 验证 session，返回 (user_id, is_super_admin) 或 (None, None)。
 
         executor 的 current_user 依赖会查 sessions 表 + 滚动续期。
         """
@@ -113,12 +118,16 @@ class SSOAuthMiddleware(BaseHTTPMiddleware):
                     cookies={"session": session},
                 )
             if resp.status_code != 200:
-                return None
+                return None, None
             data = resp.json()
-            return data.get("user_id")
+            user_id = data.get("user_id")
+            # executor /api/auth/me 现在返回 is_super_admin（D28），
+            # 旧版不返回则默认 False（兼容）
+            is_super = bool(data.get("is_super_admin", False))
+            return user_id, is_super
         except Exception:
             logger.warning("SSO 回调 executor 失败（executor 不可达？）", exc_info=True)
-            return None
+            return None, None
 
 
 def _unauthorized(detail: str) -> JSONResponse:

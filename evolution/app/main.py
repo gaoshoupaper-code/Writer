@@ -129,6 +129,9 @@ app.include_router(benchmark_router, prefix="/api")
 # 大模型 API 配置（桌面化改造，2026-07-07：桌面端唯一 key 配置入口）
 from app.config.api import router as config_router
 app.include_router(config_router, prefix="/api")
+# 管理后台代理（积分制 Phase 4：转发到 executor /api/admin/*）
+from app.admin_proxy.router import router as admin_proxy_router
+app.include_router(admin_proxy_router, prefix="/api")
 
 
 @app.get("/health")

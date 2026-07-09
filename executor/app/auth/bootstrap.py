@@ -33,11 +33,12 @@ def bootstrap_admin() -> dict | None:
     if users.has_admin():
         return None  # 已有管理员，幂等跳过
 
-    # 创建管理员账号
+    # 创建管理员账号（D28：首个管理员同时置 is_super_admin=1）
     admin = users.create(
         username=settings.admin_username,
         password=settings.admin_password,
         is_admin=True,
+        is_super_admin=True,
         workspace_quota=settings.default_workspace_quota,
     )
 

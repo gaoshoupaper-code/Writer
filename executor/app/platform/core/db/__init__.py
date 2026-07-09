@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS users (
     username             TEXT UNIQUE NOT NULL,
     password_hash        TEXT NOT NULL,
     is_admin             INTEGER NOT NULL DEFAULT 0,
+    -- 超级管理员（D28）：唯一能访问进化端管理后台的角色
+    is_super_admin       INTEGER NOT NULL DEFAULT 0,
     -- API key：AES-256-GCM 密文（nonce||ciphertext+tag，urlsafe-base64）
     encrypted_api_key    TEXT,
     api_key_base_url     TEXT,
@@ -56,6 +58,8 @@ CREATE TABLE IF NOT EXISTS users (
     -- 冻结标记：1 表示禁用，无法登录
     disabled             INTEGER NOT NULL DEFAULT 0,
     workspace_quota      INTEGER NOT NULL DEFAULT 5,
+    -- 积分余额（D3 token 实扣）：正数=可用，负数=负债（D15/D27）
+    credits_balance      INTEGER NOT NULL DEFAULT 0,
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL
 );
@@ -75,13 +79,15 @@ CREATE TABLE IF NOT EXISTS provider_configs (
 );
 
 CREATE TABLE IF NOT EXISTS invite_codes (
-    code          TEXT PRIMARY KEY,
-    created_by    TEXT NOT NULL REFERENCES users(user_id),
-    used_by       TEXT REFERENCES users(user_id),
-    is_admin_code INTEGER NOT NULL DEFAULT 0,
-    created_at    TEXT NOT NULL,
-    used_at       TEXT,
-    revoked_at    TEXT
+    code             TEXT PRIMARY KEY,
+    created_by       TEXT NOT NULL REFERENCES users(user_id),
+    used_by          TEXT REFERENCES users(user_id),
+    is_admin_code    INTEGER NOT NULL DEFAULT 0,
+    -- D10：每码单独配额，注册时到账（AD10）
+    granted_credits  INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    used_at          TEXT,
+    revoked_at       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -167,6 +173,60 @@ CREATE INDEX IF NOT EXISTS idx_images_final ON images(workspace_id, is_final);
 CREATE INDEX IF NOT EXISTS idx_images_owner ON images(owner_id);
 CREATE INDEX IF NOT EXISTS idx_skills_owner ON skills(owner_id);
 CREATE INDEX IF NOT EXISTS idx_provider_configs_active ON provider_configs(owner_id, is_active);
+
+-- ══ 积分制（D1-D28）═══════════════════════════════════════════════
+
+-- D4 预扣冻结记录：每次创作一条，跑完结算（多退少补）
+CREATE TABLE IF NOT EXISTS credit_holds (
+    hold_id      TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL REFERENCES users(user_id),
+    thread_id    TEXT NOT NULL,
+    trace_id     TEXT,
+    -- 篇幅档位 1-6（D9：访谈 Agent 收集的 6 选 1）
+    tier         INTEGER NOT NULL,
+    -- 预扣冻结的积分数（D14 草表：500/1500/3500/7000/10000/13000）
+    held_amount  INTEGER NOT NULL,
+    -- 实际已消耗（实时累加，model_call 每次 LLM 调用后加）
+    consumed     INTEGER NOT NULL DEFAULT 0,
+    -- active=预扣中 / settled=正常结算完成 / force_stopped=触及-5000强停(D27)
+    status       TEXT NOT NULL DEFAULT 'active',
+    created_at   TEXT NOT NULL,
+    settled_at   TEXT
+);
+
+-- D19 积分流水：只记关键变动（管理员调整/邀请码到账/创作消耗汇总）
+CREATE TABLE IF NOT EXISTS credit_transactions (
+    tx_id         TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL REFERENCES users(user_id),
+    -- invite_grant=邀请码到账 / admin_adjust=管理员手动调整 /
+    -- creation_consume=创作消耗(D23汇总一条) / creation_refund=预扣退还
+    type          TEXT NOT NULL,
+    -- 正=入账，负=扣减
+    amount        INTEGER NOT NULL,
+    -- 操作后余额（审计用）
+    balance_after INTEGER NOT NULL,
+    ref_thread_id TEXT,
+    ref_hold_id   TEXT,
+    note          TEXT,
+    -- 操作者 user_id（admin_adjust 时=管理员；其余=system）
+    created_by    TEXT,
+    created_at    TEXT NOT NULL
+);
+
+-- AD11 暗调参数配置表（进化端管理页在线改，不重启）
+CREATE TABLE IF NOT EXISTS credit_config (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    description TEXT,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_credit_holds_user ON credit_holds(user_id);
+CREATE INDEX IF NOT EXISTS idx_credit_holds_thread ON credit_holds(thread_id);
+CREATE INDEX IF NOT EXISTS idx_credit_holds_status ON credit_holds(status);
+CREATE INDEX IF NOT EXISTS idx_credit_transactions_user ON credit_transactions(user_id);
+CREATE INDEX IF NOT EXISTS idx_credit_transactions_type ON credit_transactions(type);
+CREATE INDEX IF NOT EXISTS idx_credit_transactions_created ON credit_transactions(created_at);
 """
 
 
@@ -198,10 +258,24 @@ class Database:
         workspace 补列（DD2）：
         - ``outline_name`` → ``title``：字段语义通用化（image workspace 非"大纲名"）
         - ``domain``：能力域隔离（writing/image/...），存量默认 'writing'
+
+        积分制补列（D1-D28）：
+        - users.credits_balance / is_super_admin
+        - invite_codes.granted_credits
+        - credit_config 初始数据播种
         """
         cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(users)")}
         if "active_model" not in cols:
             self._conn.execute("ALTER TABLE users ADD COLUMN active_model TEXT")
+        # 积分制（D28 超管 + D3 积分余额）
+        if "is_super_admin" not in cols:
+            self._conn.execute(
+                "ALTER TABLE users ADD COLUMN is_super_admin INTEGER NOT NULL DEFAULT 0"
+            )
+        if "credits_balance" not in cols:
+            self._conn.execute(
+                "ALTER TABLE users ADD COLUMN credits_balance INTEGER NOT NULL DEFAULT 0"
+            )
 
         ws_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(workspaces)")}
         # outline_name → title（旧库才有 outline_name；全新库 _SCHEMA 直接是 title）
@@ -212,6 +286,46 @@ class Database:
             self._conn.execute(
                 "ALTER TABLE workspaces ADD COLUMN domain TEXT NOT NULL DEFAULT 'writing'"
             )
+
+        # 邀请码积分配额（D10）
+        invite_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(invite_codes)")}
+        if "granted_credits" not in invite_cols:
+            self._conn.execute(
+                "ALTER TABLE invite_codes ADD COLUMN granted_credits INTEGER NOT NULL DEFAULT 0"
+            )
+
+        # 积分暗调参数初始播种（AD11：首次启动写入默认值，之后管理页在线改）
+        self._seed_credit_config()
+
+    def _seed_credit_config(self) -> None:
+        """播种 credit_config 默认值（幂等：已存在的 key 不覆盖）。"""
+        import json
+        defaults = {
+            # D7 三档权重折算（输出×2.0 / 输入未命中×1.0 / 输入命中×0.01）
+            "output_token_weight": ("2.0", "输出 token 权重（相对输入未命中基准）"),
+            "input_miss_weight": ("1.0", "输入缓存未命中 token 权重（基准）"),
+            "input_hit_weight": ("0.01", "输入缓存命中 token 权重"),
+            # 标准 token → 积分单价（暗调主旋钮）
+            "credits_per_1k_tokens": ("1.0", "每千标准 token 折算积分数"),
+            # D14 六档预扣额度（JSON 数组：[档1, 档2, 档3, 档4, 档5, 档6]）
+            "tier_hold_amounts": (
+                json.dumps([500, 1500, 3500, 7000, 10000, 13000]),
+                "六档篇幅预扣积分配额（D14）",
+            ),
+            # D27 负债上限（触及强停）
+            "max_debt": ("-5000", "最大负债额度（余额下限，触及强停）"),
+        }
+        now = _now()
+        for key, (value, desc) in defaults.items():
+            existing = self._conn.execute(
+                "SELECT 1 FROM credit_config WHERE key = ?", (key,)
+            ).fetchone()
+            if not existing:
+                self._conn.execute(
+                    "INSERT INTO credit_config (key, value, description, updated_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (key, value, desc, now),
+                )
 
     # ── 事务上下文 ──────────────────────────────────────────
     def transaction(self):
@@ -260,17 +374,18 @@ class UserRepository:
 
     def create(
         self, *, username: str, password: str, is_admin: bool = False,
-        workspace_quota: int = 5,
+        workspace_quota: int = 5, is_super_admin: bool = False,
     ) -> dict:
         user_id = uuid4().hex
         now = _now()
         with self.db.transaction() as conn:
             conn.execute(
                 "INSERT INTO users (user_id, username, password_hash, is_admin, "
-                "workspace_quota, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "is_super_admin, workspace_quota, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (user_id, username, hash_password(password),
-                 1 if is_admin else 0, workspace_quota, now, now),
+                 1 if is_admin else 0, 1 if is_super_admin else 0,
+                 workspace_quota, now, now),
             )
         return self.get_by_id(user_id)  # type: ignore[return-value]
 
@@ -363,6 +478,41 @@ class UserRepository:
             "SELECT COUNT(*) AS c FROM workspaces WHERE owner_id = ?", (user_id,)
         ).fetchone()
         return int(row["c"]) if row else 0
+
+    # ── 积分（D3 token 实扣 / D8 余额管理）──────────────────────
+
+    def get_credits(self, user_id: str) -> int:
+        """返回用户当前积分余额。"""
+        row = self.db.conn.execute(
+            "SELECT credits_balance FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return int(row["credits_balance"]) if row else 0
+
+    def set_credits(self, user_id: str, amount: int) -> None:
+        """直接设置余额（管理员用，通常走 adjust_credits 留流水）。"""
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE users SET credits_balance = ?, updated_at = ? WHERE user_id = ?",
+                (amount, _now(), user_id),
+            )
+
+    def adjust_credits(self, user_id: str, delta: int) -> int:
+        """原子增减余额（delta 正=入账，负=扣减），返回操作后余额。
+
+        transaction() 已用 RLock + BEGIN 保证串行，读-改-写在同一事务内原子完成。
+        """
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT credits_balance FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            if not row:
+                raise ValueError(f"User not found: {user_id}")
+            new_balance = int(row["credits_balance"]) + delta
+            conn.execute(
+                "UPDATE users SET credits_balance = ?, updated_at = ? WHERE user_id = ?",
+                (new_balance, _now(), user_id),
+            )
+            return new_balance
 
 
 class ProviderConfigRepository:
@@ -508,6 +658,7 @@ class InviteCodeRepository:
 
     def create(
         self, *, created_by: str, count: int = 1, is_admin_code: bool = False,
+        granted_credits: int = 0,
     ) -> list[str]:
         import secrets as _s
         codes: list[str] = []
@@ -517,8 +668,9 @@ class InviteCodeRepository:
                 code = _s.token_urlsafe(16)
                 conn.execute(
                     "INSERT INTO invite_codes "
-                    "(code, created_by, is_admin_code, created_at) VALUES (?, ?, ?, ?)",
-                    (code, created_by, 1 if is_admin_code else 0, now),
+                    "(code, created_by, is_admin_code, granted_credits, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (code, created_by, 1 if is_admin_code else 0, granted_credits, now),
                 )
                 codes.append(code)
         return codes
@@ -559,6 +711,158 @@ class InviteCodeRepository:
             "SELECT * FROM invite_codes ORDER BY created_at DESC"
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+class CreditHoldRepository:
+    """预扣冻结记录访问层（D4 事前预扣 + 多退少补）。
+
+    每次"正式创作"创建一条 hold，实时累加 consumed，创作结束时结算。
+    """
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def create(
+        self, *, user_id: str, thread_id: str, trace_id: str | None,
+        tier: int, held_amount: int,
+    ) -> dict:
+        hold_id = uuid4().hex
+        now = _now()
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO credit_holds "
+                "(hold_id, user_id, thread_id, trace_id, tier, held_amount, "
+                "consumed, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, 'active', ?)",
+                (hold_id, user_id, thread_id, trace_id, tier, held_amount, now),
+            )
+        return self.get(hold_id)  # type: ignore[return-value]
+
+    def get(self, hold_id: str) -> dict | None:
+        row = self.db.conn.execute(
+            "SELECT * FROM credit_holds WHERE hold_id = ?", (hold_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_active_by_thread(self, thread_id: str) -> dict | None:
+        """取某 thread 当前活跃的预扣（同一创作只有一条 active）。"""
+        row = self.db.conn.execute(
+            "SELECT * FROM credit_holds WHERE thread_id = ? AND status = 'active' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (thread_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def add_consumed(self, hold_id: str, amount: int) -> dict | None:
+        """累加实际消耗（每次 model_call 后调），返回更新后的 hold。"""
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE credit_holds SET consumed = consumed + ? WHERE hold_id = ?",
+                (amount, hold_id),
+            )
+        return self.get(hold_id)
+
+    def settle(self, hold_id: str, status: str = "settled") -> dict | None:
+        """结算 hold（settled=正常完成 / force_stopped=触及负债上限强停）。"""
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE credit_holds SET status = ?, settled_at = ? WHERE hold_id = ?",
+                (status, _now(), hold_id),
+            )
+        return self.get(hold_id)
+
+    def list_by_user(self, user_id: str, limit: int = 50) -> list[dict]:
+        rows = self.db.conn.execute(
+            "SELECT * FROM credit_holds WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+class CreditTransactionRepository:
+    """积分流水访问层（D19 只记关键变动）。
+
+    类型：invite_grant / admin_adjust / creation_consume / creation_refund。
+    每条记录操作后余额（balance_after），支持审计和对账。
+    """
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def create(
+        self, *, user_id: str, type: str, amount: int,
+        balance_after: int, ref_thread_id: str | None = None,
+        ref_hold_id: str | None = None, note: str | None = None,
+        created_by: str | None = None,
+    ) -> dict:
+        tx_id = uuid4().hex
+        now = _now()
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO credit_transactions "
+                "(tx_id, user_id, type, amount, balance_after, ref_thread_id, "
+                "ref_hold_id, note, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (tx_id, user_id, type, amount, balance_after,
+                 ref_thread_id, ref_hold_id, note, created_by, now),
+            )
+        return self.get(tx_id)  # type: ignore[return-value]
+
+    def get(self, tx_id: str) -> dict | None:
+        row = self.db.conn.execute(
+            "SELECT * FROM credit_transactions WHERE tx_id = ?", (tx_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_by_user(self, user_id: str, limit: int = 50) -> list[dict]:
+        rows = self.db.conn.execute(
+            "SELECT * FROM credit_transactions WHERE user_id = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_all(self, limit: int = 100) -> list[dict]:
+        rows = self.db.conn.execute(
+            "SELECT * FROM credit_transactions ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+class CreditConfigRepository:
+    """积分暗调参数访问层（AD11：管理页在线改，不重启）。
+
+    启动时由 _seed_credit_config 播种默认值。
+    """
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def get(self, key: str) -> str | None:
+        row = self.db.conn.execute(
+            "SELECT value FROM credit_config WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
+    def get_all(self) -> dict[str, str]:
+        rows = self.db.conn.execute(
+            "SELECT key, value FROM credit_config"
+        ).fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+    def set(self, key: str, value: str, description: str | None = None) -> None:
+        with self.db.transaction() as conn:
+            if description is not None:
+                conn.execute(
+                    "UPDATE credit_config SET value = ?, description = ?, updated_at = ? "
+                    "WHERE key = ?",
+                    (value, description, _now(), key),
+                )
+            else:
+                conn.execute(
+                    "UPDATE credit_config SET value = ?, updated_at = ? WHERE key = ?",
+                    (value, _now(), key),
+                )
 
 
 class SessionRepository:

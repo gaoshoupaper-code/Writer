@@ -1308,6 +1308,20 @@ export default function Home() {
                 );
               } else if (event.type === "final") {
                 finalData = event.data as ScreenplayResponse;
+              } else if (event.type === "credit_exhausted") {
+                // T6.4：积分耗尽强停（D27）
+                const msg = (event.data as { message?: string })?.message ?? "积分耗尽";
+                setLiveTraceId("");
+                toast.error(msg);
+                setMessages((current) =>
+                  updateAssistantMessage(current, assistantIdx, (message) => ({
+                    ...message,
+                    status: "failed",
+                    content: `⚠️ ${msg}\n\n已创作的内容已保存，补充积分后可继续创作。`,
+                    contentFormat: "markdown",
+                  })),
+                );
+                break;
               } else if (event.type === "interrupt") {
                 const iv = event.data as {
                   kind?: string;
@@ -1388,6 +1402,22 @@ export default function Home() {
         );
       }
     } catch (submitError) {
+      // T5.3：冻结用户友好提示（403 → 积分不足）
+      const errMsg = submitError instanceof Error ? submitError.message : "";
+      if (errMsg.includes("积分") || errMsg.includes("403") || errMsg.includes("冻结")) {
+        setLiveTraceId("");
+        toast.error("积分余额不足，账户已冻结。请联系管理员补充积分。");
+        setMessages((current) =>
+          updateAssistantMessage(current, assistantIdx, (message) => ({
+            ...message,
+            status: "failed",
+            content: "⚠️ 积分余额不足，无法开始创作。请联系管理员补充积分。",
+            contentFormat: "markdown",
+          })),
+        );
+        if (isResume) throw submitError;
+        return;
+      }
       if (submitError instanceof DOMException && submitError.name === "AbortError") {
         setLiveTraceId("");
         setMessages((current) =>
