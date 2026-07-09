@@ -134,6 +134,38 @@ info "上传到 ${DEPLOY_HOST}:${REMOTE_DIR}/ ..."
 ssh "${DEPLOY_HOST}" "mkdir -p ${REMOTE_DIR}" || error "SSH 连接失败，检查 DEPLOY_HOST 和密钥配置"
 scp "${UPLOAD_FILES[@]}" "${LATEST_JSON}" "${DEPLOY_HOST}:${REMOTE_DIR}/"
 
+# ── 6. 清理旧版安装包（保留最近 3 版）──────────────────────────
+# 每次发版后自动清理，避免安装包无限堆积。
+# 规则：按版本号降序，保留最新的 KEEP_VERSIONS 个版本的安装包，更早的删除。
+#   - 只删进化端产物（前缀 siyen-evolution-）
+#   - latest-evo.json 永不删（updater endpoint）
+#   - 用 sort -V 做语义版本排序
+# KEEP_VERSIONS 可通过环境变量覆盖（如 KEEP_VERSIONS=5 ./publish-evolution.sh）。
+KEEP_VERSIONS="${KEEP_VERSIONS:-3}"
+info "清理旧版安装包（保留最近 ${KEEP_VERSIONS} 版）..."
+ssh "${DEPLOY_HOST}" bash -s "${REMOTE_DIR}" "${KEEP_VERSIONS}" <<'CLEANUP' || warn "清理旧包失败（不影响本次发布）"
+set -euo pipefail
+DIR="$1"
+KEEP="$2"
+# 从 siyen-evolution-<version>-windows.* 解析版本号，去重 + 降序，跳过最新 KEEP 个
+DELETE_VERSIONS=$(ls "${DIR}"/siyen-evolution-*-windows.msi "${DIR}"/siyen-evolution-*-windows-setup.exe 2>/dev/null \
+  | sed -E 's|.*/siyen-evolution-([0-9]+\.[0-9]+\.[0-9]+)-windows.*|\1|' \
+  | sort -Vru \
+  | tail -n +"$((${KEEP} + 1))")
+if [ -z "${DELETE_VERSIONS}" ]; then
+  echo "[INFO] 无旧版需清理"
+  exit 0
+fi
+for v in ${DELETE_VERSIONS}; do
+  for f in "${DIR}/siyen-evolution-${v}-windows.msi" "${DIR}/siyen-evolution-${v}-windows-setup.exe"; do
+    if [ -f "${f}" ]; then
+      rm -f "${f}"
+      echo "[INFO] 已删除旧包：$(basename "${f}")"
+    fi
+  done
+done
+CLEANUP
+
 info "进化端发布完成！"
 [ ${MSI_OK}  -eq 1 ] && info "  MSI 安装包：${SERVER_URL}/releases/${MSI_CANONICAL}"
 [ ${NSIS_OK} -eq 1 ] && info "  EXE 安装包：${SERVER_URL}/releases/${EXE_CANONICAL}"
