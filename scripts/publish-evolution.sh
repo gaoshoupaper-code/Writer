@@ -50,6 +50,14 @@ fi
 # ── 2. 本地构建 ──────────────────────────────────────────────
 info "开始 tauri build（进化端，生成签名安装包）..."
 cd "$(dirname "$0")/../evolution/desktop"
+
+# 清理 bundle 目录的旧产物（.exe/.msi/.sig）。
+# 根因修复：旧版产物残留导致 `ls | head -1` 选错文件，把旧版当新版上传。
+BUNDLE_BASE="src-tauri/target/release/bundle"
+info "清理旧 bundle 产物（${BUNDLE_BASE}/{nsis,msi}/*.exe *.msi *.sig）..."
+rm -f "${BUNDLE_BASE}"/nsis/*.exe "${BUNDLE_BASE}"/nsis/*.sig 2>/dev/null || true
+rm -f "${BUNDLE_BASE}"/msi/*.msi "${BUNDLE_BASE}"/msi/*.sig 2>/dev/null || true
+
 npm run tauri build 2>&1 | tail -5
 
 # ── 3. 读版本号 + 定位产物 ───────────────────────────────────
@@ -63,7 +71,7 @@ NSIS_DIR="src-tauri/target/release/bundle/nsis"
 TMP_DIR=$(mktemp -d)
 UPLOAD_FILES=()
 
-# 处理单个产物：定位 → 显式签名兜底 → 复制为约定名
+# 处理单个产物：定位 → 强制重新签名 → 复制为约定名
 process_bundle() {
   local bdir="$1" ext="$2" canonical="$3"
   local src sigfile
@@ -72,12 +80,11 @@ process_bundle() {
   sigfile="${src}.sig"
   info "Tauri 产物：$(basename "${src}")"
 
-  # 显式签名兜底：tauri build 在某些配置下不会自动签名
-  if [ ! -f "${sigfile}" ]; then
-    info "未检测到自动生成的 .sig，显式签名中..."
-    npx tauri signer sign "${src}" >/dev/null || error "签名失败，检查 TAURI_SIGNING_PRIVATE_KEY"
-    info "签名完成：${sigfile}"
-  fi
+  # 强制重新签名（不复用残留 .sig，避免签名与二进制不匹配导致验签失败）
+  info "签名中（强制重新签名）..."
+  rm -f "${sigfile}"
+  npx tauri signer sign "${src}" >/dev/null || error "签名失败，检查 TAURI_SIGNING_PRIVATE_KEY / PASSWORD"
+  info "签名完成：$(basename "${sigfile}")"
 
   cp "${src}" "${TMP_DIR}/${canonical}"
   UPLOAD_FILES+=("${TMP_DIR}/${canonical}")
@@ -99,10 +106,12 @@ process_bundle "${MSI_DIR}" msi "${MSI_CANONICAL}" && MSI_OK=1 || MSI_OK=0
 # ── 4. 生成 latest-evo.json ──────────────────────────────────
 # 进化端独立 updater endpoint（与写作端 latest.json 分开）
 LATEST_JSON="${TMP_DIR}/latest-evo.json"
+# 定位 updater 用的二进制（读它的 .sig 写进 latest-evo.json）。
+# bundle 目录已在 build 前清理，此处只有一个产物，glob 直接匹配最稳。
 if [ ${NSIS_OK} -eq 1 ]; then
-  UPDATER_BINARY="${NSIS_DIR}/$(ls "${NSIS_DIR}" | grep -E '\.exe$' | head -1)"
+  UPDATER_BINARY=$(ls "${NSIS_DIR}"/*.exe | head -1)
 else
-  UPDATER_BINARY="${MSI_DIR}/$(ls "${MSI_DIR}" | grep -E '\.msi$' | head -1)"
+  UPDATER_BINARY=$(ls "${MSI_DIR}"/*.msi | head -1)
 fi
 SIG_CONTENT=$(cat "${UPDATER_BINARY}.sig")
 # latest-evo.json 里的 url 用约定名（带 -evolution）
