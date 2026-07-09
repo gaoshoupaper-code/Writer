@@ -5410,7 +5410,8 @@ html[data-theme="dark"] .provider-item {
 /* ── 更新提示横条（UpdateBanner，自动更新 2026-07-09）── */
 /* 全局 fixed 钉顶：写作端没有统一 Shell，banner 挂在 App.tsx 全局，
    用 fixed 保证所有页面（login/工作区/settings）都可见。
-   配色复用 --teal（与进化端一致），仅在 available=true 时渲染。 */
+   配色复用 --teal（与进化端一致），仅在 available=true 时渲染。
+   flex-wrap 让展开的 changelog 列表换行到第二行。 */
 .update-banner {
   position: fixed;
   top: 0;
@@ -5418,9 +5419,9 @@ html[data-theme="dark"] .provider-item {
   right: 0;
   z-index: 9999;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
+  gap: 12px 16px;
   padding: 10px 20px;
   background: rgba(58, 154, 126, 0.12);
   border-bottom: 1px solid var(--teal, #3a9a7e);
@@ -5431,6 +5432,15 @@ html[data-theme="dark"] .provider-item {
 @keyframes update-banner-in {
   from { opacity: 0; transform: translateY(-8px); }
   to   { opacity: 1; transform: translateY(0); }
+}
+
+/* 第一行左侧：版本文字 + 更新内容切换按钮 */
+.update-banner-main {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .update-banner-text {
@@ -5446,6 +5456,24 @@ html[data-theme="dark"] .provider-item {
   margin-left: 8px;
 }
 
+/* 「更新内容 ▾」切换按钮 */
+.update-banner-toggle {
+  padding: 2px 10px;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid var(--teal, #3a9a7e);
+  background: transparent;
+  color: var(--teal-dark, #1a6b52);
+  transition: background 0.15s;
+  white-space: nowrap;
+}
+
+.update-banner-toggle:hover {
+  background: rgba(58, 154, 126, 0.15);
+}
+
 .update-banner-btn {
   padding: 6px 16px;
   border-radius: 6px;
@@ -5457,6 +5485,7 @@ html[data-theme="dark"] .provider-item {
   color: #fff;
   transition: background 0.15s;
   white-space: nowrap;
+  flex: 0 0 auto;
 }
 
 .update-banner-btn:hover:not(:disabled) {
@@ -5466,6 +5495,33 @@ html[data-theme="dark"] .provider-item {
 .update-banner-btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+/* 展开的 changelog 列表（换行到第二行，占满整宽） */
+.update-banner-changelog {
+  flex: 1 1 100%;
+  list-style: none;
+  margin: 0;
+  padding: 8px 0 4px;
+  border-top: 1px dashed rgba(58, 154, 126, 0.3);
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.update-banner-changelog li {
+  position: relative;
+  padding-left: 16px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--teal-dark, #1a6b52);
+}
+
+.update-banner-changelog li::before {
+  content: "·";
+  position: absolute;
+  left: 4px;
+  color: var(--teal, #3a9a7e);
+  font-weight: bold;
 }
 
 /* ── settings 页：应用更新区块 ── */
