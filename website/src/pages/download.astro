@@ -1,35 +1,54 @@
 ---
 /// 下载页（Editorial 重设计，与首页同一视觉语言）。
 /// 安装包托管在 executor 服务器的 nginx /releases/ 静态目录。
-/// 版本号硬编码（发版时改这里 + Content Collections），避免构建时 fetch 失败。
+/// 版本号硬编码（发版时由 publish.sh / publish-evolution.sh 自动更新），避免构建时 fetch 失败。
 //
 /// ⚠️ 安装包当前未购买微软代码签名证书（Authenticode），浏览器会提示"不常下载"、
 /// Windows 会弹 SmartScreen。这是正常现象，已在下方给出操作指引。
 /// Tauri 更新签名（minisign）已配，自动更新不受影响。
 
-const VERSION = "0.1.1";
-const MSI_URL = `https://siyen.site/releases/siyen-${VERSION}-windows.msi`;
-const EXE_URL = `https://siyen.site/releases/siyen-${VERSION}-windows-setup.exe`;
+// 两端独立版本号（发版脚本自动 sed 替换）
+const CREATOR_VERSION = "0.1.2";
+const EVOLUTION_VERSION = "0.2.2";
 
-// 下载项（图标用线条 SVG，不用 emoji）
-const downloads = [
+const CREATOR_EXE = `https://siyen.site/releases/siyen-${CREATOR_VERSION}-windows-setup.exe`;
+const CREATOR_MSI = `https://siyen.site/releases/siyen-${CREATOR_VERSION}-windows.msi`;
+const EVO_EXE = `https://siyen.site/releases/siyen-evolution-${EVOLUTION_VERSION}-windows-setup.exe`;
+
+const downloadIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>`;
+
+// 创作端下载项
+const creatorDownloads = [
   {
     label: "安装包",
     ext: ".exe",
     size: "3.6 MB",
-    url: EXE_URL,
+    url: CREATOR_EXE,
     primary: true,
     note: "体积更小，安装更顺滑，推荐大多数用户。",
-    icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>`,
+    icon: downloadIcon,
   },
   {
     label: "安装包",
     ext: ".msi",
     size: "5.3 MB",
-    url: MSI_URL,
+    url: CREATOR_MSI,
     primary: false,
     note: "适合企业批量部署，功能与 .exe 完全相同。",
-    icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>`,
+    icon: downloadIcon,
+  },
+];
+
+// 进化端下载项（仅 .exe）
+const evoDownloads = [
+  {
+    label: "安装包",
+    ext: ".exe",
+    size: "3.6 MB",
+    url: EVO_EXE,
+    primary: true,
+    note: "进化端仅提供 .exe 格式，功能与创作端一致。",
+    icon: downloadIcon,
   },
 ];
 
@@ -94,13 +113,13 @@ const steps = [
       <section class="hero">
         <div class="wrap hero__grid">
           <div class="hero__lead">
-            <p class="kicker"><span class="kicker__dot"></span>下载 · v{VERSION}</p>
+            <p class="kicker"><span class="kicker__dot"></span>下载 · 创作端 v{CREATOR_VERSION} · 进化端 v{EVOLUTION_VERSION}</p>
             <h1 class="hero__title">
               在 Windows 上<br />
               <em>开始写作</em>。
             </h1>
             <p class="hero__sub">
-              桌面端支持离线缓存、自动更新。两个安装包功能完全相同，选其一即可。
+              桌面端支持离线缓存、自动更新。下方分别提供创作端与进化端安装包。
             </p>
           </div>
           <aside class="hero__rail">
@@ -110,12 +129,12 @@ const steps = [
                 <dd>Windows 10 / 11（64 位）</dd>
               </div>
               <div class="facts__row">
-                <dt>版本</dt>
-                <dd>v{VERSION}</dd>
+                <dt>创作端</dt>
+                <dd>v{CREATOR_VERSION}</dd>
               </div>
               <div class="facts__row">
-                <dt>体积</dt>
-                <dd>3.6 MB（.exe）</dd>
+                <dt>进化端</dt>
+                <dd>v{EVOLUTION_VERSION}</dd>
               </div>
               <div class="facts__row">
                 <dt>依赖</dt>
@@ -126,19 +145,19 @@ const steps = [
         </div>
       </section>
 
-      <!-- ============ 下载卡片 ============ -->
+      <!-- ============ 创作端下载卡片 ============ -->
       <section class="downloads">
         <div class="wrap">
           <header class="section-head">
             <span class="section-num">02</span>
             <div class="section-head__text">
-              <h2 class="section-title">选择安装包</h2>
-              <p class="section-lead">推荐 .exe，体积更小，安装更顺滑。</p>
+              <h2 class="section-title">思衍 <em>创作端</em></h2>
+              <p class="section-lead">写作工具。推荐 .exe，体积更小，安装更顺滑。</p>
             </div>
           </header>
 
           <div class="dl-grid">
-            {downloads.map((d) => (
+            {creatorDownloads.map((d) => (
               <a
                 href={d.url}
                 class:list={["dl-card", { "dl-card--primary": d.primary }]}
@@ -162,11 +181,43 @@ const steps = [
         </div>
       </section>
 
+      <!-- ============ 进化端下载卡片 ============ -->
+      <section class="downloads downloads--evo">
+        <div class="wrap">
+          <header class="section-head">
+            <span class="section-num">03</span>
+            <div class="section-head__text">
+              <h2 class="section-title">思衍 <em>进化端</em></h2>
+              <p class="section-lead">模型进化 / 监测 / 评估工具。</p>
+            </div>
+          </header>
+
+          <div class="dl-grid">
+            {evoDownloads.map((d) => (
+              <a
+                href={d.url}
+                class:list={["dl-card", { "dl-card--primary": d.primary }]}
+              >
+                <span class="dl-card__icon" set:html={d.icon} aria-hidden="true"></span>
+                <span class="dl-card__main">
+                  <span class="dl-card__label">{d.label} <em>{d.ext}</em></span>
+                  <span class="dl-card__note">{d.note}</span>
+                </span>
+                <span class="dl-card__meta">
+                  <span class="dl-card__size">{d.size}</span>
+                  <span class="dl-card__cta" aria-hidden="true">下载 →</span>
+                </span>
+              </a>
+            ))}
+          </div>
+        </div>
+      </section>
+
       <!-- ============ 安全提示：编辑式步骤 ============ -->
       <section class="warning">
         <div class="wrap">
           <header class="section-head">
-            <span class="section-num">03</span>
+            <span class="section-num">04</span>
             <div class="section-head__text">
               <h2 class="section-title">关于<em>安全提示</em></h2>
               <p class="section-lead">
