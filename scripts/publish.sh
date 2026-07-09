@@ -81,21 +81,38 @@ TMP_DIR=$(mktemp -d)
 UPLOAD_FILES=()
 
 # 处理单个产物：定位 → 强制重新签名 → 复制为约定名
-# 用法：process_bundle <bundle_dir> <ext> <canonical_name>
+# 用法：process_bundle <bundle_dir> <exact_filename> <canonical_name>
+#
+# 根因修复（cbd46dd 未修干净的致命 bug）：
+# 旧实现用 `ls | head -1` 选产物，当 bundle 目录残留多个版本（如 0.1.1 + 0.1.2）
+# 时，字典序会让 Siyen_0.1.1 排在 Siyen_0.1.2 前面，导致选错旧版二进制，
+# 签名签的是旧版，而 latest.json 声明新版本号 → 签名与二进制不匹配，验签失败。
+# 现在改用【精确文件名】定位（productName + VERSION + 架构拼出 Tauri 标准产物名），
+# 选错不可能；精确名不存在直接报错退出，让问题尽早暴露而非静默选别的文件。
 process_bundle() {
-  local bdir="$1" ext="$2" canonical="$3"
+  local bdir="$1" exact="$2" canonical="$3"
   local src sigfile
-  src=$(ls "${bdir}"/*."${ext}" 2>/dev/null | head -1)
-  [ -z "${src}" ] && { warn "未找到 .${ext} 产物（${bdir}），跳过"; return 1; }
+  src="${bdir}/${exact}"
+  [ ! -f "${src}" ] && { warn "未找到产物 ${exact}（${bdir}），跳过"; return 1; }
   sigfile="${src}.sig"
   info "Tauri 产物：$(basename "${src}")"
 
   # 强制重新签名（不依赖 tauri build 自动签名，也不复用残留 .sig）。
-  # 根因修复：曾因复用旧版 .sig 导致 latest.json 签名与二进制不匹配，验签失败。
   info "签名中（强制重新签名）..."
   rm -f "${sigfile}"
   npx tauri signer sign "${src}" >/dev/null || error "签名失败，检查 TAURI_SIGNING_PRIVATE_KEY / PASSWORD"
-  info "签名完成：$(basename "${sigfile}")"
+
+  # 签名自检：解码 .sig 的 trusted comment 里的 file: 字段，
+  # 断言它等于实际签名的文件名。不匹配说明签错了文件，立即终止。
+  # 这道关卡确保"签名错配"的 bug 永不再现。
+  local sig_base64 sig_decoded sig_file
+  sig_base64=$(cat "${sigfile}")
+  sig_decoded=$(echo "${sig_base64}" | base64 -d 2>/dev/null || true)
+  sig_file=$(echo "${sig_decoded}" | grep -oP 'file:\K.*' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)
+  if [ -n "${sig_file}" ] && [ "${sig_file}" != "$(basename "${src}")" ]; then
+    error "签名自检失败：.sig 指向 '${sig_file}'，但实际签名的是 '$(basename "${src}")'。产物选择错误，终止发布。"
+  fi
+  info "签名完成（自检通过）：$(basename "${sigfile}")"
 
   cp "${src}" "${TMP_DIR}/${canonical}"
   UPLOAD_FILES+=("${TMP_DIR}/${canonical}")
@@ -103,42 +120,82 @@ process_bundle() {
   return 0
 }
 
+# Tauri 2 标准产物名：{productName}_{version}_{arch}-{target}.{ext}
+# productName=Siyen（tauri.conf.json），arch=x64，Windows nsis=setup.exe / msi=en-US.msi
+NSIS_PRODUCT_NAME="Siyen_${VERSION}_x64-setup.exe"
+MSI_PRODUCT_NAME="Siyen_${VERSION}_x64_en-US.msi"
+
 # NSIS .exe（自动更新 + 推荐下载）
 EXE_CANONICAL="siyen-${VERSION}-windows-setup.exe"
-process_bundle "${NSIS_DIR}" exe "${EXE_CANONICAL}" && NSIS_OK=1 || NSIS_OK=0
+process_bundle "${NSIS_DIR}" "${NSIS_PRODUCT_NAME}" "${EXE_CANONICAL}" && NSIS_OK=1 || NSIS_OK=0
 
 # MSI（备选下载）
 MSI_CANONICAL="siyen-${VERSION}-windows.msi"
-process_bundle "${MSI_DIR}" msi "${MSI_CANONICAL}" && MSI_OK=1 || MSI_OK=0
+process_bundle "${MSI_DIR}" "${MSI_PRODUCT_NAME}" "${MSI_CANONICAL}" && MSI_OK=1 || MSI_OK=0
 
 # 两种都没发布 = 失败
 [ ${NSIS_OK} -eq 0 ] && [ ${MSI_OK} -eq 0 ] && error "MSI 和 NSIS 产物均未找到"
+
+# ── 3.2 生成 changelog（从 git log 自动提取，写进 latest.json 的 notes）─────
+# 用户能在更新横条里看到「本次更新了什么」。
+# 规则：
+#   - 只取本版本相对上个 tag 新增的 commit（无 tag 则取最近 10 条）
+#   - 轻量过滤：去 conventional 前缀(feat/fix/chore…)、去 merge commit、去重、去空行
+#   - 输出为换行分隔的纯文本字符串（每行一条），写进 notes（Tauri 要求 notes 是 string）
+#   - 前端 UpdateBanner 按换行拆分渲染为列表
+# 注意：本函数 stdout 只输出 changelog 文本（被 $(...) 捕获写进 notes），日志必须 >&2。
+TAG_PREFIX="creator-v"
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo ".")
+generate_changelog() {
+  local last_tag commits filtered
+  last_tag=$(git -C "${REPO_ROOT}" tag -l "${TAG_PREFIX}*" --sort=-version:refname 2>/dev/null | head -1)
+  if [ -n "${last_tag}" ]; then
+    info "changelog 范围：${last_tag}..HEAD" >&2
+    commits=$(git -C "${REPO_ROOT}" log --format="%s" "${last_tag}..HEAD" -- desktop/ 2>/dev/null)
+  else
+    info "无 ${TAG_PREFIX}* tag，changelog 取最近 10 条 commit" >&2
+    commits=$(git -C "${REPO_ROOT}" log --format="%s" -10 -- desktop/ 2>/dev/null)
+  fi
+  filtered=$(echo "${commits}" \
+    | grep -v '^Merge' \
+    | sed -E 's/^(feat|fix|chore|refactor|docs|style|test|perf|ci|build|revert)(\([^)]*\))?(!)?:[[:space:]]*//' \
+    | grep -v '^[[:space:]]*$' \
+    | awk '!seen[$0]++')
+  echo "${filtered}"
+}
+# CHANGELOG_JSON 是换行分隔的文本，用 python 转成合法 JSON 字符串（带引号和 \n 转义），
+# 直接放进 heredoc 的 notes 字段（notes 必须是 JSON string 类型）。
+CHANGELOG_RAW=$(generate_changelog)
+CHANGELOG_JSON=$(echo "${CHANGELOG_RAW}" | python -c '
+import sys, json
+text = sys.stdin.read().strip()
+lines = [l.strip() for l in text.splitlines() if l.strip()]
+print(json.dumps("\n".join(lines), ensure_ascii=False))
+')
+info "changelog：${CHANGELOG_JSON}"
 
 # ── 4. 生成 latest.json ──────────────────────────────────────
 # updater url 优先用 NSIS exe（Tauri 2 updater 原生格式），
 # 若只有 MSI 则回退到 MSI。
 LATEST_JSON="${TMP_DIR}/latest.json"
 # 定位 updater 用的二进制（读它的 .sig 写进 latest.json）。
-# bundle 目录已在 build 前清理，此处只有一个产物，glob 直接匹配最稳。
+# 用精确文件名（与 process_bundle 一致），不再用 ls|head-1，避免选错版本。
 if [ ${NSIS_OK} -eq 1 ]; then
-  UPDATER_BINARY=$(ls "${NSIS_DIR}"/*.exe | head -1)
-else
-  UPDATER_BINARY=$(ls "${MSI_DIR}"/*.msi | head -1)
-fi
-SIG_CONTENT=$(cat "${UPDATER_BINARY}.sig")
-UPDATER_NAME=$(basename "${UPDATER_BINARY}")
-# latest.json 里的 url 用约定名（和 download.astro 一致）
-if [ ${NSIS_OK} -eq 1 ]; then
+  UPDATER_BINARY="${NSIS_DIR}/${NSIS_PRODUCT_NAME}"
   UPDATER_URL_NAME="${EXE_CANONICAL}"
 else
+  UPDATER_BINARY="${MSI_DIR}/${MSI_PRODUCT_NAME}"
   UPDATER_URL_NAME="${MSI_CANONICAL}"
 fi
+SIG_CONTENT=$(cat "${UPDATER_BINARY}.sig")
 
 # latest.json 格式（Tauri 2 updater 规范）
+# notes 是 JSON string 类型（Tauri 强制要求）。
+# CHANGELOG_JSON 是 python json.dumps() 输出的合法 JSON 字符串（带引号、\n 转义），直接展开。
 cat > "${LATEST_JSON}" <<EOF
 {
   "version": "${VERSION}",
-  "notes": "思衍 v${VERSION}",
+  "notes": ${CHANGELOG_JSON},
   "pub_date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
   "platforms": {
     "windows-x86_64": {
@@ -197,6 +254,41 @@ info "  下载页：${SERVER_URL}/download"
 [ ${NSIS_OK}  -eq 1 ] && info "  EXE 安装包：${SERVER_URL}/releases/${EXE_CANONICAL}"
 info "  updater endpoint：${SERVER_URL}/releases/latest.json"
 info "  版本：v${VERSION}"
+
+# ── 7. 打 git tag（支撑下次发版的增量 changelog）──────────────────
+# 下次 publish 时 generate_changelog 会 git log <本tag>..HEAD 取增量 commit。
+# 不自动 push（避免脚本意外改 remote），由用户手动 push。
+NEW_TAG="${TAG_PREFIX}${VERSION}"
+if git rev-parse "${NEW_TAG}" >/dev/null 2>&1; then
+  warn "tag ${NEW_TAG} 已存在，跳过打 tag"
+else
+  git tag "${NEW_TAG}" && info "已打 tag：${NEW_TAG}（记得 git push origin ${NEW_TAG}）"
+fi
+
+# ── 8. 联动更新官网下载页版本号 ──────────────────────────────
+# download.astro / index.astro 的版本号是硬编码的，发版后需同步更新，
+# 否则用户从官网下载到的永远是旧版本号指向的包。
+# 这里只改文件（不部署官网容器，避免误操作），改完提示用户 commit + 重新部署。
+WEBSITE_DIR="$(dirname "$0")/../website"
+DOWNLOAD_ASTRO="${WEBSITE_DIR}/src/pages/download.astro"
+INDEX_ASTRO="${WEBSITE_DIR}/src/pages/index.astro"
+if [ -f "${DOWNLOAD_ASTRO}" ]; then
+  # 替换 CREATOR_VERSION = "x.y.z" → 新版本号
+  sed -i -E "s/(CREATOR_VERSION[[:space:]]*=[[:space:]]*\")[^\"]*/\1${VERSION}/" "${DOWNLOAD_ASTRO}" \
+    && info "已更新 download.astro 创作端版本号 → v${VERSION}" \
+    || warn "更新 download.astro 失败（不影响安装包发布）"
+fi
+if [ -f "${INDEX_ASTRO}" ]; then
+  # 替换首页 hero meta 的 v0.1.1 → 新版本号
+  sed -i -E "s/v[0-9]+\.[0-9]+\.[0-9]+(\s*·)/v${VERSION}\1/" "${INDEX_ASTRO}" \
+    && info "已更新 index.astro 首页版本号 → v${VERSION}" \
+    || warn "更新 index.astro 失败（不影响安装包发布）"
+fi
+if [ -f "${DOWNLOAD_ASTRO}" ] || [ -f "${INDEX_ASTRO}" ]; then
+  info "⚠️  官网页面已更新版本号，请手动执行："
+  info "    git add website/ && git commit -m 'chore(website): 下载页版本号 → v${VERSION}'"
+  info "    然后在服务器重新部署官网容器（docker-compose build website && docker-compose up -d website）"
+fi
 
 # 清理临时文件
 rm -rf "${TMP_DIR}"
