@@ -19,6 +19,11 @@ use tauri_plugin_updater::UpdaterExt;
 pub struct UpdateInfo {
     /// 是否有新版。
     pub available: bool,
+    /// 检查结果状态（让前端精确区分三种情况，不再只靠 available）：
+    ///   "update_available" —— 有新版，提示用户更新
+    ///   "up_to_date"       —— 已是最新
+    ///   "check_failed"     —— 检查失败（网络断/endpoint 没配），body 带错误详情
+    pub status: String,
     /// 当前版本。
     pub current_version: String,
     /// 最新版本（available=true 时有值）。
@@ -27,7 +32,7 @@ pub struct UpdateInfo {
     /// 发布日期。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub date: Option<String>,
-    /// 更新内容（changelog）。
+    /// 更新内容（changelog）；检查失败时存放错误详情。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
 }
@@ -48,6 +53,7 @@ pub async fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
         Ok(Some(update)) => {
             let info = UpdateInfo {
                 available: true,
+                status: "update_available".to_string(),
                 current_version,
                 version: Some(update.version.clone()),
                 date: update.date.map(|d| d.to_string()),
@@ -59,16 +65,19 @@ pub async fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
         }
         Ok(None) => Ok(UpdateInfo {
             available: false,
+            status: "up_to_date".to_string(),
             current_version,
             version: None,
             date: None,
             body: None,
         }),
         Err(e) => {
-            // 检查失败（网络断/updater endpoint 没配）不报错，静默返回无更新。
-            // 更新是"锦上添花"，不该阻塞用户。
+            // 检查失败（网络断/updater endpoint 没配）：status="check_failed" + body 带原始错误。
+            // 不再用 available:false 伪装成"已是最新"——前端凭 status 精确提示，不再谎报。
+            // 仍返回 Ok（不抛错）以免 invoke 走 catch 分支丢掉结构化信息；启动检查也不打扰用户。
             Ok(UpdateInfo {
                 available: false,
+                status: "check_failed".to_string(),
                 current_version,
                 version: None,
                 date: None,

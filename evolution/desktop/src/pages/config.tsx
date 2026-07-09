@@ -75,11 +75,16 @@ export default function ConfigPage() {
     try {
       const info = await invoke<{
         available: boolean;
+        status: string;
         current_version: string;
         version: string | null;
+        body: string | null;
       }>("check_update");
-      if (info.available) {
+      // 凭 status 精确区分「已是最新」与「检查失败」，避免谎报"已是最新"。
+      if (info.status === "update_available") {
         toast.success(`发现新版本 v${info.version}，请看顶部提示更新`);
+      } else if (info.status === "check_failed") {
+        toast.error(info.body ?? "检查更新失败");
       } else {
         toast.success(`已是最新版本（v${info.current_version}）`);
       }
