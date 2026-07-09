@@ -135,7 +135,7 @@ export type WorkspaceCharacterContent = {
 };
 
 export type StreamEvent = {
-  type: "model_output" | "tool_call" | "tool_output" | "tool_error" | "model_stream" | "final" | "trace_event" | "trace_snapshot" | "interrupt";
+  type: "model_output" | "tool_call" | "tool_output" | "tool_error" | "model_stream" | "final" | "trace_event" | "trace_snapshot" | "interrupt" | "credit_exhausted";
   data: Record<string, unknown>;
 };
 
