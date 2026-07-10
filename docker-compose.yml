@@ -74,6 +74,9 @@ services:
       # 容器内 executor 地址（用 docker 服务名）：trace 拉取 + SSO 回调 /api/auth/me
       - EXECUTOR_URL=http://executor:7788
       - TZ=Asia/Shanghai
+      # 数据库路径指向 volume（data/evolution.db），否则默认 evolution.db 解析到
+      # 工作目录（非 volume），每次重建镜像就丢 llm_configs 等数据。
+      - EVOLUTION_DB=data/evolution.db
       # 桌面化鉴权（2026-07-07）：SSO 白名单 + 内网通知 token + 加密主密钥。
       # 这三项是安全关键，不写在 .env（避免随源码泄露），由 compose environment 注入。
       # 部署时在 evolution/.env 里设真实值，或用 Docker secrets。
