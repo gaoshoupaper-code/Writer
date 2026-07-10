@@ -31,7 +31,7 @@ export function TopNav() {
   const [isSuperAdmin, setIsSuperAdmin] = useState(false);
 
   useEffect(() => {
-    fetch(`${API_BASE_URL}/api/admin/me/profile`, { credentials: "include" })
+    fetch(`${API_BASE_URL}/api/me`, { credentials: "include" })
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => setIsSuperAdmin(Boolean(data?.is_super_admin)))
       .catch(() => setIsSuperAdmin(false));

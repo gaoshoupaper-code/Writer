@@ -40,6 +40,8 @@ admin_router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 class MyProfile(BaseModel):
     username: str
+    is_admin: bool = False
+    is_super_admin: bool = False
     has_api_key: bool
     base_url: str | None
     active_model: str | None
@@ -61,6 +63,8 @@ def get_my_profile(user: CurrentUser = Depends(current_user)) -> MyProfile:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "用户不存在")
     return MyProfile(
         username=row["username"],
+        is_admin=bool(row.get("is_admin", 0)),
+        is_super_admin=bool(row.get("is_super_admin", 0)),
         has_api_key=bool(row["encrypted_api_key"]),
         base_url=row["api_key_base_url"],
         active_model=row.get("active_model"),
