@@ -657,79 +657,7 @@ a {
   box-shadow: 0 10px 26px rgba(82, 103, 216, 0.2);
 }
 
-.tool-status-list {
-  display: grid;
-  gap: 7px;
-  margin: 0 0 12px;
-  padding: 0;
-  list-style: none;
-}
-
-.tool-status {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  width: fit-content;
-  max-width: 100%;
-  border: 1px solid rgba(116, 103, 196, 0.18);
-  border-radius: 999px;
-  padding: 5px 9px;
-  color: #4a4772;
-  background: rgba(248, 240, 218, 0.58);
-  font-size: 12px;
-  line-height: 1.2;
-}
-
-.tool-status.done {
-  border-color: rgba(25, 169, 154, 0.2);
-  color: #236861;
-  background: rgba(25, 169, 154, 0.08);
-}
-
-.tool-status.failed {
-  border-color: rgba(229, 72, 77, 0.22);
-  color: #9f3338;
-  background: rgba(229, 72, 77, 0.08);
-}
-
-.tool-status.running {
-  border-color: rgba(95, 124, 255, 0.24);
-  background: rgba(95, 124, 255, 0.08);
-}
-
-.tool-status.is-child {
-  margin-left: 24px;
-  font-size: 11px;
-  padding: 4px 8px;
-}
-
-.tool-status-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 700;
-}
-
-.tool-status-state {
-  flex: 0 0 auto;
-  color: inherit;
-  font-weight: 800;
-}
-
-.tool-status.running .tool-status-state::after {
-  display: inline-block;
-  width: 1.2em;
-  content: "";
-  animation: tool-waiting-dots 1.1s steps(4, end) infinite;
-}
-
-.tool-status.is-task {
-  border-color: rgba(245, 184, 75, 0.3);
-  background: rgba(245, 184, 75, 0.06);
-  color: #8a6d1b;
-}
+/* tool-status* CSS 已删除（T23 清理死代码：旧逐工具气泡 UI，被 ExecutionView 取代） */
 
 .subagent-label {
   flex: 0 0 auto;
@@ -2661,21 +2589,7 @@ a {
   cursor: default;
 }
 
-@keyframes tool-waiting-dots {
-  0% {
-    content: "";
-  }
-  25% {
-    content: ".";
-  }
-  50% {
-    content: "..";
-  }
-  75%,
-  100% {
-    content: "...";
-  }
-}
+/* tool-waiting-dots 动画已删除（T23：tool-status 死代码清理的一部分） */
 
 .message-role {
   display: block;
@@ -4415,22 +4329,346 @@ html[data-theme="dark"] .panel-heading {
   color: #e5484d;
 }
 
-/* ── D5：无阶段卡片时主 agent 工具的极简兜底 ── */
-.message-action-fallback {
-  margin: 0 0 10px;
+/* message-action-fallback + D5 兜底已删除（T23：被 ExecutionView booting/thinking 取代） */
+
+/* ════════════════════════════════════════════════════
+   小衍执行体验（ExecutionView 子组件）
+   设计文档 20260710_140000 §UI 规格
+   ════════════════════════════════════════════════════ */
+
+/* ── 通用状态圆点 ── */
+.yan-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.yan-status-dot[data-status="running"] {
+  background: #5f7cff;
+  animation: stage-pulse 1.2s ease-in-out infinite;
+}
+.yan-status-dot[data-status="completed"] {
+  background: var(--teal);
+}
+.yan-status-dot[data-status="failed"] {
+  background: #e5484d;
+}
+
+/* ── 阶段缩略链（writing/history 共用）── */
+.yan-writing-trail,
+.yan-history-trail {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+.yan-trail-item {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 3px;
+}
+.yan-trail-sep {
+  opacity: 0.4;
+  margin: 0 3px;
+}
+.yan-trail-mark.completed { color: var(--teal); }
+.yan-trail-mark.running {
+  color: #5f7cff;
+  animation: stage-pulse 1.2s ease-in-out infinite;
+}
+.yan-trail-mark.failed { color: #e5484d; }
+
+/* ── BootingView（黑屏期）── */
+.yan-booting {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  animation: fade-in 0.2s ease-out;
+}
+.yan-booting-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 2px solid var(--teal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  color: var(--teal);
+  animation: yan-breathe 2s ease-in-out infinite;
+  flex-shrink: 0;
+}
+.yan-booting-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.yan-booting-text {
+  font-size: 13px;
+  color: var(--ink);
+  opacity: 0.8;
+}
+.yan-booting-dots {
+  display: inline-flex;
+  gap: 3px;
+}
+.yan-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--teal);
+  opacity: 0.4;
+  animation: yan-dot-wave 1.4s ease-in-out infinite;
+}
+.yan-dot:nth-child(2) { animation-delay: 0.2s; }
+.yan-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes yan-breathe {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(0.92); opacity: 0.7; }
+}
+@keyframes yan-dot-wave {
+  0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-2px); }
+}
+
+/* ── ThinkingView（思考流折叠摘要）── */
+.yan-thinking {
+  margin: 4px 0 8px;
+}
+.yan-thinking-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 12px;
+  background: rgba(116, 103, 196, 0.06);
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--ink);
+  transition: background 0.15s;
+}
+.yan-thinking-summary:hover {
+  background: rgba(116, 103, 196, 0.12);
+}
+.yan-thinking-text {
+  animation: stage-focus-breathe 1.8s ease-in-out infinite;
+}
+.yan-thinking-stage {
+  font-size: 11px;
+  color: var(--muted);
+  padding-left: 6px;
+  border-left: 1px solid var(--border);
+}
+.yan-thinking-detail {
+  margin: 6px 0 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.02);
+}
+.yan-thinking-placeholder {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.6;
+  margin: 0;
+}
+.yan-thinking-expand-hint {
+  font-size: 10px;
+  color: var(--muted);
+  margin-left: 4px;
+}
+.yan-thinking-reasoning {
+  font-size: 12px;
+  color: var(--ink);
+  opacity: 0.75;
+  line-height: 1.7;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+  font-family: var(--font-mono, monospace);
+}
+
+/* ── WritingProgress（写作中）── */
+.yan-writing {
+  margin: 4px 0 8px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(95, 124, 255, 0.04);
+  border: 1px solid rgba(95, 124, 255, 0.1);
+}
+.yan-writing-headline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.yan-writing-copy {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  animation: stage-focus-breathe 1.8s ease-in-out infinite;
+}
+.yan-writing-stats {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
   font-size: 12px;
   color: var(--muted);
 }
-.message-action-fallback::before {
-  content: "";
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: #5f7cff;
-  animation: stage-pulse 1.2s ease-in-out infinite;
+.yan-writing-chapter {
+  font-weight: 500;
+  color: var(--ink);
+}
+.yan-writing-words {
+  color: var(--muted);
+}
+.yan-writing-progress-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.06);
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+.yan-writing-progress-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--teal), #5f7cff);
+  animation: yan-progress-pulse 2s ease-in-out infinite;
+  transition: width 0.3s ease;
+}
+@keyframes yan-progress-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+/* ── DeliveryCeremony（交付仪式）── */
+.yan-delivery {
+  margin: 4px 0 8px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, rgba(201, 121, 78, 0.06), rgba(184, 146, 58, 0.06));
+  border: 1px solid rgba(201, 121, 78, 0.15);
+  animation: fade-in 0.3s ease-out;
+}
+.yan-delivery-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.yan-delivery-sparkle {
+  font-size: 18px;
+  animation: yan-sparkle 1.5s ease-in-out infinite;
+}
+.yan-delivery-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--coral);
+}
+.yan-delivery-summary {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 6px;
+}
+.yan-delivery-stat {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 2px 8px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.03);
+}
+.yan-delivery-interaction {
+  font-size: 12px;
+  color: var(--ink);
+  opacity: 0.7;
+  margin: 0;
+}
+@keyframes yan-sparkle {
+  0%, 100% { transform: scale(1) rotate(0deg); }
+  50% { transform: scale(1.15) rotate(10deg); }
+}
+
+/* ── FailedView / StoppedView ── */
+.yan-failed,
+.yan-stopped {
+  margin: 4px 0 8px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(229, 72, 77, 0.04);
+  border: 1px solid rgba(229, 72, 77, 0.1);
+}
+.yan-failed-copy,
+.yan-stopped-copy {
+  font-size: 13px;
+  color: var(--ink);
+  margin: 0 0 4px;
+}
+.yan-failed-action,
+.yan-stopped-action {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+.yan-retry-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(95, 124, 255, 0.2);
+  background: rgba(95, 124, 255, 0.06);
+  color: #5f7cff;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.yan-retry-button:hover {
+  background: rgba(95, 124, 255, 0.12);
+}
+
+/* ── HistoryFolded（历史折叠）── */
+.yan-history {
+  margin: 4px 0 8px;
+}
+.yan-history-toggle {
+  font-size: 11px;
+  color: var(--muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px 0;
+}
+.yan-history-toggle:hover {
+  color: var(--ink);
+}
+.yan-history-detail {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.02);
+}
+.yan-history-stats {
+  display: flex;
+  gap: 12px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 /* ── 工具调用折叠摘要（ToolTree 决策2）── */

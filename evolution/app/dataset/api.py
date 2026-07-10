@@ -2,8 +2,13 @@
 
 端点：
   GET  /api/dataset/cases               列出 case（按 layer 过滤，带元数据）
+  GET  /api/dataset/cases/{case_id}     单 case 内容（demand.md + reference.md）
   GET  /api/dataset/golden-revision     当前 golden 锁定的 revision
-  POST /api/dataset/cases/{id}/promote  升级 growing→golden（维护者独占，D17）
+
+设计决策（重构 2026-07-10）：golden 运行时只读。
+  golden 以 git 仓库为权威源（evolution/data/evalset/golden/，随镜像更新），
+  运行时禁止写入——变更 golden 只能 git commit + rebuild。
+  原运行时 promote（growing→golden）端点已删除（与只读矛盾，曾导致数据丢失）。
 """
 from __future__ import annotations
 
@@ -11,7 +16,6 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
 
 from app.common import evalset
 from app.dataset import repo as dataset_repo
@@ -34,7 +38,14 @@ def list_cases(
     以文件系统为准（demand.md 存在才算 case），元数据从 dataset_meta 补充。
     """
     # 文件系统 case 列表（带 title）
-    fs_cases = evalset.list_cases_with_title(layer=layer)
+    try:
+        fs_cases = evalset.list_cases_with_title(layer=layer)
+    except Exception:
+        logger.error("evalset 文件系统扫描失败", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="数据集目录扫描失败，请检查 evalset 目录状态",
+        )
 
     # 元数据索引（表缺失/查询失败时降级为空，不阻塞文件系统 case 列表）
     try:
@@ -126,78 +137,6 @@ def get_golden_revision() -> dict[str, Any]:
         "intact": revision.verify_golden_intact(locked) if locked else True,
         "case_count": len(golden_cases),
         "cases": golden_cases,
-    }
-
-
-# ── 升级 growing→golden ────────────────────────────────────
-
-
-class PromoteRequest(BaseModel):
-    """升级请求。maintainer_token 做简单维护者校验（D17）。
-
-    token 在 settings.maintainer_token 配置；空则不校验（开发模式）。
-    """
-    maintainer_token: str | None = None
-
-
-@router.post("/cases/{case_id}/promote")
-def promote_to_golden(case_id: str, req: PromoteRequest) -> dict[str, Any]:
-    """升级 growing→golden（维护者独占，决策 D5/D17）。
-
-    流程：
-      1. 校验 case 存在于 growing
-      2. 校验 maintainer_token
-      3. 物理迁移目录 growing→golden（git mv 风格，保留历史）
-      4. 计算新 golden revision（含本次升级后所有 golden case）
-      5. 更新 dataset_meta（layer=golden + demand_revision）
-    """
-    from app.core.settings import settings
-
-    # 维护者校验
-    expected = getattr(settings, "maintainer_token", None) or ""
-    if expected and req.maintainer_token != expected:
-        raise HTTPException(status_code=403, detail="maintainer token 校验失败")
-
-    # 校验 case 在 growing
-    if not evalset.case_exists(case_id, layer="growing"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"case {case_id} 不在 growing 层（无法升级）",
-        )
-
-    # 物理迁移目录：growing/<case_id> → golden/<case_id>
-    src = evalset.layer_root("growing") / case_id
-    dst = evalset.layer_root("golden") / case_id
-    if dst.exists():
-        raise HTTPException(
-            status_code=409,
-            detail=f"golden 层已存在同名 case: {case_id}",
-        )
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    src.rename(dst)
-    logger.info("case %s 目录迁移: growing → golden", case_id)
-
-    # 计算升级后的 golden revision（所有 golden case 的内容指纹）
-    new_revision = revision.lock_golden_revision()
-
-    # 更新 dataset_meta
-    existing = dataset_repo.get(case_id)
-    if existing:
-        dataset_repo.promote_to_golden(case_id, demand_revision=new_revision)
-    else:
-        # 元数据缺失（理论上不该，但兜底）
-        dataset_repo.register_case(
-            case_id=case_id,
-            layer="golden",
-            demand_revision=new_revision,
-            created_by="maintainer",
-        )
-
-    return {
-        "case_id": case_id,
-        "layer": "golden",
-        "demand_revision": new_revision,
-        "golden_case_count": len(dataset_repo.get_golden_case_ids()),
     }
 
 

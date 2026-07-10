@@ -1,41 +1,54 @@
 import { useEffect, useState, useCallback } from "react";
-import { toast } from "sonner";
 import { getDatasetCases, getGoldenRevision, type DatasetCase, type GoldenRevision } from "@/lib/api";
 import CaseDetailSheet from "./CaseDetailSheet";
 
 /**
- * Golden Tab：冻结基准层。
+ * Golden Tab：冻结基准层（只读）。
  *
  * 头部展示 golden revision（指纹 + locked/intact + case 数），
  * 下方 case 表格，点击行打开详情侧滑。
+ *
+ * 重构 2026-07-10：
+ * - 移除升级能力（golden 运行时只读）
+ * - 加错误状态（加载失败显示错误卡片+重试，不静默吞成空列表）
+ * - revision 拉取失败显示占位，不消失
+ * - 刷新受父组件 refreshSignal 驱动
  */
-export default function GoldenTab() {
+export default function GoldenTab({ refreshSignal }: { refreshSignal: number }) {
   const [cases, setCases] = useState<DatasetCase[]>([]);
   const [revision, setRevision] = useState<GoldenRevision | null>(null);
+  const [revError, setRevError] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   // 详情 Sheet
   const [selected, setSelected] = useState<DatasetCase | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
 
   const refresh = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    setRevError(false);
     try {
-      const [cs, rev] = await Promise.all([
-        getDatasetCases("golden").catch(() => ({ cases: [], total: 0 })),
-        getGoldenRevision().catch(() => null),
-      ]);
+      const cs = await getDatasetCases("golden");
       setCases(cs.cases);
-      setRevision(rev);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "读取 golden 列表失败");
+      setError(err instanceof Error ? err.message : "读取 golden 列表失败");
     } finally {
       setLoading(false);
+    }
+    // revision 独立拉取，失败不影响 case 列表
+    try {
+      const rev = await getGoldenRevision();
+      setRevision(rev);
+    } catch {
+      setRevError(true);
     }
   }, []);
 
   useEffect(() => {
     refresh();
-  }, [refresh]);
+  }, [refresh, refreshSignal]);
 
   function openDetail(c: DatasetCase) {
     setSelected(c);
@@ -44,31 +57,53 @@ export default function GoldenTab() {
 
   if (loading) return <div className="page-loading">加载 golden 列表…</div>;
 
+  if (error) {
+    return (
+      <div className="error-card">
+        <span className="error-icon">⚠</span>
+        <div className="error-body">
+          <div className="error-title">加载失败</div>
+          <div className="error-desc">{error}</div>
+        </div>
+        <button className="action-link" onClick={refresh}>重试</button>
+      </div>
+    );
+  }
+
   return (
     <div className="tab-pane">
       {/* golden revision 头部 */}
-      {revision && (
+      {(revision || revError) && (
         <section className="golden-revision-bar">
-          <div className="rev-item">
-            <span className="rev-label">Revision</span>
-            <span className="rev-value mono">{revision.revision?.slice(0, 12) || "—"}</span>
-          </div>
-          <div className="rev-item">
-            <span className="rev-label">锁定</span>
-            <span className={`rev-badge ${revision.locked ? "ok" : "warn"}`}>
-              {revision.locked ? "已锁定" : "未锁定"}
-            </span>
-          </div>
-          <div className="rev-item">
-            <span className="rev-label">完整性</span>
-            <span className={`rev-badge ${revision.intact ? "ok" : "danger"}`}>
-              {revision.intact ? "完好" : "已篡改"}
-            </span>
-          </div>
-          <div className="rev-item">
-            <span className="rev-label">Case 数</span>
-            <span className="rev-value">{revision.case_count}</span>
-          </div>
+          {revError ? (
+            <div className="rev-item">
+              <span className="rev-label">Revision</span>
+              <span className="rev-badge danger">⚠ 加载失败</span>
+            </div>
+          ) : revision && (
+            <>
+              <div className="rev-item">
+                <span className="rev-label">Revision</span>
+                <span className="rev-value mono">{revision.revision?.slice(0, 12) || "—"}</span>
+              </div>
+              <div className="rev-item">
+                <span className="rev-label">锁定</span>
+                <span className={`rev-badge ${revision.locked ? "ok" : "warn"}`}>
+                  {revision.locked ? "已锁定" : "未锁定"}
+                </span>
+              </div>
+              <div className="rev-item">
+                <span className="rev-label">完整性</span>
+                <span className={`rev-badge ${revision.intact ? "ok" : "danger"}`}>
+                  {revision.intact ? "完好" : "已篡改"}
+                </span>
+              </div>
+              <div className="rev-item">
+                <span className="rev-label">Case 数</span>
+                <span className="rev-value">{revision.case_count}</span>
+              </div>
+            </>
+          )}
         </section>
       )}
 
