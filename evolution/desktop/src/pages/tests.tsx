@@ -8,8 +8,10 @@ import {
   retryTest,
   stopTest,
   deleteTest,
+  getDatasetCases,
   type ManualTest,
   type TestAgentOption,
+  type DatasetCase,
 } from "@/lib/api";
 
 /**
@@ -24,6 +26,7 @@ export default function TestsPage() {
   const navigate = useNavigate();
   const [tests, setTests] = useState<ManualTest[]>([]);
   const [agents, setAgents] = useState<TestAgentOption[]>([]);
+  const [cases, setCases] = useState<DatasetCase[]>([]);
   const [loading, setLoading] = useState(true);
   const [starting, setStarting] = useState(false);
 
@@ -33,6 +36,22 @@ export default function TestsPage() {
   const [versionId, setVersionId] = useState("");
 
   const [statusFilter, setStatusFilter] = useState("全部");
+
+  /** 拉取数据集 case 列表，供「新建测试」下拉选择。 */
+  const refreshCases = useCallback(async () => {
+    try {
+      const resp = await getDatasetCases();
+      setCases(resp.cases);
+      // 默认选中第一个，避免空提交
+      setCaseId((prev) => prev || resp.cases[0]?.case_id || "");
+    } catch {
+      setCases([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshCases();
+  }, [refreshCases]);
 
   const refresh = useCallback(async () => {
     try {
@@ -68,7 +87,6 @@ export default function TestsPage() {
       }
       const resp = await startTest(payload);
       toast.success(`测试已启动：${resp.test_id.slice(0, 8)}`);
-      setCaseId("");
       refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "启动测试失败");
@@ -124,14 +142,20 @@ export default function TestsPage() {
         <h3>新建测试</h3>
         <div className="test-form">
           <label className="test-field">
-            <span>Case ID</span>
-            <input
-              className="config-input"
+            <span>数据集 Case</span>
+            <select
+              className="evolve-select"
               value={caseId}
               onChange={(e) => setCaseId(e.target.value)}
-              placeholder="case-001"
               disabled={starting}
-            />
+            >
+              {cases.length === 0 && <option value="">（暂无数据集 case）</option>}
+              {cases.map((c) => (
+                <option key={c.case_id} value={c.case_id}>
+                  [{c.layer}] {c.case_id} — {c.title}
+                </option>
+              ))}
+            </select>
           </label>
           <label className="test-field">
             <span>版本类型</span>
