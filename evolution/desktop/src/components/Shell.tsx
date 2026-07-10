@@ -33,21 +33,27 @@ export default function Shell() {
   const [checking, setChecking] = useState(true);
 
   useEffect(() => {
-    fetchMeOrNull().then((user) => {
-      if (!user) {
-        // 本地 dev 模式：executor 未启动时绕过登录，用 mock 用户直接进。
-        // 生产构建（import.meta.env.DEV === false）仍强制登录。
-        if (import.meta.env.DEV) {
-          setMe({ user_id: "dev-local", username: "本地开发", is_admin: true, is_super_admin: true, has_api_key: false });
+    // 守卫重试：fetchMeOrNull 失败后重试 2 次（间隔 1s/2s），
+    // 全部失败才跳登录。避免 executor 瞬时抖动 → 误跳登录页闪烁。
+    async function checkAuth() {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const user = await fetchMeOrNull();
+        if (user) {
+          setMe(user);
           setChecking(false);
           return;
         }
-        navigate("/login", { replace: true });
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+      }
+      // 全部失败：dev 模式用 mock 绕过，生产跳登录
+      if (import.meta.env.DEV) {
+        setMe({ user_id: "dev-local", username: "本地开发", is_admin: true, is_super_admin: true, has_api_key: false });
+        setChecking(false);
         return;
       }
-      setMe(user);
-      setChecking(false);
-    });
+      navigate("/login", { replace: true });
+    }
+    checkAuth();
   }, [navigate]);
 
   if (checking || !me) {

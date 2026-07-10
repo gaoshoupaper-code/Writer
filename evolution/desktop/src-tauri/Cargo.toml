@@ -26,3 +26,6 @@ reqwest = { version = "0.12", features = ["json", "stream", "cookies", "rustls-t
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 futures-util = "0.3"
 url = "2"
+# cookie 持久化：可序列化的 cookie jar，重启后从 Tauri Store 恢复 session（免重登）
+cookie_store = "0.21"
+cookie = "0.18"

@@ -80,9 +80,14 @@ class SSOAuthMiddleware(BaseHTTPMiddleware):
         user_id, is_super_admin = self._cache_get(session)
         if user_id is None:
             # 缓存 miss/过期 → 回调 executor 验证
-            user_id, is_super_admin = await self._verify_with_executor(session)
-            if user_id is None:
+            result = await self._verify_with_executor(session)
+            # executor 不可达 → 503（不触发前端 401 跳登录）
+            if result is _EXECUTOR_UNAVAILABLE:
+                return _unavailable("认证服务暂时不可达，请稍后重试")
+            # session 真失效 → 401
+            if result is None:
                 return _unauthorized("session 无效或已过期")
+            user_id, is_super_admin = result
             self._cache_set(session, user_id, is_super_admin)
 
         # 白名单校验
@@ -106,10 +111,16 @@ class SSOAuthMiddleware(BaseHTTPMiddleware):
         """写缓存。无淘汰策略（单人场景缓存条目极少，不必清理）。"""
         self._cache[session] = (user_id, is_super_admin, time.time() + self._cache_ttl)
 
-    async def _verify_with_executor(self, session: str) -> tuple[str, bool] | tuple[None, None]:
-        """内网回调 executor /api/auth/me 验证 session，返回 (user_id, is_super_admin) 或 (None, None)。
+    async def _verify_with_executor(
+        self, session: str
+    ) -> tuple[str, bool] | None | object:
+        """内网回调 executor /api/auth/me 验证 session。
 
-        executor 的 current_user 依赖会查 sessions 表 + 滚动续期。
+        返回三态：
+        - (user_id, is_super_admin)：验证成功
+        - None：session 真失效（executor 返回 401/404 等）→ 前端应跳登录
+        - _EXECUTOR_UNAVAILABLE：executor 不可达（网络超时/连接拒绝）→ 返回 503，
+          前端静默重试、不跳登录。这是区分"服务暂时不可达"和"真的没登录"的关键。
         """
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
@@ -117,21 +128,33 @@ class SSOAuthMiddleware(BaseHTTPMiddleware):
                     f"{self._executor_url}/api/auth/me",
                     cookies={"session": session},
                 )
-            if resp.status_code != 200:
-                return None, None
-            data = resp.json()
-            user_id = data.get("user_id")
-            # executor /api/auth/me 现在返回 is_super_admin（D28），
-            # 旧版不返回则默认 False（兼容）
-            is_super = bool(data.get("is_super_admin", False))
-            return user_id, is_super
         except Exception:
-            logger.warning("SSO 回调 executor 失败（executor 不可达？）", exc_info=True)
-            return None, None
+            # 网络异常：executor 宕机/OOM/内网瞬断 → 503，不当作 session 失效
+            logger.warning("SSO 回调 executor 失败（executor 不可达）", exc_info=True)
+            return _EXECUTOR_UNAVAILABLE
+
+        if resp.status_code != 200:
+            # executor 正常响应但 session 无效 → 真 401
+            return None
+        data = resp.json()
+        user_id = data.get("user_id")
+        # executor /api/auth/me 现在返回 is_super_admin（D28），
+        # 旧版不返回则默认 False（兼容）
+        is_super = bool(data.get("is_super_admin", False))
+        return user_id, is_super
+
+
+# 哨兵对象：executor 不可达时的唯一标识（区别于 None = session 真失效）
+_EXECUTOR_UNAVAILABLE = object()
 
 
 def _unauthorized(detail: str) -> JSONResponse:
     return JSONResponse(status_code=401, content={"detail": detail})
+
+
+def _unavailable(detail: str) -> JSONResponse:
+    """executor 不可达 → 503，前端静默重试、不跳登录。"""
+    return JSONResponse(status_code=503, content={"detail": detail})
 
 
 def _forbidden(detail: str) -> JSONResponse:

@@ -523,6 +523,24 @@ dependencies = [
 
 [[package]]
 name = "cookie_store"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2eac901828f88a5241ee0600950ab981148a18f2f756900ffba1b125ca6a3ef9"
+dependencies = [
+ "cookie",
+ "document-features",
+ "idna",
+ "log",
+ "publicsuffix",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "time",
+ "url",
+]
+
+[[package]]
+name = "cookie_store"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15b2c103cf610ec6cae3da84a766285b42fd16aad564758459e6ecf128c75206"
@@ -1005,8 +1023,10 @@ dependencies = [
 
 [[package]]
 name = "evolution-desktop"
-version = "0.2.3"
+version = "0.2.10"
 dependencies = [
+ "cookie",
+ "cookie_store 0.21.1",
  "futures-util",
  "reqwest 0.12.28",
  "serde",
@@ -2979,7 +2999,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "cookie",
- "cookie_store",
+ "cookie_store 0.22.1",
  "futures-core",
  "futures-util",
  "http",

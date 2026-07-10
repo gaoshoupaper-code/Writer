@@ -1,4 +1,24 @@
 import { invoke } from "@tauri-apps/api/core";
+import type {
+  TraceDetail,
+  TraceListItem,
+  ActiveRun,
+  StatsOverview,
+  SkillStat,
+  TimelinePoint,
+  FailurePattern,
+} from "@/lib/types";
+
+// 统一类型从 lib/types.ts 引用（trace 移植后对齐）
+export type {
+  TraceDetail,
+  TraceListItem,
+  ActiveRun,
+  StatsOverview,
+  SkillStat,
+  TimelinePoint,
+  FailurePattern,
+};
 
 /**
  * Evolution 桌面端 API 客户端（桌面化改造 2026-07-07）。
@@ -20,11 +40,21 @@ interface HttpRelayResponse {
 
 /**
  * 401 跳转回调：由路由层注入（api.ts 不直接耦合 react-router）。
+ * 去抖：500ms 窗口内多次 401 只触发一次，避免并发请求同时 401 导致反复跳转闪烁。
  */
 let onUnauthorized: (() => void) | null = null;
+let _unauthorizedFiring: boolean = false;
 
 export function setUnauthorizedHandler(handler: (() => void) | null) {
   onUnauthorized = handler;
+}
+
+function triggerUnauthorized() {
+  if (!onUnauthorized || _unauthorizedFiring) return;
+  _unauthorizedFiring = true;
+  onUnauthorized();
+  // 500ms 去抖窗口：窗口内到达的其它 401 不再重复触发跳转
+  setTimeout(() => { _unauthorizedFiring = false; }, 500);
 }
 
 /**
@@ -77,6 +107,17 @@ export async function evoFetch(path: string, init: RequestInit = {}): Promise<Re
   return _fetch(full, init);
 }
 
+/**
+ * 503（认证服务不可达）静默重试：最多 3 次，指数退避 1s/2s/4s。
+ * 重试期间不跳登录、不闪烁，只有重试耗尽才把 503 响应返回给上层。
+ */
+const _RETRY_503_MAX = 3;
+const _RETRY_503_BASE_MS = 1000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function _fetch(input: string, init: RequestInit): Promise<RelayResponse> {
   let bodyValue: unknown = undefined;
   if (init.body) {
@@ -96,22 +137,30 @@ async function _fetch(input: string, init: RequestInit): Promise<RelayResponse> 
     }
   }
 
-  const relay = await invoke<HttpRelayResponse>("http_request", {
-    request: {
-      path: input,
-      method: init.method || "GET",
-      headers: Object.keys(headers).length ? headers : null,
-      body: bodyValue ?? null,
-      stream: false,
-    },
-  });
+  const reqArgs = {
+    path: input,
+    method: init.method || "GET",
+    headers: Object.keys(headers).length ? headers : null,
+    body: bodyValue ?? null,
+    stream: false,
+  };
 
-  // 401 → 触发跳登录
-  if (relay.status === 401 && onUnauthorized) {
-    onUnauthorized();
+  // 503 重试循环：executor 不可达时静默重试，不跳登录
+  for (let attempt = 0; ; attempt++) {
+    const relay = await invoke<HttpRelayResponse>("http_request", { request: reqArgs });
+
+    if (relay.status === 503 && attempt < _RETRY_503_MAX) {
+      await sleep(_RETRY_503_BASE_MS * Math.pow(2, attempt)); // 1s/2s/4s
+      continue;
+    }
+
+    // 401 → 触发跳登录（去抖：500ms 窗口内多次只触发一次）
+    if (relay.status === 401) {
+      triggerUnauthorized();
+    }
+
+    return new RelayResponse(relay);
   }
-
-  return new RelayResponse(relay);
 }
 
 /** JSON 解析辅助：非 2xx 抛错，2xx 返回 json。 */
@@ -271,41 +320,8 @@ export async function testLlmConfig(payload: {
 
 // ════════════════════════════════════════════════════════════
 //  监测（stats + active-runs + traces）
+//  类型统一从 @/lib/types 引用（trace 移植后对齐）
 // ════════════════════════════════════════════════════════════
-
-export interface StatsOverview {
-  total: number;
-  success: number;
-  failed: number;
-  error_rate: number;
-  duration_p50: number | null;
-  duration_p90: number | null;
-  duration_p99: number | null;
-  total_tokens: number;
-  total_input_tokens: number;
-  total_output_tokens: number;
-}
-
-export interface SkillStat {
-  agent_name: string;
-  call_count: number;
-  node_count: number;
-  avg_duration_ms: number | null;
-  fail_count: number;
-  fail_rate: number;
-}
-
-export interface TimelinePoint {
-  bucket: string;
-  total: number;
-  failed: number;
-}
-
-export interface FailurePattern {
-  error_pattern: string;
-  count: number;
-  sample_trace_ids: string[];
-}
 
 export async function getStatsOverview(): Promise<StatsOverview> {
   return evoJson<StatsOverview>("/api/stats/overview", { method: "GET" });
@@ -323,40 +339,11 @@ export async function getStatsFailures(top = 10): Promise<FailurePattern[]> {
   return evoJson<FailurePattern[]>(`/api/stats/failures?top=${top}`, { method: "GET" });
 }
 
-export interface ActiveRun {
-  trace_id: string;
-  workspace_id: string;
-  thread_id: string | null;
-  endpoint: string | null;
-  status: string;
-  started_at: string | null;
-  duration_ms: number | null;
-  event_count: number;
-  session_name: string | null;
-  ingested: boolean;
-}
-
 export async function getActiveRuns(): Promise<ActiveRun[]> {
   return evoJson<ActiveRun[]>("/api/active-runs", { method: "GET" });
 }
 
 // ── trace 列表 + 详情 ──
-
-export interface TraceListItem {
-  trace_id: string;
-  workspace_id: string;
-  thread_id: string | null;
-  session_name: string | null;
-  endpoint: string | null;
-  status: string;
-  started_at: string | null;
-  ended_at: string | null;
-  duration_ms: number | null;
-  event_count: number;
-  error: string | null;
-  owner_user_id: string;
-  run_purpose: string;
-}
 
 export async function getTraces(params?: {
   status?: string;
@@ -371,24 +358,6 @@ export async function getTraces(params?: {
   if (params?.offset) qs.set("offset", String(params.offset));
   const q = qs.toString();
   return evoJson<TraceListItem[]>(`/api/traces${q ? "?" + q : ""}`, { method: "GET" });
-}
-
-export interface TraceDetail {
-  run: {
-    trace_id: string;
-    workspace_id: string;
-    status: string;
-    started_at: string | null;
-    ended_at: string | null;
-    duration_ms: number | null;
-    event_count: number;
-    error: string | null;
-    [k: string]: any;
-  };
-  events: any[];
-  nodes: any[];
-  context: any[];
-  todos: any[];
 }
 
 export async function getTraceDetail(traceId: string): Promise<TraceDetail> {

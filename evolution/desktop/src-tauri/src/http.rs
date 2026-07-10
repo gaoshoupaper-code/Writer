@@ -87,8 +87,12 @@ pub struct SseEnd {
 ///
 /// 前端用法：`const res = await invoke("http_request", { path, method, body })`
 /// 返回 { status, headers, body }。body 是文本，前端按需 parse。
+///
+/// 响应后自动持久化 cookie jar（登录响应含 Set-Cookie 时 jar 已更新），
+/// 重启后可恢复 session 免重登。持久化失败不阻断请求（只 log）。
 #[tauri::command]
 pub async fn http_request(
+    app: AppHandle,
     state: State<'_, SharedState>,
     request: HttpRequest,
 ) -> Result<HttpResponse, String> {
@@ -131,6 +135,12 @@ pub async fn http_request(
         .text()
         .await
         .map_err(|e| format!("读取响应体失败: {e}"))?;
+
+    // 持久化 cookie jar（登录等响应含 Set-Cookie 时 jar 已更新）。
+    // 失败不阻断请求——最坏情况是重启要重登，与改造前一致。
+    if let Err(e) = state.save_cookie_jar(&app).await {
+        eprintln!("warn: cookie jar 持久化失败（不阻断请求）: {e}");
+    }
 
     Ok(HttpResponse {
         status,
