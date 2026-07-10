@@ -11,6 +11,10 @@ import Harness from "@/pages/harness";
 import Dataset from "@/pages/dataset";
 import Tests from "@/pages/tests";
 import TraceDetail from "@/pages/trace-detail";
+import AdminUsers from "@/pages/admin/users";
+import AdminInviteCodes from "@/pages/admin/invite-codes";
+import AdminCredits from "@/pages/admin/credits";
+import AdminCreditsSettings from "@/pages/admin/credits/settings";
 import Shell from "@/components/Shell";
 
 function UnauthorizedHandler() {
@@ -43,6 +47,10 @@ function App() {
           <Route path="/dataset" element={<Dataset />} />
           <Route path="/tests" element={<Tests />} />
           <Route path="/config" element={<Config />} />
+          <Route path="/admin/users" element={<AdminUsers />} />
+          <Route path="/admin/invite-codes" element={<AdminInviteCodes />} />
+          <Route path="/admin/credits" element={<AdminCredits />} />
+          <Route path="/admin/credits/settings" element={<AdminCreditsSettings />} />
           <Route path="/traces/:traceId" element={<TraceDetail />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />

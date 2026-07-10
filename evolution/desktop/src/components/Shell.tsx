@@ -9,7 +9,7 @@ import UpdateBanner from "@/components/UpdateBanner";
  * 侧栏导航 + 内容区。登录守卫：未登录跳 /login。
  * 信息架构（设计文档）：监测 / 配置 已实现；核心工作区 / 试验台 Phase 5 扩展。
  */
-const NAV_ITEMS = [
+const BASE_NAV_ITEMS = [
   { to: "/", label: "监测", end: true, icon: "📊" },
   { to: "/evaluation", label: "评估", end: false, icon: "📝" },
   { to: "/evolve", label: "进化", end: false, icon: "🧬" },
@@ -17,6 +17,14 @@ const NAV_ITEMS = [
   { to: "/dataset", label: "数据集", end: false, icon: "🗂️" },
   { to: "/tests", label: "单次测试", end: false, icon: "🧪" },
   { to: "/config", label: "配置", end: false, icon: "⚙️" },
+];
+
+// 管理后台导航（仅 super_admin 可见）。
+const ADMIN_NAV_ITEMS = [
+  { to: "/admin/users", label: "用户管理", end: false, icon: "👤" },
+  { to: "/admin/invite-codes", label: "邀请码", end: false, icon: "🎟️" },
+  { to: "/admin/credits", label: "积分流水", end: false, icon: "💧" },
+  { to: "/admin/credits/settings", label: "积分设置", end: false, icon: "🎛️" },
 ];
 
 export default function Shell() {
@@ -30,7 +38,7 @@ export default function Shell() {
         // 本地 dev 模式：executor 未启动时绕过登录，用 mock 用户直接进。
         // 生产构建（import.meta.env.DEV === false）仍强制登录。
         if (import.meta.env.DEV) {
-          setMe({ user_id: "dev-local", username: "本地开发", is_admin: true, has_api_key: false });
+          setMe({ user_id: "dev-local", username: "本地开发", is_admin: true, is_super_admin: true, has_api_key: false });
           setChecking(false);
           return;
         }
@@ -45,6 +53,10 @@ export default function Shell() {
   if (checking || !me) {
     return <div className="shell-loading">加载中…</div>;
   }
+
+  const navItems = me.is_super_admin
+    ? [...BASE_NAV_ITEMS, ...ADMIN_NAV_ITEMS]
+    : BASE_NAV_ITEMS;
 
   async function handleLogout() {
     try {
@@ -63,7 +75,7 @@ export default function Shell() {
           <span className="shell-brand-text">思衍进化</span>
         </div>
         <nav className="shell-nav">
-          {NAV_ITEMS.map((item) =>
+          {navItems.map((item) =>
             item.to ? (
               <NavLink
                 key={item.to}

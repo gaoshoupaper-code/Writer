@@ -137,6 +137,7 @@ export interface AuthMe {
   user_id: string;
   username: string;
   is_admin: boolean;
+  is_super_admin: boolean;
   has_api_key: boolean;
 }
 
@@ -735,5 +736,135 @@ export async function decidePromoteTask(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+  });
+}
+
+// ════════════════════════════════════════════════════════════
+//  管理后台（走 executor /api/admin/*，需 super_admin）
+//  与 evolution 域不同——这些接口在 executor 上，用 apiFetch（无 /evolution-api 前缀）。
+// ════════════════════════════════════════════════════════════
+
+export interface AdminUser {
+  user_id: string;
+  username: string;
+  is_admin: boolean;
+  is_super_admin: boolean;
+  disabled: boolean;
+  has_api_key: boolean;
+  credits_balance: number;
+  workspace_count: number;
+  created_at: string;
+}
+
+export interface InviteCode {
+  code: string;
+  created_at: string;
+  is_admin_code: boolean;
+  granted_credits: number;
+  used: boolean;
+  used_by: string | null;
+  used_at: string | null;
+  revoked_at: string | null;
+}
+
+export interface CreditTransaction {
+  tx_id: string;
+  user_id: string;
+  type: string;
+  amount: number;
+  balance_after: number;
+  ref_thread_id: string | null;
+  ref_hold_id: string | null;
+  note: string | null;
+  created_by: string | null;
+  created_at: string;
+}
+
+export interface CreditConfigItem {
+  value: string;
+  description: string;
+  updated_at: string;
+}
+
+// ── 用户管理 ──────────────────────────────────────────────────
+
+export async function fetchUsers(): Promise<AdminUser[]> {
+  return apiJson<AdminUser[]>("/api/admin/users", { method: "GET" });
+}
+
+export async function updateUser(
+  userId: string,
+  payload: { disabled?: boolean },
+): Promise<Record<string, unknown>> {
+  return apiJson(`/api/admin/users/${userId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function resetPassword(
+  userId: string,
+): Promise<{ status: string; temp_password: string }> {
+  return apiJson(`/api/admin/users/${userId}/reset-password`, { method: "POST" });
+}
+
+export async function adjustCredits(
+  userId: string,
+  amount: number,
+  note: string,
+): Promise<{ status: string; balance: number }> {
+  return apiJson(`/api/admin/users/${userId}/credits`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ amount, note }),
+  });
+}
+
+// ── 邀请码管理 ────────────────────────────────────────────────
+
+export async function fetchInviteCodes(): Promise<InviteCode[]> {
+  return apiJson<InviteCode[]>("/api/admin/invite-codes", { method: "GET" });
+}
+
+export async function createInviteCodes(
+  count: number,
+  grantedCredits: number,
+): Promise<string[]> {
+  return apiJson<string[]>("/api/admin/invite-codes", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ count, granted_credits: grantedCredits }),
+  });
+}
+
+export async function revokeInviteCode(code: string): Promise<Record<string, unknown>> {
+  return apiJson(`/api/admin/invite-codes/${code}`, { method: "DELETE" });
+}
+
+// ── 积分流水 ──────────────────────────────────────────────────
+
+export async function fetchAllTransactions(limit = 100): Promise<CreditTransaction[]> {
+  return apiJson<CreditTransaction[]>(`/api/admin/credits/transactions?limit=${limit}`, {
+    method: "GET",
+  });
+}
+
+// ── 积分配置（暗调旋钮）──────────────────────────────────────
+
+export async function fetchCreditsConfig(): Promise<Record<string, CreditConfigItem>> {
+  return apiJson<Record<string, CreditConfigItem>>("/api/admin/credits/config", {
+    method: "GET",
+  });
+}
+
+export async function updateCreditsConfig(
+  key: string,
+  value: string,
+): Promise<Record<string, unknown>> {
+  return apiJson(`/api/admin/credits/config/${key}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ value }),
   });
 }
