@@ -3,10 +3,14 @@
 # publish-evolution.sh —— 进化端桌面端发布脚本（2026-07-08）
 # ─────────────────────────────────────────────────────────────
 # 流程（照搬 publish.sh，适配进化端）：
-#   1. 本地 tauri build 生成 .msi + .exe + .sig（签名密钥从 TAURI_SIGNING_PRIVATE_KEY 读）
-#   2. 读 tauri.conf.json 版本号
-#   3. 生成 latest-evo.json（进化端独立 updater endpoint，与写作端 latest.json 分开）
-#   4. scp 上传到服务器 /home/deploy/Writer/releases/（nginx /releases/ 托管）
+#   1. 自动 bump patch 版本号（tauri.conf.json + Cargo.toml 同步 +1）
+#   2. 本地 tauri build 生成 .msi + .exe + .sig（签名密钥从 TAURI_SIGNING_PRIVATE_KEY 读）
+#   3. 读 tauri.conf.json 版本号
+#   4. 生成 latest-evo.json（进化端独立 updater endpoint，与写作端 latest.json 分开）
+#   5. scp 上传到服务器 /home/deploy/Writer/releases/（nginx /releases/ 托管）
+#   6. 自动 commit + push 版本号变更（download.astro + tauri.conf + Cargo.toml）
+#
+# 设 NO_BUMP=1 可跳过自动 bump（重发同版本时用）。
 #
 # 与 publish.sh 的区别：
 #   - 构建目录：evolution/desktop（非 desktop）
@@ -47,9 +51,28 @@ if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
   密钥私钥个人保管，绝不上 git。"
 fi
 
-# ── 2. 本地构建 ──────────────────────────────────────────────
-info "开始 tauri build（进化端，生成签名安装包）..."
+# ── 2. 切到构建目录 ─────────────────────────────────────────
 cd "$(dirname "$0")/../evolution/desktop"
+
+# ── 2.1 自动 bump patch 版本号 ─────────────────────────────
+# 发版前把 patch 号 +1，同步写回 tauri.conf.json + Cargo.toml，保证两者一致。
+# 曾因两处版本号不一致（tauri.conf=0.2.4 / Cargo.toml=0.2.3）导致编译进二进制的
+# 版本与打包元数据错位、updater 版本判断混乱。
+# 设 NO_BUMP=1 可跳过（重发同版本 / 手动指定版本号时用）。
+if [ "${NO_BUMP:-0}" != "1" ]; then
+  CUR_VER=$(grep -oP '"version":\s*"\K[^"]+' src-tauri/tauri.conf.json | head -1)
+  # patch 号 +1：MAJOR.MINOR.PATCH → MAJOR.MINOR.(PATCH+1)
+  NEW_VER=$(echo "${CUR_VER}" | awk -F. '{printf "%s.%s.%d", $1, $2, $3+1}')
+  info "版本号自动 bump：v${CUR_VER} → v${NEW_VER}"
+  # 同步写回 tauri.conf.json + Cargo.toml
+  sed -i -E "s/(\"version\":\s*\")[^\"]*/\1${NEW_VER}/" src-tauri/tauri.conf.json
+  sed -i -E "s/^(version\s*=\s*\")[^\"]*/\1${NEW_VER}/" src-tauri/Cargo.toml
+else
+  warn "NO_BUMP=1，跳过版本号 bump（重发当前版本）"
+fi
+
+# ── 2.2 本地构建 ───────────────────────────────────────────
+info "开始 tauri build（进化端，生成签名安装包）..."
 
 # 清理 bundle 目录的旧产物（.exe/.msi/.sig）。
 # 根因修复：旧版产物残留导致 `ls | head -1` 选错文件，把旧版当新版上传。
@@ -249,41 +272,41 @@ fi
 
 # ── 8. 联动更新官网下载页版本号（自动 commit + push）──────────────
 # download.astro 的进化端版本号是硬编码的，发版后需同步更新。
-# 改完后自动 commit + push，保证服务器 git pull 能拿到新版本号。
+# 同时把第 2.1 步 bump 改动的 tauri.conf.json + Cargo.toml 一起提交，
+# 保证三处版本号一致。改完后自动 commit + push。
 # 但【不】自动部署官网容器——部署是生产操作，由用户确认后手动执行。
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "$(dirname "$0")/..")"
 WEBSITE_DIR="$(dirname "$0")/../website"
 DOWNLOAD_ASTRO="${WEBSITE_DIR}/src/pages/download.astro"
-WEBSITE_CHANGED=0
 
 if [ -f "${DOWNLOAD_ASTRO}" ]; then
   sed -i -E "s/(EVOLUTION_VERSION[[:space:]]*=[[:space:]]*\")[^\"]*/\1${VERSION}/" "${DOWNLOAD_ASTRO}" \
     && info "已更新 download.astro 进化端版本号 → v${VERSION}" \
     || warn "更新 download.astro 失败（不影响安装包发布）"
-  WEBSITE_CHANGED=1
 fi
 
-# 改了文件才 commit + push；没改动（版本号已是最新）则跳过。
-if [ ${WEBSITE_CHANGED} -eq 1 ]; then
-  REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "$(dirname "$0")/..")"
-  git -C "${REPO_ROOT}" add website/src/pages/download.astro 2>/dev/null || \
-    git -C "${REPO_ROOT}" add website/
-  if git -C "${REPO_ROOT}" diff --cached --quiet; then
-    info "官网版本号已是最新，无需 commit"
+# 统一提交：download.astro + tauri.conf.json + Cargo.toml（版本号同步）
+git -C "${REPO_ROOT}" add \
+  website/src/pages/download.astro \
+  evolution/desktop/src-tauri/tauri.conf.json \
+  evolution/desktop/src-tauri/Cargo.toml 2>/dev/null || true
+
+if git -C "${REPO_ROOT}" diff --cached --quiet; then
+  info "版本号已是最新，无需 commit"
+else
+  git -C "${REPO_ROOT}" commit -m "chore(evolution): 版本号同步 → v${VERSION}" \
+    && info "已自动 commit 版本号更新（download.astro + tauri.conf + Cargo.toml）" \
+    || warn "自动 commit 失败，请手动 commit"
+  if git -C "${REPO_ROOT}" push origin HEAD 2>/dev/null; then
+    info "已自动 push 到 remote"
   else
-    git -C "${REPO_ROOT}" commit -m "chore(website): 下载页进化端版本号 → v${VERSION}" \
-      && info "已自动 commit 官网版本号更新" \
-      || warn "自动 commit 失败，请手动 commit"
-    if git -C "${REPO_ROOT}" push origin HEAD 2>/dev/null; then
-      info "已自动 push 到 remote"
-    else
-      warn "自动 push 失败，请手动执行：git push origin HEAD"
-    fi
+    warn "自动 push 失败，请手动执行：git push origin HEAD"
   fi
-  info "⚠️  官网版本号已 commit + push，请在服务器部署官网容器使其生效："
-  info "    ssh writer → cd /home/deploy/Writer → git pull"
-  info "    docker compose build website && docker compose up -d website"
-  info "    （必须 build，不能只 restart —— 版本号在构建时烤进静态 HTML）"
 fi
+info "⚠️  官网版本号已 commit + push，请在服务器部署官网容器使其生效："
+info "    ssh writer → cd /home/deploy/Writer → git pull"
+info "    docker compose build website && docker compose up -d website"
+info "    （必须 build，不能只 restart —— 版本号在构建时烤进静态 HTML）"
 
 # 清理临时文件
 rm -rf "${TMP_DIR}"
