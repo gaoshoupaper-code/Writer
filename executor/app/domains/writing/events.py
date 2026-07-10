@@ -229,6 +229,20 @@ class WritingEventSink:
                 content = ""
             if content:
                 frames.append(_sse("model_stream", {"content": content}))
+            # T20: 转发 reasoning token（DeepSeek thinking 模式的思考链）。
+            # DeepSeekThinkingChatModel 已在流式 chunk 的 additional_kwargs["reasoning_content"]
+            # 上携带逐 token reasoning delta（deepseek_thinking.py:112-114）。
+            # 非 deepseek 模型不产出此字段，自动降级为只推 model_stream。
+            reasoning = ""
+            if hasattr(chunk, "additional_kwargs"):
+                reasoning = str(chunk.additional_kwargs.get("reasoning_content", "") or "")
+            elif isinstance(chunk, dict):
+                msg = chunk.get("message") or chunk
+                if isinstance(msg, dict):
+                    ak = msg.get("additional_kwargs") or {}
+                    reasoning = str(ak.get("reasoning_content", "") or "")
+            if reasoning:
+                frames.append(_sse("reasoning_stream", {"content": reasoning}))
 
         return frames
 

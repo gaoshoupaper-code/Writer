@@ -84,6 +84,32 @@ class TestWritingEventSinkBasicEvents(unittest.TestCase):
         """on_chat_model_stream → model_stream 帧。"""
         chunk = MagicMock()
         chunk.content = "流式片段"
+        # MagicMock 的 additional_kwargs 默认是 MagicMock，需显式设为空 dict
+        chunk.additional_kwargs = {}
+        event = {"event": "on_chat_model_stream", "name": "", "data": {"chunk": chunk}}
+        frames = asyncio.run(self.sink.on_event(event))
+        self.assertEqual(len(frames), 1)
+        self.assertIn("model_stream", frames[0])
+
+    def test_on_chat_model_stream_with_reasoning_produces_reasoning_stream(self):
+        """on_chat_model_stream 的 chunk 带 reasoning_content → 额外产出 reasoning_stream 帧（T20）。"""
+        chunk = MagicMock()
+        chunk.content = "正文片段"
+        chunk.additional_kwargs = {"reasoning_content": "嗯，让我想想这段怎么写"}
+        event = {"event": "on_chat_model_stream", "name": "", "data": {"chunk": chunk}}
+        frames = asyncio.run(self.sink.on_event(event))
+        # 应产出两帧：model_stream + reasoning_stream
+        self.assertEqual(len(frames), 2)
+        self.assertIn("model_stream", frames[0])
+        self.assertIn("正文片段", frames[0])
+        self.assertIn("reasoning_stream", frames[1])
+        self.assertIn("嗯，让我想想这段怎么写", frames[1])
+
+    def test_on_chat_model_stream_no_reasoning(self):
+        """chunk 不带 reasoning_content → 只产出 model_stream，无 reasoning_stream（T20 降级）。"""
+        chunk = MagicMock()
+        chunk.content = "普通片段"
+        chunk.additional_kwargs = {}
         event = {"event": "on_chat_model_stream", "name": "", "data": {"chunk": chunk}}
         frames = asyncio.run(self.sink.on_event(event))
         self.assertEqual(len(frames), 1)
