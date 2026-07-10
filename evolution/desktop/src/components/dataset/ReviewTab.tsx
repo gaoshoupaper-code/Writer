@@ -27,7 +27,7 @@ import {
  * - judge 分数徽章取 content_overall（SD5）：≥0.8 绿 / 0.4~0.8 黄 / <0.4 红 / null 灰
  * - 5s 轮询（对齐 tests.tsx），切走 Tab 时自动停止（Radix Tabs 卸载）
  */
-export default function ReviewTab() {
+export default function ReviewTab({ refreshSignal }: { refreshSignal: number }) {
   const navigate = useNavigate();
   const [tasks, setTasks] = useState<PromoteTask[]>([]);
   const [loading, setLoading] = useState(true);
@@ -58,7 +58,7 @@ export default function ReviewTab() {
     refresh();
     const timer = setInterval(refresh, 5000);
     return () => clearInterval(timer);
-  }, [refresh]);
+  }, [refresh, refreshSignal]);
 
   // ── reject：一键确认 ──
   async function handleReject(task: PromoteTask) {

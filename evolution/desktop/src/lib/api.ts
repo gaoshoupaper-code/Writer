@@ -647,20 +647,6 @@ export async function getGoldenRevision(): Promise<GoldenRevision> {
   return evoJson<GoldenRevision>("/api/dataset/golden-revision", { method: "GET" });
 }
 
-/** 升级 growing→golden（维护者独占，开发模式不校验 token）。 */
-export async function promoteCaseToGolden(caseId: string): Promise<{
-  case_id: string;
-  layer: string;
-  demand_revision: string;
-  golden_case_count: number;
-}> {
-  return evoJson(`/api/dataset/cases/${caseId}/promote`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({}),
-  });
-}
-
 // ════════════════════════════════════════════════════════════
 //  标注队列（promote）— 生产 trace → growing 的标注闸门
 // ════════════════════════════════════════════════════════════

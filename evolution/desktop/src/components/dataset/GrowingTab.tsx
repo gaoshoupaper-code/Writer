@@ -1,29 +1,32 @@
 import { useEffect, useState, useCallback } from "react";
-import { toast } from "sonner";
-import { getDatasetCases, promoteCaseToGolden, type DatasetCase } from "@/lib/api";
+import { getDatasetCases, type DatasetCase } from "@/lib/api";
 import CaseDetailSheet from "./CaseDetailSheet";
 
 /**
  * Growing Tab：增长探索层。
  *
- * 生产 promote 入库的真实 case。行内有升级按钮（快捷入口），
- * 详情侧滑内也有升级按钮。
+ * 生产 promote 入库的真实 case。只读查看（重构 2026-07-10：
+ * golden 运行时只读，运行时升级能力已移除）。
+ *
+ * 刷新：受父组件 refreshSignal 驱动（页面头部刷新按钮）。
  */
-export default function GrowingTab() {
+export default function GrowingTab({ refreshSignal }: { refreshSignal: number }) {
   const [cases, setCases] = useState<DatasetCase[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   // 详情 Sheet
   const [selected, setSelected] = useState<DatasetCase | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
-  const [promotingId, setPromotingId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
+    setLoading(true);
+    setError(null);
     try {
-      const cs = await getDatasetCases("growing").catch(() => ({ cases: [], total: 0 }));
+      const cs = await getDatasetCases("growing");
       setCases(cs.cases);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "读取 growing 列表失败");
+      setError(err instanceof Error ? err.message : "读取 growing 列表失败");
     } finally {
       setLoading(false);
     }
@@ -31,28 +34,27 @@ export default function GrowingTab() {
 
   useEffect(() => {
     refresh();
-  }, [refresh]);
+  }, [refresh, refreshSignal]);
 
   function openDetail(c: DatasetCase) {
     setSelected(c);
     setSheetOpen(true);
   }
 
-  async function handlePromote(c: DatasetCase) {
-    if (!confirm(`确认将 ${c.case_id} 升级到 golden？此操作会重算 golden revision。`)) return;
-    setPromotingId(c.case_id);
-    try {
-      const resp = await promoteCaseToGolden(c.case_id);
-      toast.success(`已升级到 golden（revision ${resp.demand_revision.slice(0, 12)}）`);
-      refresh();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "升级失败");
-    } finally {
-      setPromotingId(null);
-    }
-  }
-
   if (loading) return <div className="page-loading">加载 growing 列表…</div>;
+
+  if (error) {
+    return (
+      <div className="error-card">
+        <span className="error-icon">⚠</span>
+        <div className="error-body">
+          <div className="error-title">加载失败</div>
+          <div className="error-desc">{error}</div>
+        </div>
+        <button className="action-link" onClick={refresh}>重试</button>
+      </div>
+    );
+  }
 
   return (
     <div className="tab-pane">
@@ -82,13 +84,6 @@ export default function GrowingTab() {
                 <td>{c.created_by}</td>
                 <td className="test-actions">
                   <button className="action-link" onClick={() => openDetail(c)}>详情</button>
-                  <button
-                    className="action-link"
-                    onClick={() => handlePromote(c)}
-                    disabled={promotingId === c.case_id}
-                  >
-                    {promotingId === c.case_id ? "升级中…" : "↑ Golden"}
-                  </button>
                 </td>
               </tr>
             ))}
@@ -101,7 +96,6 @@ export default function GrowingTab() {
         layer="growing"
         open={sheetOpen}
         onOpenChange={setSheetOpen}
-        onPromoted={refresh}
       />
     </div>
   );

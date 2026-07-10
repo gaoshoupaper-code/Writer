@@ -7,30 +7,27 @@ import {
   SheetClose,
 } from "@/components/ui/sheet";
 import { toast } from "sonner";
-import { getCaseContent, promoteCaseToGolden, type DatasetCase } from "@/lib/api";
+import { getCaseContent, type DatasetCase } from "@/lib/api";
 
 /**
  * Case 详情侧滑面板（SD3/SD4）。
  *
  * Golden + Growing 共用。打开时按需加载 demand.md / reference.md 内容。
- * Growing 时传入 onPromoted 回调，显示升级按钮。
+ * 重构 2026-07-10：移除升级到 golden 的能力（golden 运行时只读）。
  */
 export default function CaseDetailSheet({
   caseItem,
   layer,
   open,
   onOpenChange,
-  onPromoted,
 }: {
   caseItem: DatasetCase | null;
   layer: "golden" | "growing";
   open: boolean;
   onOpenChange: (v: boolean) => void;
-  onPromoted?: () => void;
 }) {
   const [content, setContent] = useState<Awaited<ReturnType<typeof getCaseContent>> | null>(null);
   const [loading, setLoading] = useState(false);
-  const [promoting, setPromoting] = useState(false);
 
   useEffect(() => {
     if (!open || !caseItem) {
@@ -45,22 +42,6 @@ export default function CaseDetailSheet({
       })
       .finally(() => setLoading(false));
   }, [open, caseItem, layer]);
-
-  async function handlePromote() {
-    if (!caseItem) return;
-    if (!confirm(`确认将 ${caseItem.case_id} 升级到 golden？此操作会重算 golden revision。`)) return;
-    setPromoting(true);
-    try {
-      const resp = await promoteCaseToGolden(caseItem.case_id);
-      toast.success(`已升级到 golden（revision ${resp.demand_revision.slice(0, 12)}）`);
-      onOpenChange(false);
-      onPromoted?.();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "升级失败");
-    } finally {
-      setPromoting(false);
-    }
-  }
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -105,19 +86,6 @@ export default function CaseDetailSheet({
                 <section className="case-section">
                   <h4 className="case-section-title">reference.md（编辑终稿）</h4>
                   <pre className="case-md">{content.reference_md}</pre>
-                </section>
-              )}
-
-              {/* 升级按钮（仅 growing）*/}
-              {layer === "growing" && onPromoted && (
-                <section className="case-actions">
-                  <button
-                    className="config-button primary"
-                    onClick={handlePromote}
-                    disabled={promoting}
-                  >
-                    {promoting ? "升级中…" : "↑ 升级到 Golden"}
-                  </button>
                 </section>
               )}
             </>

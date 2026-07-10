@@ -56,9 +56,9 @@ def compute_golden_revision() -> str:
 
 
 def lock_golden_revision() -> str:
-    """计算当前 golden 内容指纹并返回（供 promote_to_golden 写入 dataset_meta）。
+    """计算当前 golden 内容指纹并返回（供写入 dataset_meta 锁定）。
 
-    调用时机：growing→golden 升级后 / golden 内容变更后。
+    调用时机：golden 内容经 git 变更后重新锁定 revision。
     """
     revision = compute_golden_revision()
     logger.info("golden revision 锁定: %s", revision)
