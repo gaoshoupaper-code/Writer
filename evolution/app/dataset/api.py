@@ -36,9 +36,13 @@ def list_cases(
     # 文件系统 case 列表（带 title）
     fs_cases = evalset.list_cases_with_title(layer=layer)
 
-    # 元数据索引
-    meta_rows = dataset_repo.list_by_layer(layer=layer)
-    meta_map = {r["case_id"]: r for r in meta_rows}
+    # 元数据索引（表缺失/查询失败时降级为空，不阻塞文件系统 case 列表）
+    try:
+        meta_rows = dataset_repo.list_by_layer(layer=layer)
+        meta_map = {r["case_id"]: r for r in meta_rows}
+    except Exception:
+        logger.warning("dataset_meta 查询失败，降级为无元数据", exc_info=True)
+        meta_map = {}
 
     cases = []
     for c in fs_cases:
@@ -105,9 +109,16 @@ def get_golden_revision() -> dict[str, Any]:
 
     revision 来自 dataset_meta（锁定值）；若元数据缺失则实时计算（未锁定状态）。
     """
-    locked = dataset_repo.get_golden_revision()
+    # revision 计算与 DB 元数据解耦：compute 为纯文件系统（必成功），
+    # DB 查询（锁定值）失败时降级——case 列表始终以文件系统为准（与 list_cases
+    # 端点一致），避免手动建目录（未注册元数据）时 case_count 显示 0。
     current = revision.compute_golden_revision()
-    golden_cases = dataset_repo.get_golden_case_ids()
+    golden_cases = evalset.list_cases(layer="golden")
+    locked = None
+    try:
+        locked = dataset_repo.get_golden_revision()
+    except Exception:
+        logger.warning("dataset_meta 查询失败，golden-revision 降级", exc_info=True)
 
     return {
         "revision": locked or current,

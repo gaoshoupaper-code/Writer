@@ -68,9 +68,18 @@ COPY evolution/ ./evolution/
 # 从阶段 1 拿前端 build 产物（覆盖宿主可能残留的 out/，.dockerignore 已排除）
 COPY --from=frontend-builder /build/out/ ./evolution/frontend/out/
 
+# golden 基准层种子副本（volume 挂载会覆盖 data/，启动时由 entrypoint 从种子同步）。
+# 放在 volume 外（/app/evalset_seed/），保证随镜像更新，不受 volume 覆盖影响。
+COPY evolution/data/evalset/golden/ /app/evalset_seed/golden/
+
+# 容器启动前同步 golden 种子到 volume（rebuild 后新 case 才能生效）
+COPY evolution/docker-entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
 # 容器内工作目录：evolution/（uvicorn app.main:app 定位用）
 WORKDIR /app/evolution
 
 EXPOSE 7789
 
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7789"]
