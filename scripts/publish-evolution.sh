@@ -247,17 +247,42 @@ else
   git tag "${NEW_TAG}" && info "已打 tag：${NEW_TAG}（记得 git push origin ${NEW_TAG}）"
 fi
 
-# ── 8. 联动更新官网下载页版本号 ──────────────────────────────
+# ── 8. 联动更新官网下载页版本号（自动 commit + push）──────────────
 # download.astro 的进化端版本号是硬编码的，发版后需同步更新。
+# 改完后自动 commit + push，保证服务器 git pull 能拿到新版本号。
+# 但【不】自动部署官网容器——部署是生产操作，由用户确认后手动执行。
 WEBSITE_DIR="$(dirname "$0")/../website"
 DOWNLOAD_ASTRO="${WEBSITE_DIR}/src/pages/download.astro"
+WEBSITE_CHANGED=0
+
 if [ -f "${DOWNLOAD_ASTRO}" ]; then
   sed -i -E "s/(EVOLUTION_VERSION[[:space:]]*=[[:space:]]*\")[^\"]*/\1${VERSION}/" "${DOWNLOAD_ASTRO}" \
     && info "已更新 download.astro 进化端版本号 → v${VERSION}" \
     || warn "更新 download.astro 失败（不影响安装包发布）"
-  info "⚠️  官网页面已更新版本号，请手动执行："
-  info "    git add website/ && git commit -m 'chore(website): 下载页进化端版本号 → v${VERSION}'"
-  info "    然后在服务器重新部署官网容器（docker-compose build website && docker-compose up -d website）"
+  WEBSITE_CHANGED=1
+fi
+
+# 改了文件才 commit + push；没改动（版本号已是最新）则跳过。
+if [ ${WEBSITE_CHANGED} -eq 1 ]; then
+  REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "$(dirname "$0")/..")"
+  git -C "${REPO_ROOT}" add website/src/pages/download.astro 2>/dev/null || \
+    git -C "${REPO_ROOT}" add website/
+  if git -C "${REPO_ROOT}" diff --cached --quiet; then
+    info "官网版本号已是最新，无需 commit"
+  else
+    git -C "${REPO_ROOT}" commit -m "chore(website): 下载页进化端版本号 → v${VERSION}" \
+      && info "已自动 commit 官网版本号更新" \
+      || warn "自动 commit 失败，请手动 commit"
+    if git -C "${REPO_ROOT}" push origin HEAD 2>/dev/null; then
+      info "已自动 push 到 remote"
+    else
+      warn "自动 push 失败，请手动执行：git push origin HEAD"
+    fi
+  fi
+  info "⚠️  官网版本号已 commit + push，请在服务器部署官网容器使其生效："
+  info "    ssh writer → cd /home/deploy/Writer → git pull"
+  info "    docker compose build website && docker compose up -d website"
+  info "    （必须 build，不能只 restart —— 版本号在构建时烤进静态 HTML）"
 fi
 
 # 清理临时文件

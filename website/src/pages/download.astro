@@ -8,7 +8,7 @@
 /// Tauri 更新签名（minisign）已配，自动更新不受影响。
 
 // 两端独立版本号（发版脚本自动 sed 替换）
-const CREATOR_VERSION = "0.1.2";
+const CREATOR_VERSION = "0.1.3";
 const EVOLUTION_VERSION = "0.2.2";
 
 const CREATOR_EXE = `https://siyen.site/releases/siyen-${CREATOR_VERSION}-windows-setup.exe`;
@@ -151,7 +151,7 @@ const steps = [
           <header class="section-head">
             <span class="section-num">02</span>
             <div class="section-head__text">
-              <h2 class="section-title">思衍 <em>创作端</em></h2>
+              <h2 class="section-title">思衍 <em>创作端</em><span class="section-ver">v{CREATOR_VERSION}</span></h2>
               <p class="section-lead">写作工具。推荐 .exe，体积更小，安装更顺滑。</p>
             </div>
           </header>
@@ -187,7 +187,7 @@ const steps = [
           <header class="section-head">
             <span class="section-num">03</span>
             <div class="section-head__text">
-              <h2 class="section-title">思衍 <em>进化端</em></h2>
+              <h2 class="section-title">思衍 <em>进化端</em><span class="section-ver">v{EVOLUTION_VERSION}</span></h2>
               <p class="section-lead">模型进化 / 监测 / 评估工具。</p>
             </div>
           </header>
@@ -358,6 +358,12 @@ const steps = [
         letter-spacing: var(--tracking-cn); color: var(--ink);
       }
       .section-title em { font-style: italic; color: var(--vermilion); }
+      .section-ver {
+        margin-left: 12px; font-style: normal; font-family: var(--font-sans);
+        font-size: var(--fs-small); font-weight: var(--fw-regular);
+        color: var(--ink-3); letter-spacing: var(--tracking-label);
+        font-variant-numeric: tabular-nums; vertical-align: 2px;
+      }
       .section-lead { margin-top: 14px; font-size: var(--fs-body); line-height: var(--lh-body); letter-spacing: var(--tracking-cn-body); color: var(--ink-2); max-width: 34em; }
       .section-lead strong { color: var(--ink); }
 
