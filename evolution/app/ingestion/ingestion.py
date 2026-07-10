@@ -12,7 +12,7 @@ import asyncio
 import logging
 from typing import Any, Literal
 
-from fastapi import APIRouter, BackgroundTasks
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 import app.core.db as db
@@ -176,6 +176,32 @@ async def notify(body: NotifyBody, background_tasks: BackgroundTasks) -> dict[st
         return {"status": "accepted", "task_id": body.task_id}
     background_tasks.add_task(_ingest_async, body.trace_id)
     return {"status": "accepted", "trace_id": body.trace_id}
+
+
+@router.get("/ingestion/active-key")
+def get_active_llm_key() -> dict[str, str]:
+    """executor 拉取激活 LLM 配置明文（内网专用，X-Notify-Token 鉴权）。
+
+    executor 的 build_writer_model 优先从这里取 (api_key, base_url, model)，
+    替代空的 PLATFORM_API_KEY/OPENAI_API_KEY 环境变量。
+
+    鉴权：挂 /api/ingestion/ 前缀 → SSO 放行 → NotifyTokenMiddleware 校验
+    X-Notify-Token（与 notify 端点同保护级）。明文 key 只在内网传给 executor，
+    不暴露给桌面端。
+
+    Returns:
+        {api_key, base_url, model}；未配置激活配置返回 404（executor 据此降级）。
+    """
+    config = None
+    try:
+        config = db.LlmConfigsRepository.get_active()
+    except Exception:
+        # 表未建/迁移中（init_db 尚未跑完）→ 当作未配置，让 executor 走环境变量降级
+        logger.warning("读取激活 LLM 配置异常（表可能未迁移），返回 404", exc_info=True)
+    if config is None:
+        raise HTTPException(status_code=404, detail="未配置激活的 LLM 配置")
+    api_key, base_url, model = config
+    return {"api_key": api_key, "base_url": base_url, "model": model}
 
 
 def _mark_test_failed_by_task(task_id: str, error: str) -> None:

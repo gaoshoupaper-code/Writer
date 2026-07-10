@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     # 默认 executor/.manifest_cache。
     manifest_cache_dir: str = ".manifest_cache"
 
+    # LLM 配置 loader 本地缓存目录：从 evolution 拉的激活 LLM 配置降级用。
+    # 默认 executor/.llm_config_cache。
+    llm_config_cache_dir: str = ".llm_config_cache"
+
     # Agent 包目录路径（Phase 7 包化重构，D8=X 生产路径）。
     # 执行端同进程 import 此目录作为 Python package，调 assemble(ctx) 装配 agent。
     # 默认指向 evolution/harnesses/current/（同机部署，真理源在 evolution）。

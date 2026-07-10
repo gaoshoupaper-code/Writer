@@ -27,10 +27,25 @@ def build_writer_model(
 ) -> ChatOpenAI:
     """构建写作模型。
 
-    平台代付模式（D1/D22/AD9）：所有用户统一使用平台 key，不再读用户自带 key。
-    api_key/base_url 参数保留仅为向后兼容（测试/旧路径），优先级低于平台配置。
+    LLM 配置来源优先级（key/base_url/model 三者同源，避免混用）：
+      1. 显式参数（api_key/base_url/model_name_override，测试/旧路径用）
+      2. evolution 激活配置（桌面端「LLM 配置」页，通过 llm_config_loader 拉取）
+      3. 环境变量 PLATFORM_API_KEY / OPENAI_API_KEY（历史兼容，可能为空）
+      4. 占位 key（启动安全，让 ChatOpenAI 构造不崩）
+
+    生产写作和 A/B 测试共用此函数，因此两者都受益于 evolution 配置打通。
     """
-    effective_model = model_name_override if model_name_override else settings.writer_model
+    from app.platform.llm_config.loader import get_active_llm_config
+
+    # evolution 激活配置（拉取失败/未配置时为 None，降级到环境变量）
+    evo_config = get_active_llm_config()
+
+    # model：显式 override > evolution > settings.writer_model
+    effective_model = (
+        model_name_override
+        or (evo_config.model if evo_config and evo_config.model else None)
+        or settings.writer_model
+    )
     provider, model_name = parse_writer_model(effective_model)
     provider_options = {}
 
@@ -47,13 +62,16 @@ def build_writer_model(
 
     # AD9：平台代付——优先用 PLATFORM_API_KEY（积分制专用），其次兼容旧 OPENAI_API_KEY。
     # api_key 参数仅为测试/旧路径保留，生产路径不再传用户 key（D22 一刀切）。
+    # evolution 配置插入中间：环境变量空时由 evolution 的 key 兜底（桌面化打通）。
     effective_key = (
         api_key
+        or (evo_config.api_key if evo_config and evo_config.api_key else None)
         or getattr(settings, "platform_api_key", "")
         or settings.openai_api_key
     )
     effective_base = (
         base_url
+        or (evo_config.base_url if evo_config and evo_config.base_url else None)
         or getattr(settings, "platform_base_url", "")
         or settings.openai_base_url
     )
