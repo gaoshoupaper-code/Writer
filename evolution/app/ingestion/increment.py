@@ -93,6 +93,53 @@ def reconstruct_full_input(
     return collected_messages
 
 
+def reconstruct_all_inputs(events: list[Any]) -> dict[str, Any]:
+    """批量重建所有增量 LLM 事件的完整 input（单次 O(N) 扫描）。
+
+    替代「对每个增量事件单独调 reconstruct_full_input」的 O(M×N) 做法。
+
+    算法：一次正向遍历，维护累加器 collected_messages：
+    - 遇到全量起点（input_context_range 为空）→ 初始化累加器为该事件的 messages
+    - 遇到增量事件（range 非空）→ 把该事件的 input.messages 追加到累加器，
+      当前累加器的快照即该事件的完整 input
+
+    Args:
+        events: 按 sequence 排序的所有事件（dict 或 TraceLogEvent）
+
+    Returns: {event_id: 完整 input} 映射（只含增量事件，全量事件不含在内）
+    """
+    result: dict[str, Any] = {}
+    collected_messages: list[Any] = []
+    base_found = False
+
+    for event in events:
+        if _get_field(event, "type") != "llm_start":
+            continue
+
+        event_range = _get_field(event, "input_context_range")
+        event_input = _get_field(event, "input")
+
+        if event_range is None:
+            # 全量起点：初始化累加器（拷贝防污染，见 reconstruct_full_input 的注释）
+            collected_messages = list(extract_messages(event_input))
+            base_found = True
+            continue
+
+        if not base_found:
+            # 链断：range 非空但还没找到全量起点，跳过（降级）
+            continue
+
+        # 增量事件：追加尾部，快照即完整 input
+        collected_messages.extend(extract_messages(event_input))
+        event_id = _get_field(event, "event_id")
+        if isinstance(event_input, dict):
+            result[event_id] = {**event_input, "messages": list(collected_messages)}
+        else:
+            result[event_id] = list(collected_messages)
+
+    return result
+
+
 def _get_field(obj: Any, field: str) -> Any:
     if isinstance(obj, dict):
         return obj.get(field)

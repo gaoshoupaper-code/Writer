@@ -89,6 +89,8 @@ class EvolutionTraceRecorder:
         # session_id → trace_id 映射（供 SSE 端点按 session_id 查 trace_id_self）。
         self._session_trace: dict[str, str] = {}
         self._anchor_counter: int = 0
+        # SSE 运行期投影 diff（Phase 2 T4 路线 Y）：per trace 的 differ。
+        self._differs: dict[str, Any] = {}
         # 写盘解耦缓冲（与执行端一致）。
         self._pending_writes: deque[tuple[str, str]] = deque()  # (trace_id, json_line)
         self._pending_lock = RLock()
@@ -141,6 +143,9 @@ class EvolutionTraceRecorder:
         self._increment_states[trace_id] = IncrementState()
         # 登记 session_id → trace_id 映射（供 SSE 端点查询）。
         self._session_trace[session_id] = trace_id
+        # 初始化 SSE diff 引擎（Phase 2 T4 路线 Y）。
+        from app.trace.differ import NodeSnapshotDiffer
+        self._differs[trace_id] = NodeSnapshotDiffer()
 
         # D8：create_run 即写 runs 行（status=running），运行中前端可见。
         db.execute(
@@ -687,6 +692,111 @@ class EvolutionTraceRecorder:
             })
         return result
 
+    # ── 运行期投影 diff（Phase 2 T4 路线 Y，供 SSE 推 node patch）──
+
+    def project_and_diff(self, trace_id: str) -> dict[str, list[TraceNode]] | None:
+        """从 DB 全量投影 → 与前次快照 diff → 返回增量 patch。
+
+        SSE 端点周期性调用此方法，把 patch 推给前端。
+        返回 None 表示 trace 不活跃或无事件。
+
+        路线 Y：projector 保持全量无状态，每次全量投影后 diff 出变更的 node。
+        单次 O(N)，节流后（500ms）扛得住上千事件。
+        """
+        from app.ingestion.projector import TraceProjector
+        from app.ingestion.increment import reconstruct_all_inputs
+
+        differ = self._differs.get(trace_id)
+        if differ is None:
+            return None
+
+        # 先 flush 该 trace 残余事件（保证 DB 有最新数据）。
+        self.flush_sync(trace_id)
+
+        events_raw = self._load_raw_events(trace_id)
+        if not events_raw:
+            return None
+
+        # 增量重建（单次 O(N)）
+        reconstructed = reconstruct_all_inputs(events_raw)
+        if reconstructed:
+            for e_raw in events_raw:
+                full_input = reconstructed.get(e_raw.get("event_id"))
+                if full_input is not None:
+                    e_raw["input"] = full_input
+        events = [TraceLogEvent.model_validate(e) for e in events_raw]
+
+        run_row = db.query_one("SELECT * FROM runs WHERE trace_id=?", (trace_id,))
+        if run_row is None:
+            return None
+        run = TraceRunSummary(
+            trace_id=trace_id,
+            workspace_id=run_row["workspace_id"],
+            thread_id=run_row["thread_id"] or "",
+            session_name=run_row["session_name"] or "",
+            workspace_path="",
+            endpoint=run_row["endpoint"] or "",
+            status=run_row["status"],  # type: ignore[arg-type]
+            started_at=run_row["started_at"] or "",
+            ended_at=run_row.get("ended_at"),
+            duration_ms=run_row["duration_ms"],
+            event_count=run_row["event_count"] or 0,
+            path="",
+            error=run_row.get("error"),
+        )
+
+        projection = TraceProjector().project(run, events)
+        return differ.diff(projection.nodes)
+
+    def project_full_nodes(self, trace_id: str) -> list[TraceNode] | None:
+        """全量投影 → 返回完整 nodes 列表（终态 snapshot 用）。
+
+        SSE 终态时调用，推全量 snapshot 强制前端对齐（T9）。
+        """
+        from app.ingestion.projector import TraceProjector
+        from app.ingestion.increment import reconstruct_all_inputs
+
+        events_raw = self._load_raw_events(trace_id)
+        if not events_raw:
+            return None
+
+        reconstructed = reconstruct_all_inputs(events_raw)
+        if reconstructed:
+            for e_raw in events_raw:
+                full_input = reconstructed.get(e_raw.get("event_id"))
+                if full_input is not None:
+                    e_raw["input"] = full_input
+        events = [TraceLogEvent.model_validate(e) for e in events_raw]
+
+        run_row = db.query_one("SELECT * FROM runs WHERE trace_id=?", (trace_id,))
+        if run_row is None:
+            return None
+        run = TraceRunSummary(
+            trace_id=trace_id,
+            workspace_id=run_row["workspace_id"],
+            thread_id=run_row["thread_id"] or "",
+            session_name=run_row["session_name"] or "",
+            workspace_path="",
+            endpoint=run_row["endpoint"] or "",
+            status=run_row["status"],  # type: ignore[arg-type]
+            started_at=run_row["started_at"] or "",
+            ended_at=run_row.get("ended_at"),
+            duration_ms=run_row["duration_ms"],
+            event_count=run_row["event_count"] or 0,
+            path="",
+            error=run_row.get("error"),
+        )
+        projection = TraceProjector().project(run, events)
+        return projection.nodes
+
+    def _load_raw_events(self, trace_id: str) -> list[dict[str, Any]]:
+        """从 DB 加载事件（dict 形态，未反序列化为 TraceLogEvent）。"""
+        rows = db.query_all(
+            "SELECT payload_json FROM event_payloads WHERE trace_id=? ORDER BY sequence",
+            (trace_id,),
+        )
+        return [json.loads(r["payload_json"]) for r in rows]
+
     # ── prompt 版本（与执行端一致）──
 
     def set_prompt_version(self, trace_id: str, prompt_name: str, version: int) -> None:
@@ -704,6 +814,7 @@ class EvolutionTraceRecorder:
         self._sequences.pop(trace_id, None)
         self._increment_states.pop(trace_id, None)
         self._run_purposes.pop(trace_id, None)
+        self._differs.pop(trace_id, None)
 
     def _lock_for(self, trace_id: str) -> RLock:
         lock = self._locks.get(trace_id)

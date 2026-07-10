@@ -1,17 +1,19 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  TraceDetail,
+  TraceDetailLite,
   TraceListItem,
   ActiveRun,
   StatsOverview,
   SkillStat,
   TimelinePoint,
   FailurePattern,
+  TraceLogEvent,
+  TraceContextSegment,
 } from "@/lib/types";
 
 // 统一类型从 lib/types.ts 引用（trace 移植后对齐）
 export type {
-  TraceDetail,
+  TraceDetailLite,
   TraceListItem,
   ActiveRun,
   StatsOverview,
@@ -360,8 +362,35 @@ export async function getTraces(params?: {
   return evoJson<TraceListItem[]>(`/api/traces${q ? "?" + q : ""}`, { method: "GET" });
 }
 
-export async function getTraceDetail(traceId: string): Promise<TraceDetail> {
-  return evoJson<TraceDetail>(`/api/traces/${traceId}`, { method: "GET" });
+export async function getTraceDetail(traceId: string): Promise<TraceDetailLite> {
+  return evoJson<TraceDetailLite>(`/api/traces/${traceId}`, { method: "GET" });
+}
+
+/**
+ * 按 event_id 批量拉取原始事件（抽屉懒加载，Phase 2）。
+ * 前端从 node.raw_event_ids 拿到事件 id 列表，调本接口拉取。
+ */
+export async function getTraceEvents(
+  traceId: string,
+  eventIds: string[],
+): Promise<TraceLogEvent[]> {
+  const ids = eventIds.join(",");
+  return evoJson<TraceLogEvent[]>(`/api/traces/${traceId}/events?event_ids=${encodeURIComponent(ids)}`, {
+    method: "GET",
+  });
+}
+
+/**
+ * 按 anchor_id 拉取单个 context segment（抽屉懒加载，Phase 2）。
+ */
+export async function getTraceContext(
+  traceId: string,
+  anchorId: string,
+): Promise<TraceContextSegment> {
+  return evoJson<TraceContextSegment>(
+    `/api/traces/${traceId}/context?anchor_id=${encodeURIComponent(anchorId)}`,
+    { method: "GET" },
+  );
 }
 
 // ════════════════════════════════════════════════════════════
