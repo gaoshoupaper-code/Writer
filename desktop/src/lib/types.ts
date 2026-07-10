@@ -135,7 +135,7 @@ export type WorkspaceCharacterContent = {
 };
 
 export type StreamEvent = {
-  type: "model_output" | "tool_call" | "tool_output" | "tool_error" | "model_stream" | "final" | "trace_event" | "trace_snapshot" | "interrupt" | "credit_exhausted";
+  type: "model_output" | "tool_call" | "tool_output" | "tool_error" | "model_stream" | "reasoning_stream" | "final" | "trace_event" | "trace_snapshot" | "interrupt" | "credit_exhausted";
   data: Record<string, unknown>;
 };
 
@@ -296,6 +296,16 @@ export type AskUserOption = {
   description: string;
 };
 
+export type ExecutionPhase =
+  | "idle"
+  | "booting"
+  | "thinking"
+  | "writing"
+  | "asking"
+  | "delivering"
+  | "failed"
+  | "stopped";
+
 export type ChatMessage = {
   role: "assistant" | "user";
   content: string;
@@ -305,6 +315,10 @@ export type ChatMessage = {
   traceId?: string;
   // D2/P7: 本条消息的执行态（streaming=进行中 / completed / failed / stopped）
   status?: "streaming" | "completed" | "failed" | "stopped";
+  // T17: 体验阶段（驱动 ExecutionView 子视图切换）。
+  // 由 derivePhaseFromMessage 从 status/tools/awaitingInput 实时派生，
+  // executionStore 在每次 message 更新后写入。
+  executionPhase?: ExecutionPhase;
   // HITL: 子代理 ask_user 中断，等待用户回答（resume 提交后清除）
   // DD4: kind 区分反馈类型（choice=访谈 / image_review=图像评审）
   awaitingInput?: {
