@@ -6,7 +6,7 @@ import type { StageFlow } from "../../lib/stage";
 import { InterviewOptions } from "./InterviewOptions";
 import { ImageReviewCard } from "./ImageReviewCard";
 import { SessionMenu } from "./SessionMenu";
-import { StageFlowView } from "./StageFlowView";
+import { ExecutionView } from "./ExecutionView";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 
@@ -144,9 +144,9 @@ export function ChatPanel({
 
       <div className="message-list" ref={listRef}>
         {messages.map((message, index) => {
-          const label = message.role === "assistant" ? "Agent" : "你";
-          const isLastAssistant = message.role === "assistant" && index === messages.length - 1 && loading;
-          const flow = stageFlows?.[index];
+          const label = message.role === "assistant" ? "小衍" : "你";
+          const isLastAssistant = message.role === "assistant" && index === messages.length - 1;
+          const flow = stageFlows?.[index] ?? null;
 
           return (
             <article
@@ -155,13 +155,15 @@ export function ChatPanel({
               key={`${message.role}-${index}`}
             >
               <span className="message-role">{label}</span>
-              {flow ? <StageFlowView flow={flow} defaultExpanded={index === messages.length - 1} /> : null}
-              {/* D5 兜底：无阶段卡片（非 task running）时，主 agent 工具的极简"正在处理…"；ask_user 不显示 */}
-              {message.role === "assistant" &&
-              flow &&
-              flow.stages.length === 0 &&
-              message.tools?.some((t) => t.status === "running" && t.name !== "ask_user") ? (
-                <div className="message-action-fallback">正在处理…</div>
+              {/* ExecutionView：取代 StageFlowView，按 executionPhase 渲染小衍执行体验 */}
+              {message.role === "assistant" && (isLastAssistant || flow) ? (
+                <ExecutionView
+                  message={message}
+                  loading={loading}
+                  isLastAssistant={isLastAssistant}
+                  stageFlow={flow}
+                  onRetry={onRetry}
+                />
               ) : null}
               <div className="message-content">
                 {message.role === "assistant" && message.contentFormat === "markdown" ? (
@@ -192,11 +194,8 @@ export function ChatPanel({
                   />
                 ) : null
               ) : null}
-              {message.role === "assistant" && (message.status === "failed" || message.status === "stopped") && !message.awaitingInput ? (
-                <button type="button" className="message-retry" onClick={() => onRetry?.()}>↻ 重试</button>
-              ) : null}
-              {/* 最后一条 assistant 消息 + loading 态 → 显示 shimmer */}
-              {isLastAssistant && !message.content ? (
+              {/* shimmer 兜底：最后一条 assistant + loading + 无 ExecutionView 渲染时 */}
+              {isLastAssistant && loading && !message.content && !message.tools?.length ? (
                 <div className="grid gap-2 mt-2">
                   <Skeleton className="h-4 w-3/4" />
                   <Skeleton className="h-4 w-1/2" />
