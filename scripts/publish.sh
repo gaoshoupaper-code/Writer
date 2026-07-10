@@ -3,10 +3,14 @@
 # publish.sh —— 桌面端发布脚本（D15/D17/S8）
 # ─────────────────────────────────────────────────────────────
 # 流程：
-#   1. 本地 tauri build 生成 .msi + .sig（签名密钥从 TAURI_SIGNING_PRIVATE_KEY 环境变量读）
-#   2. 读 tauri.conf.json 版本号
-#   3. 生成 latest.json（含 download URL + signature）
-#   4. scp 上传到服务器 /var/www/releases/（nginx /download/ 托管）
+#   1. 自动 bump patch 版本号（tauri.conf.json + Cargo.toml 同步 +1）
+#   2. 本地 tauri build 生成 .msi + .exe + .sig（签名密钥从 TAURI_SIGNING_PRIVATE_KEY 环境变量读）
+#   3. 读 tauri.conf.json 版本号
+#   4. 生成 latest.json（含 download URL + signature）
+#   5. scp 上传到服务器 /home/deploy/Writer/releases/（nginx /releases/ 托管）
+#   6. 自动 commit + push 版本号变更（download.astro + index.astro + tauri.conf + Cargo.toml）
+#
+# 设 NO_BUMP=1 可跳过自动 bump（重发同版本时用）。
 #
 # 前置：
 #   - 设置环境变量 TAURI_SIGNING_PRIVATE_KEY（D17：个人保管，不上 git）
@@ -46,9 +50,28 @@ if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
   密钥私钥个人保管，绝不上 git（D17）。"
 fi
 
-# ── 2. 本地构建 ──────────────────────────────────────────────
-info "开始 tauri build（生成签名安装包）..."
+# ── 2. 切到构建目录 ─────────────────────────────────────────
 cd "$(dirname "$0")/../desktop"
+
+# ── 2.1 自动 bump patch 版本号 ─────────────────────────────
+# 发版前把 patch 号 +1，同步写回 tauri.conf.json + Cargo.toml，保证两者一致。
+# 曾因两处版本号不一致（tauri.conf=0.1.4 / Cargo.toml=0.1.3）导致编译进二进制的
+# 版本与打包元数据错位、updater 版本判断混乱。
+# 设 NO_BUMP=1 可跳过（重发同版本 / 手动指定版本号时用）。
+if [ "${NO_BUMP:-0}" != "1" ]; then
+  CUR_VER=$(grep -oP '"version":\s*"\K[^"]+' src-tauri/tauri.conf.json | head -1)
+  # patch 号 +1：MAJOR.MINOR.PATCH → MAJOR.MINOR.(PATCH+1)
+  NEW_VER=$(echo "${CUR_VER}" | awk -F. '{printf "%s.%s.%d", $1, $2, $3+1}')
+  info "版本号自动 bump：v${CUR_VER} → v${NEW_VER}"
+  # 同步写回 tauri.conf.json + Cargo.toml
+  sed -i -E "s/(\"version\":\s*\")[^\"]*/\1${NEW_VER}/" src-tauri/tauri.conf.json
+  sed -i -E "s/^(version\s*=\s*\")[^\"]*/\1${NEW_VER}/" src-tauri/Cargo.toml
+else
+  warn "NO_BUMP=1，跳过版本号 bump（重发当前版本）"
+fi
+
+# ── 2.2 本地构建 ───────────────────────────────────────────
+info "开始 tauri build（生成签名安装包）..."
 
 # 清理 bundle 目录的旧产物（.exe/.msi/.sig）。
 # 根因修复：旧版产物残留在 bundle 目录里，导致下方 `ls | head -1` 选错文件，
@@ -293,15 +316,19 @@ fi
 
 # 改了文件才 commit + push；没改动（版本号已是最新）则跳过。
 if [ ${WEBSITE_CHANGED} -eq 1 ]; then
-  # 只 add website/，不误提交其他未暂存改动。
-  git -C "$(dirname "$0")/.." add website/src/pages/download.astro website/src/pages/index.astro 2>/dev/null || \
-    git -C "$(dirname "$0")/.." add website/
+  # 统一提交：download.astro + index.astro + tauri.conf.json + Cargo.toml（版本号同步）
+  # 只 add 这几个版本号相关文件，不误提交其他未暂存改动。
+  git -C "$(dirname "$0")/.." add \
+    website/src/pages/download.astro \
+    website/src/pages/index.astro \
+    desktop/src-tauri/tauri.conf.json \
+    desktop/src-tauri/Cargo.toml 2>/dev/null || true
   # 检查是否有 staged 改动（版本号没变时 sed 的改动会被 git 识别为无变化）
   if git -C "$(dirname "$0")/.." diff --cached --quiet; then
-    info "官网版本号已是最新，无需 commit"
+    info "版本号已是最新，无需 commit"
   else
-    git -C "$(dirname "$0")/.." commit -m "chore(website): 下载页版本号 → v${VERSION}" \
-      && info "已自动 commit 官网版本号更新" \
+    git -C "$(dirname "$0")/.." commit -m "chore(desktop): 版本号同步 → v${VERSION}" \
+      && info "已自动 commit 版本号更新（download.astro + index.astro + tauri.conf + Cargo.toml）" \
       || warn "自动 commit 失败，请手动 commit"
     # 自动 push（让服务器 git pull 能拉到新版本号）
     if git -C "$(dirname "$0")/.." push origin HEAD 2>/dev/null; then
