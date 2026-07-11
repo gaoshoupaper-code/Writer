@@ -39,7 +39,7 @@ class TraceDetailLite(BaseModel):
 
 
 class TraceListItem(BaseModel):
-    """trace 列表项（runs 表行 + 命中规则数）。"""
+    """trace 列表项（runs 表行 + 命中规则数 + 用户名映射）。"""
     trace_id: str
     workspace_id: str
     thread_id: str | None
@@ -52,21 +52,37 @@ class TraceListItem(BaseModel):
     event_count: int
     error: str | None
     flag_count: int = 0   # 命中规则数（标红数）
-    owner_user_id: str = "unknown"   # 归属用户（Phase 3 D16）
+    owner_user_id: str = "unknown"   # 归属用户 ID（Phase 3 D16）
+    owner_username: str | None = None   # 用户名（LEFT JOIN user_cache，映射不到时 None）
     run_purpose: str = "user_generation"   # trace 来源（D2：区分执行端/进化端）
 
 
-@router.get("/traces", response_model=list[TraceListItem])
+class TraceListResponse(BaseModel):
+    """trace 列表分页响应（含 total 供前端分页器计算页码）。"""
+    items: list[TraceListItem]
+    total: int        # 满足当前过滤条件的总条数
+    limit: int
+    offset: int
+
+
+@router.get("/traces", response_model=TraceListResponse)
 def list_traces(
     workspace: str | None = Query(None, description="按 workspace_id 过滤"),
     thread_id: str | None = Query(None, description="按 thread_id 过滤"),
     status: str | None = Query(None, description="按 status 过滤"),
     owner: str | None = Query(None, description="按 owner_user_id 过滤（D16 防串户）"),
     run_purpose: str | None = Query(None, description="按 run_purpose 过滤（evolution_eval/evolution_evolve/user_generation）"),
+    since: str | None = Query(None, description="ISO 8601 时间戳，只返回 started_at >= since 的 trace"),
+    until: str | None = Query(None, description="ISO 8601 时间戳，只返回 started_at <= until 的 trace"),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
-) -> list[TraceListItem]:
-    """全局 trace 列表，按 started_at 倒序。"""
+) -> TraceListResponse:
+    """全局 trace 列表，按 started_at 倒序。
+
+    LEFT JOIN user_cache 把 owner_user_id 映射成可读 username（进化端 trace
+    owner='unknown' JOIN 不到时 owner_username=None）。时间范围过滤用 started_at
+    字符串比较（ISO 格式天然有序），NULL started_at 不匹配会被排除。
+    """
     where: list[str] = []
     params: list[Any] = []
     if workspace:
@@ -84,25 +100,46 @@ def list_traces(
     if owner:
         where.append("r.owner_user_id = ?")
         params.append(owner)
+    if since:
+        where.append("r.started_at >= ?")
+        params.append(since)
+    if until:
+        where.append("r.started_at <= ?")
+        params.append(until)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    # total 条数（同一 where，不含 LIMIT/OFFSET）
+    total_row = db.query_one(
+        f"SELECT COUNT(*) AS c FROM runs r {where_sql}",
+        tuple(params),
+    )
+    total = total_row["c"] if total_row else 0
+
     rows = db.query_all(
-        f"""SELECT r.* FROM runs r {where_sql}
+        f"""SELECT r.*, uc.username AS owner_username
+            FROM runs r
+            LEFT JOIN user_cache uc ON r.owner_user_id = uc.user_id
+            {where_sql}
             ORDER BY r.started_at DESC LIMIT ? OFFSET ?""",
         tuple(params + [limit, offset]),
     )
-    return [
-        TraceListItem(
-            trace_id=r["trace_id"], workspace_id=r["workspace_id"],
-            thread_id=r["thread_id"], session_name=r["session_name"],
-            endpoint=r["endpoint"], status=r["status"],
-            started_at=r["started_at"], ended_at=r["ended_at"],
-            duration_ms=r["duration_ms"], event_count=r["event_count"] or 0,
-            error=r["error"], flag_count=0,
-            owner_user_id=r.get("owner_user_id") or "unknown",
-            run_purpose=r.get("run_purpose") or "user_generation",
-        )
-        for r in rows
-    ]
+    return TraceListResponse(
+        items=[
+            TraceListItem(
+                trace_id=r["trace_id"], workspace_id=r["workspace_id"],
+                thread_id=r["thread_id"], session_name=r["session_name"],
+                endpoint=r["endpoint"], status=r["status"],
+                started_at=r["started_at"], ended_at=r["ended_at"],
+                duration_ms=r["duration_ms"], event_count=r["event_count"] or 0,
+                error=r["error"], flag_count=0,
+                owner_user_id=r.get("owner_user_id") or "unknown",
+                owner_username=r.get("owner_username"),
+                run_purpose=r.get("run_purpose") or "user_generation",
+            )
+            for r in rows
+        ],
+        total=total, limit=limit, offset=offset,
+    )
 
 
 @router.get("/traces/{trace_id}", response_model=TraceDetailLite)

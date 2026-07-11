@@ -32,6 +32,7 @@ from app.core.settings import settings
 from app.ingestion.ingestion import router as ingestion_router
 from app.view.traces import router as traces_router
 from app.view.stats import router as stats_router
+from app.view.users import router as users_router
 from app.versioning.snapshot_api import router as snapshot_router
 from app.versioning.elements_api import router as elements_router
 from app.view.active import router as active_api_router
@@ -108,6 +109,7 @@ app.add_middleware(NotifyTokenMiddleware)
 app.include_router(ingestion_router, prefix="/api")
 app.include_router(traces_router, prefix="/api")
 app.include_router(stats_router, prefix="/api")
+app.include_router(users_router, prefix="/api")
 app.include_router(snapshot_router, prefix="/api")
 # 执行端 Agent 要素展示（前端「Agent 要素」页，D1-D7）
 app.include_router(elements_router, prefix="/api")
