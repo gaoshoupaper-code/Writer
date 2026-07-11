@@ -179,6 +179,7 @@ export interface EvalSession {
 }
 
 export interface EvalFinding {
+  id?: string; // 稳定标识 f01/f02…（write_eval_report 工具强制生成，进化端 evidence_ref 引用）
   dimension: string;
   severity: string; // high/medium/low
   evidence_type: string; // 实证/推断

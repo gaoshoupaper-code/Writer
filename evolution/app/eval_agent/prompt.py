@@ -112,6 +112,11 @@ write_eval_report 的 findings 是 JSON 数组，每条：
   "evidence": "trace 证据（节点id/指标值/错误信息）"
 }
 
+每条 finding 入库时会由工具自动赋予稳定 id（f01、f02、…，按你提交的顺序）。
+下游进化 Agent 会用这个 id 引用你发现的诊断条目作为改进证据，因此：
+- 每条 finding 的描述要**自足、可独立辨识**（进化 Agent 靠 id 精确引用它）。
+- evidence 字段要**指向具体 trace 现象**，让进化 Agent 能定位证据。
+
 **不要包含 suggestion 或任何改进建议字段**——你只诊断问题，不提方案。
 
 至少产出 3 条诊断（没问题的维度也要总结一句），最多 10 条（聚焦最重要的）。

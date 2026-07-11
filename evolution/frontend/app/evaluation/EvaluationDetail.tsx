@@ -112,8 +112,9 @@ export function EvaluationDetail({ evalId }: { evalId: string }) {
                     诊断条目（{detail.findings.length} 条）
                   </div>
                   {detail.findings.map((f, i) => (
-                    <div key={i} className="finding-card" style={{ marginBottom: 8, padding: "8px 12px", borderLeft: `3px solid ${sevColor(f.severity)}` }}>
+                    <div key={f.id ?? i} className="finding-card" style={{ marginBottom: 8, padding: "8px 12px", borderLeft: `3px solid ${sevColor(f.severity)}` }}>
                       <div style={{ display: "flex", gap: 8, fontSize: 12 }}>
+                        {f.id && <span className="mono text-dim" style={{ fontSize: 11 }}>{f.id}</span>}
                         <span style={{ color: sevColor(f.severity), fontWeight: 600 }}>{f.severity.toUpperCase()}</span>
                         <span className="text-dim">{f.dimension}</span>
                         <span className="text-dim">· {f.evidence_type}</span>

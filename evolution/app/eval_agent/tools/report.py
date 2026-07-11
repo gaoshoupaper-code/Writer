@@ -39,6 +39,7 @@ def make_report_tools() -> list:
                 "evidence": "trace 证据（节点id/指标值）"
               }
               注意：不要包含 suggestion/改进建议 字段（评估只诊断不提方案）。
+              每条 finding 的 id 由工具强制生成（f01/f02…），你无需填写。
             summary: 自然语言总述（整体评估结论：主要问题在哪、严重程度如何，
               不要写"该怎么改"）
         """
@@ -50,10 +51,11 @@ def make_report_tools() -> list:
             findings = json.loads(findings_json)
             if not isinstance(findings, list):
                 return "findings_json 必须是 JSON 数组"
-            # 去除每条 finding 里可能误带的 suggestion 字段（T4/S14：只诊断不提方案）
-            for f in findings:
+            # 规范化每条 finding：去 suggestion + 强制重编号 id（进化端 evidence_ref 依赖稳定 id）
+            for i, f in enumerate(findings, 1):
                 if isinstance(f, dict):
                     f.pop("suggestion", None)
+                    f["id"] = f"f{i:02d}"  # 强制覆盖，杜绝 Agent 产出格式不一致
 
             # 取内容分数（后台任务可能已完成）—— 只读访问 content 状态
             content_scores: dict[str, Any] = {}
@@ -76,10 +78,11 @@ def make_report_tools() -> list:
             if findings:
                 lines.append("## 诊断条目")
                 lines.append("")
-                for i, f in enumerate(findings, 1):
+                for f in findings:
+                    fid = f.get("id", "?")
                     sev = f.get("severity", "?")
                     dim = f.get("dimension", "?")
-                    lines.append(f"### {i}. [{sev.upper()}] {dim}")
+                    lines.append(f"### {fid} [{sev.upper()}] {dim}")
                     lines.append(f"- **类型**：{f.get('evidence_type', '?')}")
                     lines.append(f"- **发现**：{f.get('finding', '')}")
                     lines.append(f"- **证据**：{f.get('evidence', '')}")
