@@ -179,11 +179,70 @@ def list_sessions(limit: int = 50) -> dict[str, Any]:
 
 @router.get("/evolve/sessions/{session_id}")
 def get_session(session_id: str) -> dict[str, Any]:
-    """查单个 session 详情。"""
+    """查单个 session 详情（含内联的 design_doc/change_log/eval_snapshot）。
+
+    审查视图所需数据全部内联到这里，前端一次请求拿全：
+      - design_doc：读盘 design_doc.md（解析 front matter → {meta, body}）
+      - change_log：读盘 change_log.md（解析 front matter → {meta, body}）
+      - eval_snapshot：通过 eval_ref 查 evaluation_sessions，取 findings + scores
+
+    读盘/查询失败时对应字段设 null（R8：残缺不崩，前端走残缺渲染）。
+    """
     session = ev_db.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"session {session_id} 不存在")
+
+    # 内联 design_doc（方案子代理产出）
+    session["design_doc"] = _try_read_doc(session.get("design_doc_path"))
+
+    # 内联 change_log（执行子代理产出）
+    session["change_log"] = _try_read_doc(session.get("change_log_path"))
+
+    # 内联关联评估的 findings + scores（审查证据来源）
+    session["eval_snapshot"] = _try_load_eval_snapshot(session.get("eval_ref"))
+
     return session
+
+
+def _try_read_doc(path: str | None) -> dict[str, Any] | None:
+    """读盘一个 markdown+YAML 文档，返回 {meta, body}。失败返回 None。
+
+    复用 docs._load_doc 的解析逻辑（front matter 分割）。
+    """
+    if not path:
+        return None
+    try:
+        from app.evolve.docs import _load_doc
+        meta, body = _load_doc(path)
+        return {"meta": meta, "body": body}
+    except FileNotFoundError:
+        logger.warning("文档不存在: %s", path)
+        return None
+    except Exception:
+        logger.exception("文档解析失败: %s", path)
+        return None
+
+
+def _try_load_eval_snapshot(eval_ref: str | None) -> dict[str, Any] | None:
+    """查关联评估的 findings + scores（审查证据来源）。
+
+    不带 report_md（太长，审查视图只需 finding 级证据 + 分数对比）。
+    """
+    if not eval_ref:
+        return None
+    try:
+        ev = eval_repo.get_session(eval_ref)
+        if not ev:
+            return None
+        return {
+            "eval_id": ev.get("eval_id"),
+            "trace_id": ev.get("trace_id"),
+            "findings": ev.get("findings"),
+            "scores": ev.get("scores"),
+        }
+    except Exception:
+        logger.exception("查评估快照失败: eval_ref=%s", eval_ref)
+        return None
 
 
 # ── SSE 实时流 ──────────────────────────────────────────────
