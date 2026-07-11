@@ -21,6 +21,7 @@ from typing import Any
 from deepagents import create_deep_agent
 from langgraph.errors import GraphRecursionError
 
+from app.eval_agent import repo as eval_repo
 from app.eval_agent.ctx import EvaluationContext, set_eval_context
 from app.eval_agent.middleware.no_fs import NoFilesystemToolsMiddleware
 from app.eval_agent.prompt import EVAL_SYSTEM_PROMPT
@@ -99,6 +100,61 @@ def build_eval_agent(ctx: EvaluationContext):
     return agent
 
 
+def _extract_last_ai_text(result: Any) -> str:
+    """从 ainvoke 返回值提取最后一条 AI 消息的文本内容。
+
+    DeepAgent（LangGraph）ainvoke 返回标准 state dict，含 "messages" 列表。
+    取最后一条 AIMessage 的文本作为 Agent 的最终产出。
+    """
+    messages = None
+    if isinstance(result, dict):
+        messages = result.get("messages")
+    if not messages:
+        return ""
+    # 从后往前找第一条有内容的 AI 消息
+    for msg in reversed(messages):
+        content = getattr(msg, "content", None)
+        if content and getattr(msg, "type", None) == "ai":
+            return str(content)
+    # 兜底：取最后一条有内容的消息
+    for msg in reversed(messages):
+        content = getattr(msg, "content", None)
+        if content:
+            return str(content)
+    return ""
+
+
+def _fallback_report(ctx: EvaluationContext, result: Any) -> None:
+    """降级兜底：Agent 正常结束但没调 write_eval_report（DB 状态仍 running）。
+
+    从 Agent 最后一条 AI 消息提取内容，构造降级报告写入 DB（status=done）。
+    避免 trace=completed / eval=failed 的状态不一致——Agent 确实跑完了诊断，
+    只是在最后一步漏调了报告工具，不该因此判为失败。
+
+    报告标注「降级」并附 Agent 实际产出，让用户能判断诊断质量。
+    """
+    ai_text = _extract_last_ai_text(result)
+    fallback_md = (
+        f"# 评估报告（trace={ctx.input_trace_id}）\n\n"
+        f"> ⚠️ **降级报告**：评估 Agent 未正常调用 `write_eval_report` 工具，"
+        f"以下为 Agent 最后的输出内容（未经结构化整理）。\n\n"
+        f"---\n\n"
+        f"{ai_text or '（Agent 未产出可提取的文本内容）'}"
+    )
+    try:
+        eval_repo.update_session(
+            ctx.eval_id,
+            status="done",
+            report_md=fallback_md,
+        )
+        ctx.emit_log("评估 Agent 未调用报告工具，已降级产出报告。")
+        logger.warning(
+            "eval %s: Agent 未调 write_eval_report，已降级写报告", ctx.eval_id,
+        )
+    except Exception:
+        logger.exception("eval %s: 降级报告写入失败", ctx.eval_id)
+
+
 async def run_eval_session(ctx: EvaluationContext) -> dict[str, Any]:
     """跑一次完整的评估 session。
 
@@ -138,7 +194,7 @@ async def run_eval_session(ctx: EvaluationContext) -> dict[str, Any]:
 
     try:
         try:
-            await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 agent.ainvoke(
                     {"messages": [{"role": "user", "content": user_input}]},
                     config=config,
@@ -165,6 +221,13 @@ async def run_eval_session(ctx: EvaluationContext) -> dict[str, Any]:
 
         # 清理后台内容评估任务引用
         clear_content_tasks()
+
+        # 降级兜底：Agent 正常结束但若没调 write_eval_report（DB 状态仍 running），
+        # 从 Agent 最后一条 AI 消息提取内容构造降级报告，避免 trace=completed /
+        # eval=failed 状态不一致。Agent 确实跑完了诊断，只是漏调了报告工具。
+        session = eval_repo.get_session(ctx.eval_id)
+        if session and session.get("status") != "done":
+            _fallback_report(ctx, result)
 
         if ctx.recorder and ctx.trace_id_self:
             ctx.recorder.complete_run(ctx.trace_id_self)
@@ -195,7 +258,6 @@ async def run_eval_session(ctx: EvaluationContext) -> dict[str, Any]:
         clear_content_tasks()
         if ctx.recorder and ctx.trace_id_self:
             ctx.recorder.fail_run(ctx.trace_id_self, e)
-        return {"status": "failed", "eval_id": ctx.eval_id, "error": str(e)}
         return {"status": "failed", "eval_id": ctx.eval_id, "error": str(e)}
 
 

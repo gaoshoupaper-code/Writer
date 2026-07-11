@@ -1,9 +1,12 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { evoSseStream } from "@/lib/stream";
 import {
   getEvalSessions,
+  getEvalSession,
   startEval,
   getTraces,
   type EvalSession,
@@ -90,6 +93,13 @@ export default function EvaluationPage() {
         setLiveLogs((prev) => [...prev, frame]);
         if (frame.type === "end" || frame.type === "error") {
           setStreaming(false);
+          // 拉取最新评估详情（含报告），确保 selectedEval 更新为带 report_md 的完整数据
+          try {
+            const detail = await getEvalSession(evalId);
+            setSelectedEval(detail);
+          } catch {
+            // 详情拉取失败时退回列表刷新
+          }
           refresh();
           break;
         }
@@ -243,10 +253,14 @@ function EvalReport({ evalSession, onTraceClick }: { evalSession: EvalSession; o
       </button>
 
       {evalSession.report_md && (
-        <details className="report-details">
-          <summary>完整报告（Markdown）</summary>
-          <pre className="report-pre">{evalSession.report_md}</pre>
-        </details>
+        <div className="report-section">
+          <h4>完整报告</h4>
+          <div className="prose-doc eval-report-md">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+              {evalSession.report_md}
+            </ReactMarkdown>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -6492,6 +6492,154 @@ html[data-theme="dark"] {
   color: var(--foreground, #e2e8f0);
 }
 
+/* ── 评估报告 Markdown 渲染区（prose-doc）── */
+.report-section {
+  margin-top: 16px;
+}
+
+.report-section h4 {
+  font-size: 13px;
+  margin: 0 0 10px;
+  color: var(--text);
+}
+
+.eval-report-md {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 20px;
+  max-height: 600px;
+  overflow-y: auto;
+}
+
+.prose-doc {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text);
+  word-break: break-word;
+}
+.prose-doc > :first-child { margin-top: 0; }
+.prose-doc > :last-child { margin-bottom: 0; }
+
+.prose-doc h1,
+.prose-doc h2,
+.prose-doc h3,
+.prose-doc h4 {
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+  margin: 22px 0 8px;
+  color: var(--text);
+}
+.prose-doc h1 {
+  font-size: 18px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.prose-doc h2 {
+  font-size: 15px;
+  color: var(--accent);
+}
+.prose-doc h3 { font-size: 13.5px; }
+.prose-doc h4 {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.prose-doc p { margin: 8px 0; color: var(--text); }
+.prose-doc strong { color: var(--text); font-weight: 650; }
+.prose-doc em { color: var(--text-dim); font-style: italic; }
+
+.prose-doc ul,
+.prose-doc ol {
+  margin: 8px 0;
+  padding-left: 22px;
+}
+.prose-doc li { margin: 3px 0; }
+.prose-doc ul > li::marker { color: var(--accent); }
+.prose-doc ol > li::marker {
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.prose-doc ul ul,
+.prose-doc ol ol,
+.prose-doc ul ol,
+.prose-doc ol ul { margin: 2px 0; }
+
+.prose-doc code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--surface-3);
+  color: var(--accent);
+  border: 1px solid var(--border-soft);
+}
+
+.prose-doc pre {
+  margin: 10px 0;
+  padding: 12px 14px;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.prose-doc pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.prose-doc blockquote {
+  margin: 10px 0;
+  padding: 6px 14px;
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 0 6px 6px 0;
+  color: var(--text-dim);
+}
+.prose-doc blockquote p { margin: 4px 0; }
+
+.prose-doc hr {
+  border: none;
+  height: 1px;
+  background: var(--border-soft);
+  margin: 18px 0;
+}
+
+.prose-doc a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid rgba(58, 154, 126, 0.3);
+}
+.prose-doc a:hover { border-bottom-color: var(--accent); }
+
+.prose-doc table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+  font-size: 12.5px;
+}
+.prose-doc th,
+.prose-doc td {
+  text-align: left;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.prose-doc th {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+
 /* ── 评估报告 ── */
 .score-breakdown {
   margin-bottom: 16px;
