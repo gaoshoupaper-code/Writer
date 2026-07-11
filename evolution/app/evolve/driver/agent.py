@@ -21,9 +21,12 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
+
+from langgraph.errors import GraphRecursionError
 
 from app.core.settings import settings
 from app.common.model_factory import build_agent_model
@@ -35,6 +38,14 @@ from app.evolve.subagents.plan.build import build_plan_subagent
 from app.trace import TraceMiddleware, TraceCallbackHandler
 
 logger = logging.getLogger("evolution.evolve.agent")
+
+# 进化驱动器的安全护栏（防止一次进化无限期挂起）：
+#   - EVOLVE_TOTAL_TIMEOUT: 整次进化的总超时（含 plan + execute 全流程），主时间护栏。
+#
+# 不设 recursion_limit 步数限制：进化全流程的时长完全由 EVOLVE_TOTAL_TIMEOUT 兜底，
+# 步数交给框架默认（≈10007，事实上的不限制），避免正常进化因步数上限被误杀。
+# GraphRecursionError 分支仅作极端死循环的防御性兜底。
+EVOLVE_TOTAL_TIMEOUT = 1800  # 秒：一次进化最多 30 分钟
 
 
 def _ensure_workspace() -> Path:
@@ -209,7 +220,9 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
     driver = build_evolve_driver(ctx)
 
     # D6：config 注入 TraceCallbackHandler（构建调用树）。
-    config: dict[str, Any] = {"recursion_limit": 100}
+    # 不设 recursion_limit——步数交给框架默认（事实上的不限制），时长靠
+    # EVOLVE_TOTAL_TIMEOUT 兜底（见下方 asyncio.wait_for）。
+    config: dict[str, Any] = {}
     if ctx.recorder and ctx.trace_id_self:
         config["callbacks"] = [TraceCallbackHandler(ctx.recorder, ctx.trace_id_self)]
 
@@ -224,10 +237,49 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
     )
 
     try:
-        await driver.ainvoke(
-            {"messages": [{"role": "user", "content": user_input}]},
-            config=config,
-        )
+        try:
+            await asyncio.wait_for(
+                driver.ainvoke(
+                    {"messages": [{"role": "user", "content": user_input}]},
+                    config=config,
+                ),
+                timeout=EVOLVE_TOTAL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "session %s: 驱动器总超时（%ds），强制结束",
+                ctx.session_id, EVOLVE_TOTAL_TIMEOUT,
+            )
+            ctx.emit_log(f"进化总耗时超过 {EVOLVE_TOTAL_TIMEOUT}s 上限，已强制结束。")
+            ev_db.update_session(ctx.session_id, status="failed")
+            if ctx.recorder and ctx.trace_id_self:
+                ctx.recorder.fail_run(
+                    ctx.trace_id_self, f"进化总超时（{EVOLVE_TOTAL_TIMEOUT}s）"
+                )
+            return {
+                "status": "failed", "session_id": ctx.session_id,
+                "error": f"进化总超时（{EVOLVE_TOTAL_TIMEOUT}s）",
+            }
+        except GraphRecursionError:
+            # 步数触顶（仅当框架默认上限被触达时出现，正常情况下不会到这）：
+            # 模型陷入死循环没收敛（plan/execute 反复调工具不收尾）。
+            logger.warning(
+                "session %s: 驱动器步数触顶（框架默认上限），未收敛", ctx.session_id
+            )
+            ctx.emit_log(
+                "进化驱动器消耗了过多步数仍未完成"
+                "（可能 plan/execute 反复调用工具未收尾）。请重试，或检查模型是否稳定。"
+            )
+            ev_db.update_session(ctx.session_id, status="failed")
+            if ctx.recorder and ctx.trace_id_self:
+                ctx.recorder.fail_run(
+                    ctx.trace_id_self, "进化驱动器步数触顶（未收敛）"
+                )
+            return {
+                "status": "failed", "session_id": ctx.session_id,
+                "error": "进化驱动器步数触顶（未收敛）",
+            }
+
         logger.info("session %s: 驱动器执行完成", ctx.session_id)
 
         # 执行完成 → 转 pending_review（待审，working 区锁定）

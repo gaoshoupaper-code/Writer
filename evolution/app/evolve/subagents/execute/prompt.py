@@ -32,7 +32,7 @@ EXECUTE_SYSTEM_PROMPT = """\
    - 「非法 hook / agent / op」→ 说明 edit 指令本身写错，修正 edits 后重新 apply_edits。
    - 「源码语法错误」→ edit_file 修正对应文件。
    **⚠️ 重试上限：validate_changes 最多调用 2 次。** 若 2 次仍失败：
-     - 不要再反复调用 validate_changes（会耗尽 driver 的 recursion_limit 导致整个流程卡死）；
+     - 不要再反复调用 validate_changes（会消耗大量时间，拖慢整个进化流程）；
      - 如实调用 write_change_log 收尾，applied 里失败的改动 result 填 "failed"，
        detail 写清失败原因（哪个类不存在 / 哪条 edit 非法），summary 注明"本次进化未完成校验，
        需人工介入 plan 阶段方案设计"；

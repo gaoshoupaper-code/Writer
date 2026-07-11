@@ -32,13 +32,11 @@ logger = logging.getLogger("evolution.eval_agent.agent")
 
 # 评估 Agent 的安全护栏（防止一次评估无限期挂起）：
 #   - EVAL_TOTAL_TIMEOUT: 整次评估的总超时（含 model + tool 全流程），主时间护栏。
-#   - EVAL_RECURSION_LIMIT: LangGraph 图最大递归步数。deepagents 每轮 ReAct 实际
-#     消耗 3 个节点（model → TodoList.after_model → tools），故 N 步 ≈ N/3 轮
-#     工具调用。评估全流程（读 trace/读 surface/取内容分数/写报告）通常 6~10 轮，
-#     这里给到 60（≈20 轮）留足余量；真正卡时长靠 EVAL_TOTAL_TIMEOUT 兜底，
-#     不靠 recursion_limit 压时间。框架默认 9999（不限制），原 80 偏松。
+#
+# 不设 recursion_limit 步数限制：评估全流程（读 trace/读 surface/取内容分数/写报告）
+# 的时长完全由 EVAL_TOTAL_TIMEOUT 兜底，步数交给框架默认（≈10007，事实上的不限制），
+# 避免正常评估因步数上限被误杀。GraphRecursionError 分支仅作极端死循环的防御性兜底。
 EVAL_TOTAL_TIMEOUT = 300  # 秒：一次评估最多 5 分钟
-EVAL_RECURSION_LIMIT = 60
 
 
 def build_eval_agent(ctx: EvaluationContext):
@@ -122,7 +120,9 @@ async def run_eval_session(ctx: EvaluationContext) -> dict[str, Any]:
     agent = build_eval_agent(ctx)
 
     # D6：config 注入 TraceCallbackHandler（构建调用树）。
-    config: dict[str, Any] = {"recursion_limit": EVAL_RECURSION_LIMIT}
+    # 不设 recursion_limit——步数交给框架默认（事实上的不限制），时长靠
+    # EVAL_TOTAL_TIMEOUT 兜底（见下方 asyncio.wait_for）。
+    config: dict[str, Any] = {}
     if ctx.recorder and ctx.trace_id_self:
         config["callbacks"] = [TraceCallbackHandler(ctx.recorder, ctx.trace_id_self)]
 
@@ -172,25 +172,23 @@ async def run_eval_session(ctx: EvaluationContext) -> dict[str, Any]:
         return {"status": "done", "eval_id": ctx.eval_id}
 
     except GraphRecursionError:
-        # 步数触顶：模型在限制轮数内没收敛（反复调工具不收尾）。
+        # 步数触顶（仅当框架默认上限被触达时出现，正常情况下不会到这）：
+        # 模型陷入死循环没收敛（反复调工具不收尾）。
         # 不是程序错误，是 Agent 行为问题——给清晰提示而非英文 traceback。
-        logger.warning(
-            "eval %s: 评估 Agent 步数触顶（limit=%d），未收敛",
-            ctx.eval_id, EVAL_RECURSION_LIMIT,
-        )
+        logger.warning("eval %s: 评估 Agent 步数触顶（框架默认上限），未收敛", ctx.eval_id)
         ctx.emit_log(
-            f"评估 Agent 在 {EVAL_RECURSION_LIMIT} 步内未完成诊断"
-            f"（可能反复查阅信息未收尾）。请重试，或检查模型是否稳定。"
+            "评估 Agent 消耗了过多步数仍未完成诊断"
+            "（可能反复查阅信息未收尾）。请重试，或检查模型是否稳定。"
         )
         clear_content_tasks()
         if ctx.recorder and ctx.trace_id_self:
             ctx.recorder.fail_run(
                 ctx.trace_id_self,
-                f"评估 Agent 步数触顶（{EVAL_RECURSION_LIMIT} 步未收敛）",
+                "评估 Agent 步数触顶（未收敛）",
             )
         return {
             "status": "failed", "eval_id": ctx.eval_id,
-            "error": f"评估 Agent 步数触顶（{EVAL_RECURSION_LIMIT} 步未收敛）",
+            "error": "评估 Agent 步数触顶（未收敛）",
         }
     except Exception as e:
         logger.exception("eval %s: 评估 Agent 执行失败", ctx.eval_id)
