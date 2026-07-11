@@ -102,12 +102,29 @@ class PhaseGuardMiddleware(AgentMiddleware):
         return violation, tool_name, phase, whitelist
 
     def _advance_if_success(self, result: Any, phase: str) -> None:
-        """工具执行成功后推进到下一阶段。"""
-        if self._is_success(result):
-            nxt = self._next_phase(phase)
-            if nxt:
-                self._set_phase(nxt)
-                logger.info("PhaseGuard: %s → %s", phase, nxt)
+        """工具执行成功后推进到下一阶段。
+
+        plan → execute 额外前置门：design_doc 必须已落盘。
+        plan 子代理可能漏调 write_design_doc 就结束（task 返回的文本总结
+        不含"失败"字样，_is_success 无法察觉），此时 design_doc_path 为空。
+        若放行推进到 execute，execute 读不到方案 → 仍产 change_log →
+        进 pending_review 但 design_doc 为 null（前端"报告不完整"）。
+        停在 plan 不推进，nudge 机制会驱动 plan 子代理重跑补产出。
+        """
+        if not self._is_success(result):
+            return
+        if phase == "plan":
+            from app.evolve.ctx import get_tool_context
+            ctx = get_tool_context()
+            if ctx is None or not ctx.design_doc_path:
+                logger.warning(
+                    "PhaseGuard: plan task 返回但未产出 design_doc，不推进阶段"
+                )
+                return
+        nxt = self._next_phase(phase)
+        if nxt:
+            self._set_phase(nxt)
+            logger.info("PhaseGuard: %s → %s", phase, nxt)
 
     def wrap_tool_call(self, request, handler):
         """拦截驱动器的工具调用（同步路径，invoke/stream 时走这里）。"""

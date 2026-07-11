@@ -238,8 +238,10 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
 
         logger.info("session %s: 驱动器执行完成", ctx.session_id)
 
-        # 执行完成 → 转 pending_review（待审，working 区锁定）
-        if ctx.change_log_path:
+        # 两阶段产出必须齐：design_doc（方案）+ change_log（落地）。
+        # 缺 design_doc 则审查报告无法渲染（前端依赖 design_doc.meta.changes），
+        # 不应进 pending_review（否则用户看到"报告不完整"死局）。
+        if ctx.change_log_path and ctx.design_doc_path:
             ctx.review_status = "pending_review"
             ev_db.update_session(ctx.session_id, status="pending_review")
             ctx.emit_log("进化流程完成，改动已落地，等待人工 review 发版。")
@@ -247,10 +249,16 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
                 ctx.recorder.complete_run(ctx.trace_id_self)
             return {"status": "done", "session_id": ctx.session_id}
         else:
-            ctx.emit_log("驱动器结束但未产出 change_log（执行阶段可能未完成）。")
+            # 区分失败原因，便于定位是哪个阶段断了
+            if not ctx.design_doc_path:
+                ctx.emit_log("驱动器结束但未产出 design_doc（方案阶段未完成）。")
+                fail_reason = "未产出 design_doc"
+            else:
+                ctx.emit_log("驱动器结束但未产出 change_log（执行阶段未完成）。")
+                fail_reason = "未产出 change_log"
             ev_db.update_session(ctx.session_id, status="failed")
             if ctx.recorder and ctx.trace_id_self:
-                ctx.recorder.fail_run(ctx.trace_id_self, "未产出 change_log")
+                ctx.recorder.fail_run(ctx.trace_id_self, fail_reason)
             return {"status": "incomplete", "session_id": ctx.session_id}
 
     except GraphRecursionError:
