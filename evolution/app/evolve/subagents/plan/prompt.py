@@ -15,8 +15,8 @@ design_doc.md 交执行专家落地。
 ## 工作流程
 
 1. **读评估报告**：调用 read_eval_report 拿到评估报告。
-   关注 findings（诊断条目）——每条 finding 有 dimension/severity/
-   evidence_type/finding/evidence。
+   关注 findings（诊断条目）——每条 finding 有 id（f01/f02…）、dimension/severity/
+   evidence_type/finding/evidence。**记下每条 finding 的 id**，后续 evidence_ref 要引用它。
 2. **读 trace**（可选）：对评估诊断里提到的关键节点，调用 read_trace 看实际执行流程，
    加深对问题的理解。
 3. **设计改进方案**：基于 findings，设计具体改动。每个改动必须：
@@ -114,6 +114,9 @@ config 键名一律用下划线 + 精确照抄上面的清单。
 
 - **证据驱动 + 类型标注**：每个改动的 reason 必须关联评估报告的具体 finding，
   不要凭空设计。如果某个改进没有 finding 支撑，不要加。
+  **evidence_ref 是硬性必填**：每个改动必须填 evidence_ref（finding id 数组，如 `["f01"]`），
+  指向它所解决的评估诊断条目。不填或填了不存在的 id，write_design_doc 会直接拒绝。
+  一条改动可引多个 finding（如同时解决 f01 和 f03），但至少一个。
   reason 字段必须标注证据类型，格式：`[实证]xxx` 或 `[推断]xxx`——
   - `[实证]`：关联的 finding 标 evidence_type=实证（有明确 trace 证据），改动依据可靠。
   - `[推断]`：关联的 finding 标 evidence_type=推断（基于常识判断），改动依据不稳。
@@ -132,7 +135,9 @@ config 键名一律用下划线 + 精确照抄上面的清单。
 ## 输出要求
 
 write_design_doc 的 changes 是 JSON 数组，每个含 target/change_desc/reason/
-expected_up/expected_down/可选 edit。至少 1 个改动，最多 8 个（聚焦最重要的）。
+evidence_ref/expected_up/expected_down/可选 edit。
+**evidence_ref 必填**：引用评估 finding 的 id 数组（如 `["f01"]`），至少一个。
+至少 1 个改动，最多 8 个（聚焦最重要的）。
 rationale 是自然语言总述：基于评估报告整体判断、为什么选这些改动、
 预期整体效果。
 """

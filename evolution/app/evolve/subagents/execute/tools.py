@@ -176,7 +176,11 @@ def make_execute_tools() -> list:
         Args:
             applied_json: 已落地改动 JSON 数组。每条：
               {"target": "改动目标", "action": "apply_edits|write_file|edit_file",
-               "result": "ok|failed", "detail": "细节"}
+               "result": "ok|failed", "detail": "细节",
+               "design_ref": 1}
+              design_ref：对应 design_doc 改动清单的序号（1-based）。
+              一条 design 改动可能拆成多条 applied（如先 write_file 再 apply_edits），
+              它们共享同一个 design_ref。纯修补（不在 design_doc 里的）可不填。
             summary: 自然语言总述（落地了什么、是否通过校验）
         """
         ctx = get_tool_context()

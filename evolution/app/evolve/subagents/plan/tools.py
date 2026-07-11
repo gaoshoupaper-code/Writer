@@ -110,7 +110,8 @@ def make_plan_tools() -> list:
               {
                 "target": "目标（agent/section/key 或源码路径）",
                 "change_desc": "改什么（描述性）",
-                "reason": "依据评估证据（引用评估报告的 finding）",
+                "reason": "依据评估证据（自然语言）",
+                "evidence_ref": ["f01"],  # 必填：引用评估 finding 的 id（read_eval_report 可查）
                 "expected_up": "预期涨的方面",
                 "expected_down": "预期跌的方面（诚实声明）",
                 "edit": {  # 可选：直接给 apply_edits 的指令
@@ -119,6 +120,9 @@ def make_plan_tools() -> list:
                     "spec": {"class": "类名", "params": {...}}
                 }
               }
+              **evidence_ref 是硬性必填**：每个改动必须引用至少一个评估 finding 的 id，
+              证明"为什么改"。id 格式 f01/f02…，从 read_eval_report 的 findings 里取。
+              一个改动可引多个 finding（一条改动同时解决多个问题）。
             rationale: 自然语言总述（基于评估报告的整体判断，为什么这么改）
         """
         ctx = get_tool_context()
@@ -131,13 +135,35 @@ def make_plan_tools() -> list:
                 return "changes_json 必须是 JSON 数组"
             if not changes:
                 return "changes 不能为空（至少一个改动）"
-            # 基本校验：每个 change 必须有 target + change_desc + reason
+
+            # 提取评估报告里的合法 finding id 集合（evidence_ref 校验依据）
+            valid_finding_ids: set[str] = set()
+            snap = ctx.eval_snapshot or {}
+            for f in snap.get("findings") or []:
+                if isinstance(f, dict) and f.get("id"):
+                    valid_finding_ids.add(str(f["id"]))
+
+            # 校验：每个 change 必须有 target + change_desc + reason + evidence_ref
             for i, c in enumerate(changes):
                 if not isinstance(c, dict):
                     return f"changes[{i}] 必须是对象"
                 for field in ("target", "change_desc", "reason"):
                     if not c.get(field):
                         return f"changes[{i}] 缺少必填字段：{field}"
+                # evidence_ref 硬校验（R6：缺证据不让过）
+                refs = c.get("evidence_ref")
+                if not isinstance(refs, list) or not refs:
+                    return (
+                        f"changes[{i}] 缺少 evidence_ref：每个改动必须引用至少一个评估 "
+                        f"finding 的 id（如 [\"f01\"]）。请先 read_eval_report 拿到 finding id。"
+                    )
+                bad = [r for r in refs if str(r) not in valid_finding_ids]
+                if bad:
+                    return (
+                        f"changes[{i}] 的 evidence_ref {bad} 不存在于评估报告的 finding 列表中。"
+                        f"合法 id：{sorted(valid_finding_ids) or '（无）'}。"
+                        f"请用 read_eval_report 确认正确的 finding id。"
+                    )
 
             path = docs.write_design_doc(
                 ctx.session_id,

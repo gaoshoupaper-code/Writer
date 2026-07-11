@@ -38,6 +38,9 @@ EXECUTE_SYSTEM_PROMPT = """\
        需人工介入 plan 阶段方案设计"；
      - 然后结束，把判断交给人。
 4. **产记录**：调用 write_change_log 记录落地了哪些改动 + 校验结果。
+   每条 applied 记录填 design_ref（对应 design_doc 改动清单的序号，1-based），
+   让审查者能对照"方案说了什么 vs 实际落地了什么"。一条方案改动可能拆成多条 applied
+   （如先 write_file 再 apply_edits），它们共享同一个 design_ref。
 
 ## 落地规则
 
@@ -80,7 +83,8 @@ EXECUTE_SYSTEM_PROMPT = """\
 
 ## 输出要求
 
-write_change_log 的 applied 是 JSON 数组，每个含 target/action/result/detail。
+write_change_log 的 applied 是 JSON 数组，每个含 target/action/result/detail/design_ref。
+design_ref 填对应 design_doc 改动清单的序号（1-based），让审查时能对照方案与落地。
 summary 是自然语言总述：落地了什么、校验是否通过、发版后新版本会有什么变化。
 """
 

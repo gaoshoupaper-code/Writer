@@ -102,7 +102,8 @@ def write_design_doc(
         {
           "target": "文件/agent/section/key 或 源码路径",
           "change_desc": "改什么（描述性）",
-          "reason": "依据评估证据",
+          "reason": "依据评估证据（自然语言）",
+          "evidence_ref": ["f01", "f03"],  # 引用评估 finding 的 id（必填非空，支持多条）
           "expected_up": "预期涨的方面",
           "expected_down": "预期跌的方面（诚实声明）",
           "edit": {  # 可选：直接给 apply_edits 的指令（执行子代理消费）
@@ -126,6 +127,9 @@ def write_design_doc(
             lines.append(f"### {i}. {c.get('target', '?')}")
             lines.append(f"- **改什么**：{c.get('change_desc', '')}")
             lines.append(f"- **为什么**：{c.get('reason', '')}")
+            refs = c.get("evidence_ref")
+            if refs:
+                lines.append(f"- **证据**：{', '.join(refs) if isinstance(refs, list) else refs}")
             lines.append(f"- **预期↑**：{c.get('expected_up', '')}")
             lines.append(f"- **预期↓**：{c.get('expected_down', '')}")
             if c.get("edit"):
@@ -167,7 +171,7 @@ def parse_design_doc_intent(path: str) -> list[dict[str, Any]]:
         return []
 
     # 只保留意图相关字段（丢掉 edit 指令，太长且属于执行细节）
-    keep_fields = ("target", "change_desc", "reason", "expected_up", "expected_down")
+    keep_fields = ("target", "change_desc", "reason", "evidence_ref", "expected_up", "expected_down")
     return [
         {k: c.get(k, "") for k in keep_fields}
         for c in changes
@@ -192,7 +196,8 @@ def write_change_log(
           "target": "改动目标",
           "action": "edit_file|write_file|apply_edits",
           "result": "ok|failed",
-          "detail": "落地细节/错误"
+          "detail": "落地细节/错误",
+          "design_ref": 1  # 对应 design_doc.changes 的序号（1-based，关联方案条目）
         }
     validation schema：
         {"passed": bool, "config_valid": bool, "import_ok": bool, "errors": [str]}
@@ -212,7 +217,9 @@ def write_change_log(
         lines.append("")
         for i, a in enumerate(applied, 1):
             mark = "✅" if a.get("result") == "ok" else "❌"
-            lines.append(f"{i}. {mark} [{a.get('action', '?')}] {a.get('target', '?')}")
+            ref = a.get("design_ref")
+            ref_tag = f" [方案#{ref}]" if ref else ""
+            lines.append(f"{i}. {mark}{ref_tag} [{a.get('action', '?')}] {a.get('target', '?')}")
             if a.get("detail"):
                 lines.append(f"   - {a['detail']}")
             lines.append("")
