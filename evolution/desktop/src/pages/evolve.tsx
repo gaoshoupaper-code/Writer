@@ -5,8 +5,6 @@ import { evoSseStream } from "@/lib/stream";
 import {
   getEvolveSessions,
   startEvolve,
-  publishEvolve,
-  discardEvolve,
   getEvaluatedTraces,
   type EvolveSession,
   type EvalSession,
@@ -99,27 +97,6 @@ export default function EvolvePage() {
         toast.error(err instanceof Error ? err.message : "实时流中断");
         setStreaming(false);
       }
-    }
-  }
-
-  async function handlePublish(sessionId: string) {
-    try {
-      const resp = await publishEvolve(sessionId);
-      toast.success(`已发布为 v${resp.snapshot_version}`);
-      refresh();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "发布失败");
-    }
-  }
-
-  async function handleDiscard(sessionId: string) {
-    if (!confirm("确认丢弃本次进化结果？将回退到上个生产版本。")) return;
-    try {
-      await discardEvolve(sessionId);
-      toast.success("已丢弃");
-      refresh();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "丢弃失败");
     }
   }
 
@@ -229,21 +206,19 @@ export default function EvolvePage() {
                       查看候选 trace →
                     </button>
                   )}
-                  {selectedSession.status === "pending_review" && (
+                  {/* 审查入口（按状态区分） */}
+                  {(selectedSession.status === "pending_review" ||
+                    selectedSession.status === "published" ||
+                    selectedSession.status === "discarded" ||
+                    selectedSession.status === "failed") && (
                     <div className="review-actions">
-                      <button className="config-button primary" onClick={() => handlePublish(selectedSession.session_id)}>
-                        ✓ 发布
-                      </button>
-                      <button className="config-button secondary" onClick={() => handleDiscard(selectedSession.session_id)}>
-                        ✗ 丢弃
+                      <button
+                        className="config-button primary"
+                        onClick={() => navigate(`/evolve/${selectedSession.session_id}/review`)}
+                      >
+                        {selectedSession.status === "pending_review" ? "🔍 审查报告" : "查看报告"}
                       </button>
                     </div>
-                  )}
-                  {selectedSession.report && (
-                    <details className="report-details">
-                      <summary>进化报告</summary>
-                      <pre className="report-pre">{JSON.stringify(selectedSession.report, null, 2)}</pre>
-                    </details>
                   )}
                 </div>
               )}

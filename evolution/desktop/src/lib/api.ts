@@ -464,6 +464,65 @@ export interface EvolveSession {
   updated_at: string | null;
   eval_ref: string | null;
   report?: any;
+  // 审查视图内联字段（get_session 详情接口返回，列表接口不含）
+  design_doc?: DesignDoc | null;
+  change_log?: ChangeLog | null;
+  eval_snapshot?: EvalSnapshot | null;
+}
+
+// ── 审查视图数据类型（D1：get_session 内联）──────────────────────
+
+export interface DesignChange {
+  target: string;
+  change_desc: string;
+  reason: string;
+  evidence_ref?: string[]; // 引用 EvalFinding.id（f01/f02…）
+  expected_up?: string;
+  expected_down?: string;
+  edit?: any;
+}
+
+export interface DesignDoc {
+  meta: {
+    designed_at: string;
+    changes_count: number;
+    changes: DesignChange[];
+  };
+  body: string;
+}
+
+export interface AppliedChange {
+  target: string;
+  action: string;
+  result: "ok" | "failed";
+  detail: string;
+  design_ref?: number; // 对应 DesignChange 的序号（1-based）
+}
+
+export interface ChangeLog {
+  meta: {
+    executed_at: string;
+    applied_count: number;
+    applied: AppliedChange[];
+    validation: { passed: boolean; config_valid?: boolean; import_ok?: boolean; errors?: string[] };
+  };
+  body: string;
+}
+
+export interface EvalFinding {
+  id?: string;
+  dimension: string;
+  severity: string;
+  evidence_type: string;
+  finding: string;
+  evidence: string;
+}
+
+export interface EvalSnapshot {
+  eval_id?: string;
+  trace_id?: string;
+  findings: EvalFinding[] | null;
+  scores: Record<string, any> | null;
 }
 
 export async function startEvolve(traceId: string): Promise<{ session_id: string; trace_id: string; eval_id: string; status: string }> {
