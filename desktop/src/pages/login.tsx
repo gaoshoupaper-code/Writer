@@ -3,13 +3,29 @@ import { FormEvent, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Link } from "react-router-dom";
 import { toast } from "sonner";
-import { login } from "@/lib/api";
+import { login, fetchMeOrNull } from "@/lib/api";
 
 export default function LoginPage() {
   const navigate = useNavigate();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [checking, setChecking] = useState(true);
+
+  // 已登录则跳首页。加 checking 锁防止 Home↔Login 反弹闪烁：
+  // 探测完成前不渲染任何内容，避免与 Home 守卫的探测互相反弹。
+  useEffect(() => {
+    let cancelled = false;
+    fetchMeOrNull().then((me) => {
+      if (cancelled) return;
+      if (me) {
+        navigate("/", { replace: true });
+      } else {
+        setChecking(false);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [navigate]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -23,6 +39,10 @@ export default function LoginPage() {
     } finally {
       setSubmitting(false);
     }
+  }
+
+  if (checking) {
+    return <main className="auth-page"><div className="shell-loading">加载中…</div></main>;
   }
 
   return (

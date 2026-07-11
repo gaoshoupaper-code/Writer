@@ -4,6 +4,7 @@
 //! - reqwest Client 长生命周期，持 cookie jar（登录态跨请求复用）。
 //! - server_url 从 Store 读，变更时重建 Client + 清 cookie（S6 补充约束）。
 //! - Client 用 Mutex 保护（重建时写替换，请求时读）。
+//! - cookie jar 可序列化，持久化到 Tauri Store——重启免重登。
 
 use std::sync::Arc;
 use tauri::AppHandle;
@@ -16,26 +17,33 @@ pub const DEFAULT_SERVER_URL: &str = "https://siyen.site";
 
 const STORE_FILE: &str = "settings.json";
 const KEY_SERVER_URL: &str = "server_url";
+const KEY_COOKIE_JAR: &str = "cookie_jar";
 
 /// App 级共享状态。Tauri manage() 注册，所有 command 通过 State 访问。
 pub struct AppState {
-    /// reqwest Client（持 cookie jar）。
+    /// reqwest Client（通过 cookie_provider 共享下面的 jar）。
     /// Arc<RwLock> 让请求并发读、重建时独占写。
     /// Option 允许"未初始化"状态（首次 server_url 读取失败时）。
     client: RwLock<Option<reqwest::Client>>,
     /// 当前 server_url（去尾斜杠）。重建 Client 时用。
     server_url: RwLock<String>,
+    /// 可序列化的 cookie jar（重启后从 Store 恢复，免重登）。
+    /// 用 std::sync::RwLock（非 tokio），因为 reqwest 的 CookieStore trait 方法是同步的。
+    cookie_jar: Arc<std::sync::RwLock<cookie_store::CookieStore>>,
 }
 
 impl AppState {
-    /// 首次初始化：从 Store 读 server_url，建 Client。
-    /// 失败回退 DEFAULT_SERVER_URL。
+    /// 首次初始化：从 Store 读 server_url + cookie jar，建 Client。
+    /// 失败回退 DEFAULT_SERVER_URL / 空 jar。
     pub async fn init(app: &AppHandle) -> Self {
         let server_url = load_server_url(app).await;
-        let client = build_client();
+        let cookie_jar = load_cookie_jar(app).await;
+        let jar_arc = Arc::new(std::sync::RwLock::new(cookie_jar));
+        let client = build_client(jar_arc.clone());
         Self {
             client: RwLock::new(Some(client)),
             server_url: RwLock::new(server_url),
+            cookie_jar: jar_arc,
         }
     }
 
@@ -55,9 +63,13 @@ impl AppState {
     /// 不清会导致带着 A 站 session 请求 B 站的诡异 bug。
     pub async fn set_server_url(&self, new_url: String) {
         let normalized = normalize_url(&new_url);
-        // 先重建 Client（新 Client = 新 cookie jar = 旧 cookie 清空）
-        let new_client = build_client();
-        // 写锁：同时更新 client 和 server_url
+        // 清空 cookie jar（新服务器旧 cookie 无效）
+        {
+            let mut jar = self.cookie_jar.write().unwrap();
+            jar.clear();
+        }
+        // 重建 Client（复用同一个 jar 实例，只是清空了内容）
+        let new_client = build_client(self.cookie_jar.clone());
         {
             let mut client_guard = self.client.write().await;
             *client_guard = Some(new_client);
@@ -67,13 +79,71 @@ impl AppState {
             *url_guard = normalized;
         }
     }
+
+    /// 持久化当前 cookie jar 到 Store（http_request 响应后调用）。
+    /// 登录响应含 Set-Cookie 时 jar 已被 reqwest 自动更新，这里序列化落盘。
+    pub async fn save_cookie_jar(&self, app: &AppHandle) -> Result<(), String> {
+        let json = {
+            let jar = self.cookie_jar.read().unwrap();
+            serde_json::to_string(&*jar)
+                .map_err(|e| format!("序列化 cookie jar 失败: {e}"))?
+        };
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = app.store(STORE_FILE)
+                .map_err(|e| format!("打开 store 失败: {e}"))?;
+            store.set(KEY_COOKIE_JAR, serde_json::json!(json));
+            store.save().map_err(|e| format!("保存 store 失败: {e}"))?;
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| format!("store 任务失败: {e}"))??;
+        Ok(())
+    }
 }
 
-/// 构建带 cookie jar 的 reqwest Client。
-/// cookie_store 特性开启后，Client 自动维护 jar，登录后后续请求自动带 session cookie。
-fn build_client() -> reqwest::Client {
+/// reqwest CookieStore trait 的适配器。
+/// cookie_store::CookieStore（可序列化）不直接实现 reqwest::cookie::CookieStore，
+/// 需要一个 wrapper 来桥接：把 reqwest 的同步 set_cookies/cookies 调用代理到内部 jar。
+struct ReqwestCookieJar(Arc<std::sync::RwLock<cookie_store::CookieStore>>);
+
+impl reqwest::cookie::CookieStore for ReqwestCookieJar {
+    fn set_cookies(
+        &self,
+        cookie_headers: &mut dyn Iterator<Item = &reqwest::header::HeaderValue>,
+        url: &url::Url,
+    ) {
+        let mut store = self.0.write().unwrap();
+        // 把 Set-Cookie header 值解析成 cookie::Cookie，再存入 jar
+        let cookies = cookie_headers.filter_map(|hv| {
+            let s = hv.to_str().ok()?;
+            cookie::Cookie::parse(s.to_owned()).ok()
+        });
+        store.store_response_cookies(cookies, url);
+    }
+
+    fn cookies(&self, url: &url::Url) -> Option<reqwest::header::HeaderValue> {
+        let store = self.0.read().unwrap();
+        // get_request_values 返回 (&str, &str) 键值对，拼成 "k1=v1; k2=v2" 格式
+        let pairs: Vec<(&str, &str)> = store.get_request_values(url).collect();
+        if pairs.is_empty() {
+            return None;
+        }
+        let header = pairs
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        reqwest::header::HeaderValue::from_str(&header).ok()
+    }
+}
+
+/// 构建带共享 cookie jar 的 reqwest Client。
+/// 用 cookie_provider 注入可序列化的外部 jar（而非 cookie_store(true) 黑盒 jar），
+/// 这样 jar 可以持久化到 Tauri Store，重启后恢复 session。
+fn build_client(jar: Arc<std::sync::RwLock<cookie_store::CookieStore>>) -> reqwest::Client {
     reqwest::Client::builder()
-        .cookie_store(true)
+        .cookie_provider(Arc::new(ReqwestCookieJar(jar)))
         // 跟随重定向（登录后可能 302）
         .redirect(reqwest::redirect::Policy::limited(5))
         // 连接建立超时：网络不通/服务器宕机时快速失败（10s），
@@ -105,6 +175,30 @@ async fn load_server_url(app: &AppHandle) -> String {
     })
     .await
     .unwrap_or_else(|_| DEFAULT_SERVER_URL.to_string())
+}
+
+/// 从 Store 反序列化 cookie jar。失败/不存在 → 空 jar（首次启动或持久化损坏）。
+async fn load_cookie_jar(app: &AppHandle) -> cookie_store::CookieStore {
+    let app = app.clone();
+    tokio::task::spawn_blocking(move || {
+        let store = match app.store(STORE_FILE) {
+            Ok(s) => s,
+            Err(_) => return cookie_store::CookieStore::default(),
+        };
+        match store.get(KEY_COOKIE_JAR) {
+            Some(v) => {
+                let json_str = match v.as_str() {
+                    Some(s) => s,
+                    None => return cookie_store::CookieStore::default(),
+                };
+                serde_json::from_str::<cookie_store::CookieStore>(json_str)
+                    .unwrap_or_else(|_| cookie_store::CookieStore::default())
+            }
+            None => cookie_store::CookieStore::default(),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| cookie_store::CookieStore::default())
 }
 
 /// 写 server_url 到 Store（持久化）。

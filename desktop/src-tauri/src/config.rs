@@ -23,11 +23,12 @@ pub async fn set_server_url(
     state: State<'_, SharedState>,
     url: String,
 ) -> Result<String, String> {
-    // 先持久化（失败就报错，不重建 Client）
+    // 先持久化 server_url（失败就报错，不重建 Client）
     save_server_url(&app, &url).await?;
-    // 持久化成功 → 重建 Client + 清 cookie
+    // 持久化成功 → 重建 Client + 清 cookie jar
     state.set_server_url(url).await;
-    // 返回规范化后的 URL（set_server_url 内部已规范化，重新读出来）
+    // 同步清空 Store 中的持久化 cookie（旧服务器 cookie 已无效）
+    state.save_cookie_jar(&app).await?;
     Ok(state.server_url().await)
 }
 
@@ -39,5 +40,6 @@ pub async fn reset_server_url(
 ) -> Result<String, String> {
     save_server_url(&app, DEFAULT_SERVER_URL).await?;
     state.set_server_url(DEFAULT_SERVER_URL.to_string()).await;
+    state.save_cookie_jar(&app).await?;
     Ok(state.server_url().await)
 }
