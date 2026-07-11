@@ -29,6 +29,10 @@ pub struct AppState {
     /// Arc<RwLock> 让请求并发读、重建时独占写。
     /// Option 允许"未初始化"状态（首次 server_url 读取失败时）。
     client: RwLock<Option<reqwest::Client>>,
+    /// SSE 流式专用 Client（无总超时，只留 connect_timeout）。
+    /// 评估/进化 Agent 可能跑很久（无总超时护栏），普通 client 的 .timeout(300s)
+    /// 会把流式响应在 5 分钟硬掐——stream_request 改用这个 client 规避。
+    stream_client: RwLock<Option<reqwest::Client>>,
     /// 当前 server_url（去尾斜杠）。重建 Client 时用。
     server_url: RwLock<String>,
     /// 可序列化的 cookie jar（重启后从 Store 恢复，免重登）。
@@ -44,8 +48,10 @@ impl AppState {
         let cookie_jar = load_cookie_jar(app).await;
         let jar_arc = Arc::new(std::sync::RwLock::new(cookie_jar));
         let client = build_client(jar_arc.clone());
+        let stream_client = build_stream_client(jar_arc.clone());
         Self {
             client: RwLock::new(Some(client)),
+            stream_client: RwLock::new(Some(stream_client)),
             server_url: RwLock::new(server_url),
             cookie_jar: jar_arc,
         }
@@ -60,6 +66,11 @@ impl AppState {
     /// 返回 None 表示 Client 重建中或未初始化。
     pub async fn client(&self) -> Option<reqwest::Client> {
         self.client.read().await.clone()
+    }
+
+    /// 取 SSE 流式专用 Client（无总超时）。
+    pub async fn stream_client(&self) -> Option<reqwest::Client> {
+        self.stream_client.read().await.clone()
     }
 
     /// 切换 server_url（S6 补充约束）。
@@ -77,6 +88,12 @@ impl AppState {
         {
             let mut client_guard = self.client.write().await;
             *client_guard = Some(new_client);
+        }
+        // 同步重建 stream_client（同样复用 jar，同样不带总超时）
+        let new_stream_client = build_stream_client(self.cookie_jar.clone());
+        {
+            let mut sc_guard = self.stream_client.write().await;
+            *sc_guard = Some(new_stream_client);
         }
         {
             let mut url_guard = self.server_url.write().await;
@@ -142,7 +159,7 @@ impl reqwest::cookie::CookieStore for ReqwestCookieJar {
     }
 }
 
-/// 构建带共享 cookie jar 的 reqwest Client。
+/// 构建带共享 cookie jar 的 reqwest Client（普通请求用）。
 /// 用 cookie_provider 注入可序列化的外部 jar（而非 cookie_store(true) 黑盒 jar），
 /// 这样 jar 可以持久化到 Tauri Store，重启后恢复 session。
 fn build_client(jar: Arc<std::sync::RwLock<cookie_store::CookieStore>>) -> reqwest::Client {
@@ -153,11 +170,26 @@ fn build_client(jar: Arc<std::sync::RwLock<cookie_store::CookieStore>>) -> reqwe
         // 连接建立超时：网络不通/服务器宕机时快速失败（10s），
         // 避免 fetchMeOrNull 等探测请求卡住前端登录守卫。
         .connect_timeout(std::time::Duration::from_secs(10))
-        // 总超时：覆盖普通请求（SSE 流式请求在 stream_request 里单独处理，
-        // 但共用 Client 无法完全区分——300s 足够覆盖大部分长生成场景）。
+        // 总超时：仅覆盖普通（非流式）请求。SSE 流式请求改用 build_stream_client
+        //（无总超时），避免评估/进化 Agent 这种长流程在 5 分钟被硬掐。
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .expect("failed to build reqwest client")
+}
+
+/// 构建不带总超时的 reqwest Client（SSE 流式请求专用）。
+///
+/// 评估/进化 Agent 后端已不设总超时护栏（时长不设上限），但若共用 build_client 的
+/// .timeout(300s)，reqwest 仍会在 5 分钟硬掐流式响应。这里只保留 connect_timeout
+///（连接建立阶段的快速失败），请求开始后不设总时长，由后端 SSE 心跳维持连接。
+fn build_stream_client(jar: Arc<std::sync::RwLock<cookie_store::CookieStore>>) -> reqwest::Client {
+    reqwest::Client::builder()
+        .cookie_provider(Arc::new(ReqwestCookieJar(jar)))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        // 故意不设 .timeout()——流式请求靠后端 heartbeat 保活，不设总时长上限。
+        .build()
+        .expect("failed to build stream reqwest client")
 }
 
 /// 从 Store 读 server_url。

@@ -164,8 +164,10 @@ pub async fn stream_request(
     state: State<'_, SharedState>,
     request: StreamRequest,
 ) -> Result<(), String> {
+    // 用无总超时的 stream_client（评估/进化 Agent 可能跑很久，普通 client 的
+    // .timeout(300s) 会把流式响应在 5 分钟硬掐）。
     let client = state
-        .client()
+        .stream_client()
         .await
         .ok_or_else(|| "HTTP client 未初始化".to_string())?;
     let server_url = state.server_url().await;

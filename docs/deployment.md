@@ -446,7 +446,7 @@ docker compose exec evolution bash
 确认 `certs/fullchain.pem` 和 `certs/privkey.pem` 软链接有效，且 Let's Encrypt 目录权限允许容器读。
 
 ### SSE 流式中断（前端 45s 看门狗误判）
-确认 nginx 的 `/api/` location 有 `proxy_buffering off;`（已配置）。若仍断，检查 `proxy_read_timeout` 是否够长（已设 300s）。
+确认 nginx 的 `/api/`、`/evolution-api/` location 都有 `proxy_buffering off;`（已配置）。若仍断，检查 `proxy_read_timeout` 是否够长——`/api/` 设 300s（写作端长生成上限），`/evolution-api/` 设 24h（评估/进化 Agent 后端不设总超时，时长不设上限，靠 SSE 心跳保活）。
 
 ### executor 连不上 evolution
 两者通过 docker 内网服务名通信。`docker compose exec executor curl http://evolution:7789/health` 应返回 ok。若失败，检查是否在同一 network（compose 默认创建）。
