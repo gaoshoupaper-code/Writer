@@ -33,10 +33,10 @@ export default function EvaluationPage() {
     try {
       const [es, tr] = await Promise.all([
         getEvalSessions(30).catch(() => ({ sessions: [], total: 0 })),
-        getTraces({ limit: 50 }).catch(() => []),
+        getTraces({ limit: 50 }).catch(() => ({ items: [], total: 0, limit: 50, offset: 0 })),
       ]);
       setEvals(es.sessions);
-      setTraces(tr);
+      setTraces(tr.items);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "读取数据失败");
     }

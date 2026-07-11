@@ -177,7 +177,7 @@ export default function TraceDetailPage() {
     return (
       <div className="trace-detail-page">
         <header className="trace-detail-header">
-          <button className="back-button" onClick={() => navigate("/")}>← 返回</button>
+          <button className="back-button" onClick={() => navigate(-1)}>← 返回</button>
         </header>
         <div className="trace-detail-error">{error}</div>
       </div>
@@ -188,7 +188,7 @@ export default function TraceDetailPage() {
     return (
       <div className="trace-detail-page">
         <header className="trace-detail-header">
-          <button className="back-button" onClick={() => navigate("/")}>← 返回</button>
+          <button className="back-button" onClick={() => navigate(-1)}>← 返回</button>
         </header>
         <div className="trace-detail-empty">trace 不存在</div>
       </div>
@@ -202,7 +202,7 @@ export default function TraceDetailPage() {
       {/* 顶部 */}
       <header className="trace-detail-header">
         <div className="trace-detail-title-row">
-          <button className="back-button" onClick={() => navigate("/")}>← 返回</button>
+          <button className="back-button" onClick={() => navigate(-1)}>← 返回</button>
           <h1>Trace {traceId?.slice(0, 12)}…</h1>
           <StatusBadge status={run.status} />
           {isLive && (

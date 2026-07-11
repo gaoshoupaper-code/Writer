@@ -11,6 +11,7 @@ import Harness from "@/pages/harness";
 import Dataset from "@/pages/dataset";
 import Tests from "@/pages/tests";
 import TraceDetail from "@/pages/trace-detail";
+import History from "@/pages/history";
 import AdminUsers from "@/pages/admin/users";
 import AdminInviteCodes from "@/pages/admin/invite-codes";
 import AdminCredits from "@/pages/admin/credits";
@@ -46,6 +47,7 @@ function App() {
           <Route path="/harness" element={<Harness />} />
           <Route path="/dataset" element={<Dataset />} />
           <Route path="/tests" element={<Tests />} />
+          <Route path="/history" element={<History />} />
           <Route path="/config" element={<Config />} />
           <Route path="/admin/users" element={<AdminUsers />} />
           <Route path="/admin/invite-codes" element={<AdminInviteCodes />} />

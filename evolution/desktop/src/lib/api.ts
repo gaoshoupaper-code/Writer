@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   TraceDetailLite,
   TraceListItem,
+  TraceListResponse,
+  UserCacheItem,
   ActiveRun,
   StatsOverview,
   SkillStat,
@@ -15,6 +17,8 @@ import type {
 export type {
   TraceDetailLite,
   TraceListItem,
+  TraceListResponse,
+  UserCacheItem,
   ActiveRun,
   StatsOverview,
   SkillStat,
@@ -350,16 +354,27 @@ export async function getActiveRuns(): Promise<ActiveRun[]> {
 export async function getTraces(params?: {
   status?: string;
   run_purpose?: string;
+  owner?: string;
+  since?: string;
+  until?: string;
   limit?: number;
   offset?: number;
-}): Promise<TraceListItem[]> {
+}): Promise<TraceListResponse> {
   const qs = new URLSearchParams();
   if (params?.status) qs.set("status", params.status);
   if (params?.run_purpose) qs.set("run_purpose", params.run_purpose);
+  if (params?.owner) qs.set("owner", params.owner);
+  if (params?.since) qs.set("since", params.since);
+  if (params?.until) qs.set("until", params.until);
   if (params?.limit) qs.set("limit", String(params.limit));
   if (params?.offset) qs.set("offset", String(params.offset));
   const q = qs.toString();
-  return evoJson<TraceListItem[]>(`/api/traces${q ? "?" + q : ""}`, { method: "GET" });
+  return evoJson<TraceListResponse>(`/api/traces${q ? "?" + q : ""}`, { method: "GET" });
+}
+
+/** 用户缓存列表（trace 历史页用户筛选下拉用） */
+export async function getUserCache(): Promise<UserCacheItem[]> {
+  return evoJson<UserCacheItem[]>("/api/users/cache", { method: "GET" });
 }
 
 export async function getTraceDetail(traceId: string): Promise<TraceDetailLite> {

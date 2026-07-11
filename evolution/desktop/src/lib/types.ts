@@ -183,7 +183,22 @@ export type TraceListItem = {
   error: string | null;
   flag_count: number;
   owner_user_id: string;
+  owner_username: string | null;
   run_purpose: string;
+};
+
+/** trace 列表分页响应（含 total 供分页器计算页码） */
+export type TraceListResponse = {
+  items: TraceListItem[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+/** 用户缓存项（GET /api/users/cache 返回，用户筛选下拉用） */
+export type UserCacheItem = {
+  user_id: string;
+  username: string;
 };
 
 /** 活跃 trace（evolution /api/active-runs 富化返回，D7） */

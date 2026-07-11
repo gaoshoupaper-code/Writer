@@ -8189,3 +8189,137 @@ html[data-theme="dark"] {
   border-radius: 4px;
   background: rgba(0, 0, 0, 0.04);
 }
+
+/* ── history 页 ── */
+.history-page {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.history-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 16px 0;
+  flex-wrap: wrap;
+}
+
+.history-filter-group {
+  display: flex;
+  gap: 4px;
+}
+
+.history-range-btn {
+  padding: 4px 12px;
+  font-size: 13px;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+  color: var(--muted, #888);
+  transition: all 0.15s;
+}
+
+.history-range-btn:hover {
+  border-color: var(--accent, #6366f1);
+  color: var(--accent, #6366f1);
+}
+
+.history-range-btn.active {
+  background: var(--accent, #6366f1);
+  border-color: var(--accent, #6366f1);
+  color: #fff;
+}
+
+.history-user-select {
+  padding: 4px 8px;
+  font-size: 13px;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text, #333);
+  cursor: pointer;
+  min-width: 120px;
+}
+
+.history-refresh {
+  margin-left: auto;
+  padding: 4px 12px;
+  font-size: 13px;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+  color: var(--muted, #888);
+}
+
+.history-refresh:hover {
+  border-color: var(--accent, #6366f1);
+  color: var(--accent, #6366f1);
+}
+
+.history-table {
+  cursor: default;
+}
+
+.history-table .history-row {
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.history-table .history-row:hover {
+  background: rgba(99, 102, 241, 0.05);
+}
+
+.history-ident {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.history-user {
+  font-size: 13px;
+  color: var(--muted, #888);
+}
+
+.history-time {
+  font-size: 12px;
+  color: var(--muted, #888);
+  white-space: nowrap;
+}
+
+.history-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  margin-top: 20px;
+}
+
+.history-pager button {
+  padding: 6px 16px;
+  font-size: 13px;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text, #333);
+}
+
+.history-pager button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.history-pager button:not(:disabled):hover {
+  border-color: var(--accent, #6366f1);
+  color: var(--accent, #6366f1);
+}
+
+.history-pager-info {
+  font-size: 13px;
+  color: var(--muted, #888);
+}
