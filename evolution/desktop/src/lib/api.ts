@@ -663,6 +663,80 @@ export async function getElements(version: number): Promise<ElementsView> {
   return evoJson<ElementsView>(`/api/snapshots/${version}/elements`, { method: "GET" });
 }
 
+// ── 版本详情（含升级 diff + 改动意图，来自 GET /api/versions/{version}） ──
+
+/** 行级 diff 的一个 hunk：equal/insert/delete 三种，无 replace（后端已拆为 del+ins） */
+export interface Hunk {
+  type: "equal" | "insert" | "delete";
+  lines: string[];
+}
+
+/** prompt diff：hunks 序列 + 增删行数摘要 */
+export interface PromptDiff {
+  hunks: Hunk[];
+  summary: { added: number; removed: number };
+}
+
+/** skills diff：路径集合差 */
+export interface SkillsDiff {
+  added: string[];
+  removed: string[];
+  unchanged_count: number;
+}
+
+/** middleware（processor）的单条变更 */
+export interface ProcessorChange {
+  key: { hook: string; group: string };
+  change_type: "added" | "removed" | "modified";
+  class_change: { old: string | null; new: string | null };
+  params_change: { old: Record<string, any> | null; new: Record<string, any> | null };
+}
+
+/** 单个 agent 的三要素 diff。whole_agent 仅整 agent 增删时存在，常规修改缺失 */
+export interface AgentDiff {
+  prompt?: PromptDiff | null;
+  skills?: SkillsDiff | null;
+  processors?: ProcessorChange[];
+  whole_agent?: "added" | "removed";
+}
+
+/** design_doc 改动意图的单条。五字段恒 string，缺失填 "" */
+export interface IntentItem {
+  target: string;
+  change_desc: string;
+  reason: string;
+  expected_up: string;
+  expected_down: string;
+}
+
+/** version_changes 表的投影：按 agent 聚合的客观 diff + 版本级主观意图 */
+export interface VersionChanges {
+  agents: { agent: string; diff: AgentDiff }[];
+  intent: IntentItem[] | null;
+}
+
+/** GET /api/versions/{version} 响应（仅 harness 页需要的字段） */
+export interface VersionDetail {
+  version: number;
+  parent_version: number | null;
+  is_bootstrap: boolean;
+  change_summary: string | null;
+  changes: VersionChanges;
+}
+
+export async function getVersionDetail(version: number): Promise<VersionDetail> {
+  return evoJson<VersionDetail>(`/api/versions/${version}`, { method: "GET" });
+}
+
+/** 懒加载某版本 harness 包内文件源码（middleware .py / skill SKILL.md） */
+export async function fetchSource(
+  version: number,
+  path: string,
+): Promise<{ path: string; content: string }> {
+  const qs = new URLSearchParams({ path });
+  return evoJson(`/api/snapshots/${version}/source?${qs.toString()}`, { method: "GET" });
+}
+
 // ════════════════════════════════════════════════════════════
 //  数据集（dataset）— golden/growing 评估集
 // ════════════════════════════════════════════════════════════
