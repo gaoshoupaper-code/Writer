@@ -41,6 +41,26 @@ def active_runs() -> list[dict[str, Any]]:
     return get_trace_recorder().list_active_runs()
 
 
+@router.get("/users")
+def list_users_brief() -> list[dict[str, Any]]:
+    """用户列表最小集（evolution 用户名映射同步用）。
+
+    evolution 定时拉取此端点，把 user_id→username 映射同步到本地 user_cache 表，
+    供 trace 历史列表展示用户名。只返回最小集，不含密码/key 等敏感字段。
+    """
+    from app.platform.core.db import UserRepository, get_database
+
+    users = UserRepository(get_database())
+    return [
+        {
+            "user_id": r["user_id"],
+            "username": r["username"],
+            "disabled": bool(r["disabled"]),
+        }
+        for r in users.list_all()
+    ]
+
+
 # ── Phase 3 T3.1：A/B 回放端点 ──────────────────────────────
 
 

@@ -387,6 +387,16 @@ def init_db() -> None:
                 updated_at   TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_llm_configs_active ON llm_configs(is_active);
+
+            -- user_cache：executor 用户列表的本地缓存（trace 历史观测功能）。
+            -- evolution 不维护用户主数据，定时从 executor /internal/users 拉取，
+            -- 供 trace 历史列表把 owner_user_id 映射成可读 username。
+            CREATE TABLE IF NOT EXISTS user_cache (
+                user_id     TEXT PRIMARY KEY,                 -- executor users.user_id
+                username    TEXT NOT NULL,                    -- 可读用户名
+                disabled    INTEGER NOT NULL DEFAULT 0,       -- 1=executor 侧已禁用
+                synced_at   TEXT NOT NULL                     -- 最近同步时间（ISO8601）
+            );
             """
         )
         conn.commit()
@@ -418,6 +428,7 @@ def init_db() -> None:
         _seed_agent_prompt_map(conn)
         # 多配置管理：llm_config（单数，单行）→ llm_configs（复数，多行 + is_active）
         _migrate_llm_configs_multi(conn)
+        # user_cache 表由 executescript CREATE IF NOT EXISTS 直接建（新表无需 ALTER 迁移）
 
 
 def _migrate_evolve_sessions_driver_fields(conn: sqlite3.Connection) -> None:

@@ -43,6 +43,7 @@ from app.eval_agent.api import router as eval_agent_router
 from app.view.versions_api import router as versions_router
 from app.dataset.api import router as dataset_router
 from app.ingestion.scan import start_scan_scheduler
+from app.ingestion.user_sync import start_user_sync_scheduler
 from app.view.active import start_active_poller
 from app.promote.api import router as promote_router
 from app.promote.scheduler import start_judge_scheduler
@@ -58,6 +59,8 @@ async def lifespan(app: FastAPI):
     start_active_poller()
     # 数据闭环：启动 promote judge 调度器（后台定时扫描生产 trace → judge）
     start_judge_scheduler()
+    # 用户映射同步：定时从 executor 拉取用户列表 → user_cache 表（trace 历史列表展示用户名）
+    start_user_sync_scheduler()
 
     # D5/D8：创建 recorder 单例 + 崩溃恢复 + 启动 drain。
     # 顺序保证：init_db 先于 recorder（recorder 写 DB 依赖表已建）。
