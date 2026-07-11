@@ -75,6 +75,23 @@ async def eval_start(
             detail=f"trace {req.trace_id} 不存在",
         )
 
+    # 防自观测：评估 Agent 只评估创作 Agent 的 trace，不能评估进化端自观测 trace
+    # （evolution_eval = 评估 Agent 自身录像，evolution_evolve = 进化 Agent 录像）。
+    # 否则会形成"评估自己"的死循环或跨 Agent 误评。
+    run_row = db.query_one(
+        "SELECT run_purpose FROM runs WHERE trace_id = ?", (req.trace_id,)
+    )
+    run_purpose = (run_row or {}).get("run_purpose") or "user_generation"
+    if run_purpose in ("evolution_eval", "evolution_evolve"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"trace {req.trace_id} 是进化端自观测 trace"
+                f"（run_purpose={run_purpose}），不能评估。"
+                "只能评估创作 Agent 的 trace。"
+            ),
+        )
+
     eval_id = uuid.uuid4().hex[:12]
 
     # 从 manual_tests 反查该 trace 对应的 Agent 版本（T7）

@@ -61,9 +61,14 @@ export function EvaluationList() {
     setTraceLoading(true);
     try {
       const data = await fetchTraces({ limit: 100 });
-      setTraces(data);
-      if (data.length > 0 && !selectedTraceId) {
-        setSelectedTraceId(data[0].trace_id);
+      // 排除进化端自观测 trace——评估 Agent 只评估创作 Agent 的 trace，
+      // 不能评估自己（evolution_eval）或进化 Agent（evolution_evolve）的录像。
+      const filtered = data.filter(
+        (t) => t.run_purpose !== "evolution_eval" && t.run_purpose !== "evolution_evolve",
+      );
+      setTraces(filtered);
+      if (filtered.length > 0 && !selectedTraceId) {
+        setSelectedTraceId(filtered[0].trace_id);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "加载 trace 失败");

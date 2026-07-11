@@ -36,7 +36,13 @@ export default function EvaluationPage() {
         getTraces({ limit: 50 }).catch(() => ({ items: [], total: 0, limit: 50, offset: 0 })),
       ]);
       setEvals(es.sessions);
-      setTraces(tr.items);
+      // 排除进化端自观测 trace——评估 Agent 只评估创作 Agent 的 trace，
+      // 不能评估自己（evolution_eval）或进化 Agent（evolution_evolve）的录像。
+      setTraces(
+        tr.items.filter(
+          (t) => t.run_purpose !== "evolution_eval" && t.run_purpose !== "evolution_evolve",
+        ),
+      );
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "读取数据失败");
     }
