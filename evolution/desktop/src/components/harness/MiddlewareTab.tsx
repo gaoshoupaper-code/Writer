@@ -9,12 +9,10 @@ import { LifecycleSwimlane } from "./LifecycleSwimlane";
 export function MiddlewareTab({
   agents,
   diffs,
-  version,
   hasSource,
 }: {
   agents: AgentElementView[];
   diffs: Map<string, AgentDiff> | null;
-  version: number;
   hasSource: boolean;
 }) {
   const totalMW = agents.reduce((sum, a) => sum + a.middlewares.length, 0);
@@ -27,15 +25,10 @@ export function MiddlewareTab({
 
   return (
     <div>
-      <LifecycleSwimlane
-        agents={agents}
-        diffs={diffs}
-        version={version}
-        hasSource={hasSource}
-      />
+      <LifecycleSwimlane agents={agents} diffs={diffs} />
       {!hasSource && (
         <div className="source-warning" style={{ marginTop: 12 }}>
-          ⚠ 此版本无源码快照，middleware 源码不可查看。
+          ⚠ 此版本无源码快照，middleware 用途说明（docstring）不可读取。
         </div>
       )}
     </div>

@@ -139,7 +139,6 @@ export default function HarnessPage() {
             <MiddlewareTab
               agents={elements.agents}
               diffs={diffs}
-              version={selectedVersion!}
               hasSource={elements.has_source}
             />
           </TabsContent>

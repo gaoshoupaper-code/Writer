@@ -58,7 +58,8 @@ export function SkillsTab({
               const isAdded = showDiff && skillsDiff?.added.includes(sk.path);
               return (
                 <div key={i} className={`skill-row ${isAdded ? "diff-add" : ""}`}>
-                  <span>{sk.path}</span>
+                  <span className="skill-path">{sk.path}</span>
+                  {sk.description && <span className="skill-desc">{sk.description}</span>}
                   {sk.load_error && <span className="skill-load-error">⚠ {sk.load_error}</span>}
                 </div>
               );
@@ -68,7 +69,7 @@ export function SkillsTab({
             {showDiff &&
               skillsDiff?.removed.map((path, i) => (
                 <div key={`del-${i}`} className="skill-row diff-del">
-                  <span>{path}</span>
+                  <span className="skill-path">{path}</span>
                 </div>
               ))}
           </div>

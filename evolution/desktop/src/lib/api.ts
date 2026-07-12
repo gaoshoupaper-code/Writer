@@ -642,13 +642,14 @@ export interface AgentElementView {
   name: string;
   kind: string; // meta | subagent
   prompt: { body: string };
-  skills: { path: string; name: string; content: string | null; load_error: string | null }[];
+  skills: { path: string; name: string; description: string | null; content: string | null; load_error: string | null }[];
   middlewares: {
     hook: string | null;
     group: string | null;
     class_name: string | null;
     params: Record<string, any>;
     source_path: string | null;
+    description: string | null;
   }[];
 }
 
@@ -734,15 +735,6 @@ export interface VersionDetail {
 
 export async function getVersionDetail(version: number): Promise<VersionDetail> {
   return evoJson<VersionDetail>(`/api/versions/${version}`, { method: "GET" });
-}
-
-/** 懒加载某版本 harness 包内文件源码（middleware .py / skill SKILL.md） */
-export async function fetchSource(
-  version: number,
-  path: string,
-): Promise<{ path: string; content: string }> {
-  const qs = new URLSearchParams({ path });
-  return evoJson(`/api/snapshots/${version}/source?${qs.toString()}`, { method: "GET" });
 }
 
 // ════════════════════════════════════════════════════════════

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { AgentElementView, AgentDiff, ProcessorChange } from "@/lib/api";
-import { HOOK_ORDER, HOOK_LABELS, agentLabel } from "@/lib/harness-constants";
+import { HOOK_ORDER, agentLabel } from "@/lib/harness-constants";
 import { MiddlewareNode } from "./MiddlewareNode";
 
 /**
@@ -13,13 +13,9 @@ import { MiddlewareNode } from "./MiddlewareNode";
 export function LifecycleSwimlane({
   agents,
   diffs,
-  version,
-  hasSource,
 }: {
   agents: AgentElementView[];
   diffs: Map<string, AgentDiff> | null;
-  version: number;
-  hasSource: boolean;
 }) {
   return (
     <div className="swimlane">
@@ -29,8 +25,7 @@ export function LifecycleSwimlane({
           <div className="swimlane-head-cell">Agent</div>
           {HOOK_ORDER.map((hook) => (
             <div key={hook} className="swimlane-head-cell">
-              <span className="hook-name">{HOOK_LABELS[hook]?.name ?? hook}</span>
-              <span className="hook-desc">{HOOK_LABELS[hook]?.desc ?? ""}</span>
+              <span className="hook-name">{hook}</span>
             </div>
           ))}
 
@@ -40,8 +35,6 @@ export function LifecycleSwimlane({
               key={agent.name}
               agent={agent}
               processorChanges={diffs?.get(agent.name)?.processors}
-              version={version}
-              hasSource={hasSource}
             />
           ))}
         </div>
@@ -54,13 +47,9 @@ export function LifecycleSwimlane({
 function SwimlaneRow({
   agent,
   processorChanges,
-  version,
-  hasSource,
 }: {
   agent: AgentElementView;
   processorChanges?: ProcessorChange[];
-  version: number;
-  hasSource: boolean;
 }) {
   const mwCount = agent.middlewares.length;
   const [expanded, setExpanded] = useState(mwCount > 0); // 有 middleware 默认展开
@@ -120,8 +109,6 @@ function SwimlaneRow({
                   key={`${mw.class_name}-${i}`}
                   mw={mw}
                   change={change}
-                  version={version}
-                  hasSource={hasSource}
                 />
               );
             })}

@@ -4,16 +4,18 @@
 供前端「Agent 要素」页渲染（Prompt/Middleware/Skills/Subagents 四要素）。
 
 端点（/api/snapshots 前缀，复用 snapshot_api 的 router 命名空间）：
-  GET /snapshots/{version}/elements   版本要素展示视图（prompt/skills 全文，middleware 元信息）
-  GET /snapshots/{version}/source     指定文件源码（middleware 懒加载用）
+  GET /snapshots/{version}/elements   版本要素展示视图（prompt/skills 全文 + description，middleware 元信息 + docstring）
+  GET /snapshots/{version}/source     指定文件源码（通用文件读取，保留备用）
 
 设计依据：20260706_150000_Agent要素展示页_设计.md（D1-D7）。
 """
 from __future__ import annotations
 
+import ast
 import logging
 from typing import Any
 
+import yaml
 from fastapi import APIRouter, HTTPException, Query
 
 from app.core.git_ops import show_file
@@ -40,8 +42,21 @@ _SUBAGENT_ROLE_MAP: dict[str, str] = {
 # ── 投影逻辑 ────────────────────────────────────────────────────
 
 
+def _parse_frontmatter(text: str) -> dict[str, Any]:
+    """从 markdown 全文提 YAML front matter（首尾 --- 之间）。
+
+    与 app/evolve/docs.py:_load_doc 同构：无 front matter 返回 {}。
+    """
+    if not text.startswith("---"):
+        return {}
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}
+    return yaml.safe_load(parts[1]) or {}
+
+
 def _build_skill_info(skill_path: str, source_commit: str | None) -> dict[str, Any]:
-    """读单个 skill 的 SKILL.md 全文（git show），容错包装。
+    """读单个 skill 的 SKILL.md 全文（git show），并解析 frontmatter 的 description。
 
     Args:
         skill_path:   config 里的 skill 路径（如 "skills/meta/auto-pipeline"）
@@ -49,30 +64,48 @@ def _build_skill_info(skill_path: str, source_commit: str | None) -> dict[str, A
     """
     name = skill_path.rstrip("/").split("/")[-1]
     if not source_commit:
-        return {"path": skill_path, "name": name, "content": None, "load_error": "该版本无 source_commit"}
+        return {"path": skill_path, "name": name, "description": None, "content": None, "load_error": "该版本无 source_commit"}
 
     file_path = f"{skill_path.rstrip('/')}/SKILL.md"
     try:
         content = show_file(source_commit, file_path)
-        return {"path": skill_path, "name": name, "content": content, "load_error": None}
+        description = _parse_frontmatter(content).get("description")
+        return {"path": skill_path, "name": name, "description": description, "content": content, "load_error": None}
     except (RuntimeError, Exception) as e:  # noqa: BLE001
         msg = str(e)
         # git show 对不存在文件返回特定错误，精简提示
         if "does not exist" in msg or "exists on disk, but not in" in msg:
             msg = f"{file_path} 在该版本不存在"
         logger.debug("skill 全文读取失败: %s @ %s → %s", file_path, source_commit, msg)
-        return {"path": skill_path, "name": name, "content": None, "load_error": msg}
+        return {"path": skill_path, "name": name, "description": None, "content": None, "load_error": msg}
 
 
-def _build_middleware_info(proc: dict) -> dict[str, Any]:
-    """单个 processor → middleware 展示元信息（含预解析 source_path）。"""
+def _build_middleware_info(proc: dict, source_commit: str | None) -> dict[str, Any]:
+    """单个 processor → middleware 展示元信息。
+
+    预解析 source_path（class_name → middleware/xxx.py），并在有 source_commit 时
+    读 .py 顶部模块 docstring 作为 description（用途说明，供前端弹窗展示）。
+    读取/解析失败 description=None，不阻断其他 middleware。
+    """
     spec = proc.get("spec", {})
+    class_name = spec.get("class")
+    source_path = class_to_source_path(class_name) if class_name else None
+
+    description: str | None = None
+    if source_commit and source_path:
+        try:
+            src = show_file(source_commit, source_path)
+            description = ast.get_docstring(ast.parse(src))
+        except (RuntimeError, Exception) as e:  # noqa: BLE001
+            logger.debug("middleware docstring 解析失败: %s @ %s → %s", source_path, source_commit, e)
+
     return {
         "hook": proc.get("hook"),
         "group": proc.get("group"),
-        "class_name": spec.get("class"),
+        "class_name": class_name,
         "params": spec.get("params", {}),
-        "source_path": class_to_source_path(spec.get("class", "")) if spec.get("class") else None,
+        "source_path": source_path,
+        "description": description,
     }
 
 
@@ -93,9 +126,9 @@ def _build_agent_view(
     skill_paths = slots.get("skills") or []
     skills = [_build_skill_info(p, source_commit) for p in skill_paths]
 
-    # Middleware：只返回元信息（源码懒加载）
+    # Middleware：元信息 + docstring（用途说明，供前端弹窗）
     processors = pipeline.get("processors", [])
-    middlewares = [_build_middleware_info(p) for p in processors]
+    middlewares = [_build_middleware_info(p, source_commit) for p in processors]
 
     return {
         "name": name,
