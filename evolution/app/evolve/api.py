@@ -89,6 +89,19 @@ async def evolve_start(
             detail=f"trace {req.trace_id} 尚未评估，请先在评估功能中评估后再启动进化",
         )
 
+    # 强前置校验（S8+）：评估报告必须有结构化 findings，否则 plan 端 evidence_ref 校验
+    # 会因"合法 id：（无）"变成不可能完成的约束（评估基础设施故障时产出的降级报告
+    # status=done 但 findings=NULL）。此时拒绝启动，提示重新评估。
+    findings = eval_session.get("findings")
+    if not findings or not isinstance(findings, list):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"trace {req.trace_id} 的评估报告缺少结构化诊断（findings 为空），"
+                f"可能是评估时基础设施故障产出的降级报告。请重新评估后再启动进化"
+            ),
+        )
+
     # working 区锁定校验（S6/4.3）：存在 pending_review 的 session 时禁止开新进化
     pending = _find_pending_review_session()
     if pending:

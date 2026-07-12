@@ -139,9 +139,23 @@ def make_plan_tools() -> list:
             # 提取评估报告里的合法 finding id 集合（evidence_ref 校验依据）
             valid_finding_ids: set[str] = set()
             snap = ctx.eval_snapshot or {}
-            for f in snap.get("findings") or []:
+            findings = snap.get("findings") or []
+            for f in findings:
                 if isinstance(f, dict) and f.get("id"):
                     valid_finding_ids.add(str(f["id"]))
+
+            # 死局短路（R6+）：评估报告无可用 finding id 时，evidence_ref 校验不可满足。
+            # 此时正常校验路径会反复返回"合法 id：（无）"让 Agent 误以为重读报告就能解决，
+            # 陷入无意义重试（实测一次进化可空转 19 次）。提前明确告知这是死局，让 Agent
+            # 停止尝试、直接结束，由 PhaseGuard 记 fail 并提示用户重新评估。
+            if not valid_finding_ids:
+                ctx.emit_step("write_design_doc", "failed", phase="plan", reason="no_findings")
+                return (
+                    "评估报告没有可引用的结构化 finding（findings 为空或无 id）。"
+                    "evidence_ref 校验无法满足，无法产出 design_doc。"
+                    "这是评估阶段的问题——请结束当前方案，提示重新评估该 trace 后再启动进化。"
+                    "不要重试 write_design_doc，不要尝试不同的 id 格式。"
+                )
 
             # 校验：每个 change 必须有 target + change_desc + reason + evidence_ref
             for i, c in enumerate(changes):
