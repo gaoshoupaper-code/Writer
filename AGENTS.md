@@ -33,10 +33,42 @@ docs/
 
 ## 部署与验证流程
 
-**开发完成后直接 push 到仓库，然后直接看上线效果，不在本地看效果。**
+**开发完成后直接 push 到仓库，然后给用户一份部署命令，由用户手动 SSH 上服务器更新。本地不看效果。**
 
-- 本地不跑效果验证，默认 CI/CD 部署后直接观测线上行为。
-- push 后等部署完成，去线上确认本次改动是否符合预期，若不符合再迭代。
+- 本地不跑效果验证；push 后由用户在服务器上拉代码、重建服务、直接观测线上行为。
+- push 后等用户部署完成，去线上确认本次改动是否符合预期，若不符合再迭代。
+
+### 收尾必给部署命令（D-部署）
+
+每次开发任务收尾时，**必须**在给部署命令前检查是否push了，回复里附上一份可直接复制粘贴的部署命令，让用户手动上服务器执行。
+
+**原则：只部署本次实际改动的服务，不要无脑全量重建。**
+- 改了 `website` → 部署 website
+- 改了 `executor` → 部署 executor
+- 改了 `evolution` → 部署 evolution
+- 改了 `desktop`（桌面端）→ 桌面端不走 docker，跳过，另行说明打包/发布方式
+
+**命令模板**（按本次改动保留对应服务段，删掉没改的）：
+
+```bash
+# 1. 本地：push 代码（由 用户 完成，提醒用户先push）
+
+# 2. SSH 登录服务器（deploy 用户，22222 端口，已配置 ssh writer）
+ssh writer
+
+# 3. 服务器上：拉最新代码
+cd ~/Writer && git pull
+
+# 4. 重建并重启【本次改动】的服务 —— 只跑动了的，别全量
+docker compose build --no-cache website      # 仅 website 改了才跑
+docker compose up -d website
+
+docker compose build executor                # 仅 executor 改了才跑
+docker compose up -d executor
+
+docker compose build evolution               # 仅 evolution 改了才跑
+docker compose up -d evolution
+```
 
 ---
 
@@ -113,6 +145,28 @@ For multi-step tasks, state a brief plan:
 
 Strong success criteria let you loop independently.
 Weak criteria ("make it work") require constant clarification.
+
+## 5. 零技术债，代码更健壮
+
+**写代码不留技术债——功能干净落地，而不是"先这样后面再说"。**
+
+技术债不是"以后再说"，是**现在就还**：每一处妥协都会变成下一次改动的陷阱。
+
+**不留债：**
+- 不写 TODO / FIXME / "临时方案" / 跳过的边界条件当成交付。要写就写对，要么明确标注并当任务跟踪，绝不静默溜过去。
+- 不留"先这样能用就行"的脆弱写法——空 catch、吞异常、魔法数字、隐式依赖、硬编码路径，这些当下省 10 分钟，日后还 10 小时。
+- 不留死代码、注释掉的代码、重复逻辑、无人调用的函数。**不干活的东西就删掉**，留着只会让读者怀疑它还有用。
+- 改动产生的孤儿（未用的 import / 变量 / 函数 / 不再触发的分支）当场清理，不留给下一个人。
+
+**写得更健壮：**
+- 对**真实存在的失败路径**有处理：外部输入、网络、文件、并发、空值——该校验校验，该降级降级，该报错就报错并带清楚信息。但不为不可能发生的情况写防御代码。
+- 错误信息要让接手的人能定位问题：说什么错在哪、上下文是什么，而不是一句 `失败` 或裸 stack。
+- 函数职责单一，命名说人话，让人读代码不用逆向工程。
+
+**自检三问（每次提交前过一遍）：**
+1. 这段代码里有"先这样后面再说"吗？有就现在解决。
+2. 我这次改动留下了死代码 / 孤儿 / 脆弱点吗？有就清掉。
+3. 换个人接手这段代码，他能看懂、能放心改吗？不能就再打磨。
 
 ---
 **These guidelines are working if:** fewer unnecessary changes in diffs,
