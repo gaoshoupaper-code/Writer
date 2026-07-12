@@ -197,7 +197,7 @@ def run_ab_generation(
         logger.info("A/B 生成启动: trace_id=%s source=%s", trace_id, source_root)
         run_config = {
             "configurable": {"thread_id": thread.thread_id},
-            "recursion_limit": 200,
+            "recursion_limit": 300,
         }
         cancelled = False
         for _chunk in agent.stream(agent_input, config=run_config):

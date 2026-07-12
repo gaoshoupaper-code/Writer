@@ -202,7 +202,7 @@ class MetaAgentService(BaseAgentService):
                 config={
                     "configurable": {"thread_id": thread.thread_id},
                     "callbacks": [TraceCallbackHandler(self.trace_recorder, trace.trace_id)],
-                    "recursion_limit": 200,
+                    "recursion_limit": 300,
                 },
             )
             content = self._extract_text(result)
@@ -265,7 +265,7 @@ class MetaAgentService(BaseAgentService):
         config = {
             "configurable": {"thread_id": thread.thread_id},
             "callbacks": [TraceCallbackHandler(self.trace_recorder, trace.trace_id)],
-            "recursion_limit": 200,
+            "recursion_limit": 300,
         }
 
         # trace_pump 作为额外并发任务（与 agent 事件/心跳公平竞争 asyncio.wait）

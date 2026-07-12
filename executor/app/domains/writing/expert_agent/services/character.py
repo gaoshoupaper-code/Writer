@@ -95,7 +95,7 @@ class CharacterService(BaseAgentService):
                 config={
                     "configurable": {"thread_id": thread.thread_id},
                     "callbacks": [TraceCallbackHandler(self.trace_recorder, trace.trace_id)],
-                    "recursion_limit": 200,
+                    "recursion_limit": 300,
                 },
             )
             content = self._extract_text(result)
