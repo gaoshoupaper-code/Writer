@@ -43,12 +43,25 @@ info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
-# ── 1. 检查环境变量 ──────────────────────────────────────────
+# ── 1. 解析签名密钥 ──────────────────────────────────────────
+# 优先级：环境变量 TAURI_SIGNING_PRIVATE_KEY > 默认密钥文件 ~/.tauri/siyen.key。
+# 进化端复用写作端同一把签名密钥。日常直接 ./publish-evolution.sh 即可，不必每次 export；
+# 需要用别的密钥时仍可 export TAURI_SIGNING_PRIVATE_KEY=... 覆盖。
+# 密钥私钥个人保管，绝不上 git。
+KEY_FILE="${HOME}/.tauri/siyen.key"
 if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
-  error "未设置 TAURI_SIGNING_PRIVATE_KEY 环境变量。
-  进化端复用写作端同一把签名密钥。设置：
-  export TAURI_SIGNING_PRIVATE_KEY=\$(cat ~/.tauri/siyen.key)
-  密钥私钥个人保管，绝不上 git。"
+  if [ -f "${KEY_FILE}" ]; then
+    TAURI_SIGNING_PRIVATE_KEY=$(cat "${KEY_FILE}")
+    export TAURI_SIGNING_PRIVATE_KEY
+    info "从 ${KEY_FILE} 自动读取签名密钥"
+  else
+    error "未找到签名密钥。
+  方式一（自动）：生成密钥到默认路径，脚本会自动读取
+    cd desktop && npx tauri signer generate -w ~/.tauri/siyen.key --force --ci -p \"\"
+    之后直接 ./scripts/publish-evolution.sh 即可
+  方式二（手动）：export TAURI_SIGNING_PRIVATE_KEY=\$(cat <你的密钥路径>)
+  进化端复用写作端同一把签名密钥。密钥私钥个人保管，绝不上 git。"
+  fi
 fi
 
 # ── 2. 切到构建目录 ─────────────────────────────────────────

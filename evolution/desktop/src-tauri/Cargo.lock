@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "evolution-desktop"
-version = "0.2.10"
+version = "0.2.17"
 dependencies = [
  "cookie",
  "cookie_store 0.21.1",
