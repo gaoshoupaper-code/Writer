@@ -12,7 +12,7 @@ import logging
 from langchain_core.tools import tool
 
 from app.eval_agent.ctx import get_eval_context
-from app.view.traces import get_trace
+from app.view.traces import get_trace, load_trace_detail
 
 logger = logging.getLogger("evolution.eval_agent.tools.trace")
 
@@ -83,7 +83,10 @@ def make_trace_tools() -> list:
             return "错误：评估 session 未初始化"
         try:
             trace_id = ctx.trace_id
-            detail = get_trace(trace_id)
+            # 需完整 TraceDetail（含 context）——get_trace 路由版是 Lite 无 context
+            detail = load_trace_detail(trace_id)
+            if detail is None:
+                return f"读节点失败：trace {trace_id} 不存在"
             # 找节点
             target = None
             for n in detail.nodes:
@@ -130,7 +133,10 @@ def make_trace_tools() -> list:
             return "错误：评估 session 未初始化"
         try:
             trace_id = ctx.trace_id
-            detail = get_trace(trace_id)
+            # 需完整 TraceDetail（含 context）——get_trace 路由版是 Lite 无 context
+            detail = load_trace_detail(trace_id)
+            if detail is None:
+                return f"读区间失败：trace {trace_id} 不存在"
             # 按 sequence 区间取 context segments
             start_seq = None
             end_seq = None

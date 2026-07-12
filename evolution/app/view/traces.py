@@ -16,6 +16,7 @@ import app.core.db as db
 from app.ingestion import projector
 from app.core.models import (
     TraceContextSegment,
+    TraceDetail,
     TraceLogEvent,
     TraceNode,
     TraceRunSummary,
@@ -142,6 +143,29 @@ def list_traces(
     )
 
 
+def load_trace_detail(trace_id: str) -> TraceDetail | None:
+    """加载完整 trace（含 events + context + nodes + todos），供内部消费。
+
+    与 get_trace 路由的区别：本函数返回完整 TraceDetail（events/context 齐全），
+    供评估/进化端内部调用（如 compute_flow_metrics 需遍历 events 算流程硬指标，
+    read_trace_node/range 需查 context）；get_trace 路由调本函数后收窄成
+    TraceDetailLite 返前端（events/context 太大走懒加载）。
+
+    trace 不存在返回 None。
+    """
+    run_row = db.query_one("SELECT * FROM runs WHERE trace_id = ?", (trace_id,))
+    if run_row is None:
+        return None
+    run = _run_summary_from_row(run_row)
+    events = _reconstruct_incremental_inputs(_load_events(trace_id))
+    projection = projector.TraceProjector().project(run, events)
+    return TraceDetail(
+        run=run, events=events,
+        nodes=projection.nodes, context=projection.context,
+        todos=projection.todos,
+    )
+
+
 @router.get("/traces/{trace_id}", response_model=TraceDetailLite)
 def get_trace(trace_id: str) -> TraceDetailLite:
     """trace 详情（轻量）：run + nodes + todos。
@@ -149,18 +173,13 @@ def get_trace(trace_id: str) -> TraceDetailLite:
     events 和 context 不再全量返回（它们是 trace 最大的两块数据）。
     前端打开抽屉时通过 /events 和 /context 懒加载接口按需拉取。
 
-    nodes/todos 始终重新投影（增量重建已优化为 O(N)，且 nodes 表不存 raw_event_ids
-    等投影字段，todos 无独立表——重新投影是唯一完整数据源）。
+    内部加载委托给 load_trace_detail（复用完整加载逻辑），此处收窄成 Lite。
     """
-    run_row = db.query_one("SELECT * FROM runs WHERE trace_id = ?", (trace_id,))
-    if run_row is None:
+    detail = load_trace_detail(trace_id)
+    if detail is None:
         raise HTTPException(status_code=404, detail="Trace not found")
-
-    run = _run_summary_from_row(run_row)
-    events = _reconstruct_incremental_inputs(_load_events(trace_id))
-    projection = projector.TraceProjector().project(run, events)
     return TraceDetailLite(
-        run=run, nodes=projection.nodes, todos=projection.todos,
+        run=detail.run, nodes=detail.nodes, todos=detail.todos,
     )
 
 

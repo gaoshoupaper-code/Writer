@@ -15,7 +15,7 @@ from app.common.flow_metrics import compute_flow_metrics
 from app.eval_agent import repo as eval_repo
 from app.eval_agent.ctx import get_eval_context
 from app.eval_agent.tools.content import get_content_task_result
-from app.view.traces import get_trace
+from app.view.traces import load_trace_detail
 
 logger = logging.getLogger("evolution.eval_agent.tools.report")
 
@@ -63,8 +63,12 @@ def make_report_tools() -> list:
             if cr and not cr.get("error") and not cr.get("skipped"):
                 content_scores = cr
 
-            # 算流程硬指标（D8：自动算，写进报告）
-            detail = get_trace(trace_id)
+            # 算流程硬指标（D8：自动算，写进报告）。
+            # 用 load_trace_detail（完整 TraceDetail，含 events）——compute_flow_metrics
+            # 要遍历 events 算指标；get_trace 路由版是 Lite 无 events 会 AttributeError。
+            detail = load_trace_detail(trace_id)
+            if detail is None:
+                return f"产出报告失败：trace {trace_id} 不存在"
             flow_metrics = compute_flow_metrics(detail)
 
             # 组装 scores（内容层 + 流程硬指标）
