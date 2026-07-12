@@ -72,19 +72,30 @@ def _poll_once(executor_url: str) -> None:
 
 @router.get("/active-runs")
 def active_runs_api() -> list[dict[str, Any]]:
-    """活跃 trace 富化列表（D7）。
+    """活跃 trace 富化列表（D7 + D9）。
 
-    薄包装 get_active_runs()（active_poller 缓存的 executor 原始数据），
-    join evolution.db runs 表补 session_name + ingested 标记。
+    数据源合并：
+    - executor 活跃 trace（轮询缓存）：创作端正在跑的 trace
+    - evolution recorder 活跃 trace（D9 新增）：进化端正在跑的评估/进化 trace
 
-    未摄入的活跃 trace（HITL awaiting_input 首次摄入空窗）join 不到 →
-    session_name=null 降级，ingested=false。
+    join evolution.db runs 表补 session_name + run_purpose + ingested 标记。
+    未摄入的活跃 trace join 不到 → session_name/run_purpose=null 降级，ingested=false。
     """
-    runs = get_active_runs()
+    # ── 合并两个数据源 ──
+    runs = get_active_runs()  # executor 活跃 trace（轮询缓存）
+
+    # D9：合并 evolution recorder 自己的活跃 trace
+    evo_runs = _get_evolution_active_runs()
+    all_trace_ids = {r.get("trace_id", "") for r in runs if r.get("trace_id")}
+    for er in evo_runs:
+        if er.get("trace_id") and er["trace_id"] not in all_trace_ids:
+            runs.append(er)
+            all_trace_ids.add(er["trace_id"])
+
     if not runs:
         return []
 
-    # 批量查 evolution.db，一次拿全部活跃 trace_id 的 session_name（避免 N 次 IO）
+    # 批量查 evolution.db，一次拿全部活跃 trace_id 的 session_name + run_purpose
     import app.core.db as db
 
     trace_ids = [r.get("trace_id", "") for r in runs if r.get("trace_id")]
@@ -92,16 +103,22 @@ def active_runs_api() -> list[dict[str, Any]]:
     if trace_ids:
         placeholders = ",".join("?" * len(trace_ids))
         rows = db.query_all(
-            f"SELECT trace_id, session_name FROM runs WHERE trace_id IN ({placeholders})",
+            f"SELECT trace_id, session_name, run_purpose FROM runs WHERE trace_id IN ({placeholders})",
             tuple(trace_ids),
         )
     else:
         rows = []
-    ingested_map = {r["trace_id"]: r.get("session_name") for r in rows}
+    ingested_map = {
+        r["trace_id"]: {
+            "session_name": r.get("session_name"),
+            "run_purpose": r.get("run_purpose"),
+        }
+        for r in rows
+    }
 
     for r in runs:
         tid = r.get("trace_id", "")
-        session_name = ingested_map.get(tid)
+        meta = ingested_map.get(tid, {})
         enriched.append({
             "trace_id": tid,
             "workspace_id": r.get("workspace_id", ""),
@@ -112,7 +129,26 @@ def active_runs_api() -> list[dict[str, Any]]:
             "duration_ms": r.get("duration_ms"),
             "event_count": r.get("event_count", 0),
             # D7 富化：join 不到时 null（前端降级显示 workspace_id/endpoint）
-            "session_name": session_name,
+            "session_name": meta.get("session_name"),
             "ingested": tid in ingested_map,
+            # D9：run_purpose（executor trace 优先用 r 自带的，join 不到时降级）
+            # evolution recorder 的活跃 trace 已自带 run_purpose（recorder.list_active_runs 返回）
+            "run_purpose": r.get("run_purpose") or meta.get("run_purpose") or "user_generation",
         })
     return enriched
+
+
+def _get_evolution_active_runs() -> list[dict[str, Any]]:
+    """获取 evolution recorder 自己的活跃 trace（D9）。
+
+    evolution 端的评估/进化 agent 运行时，trace 由 EvolutionTraceRecorder 记录，
+    不经过 executor 的 active-runs 轮询。这里从 app.state.trace_recorder 取内存中活跃列表。
+    """
+    try:
+        from app.main import app
+        recorder = getattr(app.state, "trace_recorder", None)
+        if recorder is None:
+            return []
+        return recorder.list_active_runs()
+    except Exception:
+        return []
