@@ -433,6 +433,10 @@ export async function startEval(traceId: string): Promise<{ eval_id: string; tra
   });
 }
 
+export async function stopEval(evalId: string): Promise<{ status: string; eval_id: string }> {
+  return evoJson(`/api/eval-agent/sessions/${evalId}/stop`, { method: "POST" });
+}
+
 export async function getEvalSessions(limit = 50): Promise<{ sessions: EvalSession[]; total: number }> {
   return evoJson(`/api/eval-agent/sessions?limit=${limit}`, { method: "GET" });
 }
@@ -531,6 +535,10 @@ export async function startEvolve(traceId: string): Promise<{ session_id: string
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ trace_id: traceId }),
   });
+}
+
+export async function stopEvolve(sessionId: string): Promise<{ status: string; session_id: string }> {
+  return evoJson(`/api/evolve/sessions/${sessionId}/stop`, { method: "POST" });
 }
 
 export async function getEvolveSessions(limit = 50): Promise<{ sessions: EvolveSession[]; total: number }> {

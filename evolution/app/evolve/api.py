@@ -20,7 +20,7 @@ import logging
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -34,6 +34,11 @@ from app.trace.recorder import EvolutionTraceRecorder
 logger = logging.getLogger("evolution.evolve.api")
 
 router = APIRouter(tags=["evolve"])
+
+# session_id → 后台进化 task。stop 端点靠它 cancel 正在跑的 Agent。
+# 原先用 FastAPI BackgroundTasks.add_task 不持有 task 引用，外部无法取消；
+# 改用 asyncio.create_task 后存这里，stop 才能调 task.cancel()。
+_running_tasks: dict[str, asyncio.Task] = {}
 
 
 def get_recorder() -> EvolutionTraceRecorder | None:
@@ -61,7 +66,6 @@ class EvolveStartResponse(BaseModel):
 @router.post("/evolve/start", response_model=EvolveStartResponse, status_code=202)
 async def evolve_start(
     req: EvolveStartRequest,
-    background_tasks: BackgroundTasks,
 ) -> EvolveStartResponse:
     """触发一次进化（方案→执行两阶段，产出待审改动）。
 
@@ -118,8 +122,9 @@ async def evolve_start(
     # 关联评估报告（eval_ref）
     ev_db.update_session(session_id, eval_ref=eval_session["eval_id"])
 
-    # 后台跑进化驱动器
-    background_tasks.add_task(_run_evolve_bg, ctx, req.trace_id)
+    # 后台跑进化驱动器（create_task 拿到 task 引用，存注册表供 stop 端点取消）
+    task = asyncio.create_task(_run_evolve_bg(ctx, req.trace_id))
+    _running_tasks[session_id] = task
 
     logger.info(
         "进化 session 启动: session=%s trace=%s eval=%s",
@@ -160,11 +165,20 @@ async def _run_evolve_bg(ctx: EvolveContext, trace_id: str) -> None:
     """
     try:
         result = await run_evolve_session(ctx, trace_id)
-        if result["status"] != "done":
+        # cancelled 是用户主动停止的合法终态，不算失败。
+        if result["status"] not in ("done", "cancelled"):
             ev_db.update_session(ctx.session_id, status="failed")
+    except asyncio.CancelledError:
+        # task.cancel() 触发；run_evolve_session 内部已处理状态推进，
+        # 但若取消在进入 session 函数前命中，这里兜底标 cancelled。
+        logger.info("进化 session %s 在后台被取消", ctx.session_id)
+        ev_db.update_session(ctx.session_id, status="cancelled")
+        raise
     except Exception as e:
         logger.exception("进化 session %s 后台执行异常", ctx.session_id)
         ev_db.update_session(ctx.session_id, status="failed")
+    finally:
+        _running_tasks.pop(ctx.session_id, None)
 
 
 # ── 查询 ────────────────────────────────────────────────────
@@ -243,6 +257,43 @@ def _try_load_eval_snapshot(eval_ref: str | None) -> dict[str, Any] | None:
     except Exception:
         logger.exception("查评估快照失败: eval_ref=%s", eval_ref)
         return None
+
+
+# ── 停止 ────────────────────────────────────────────────────
+
+
+@router.post("/evolve/sessions/{session_id}/stop")
+def stop_session(session_id: str) -> dict[str, Any]:
+    """手动停止运行中的进化 session（task.cancel → CancelledError 中断 ainvoke）。
+
+    非阻塞：只取消 task + 标 cancelled，不等 Agent 真正退出。
+    真正的状态收尾（recorder.cancel_run + DB）由 run_evolve_session 的
+    CancelledError 分支处理。
+
+    已知边界：Agent 若停在改源码中途，harnesses/current/ 下可能留脏文件，
+    本端点不清理（由用户手动 stash / 重置）。
+    """
+    session = ev_db.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"session {session_id} 不存在")
+    if session.get("status") != "running":
+        raise HTTPException(
+            status_code=400,
+            detail=f"session 状态为 {session.get('status')}，只有 running 可停止",
+        )
+
+    task = _running_tasks.get(session_id)
+    if task is not None and not task.done():
+        task.cancel()
+        logger.info("进化 session %s 已请求取消（task.cancel）", session_id)
+    else:
+        # 竞态：task 已结束或不在注册表（进程重启后）。仍标 cancelled 对齐状态。
+        logger.warning(
+            "进化 session %s 未找到活跃 task，仅标记 cancelled", session_id
+        )
+
+    ev_db.update_session(session_id, status="cancelled")
+    return {"status": "cancelled", "session_id": session_id}
 
 
 # ── SSE 实时流 ──────────────────────────────────────────────

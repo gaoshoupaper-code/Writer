@@ -54,12 +54,13 @@ _FLUSH_BATCH_MAX = 200  # 单批最多写多少行
 # WAL 落盘根目录（evolution/data/traces/）。
 _WAL_ROOT = Path(__file__).resolve().parent.parent.parent / "data" / "traces"
 
-# trace 终态的取消来源（与执行端对齐，进化端目前只触发 client_disconnect）。
-CancelReason = Literal["client_disconnect", "timeout", "crash_recovery"]
+# trace 终态的取消来源（与执行端对齐）。
+CancelReason = Literal["client_disconnect", "timeout", "crash_recovery", "user_stop"]
 _CANCEL_REASON_MESSAGES: dict[str, str] = {
     "client_disconnect": "Session cancelled",
     "timeout": "Session timeout",
     "crash_recovery": "Recovered from crash (process restart)",
+    "user_stop": "Stopped by user",
 }
 
 

@@ -5,6 +5,7 @@ import { evoSseStream } from "@/lib/stream";
 import {
   getEvolveSessions,
   startEvolve,
+  stopEvolve,
   getEvaluatedTraces,
   type EvolveSession,
   type EvalSession,
@@ -30,6 +31,8 @@ export default function EvolvePage() {
   const [starting, setStarting] = useState(false);
   const [liveLogs, setLiveLogs] = useState<{ type: string; message?: string; [k: string]: any }[]>([]);
   const [streaming, setStreaming] = useState(false);
+  const [streamingSessionId, setStreamingSessionId] = useState<string | null>(null);
+  const [stopping, setStopping] = useState(false);
   const streamCancelRef = useRef<(() => void) | null>(null);
 
   const refresh = useCallback(async () => {
@@ -66,12 +69,29 @@ export default function EvolvePage() {
       toast.success(`进化已启动：${resp.session_id.slice(0, 8)}`);
       // 立即订阅 SSE 流
       setStreaming(true);
+      setStreamingSessionId(resp.session_id);
       subscribeStream(resp.session_id);
       refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "启动进化失败");
     } finally {
       setStarting(false);
+    }
+  }
+
+  async function handleStop() {
+    if (!streamingSessionId) return;
+    if (!window.confirm("确定停止？Agent 正在执行的改动可能不完整。")) return;
+    setStopping(true);
+    try {
+      await stopEvolve(streamingSessionId);
+      toast.success("已请求停止进化");
+      // 断开前端 SSE 订阅；后端 cancel_run 会推 error 帧但前端可能已主动断开
+      streamCancelRef.current?.();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "停止失败");
+    } finally {
+      setStopping(false);
     }
   }
 
@@ -88,6 +108,7 @@ export default function EvolvePage() {
         setLiveLogs((prev) => [...prev, frame]);
         if (frame.type === "end" || frame.type === "error") {
           setStreaming(false);
+          setStreamingSessionId(null);
           refresh();
           break;
         }
@@ -121,6 +142,7 @@ export default function EvolvePage() {
                   setLiveLogs([]);
                   if (s.status === "running") {
                     setStreaming(true);
+                    setStreamingSessionId(s.session_id);
                     subscribeStream(s.session_id);
                   }
                 }}
@@ -174,6 +196,14 @@ export default function EvolvePage() {
               {streaming && (
                 <div className="streaming-badge">
                   <span className="pulse" /> 实时流中…
+                  <button
+                    className="config-button danger"
+                    onClick={handleStop}
+                    disabled={stopping}
+                    style={{ marginLeft: 12 }}
+                  >
+                    {stopping ? "停止中…" : "停止"}
+                  </button>
                 </div>
               )}
               {liveLogs.length > 0 && (
@@ -234,6 +264,7 @@ function statusLabel(s: string): string {
   const map: Record<string, string> = {
     running: "运行中", done: "完成", failed: "失败",
     pending_review: "待审查", published: "已发布", discarded: "已丢弃",
+    cancelled: "已停止",
   };
   return map[s] ?? s;
 }

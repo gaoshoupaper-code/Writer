@@ -8,6 +8,7 @@ import {
   getEvalSessions,
   getEvalSession,
   startEval,
+  stopEval,
   getTraces,
   type EvalSession,
   type TraceListItem,
@@ -30,6 +31,8 @@ export default function EvaluationPage() {
   const [starting, setStarting] = useState(false);
   const [liveLogs, setLiveLogs] = useState<any[]>([]);
   const [streaming, setStreaming] = useState(false);
+  const [streamingEvalId, setStreamingEvalId] = useState<string | null>(null);
+  const [stopping, setStopping] = useState(false);
   const streamCancelRef = useRef<(() => void) | null>(null);
 
   const refresh = useCallback(async () => {
@@ -71,12 +74,28 @@ export default function EvaluationPage() {
       const resp = await startEval(selectedTraceId);
       toast.success(`评估已启动：${resp.eval_id.slice(0, 8)}`);
       setStreaming(true);
+      setStreamingEvalId(resp.eval_id);
       subscribeStream(resp.eval_id);
       refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "启动评估失败");
     } finally {
       setStarting(false);
+    }
+  }
+
+  async function handleStop() {
+    if (!streamingEvalId) return;
+    if (!window.confirm("确定停止评估？")) return;
+    setStopping(true);
+    try {
+      await stopEval(streamingEvalId);
+      toast.success("已请求停止评估");
+      streamCancelRef.current?.();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "停止失败");
+    } finally {
+      setStopping(false);
     }
   }
 
@@ -93,6 +112,7 @@ export default function EvaluationPage() {
         setLiveLogs((prev) => [...prev, frame]);
         if (frame.type === "end" || frame.type === "error") {
           setStreaming(false);
+          setStreamingEvalId(null);
           // 拉取最新评估详情（含报告），确保 selectedEval 更新为带 report_md 的完整数据
           try {
             const detail = await getEvalSession(evalId);
@@ -132,6 +152,7 @@ export default function EvaluationPage() {
                   setLiveLogs([]);
                   if (e.status === "running") {
                     setStreaming(true);
+                    setStreamingEvalId(e.eval_id);
                     subscribeStream(e.eval_id);
                   }
                 }}
@@ -181,6 +202,14 @@ export default function EvaluationPage() {
               {streaming && (
                 <div className="streaming-badge">
                   <span className="pulse" /> 实时流中…
+                  <button
+                    className="config-button danger"
+                    onClick={handleStop}
+                    disabled={stopping}
+                    style={{ marginLeft: 12 }}
+                  >
+                    {stopping ? "停止中…" : "停止"}
+                  </button>
                 </div>
               )}
               {liveLogs.length > 0 && (
@@ -267,7 +296,7 @@ function EvalReport({ evalSession, onTraceClick }: { evalSession: EvalSession; o
 }
 
 function evalStatusLabel(s: string): string {
-  const map: Record<string, string> = { running: "运行中", done: "完成", failed: "失败" };
+  const map: Record<string, string> = { running: "运行中", done: "完成", failed: "失败", cancelled: "已停止" };
   return map[s] ?? s;
 }
 

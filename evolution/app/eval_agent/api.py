@@ -20,7 +20,7 @@ import uuid
 from typing import Any
 
 import app.core.db as db
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -32,6 +32,11 @@ from app.trace.recorder import EvolutionTraceRecorder
 logger = logging.getLogger("evolution.eval_agent.api")
 
 router = APIRouter(prefix="/eval-agent", tags=["eval-agent"])
+
+# eval_id → 后台评估 task。stop 端点靠它 cancel 正在跑的 Agent。
+# 原先用 FastAPI BackgroundTasks.add_task 不持有 task 引用，外部无法取消；
+# 改用 asyncio.create_task 后存这里，stop 才能调 task.cancel()。
+_running_tasks: dict[str, asyncio.Task] = {}
 
 
 def get_recorder() -> EvolutionTraceRecorder | None:
@@ -62,7 +67,6 @@ class EvalStartResponse(BaseModel):
 @router.post("/start", response_model=EvalStartResponse, status_code=202)
 async def eval_start(
     req: EvalStartRequest,
-    background_tasks: BackgroundTasks,
 ) -> EvalStartResponse:
     """启动一次评估（异步）。立即返回 eval_id，后台跑评估 Agent。"""
     # 校验 trace 存在
@@ -112,8 +116,9 @@ async def eval_start(
     )
     ctx.recorder = get_recorder()
 
-    # 后台跑评估 Agent
-    background_tasks.add_task(_run_eval_bg, ctx)
+    # 后台跑评估 Agent（create_task 拿到 task 引用，存注册表供 stop 端点取消）
+    task = asyncio.create_task(_run_eval_bg(ctx))
+    _running_tasks[eval_id] = task
 
     logger.info(
         "评估 session 启动: eval=%s trace=%s version=%s/%s",
@@ -154,11 +159,21 @@ async def _run_eval_bg(ctx: EvaluationContext) -> None:
             session = eval_repo.get_session(ctx.eval_id)
             if session is None or session.get("status") != "done":
                 eval_repo.update_session(ctx.eval_id, status="failed")
+        elif result["status"] == "cancelled":
+            # 用户主动停止的合法终态，不算失败。
+            pass
         else:
             eval_repo.update_session(ctx.eval_id, status="failed")
+    except asyncio.CancelledError:
+        # 取消在进 session 函数前命中（兜底）。run_eval_session 内部已处理时不会走到这。
+        logger.info("评估 session %s 在后台被取消", ctx.eval_id)
+        eval_repo.update_session(ctx.eval_id, status="cancelled")
+        raise
     except Exception as e:
         logger.exception("评估 session %s 后台执行异常", ctx.eval_id)
         eval_repo.update_session(ctx.eval_id, status="failed")
+    finally:
+        _running_tasks.pop(ctx.eval_id, None)
 
 
 # ── 查询 ────────────────────────────────────────────────────
@@ -188,6 +203,39 @@ def list_evaluated_traces(limit: int = 100) -> dict[str, Any]:
     """列已评估（有 done 记录）的 trace（进化入口「选已评估 trace」用）。"""
     traces = eval_repo.list_evaluated_traces(limit=limit)
     return {"traces": traces, "total": len(traces)}
+
+
+# ── 停止 ────────────────────────────────────────────────────
+
+
+@router.post("/sessions/{eval_id}/stop")
+def stop_session(eval_id: str) -> dict[str, Any]:
+    """手动停止运行中的评估 session（task.cancel → CancelledError 中断 ainvoke）。
+
+    非阻塞：只取消 task + 标 cancelled，不等 Agent 真正退出。
+    真正的状态收尾（recorder.cancel_run + DB）由 run_eval_session 的
+    CancelledError 分支处理。
+    """
+    session = eval_repo.get_session(eval_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"评估 session {eval_id} 不存在")
+    if session.get("status") != "running":
+        raise HTTPException(
+            status_code=400,
+            detail=f"评估 session 状态为 {session.get('status')}，只有 running 可停止",
+        )
+
+    task = _running_tasks.get(eval_id)
+    if task is not None and not task.done():
+        task.cancel()
+        logger.info("评估 session %s 已请求取消（task.cancel）", eval_id)
+    else:
+        logger.warning(
+            "评估 session %s 未找到活跃 task，仅标记 cancelled", eval_id
+        )
+
+    eval_repo.update_session(eval_id, status="cancelled")
+    return {"status": "cancelled", "eval_id": eval_id}
 
 
 # ── SSE 实时流 ──────────────────────────────────────────────
