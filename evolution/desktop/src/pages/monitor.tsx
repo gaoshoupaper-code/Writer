@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import {
@@ -15,11 +15,11 @@ import {
 /**
  * 监测大盘（设计文档信息架构：默认首屏）。
  *
- * 四个区块：
- * 1. 统计概览卡片（总数/成功率/token/延迟分位）
- * 2. 活跃 run 列表（实时刷新，点进下钻 trace）
- * 3. skill 调用统计（哪个 agent 跑得多/失败多）
- * 4. 失败模式聚类（常见 error）
+ * 双 Tab（D7）：
+ * - 创作监测：run_purpose = user_generation（用户在创作端的创作过程）
+ * - 进化监测：run_purpose = evolution_eval + evolution_evolve（进化端自身的评估/进化过程）
+ *
+ * Tab 只影响活跃 run 列表（前端过滤，S6）；统计概览/skill/失败模式保持全局（D8）。
  */
 export default function MonitorPage() {
   const navigate = useNavigate();
@@ -28,6 +28,7 @@ export default function MonitorPage() {
   const [failures, setFailures] = useState<FailurePattern[]>([]);
   const [activeRuns, setActiveRuns] = useState<ActiveRun[]>([]);
   const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState<"creation" | "evolution">("creation");
 
   const refresh = useCallback(async () => {
     try {
@@ -55,6 +56,17 @@ export default function MonitorPage() {
     return () => clearInterval(timer);
   }, [refresh]);
 
+  // 按 tab 过滤活跃 run（S6：全量拉取 + 前端过滤）
+  const filteredRuns = useMemo(() => {
+    if (tab === "creation") {
+      return activeRuns.filter((r) => !r.run_purpose || r.run_purpose === "user_generation");
+    }
+    // 进化监测：eval + evolve
+    return activeRuns.filter(
+      (r) => r.run_purpose === "evolution_eval" || r.run_purpose === "evolution_evolve",
+    );
+  }, [activeRuns, tab]);
+
   if (loading) {
     return <div className="page-loading">加载监测数据…</div>;
   }
@@ -70,7 +82,7 @@ export default function MonitorPage() {
         <p className="page-desc">总览运行健康度、活跃任务与失败模式（每 5 秒自动刷新）</p>
       </header>
 
-      {/* 统计概览卡片 */}
+      {/* 统计概览卡片（全局，不受 tab 影响） */}
       <section className="stats-grid">
         <div className="stat-card">
           <span className="stat-value">{overview?.total ?? 0}</span>
@@ -94,14 +106,36 @@ export default function MonitorPage() {
         </div>
       </section>
 
-      {/* 活跃 run */}
+      {/* 双 Tab */}
+      <nav className="inspection-tabs monitor-tabs">
+        <button
+          className={`inspection-tab ${tab === "creation" ? "active" : ""}`}
+          type="button"
+          onClick={() => setTab("creation")}
+        >
+          创作监测
+        </button>
+        <button
+          className={`inspection-tab ${tab === "evolution" ? "active" : ""}`}
+          type="button"
+          onClick={() => setTab("evolution")}
+        >
+          进化监测
+        </button>
+      </nav>
+
+      {/* 活跃 run（按 tab 过滤） */}
       <section className="monitor-section">
-        <h2 className="section-title">活跃运行（{activeRuns.length}）</h2>
-        {activeRuns.length === 0 ? (
-          <div className="monitor-empty">当前无活跃运行</div>
+        <h2 className="section-title">
+          {tab === "creation" ? "创作活跃运行" : "进化活跃运行"}（{filteredRuns.length}）
+        </h2>
+        {filteredRuns.length === 0 ? (
+          <div className="monitor-empty">
+            {tab === "creation" ? "当前无创作活跃运行" : "当前无进化活跃运行"}
+          </div>
         ) : (
           <div className="run-list">
-            {activeRuns.map((run) => (
+            {filteredRuns.map((run) => (
               <div
                 key={run.trace_id}
                 className="run-item"
@@ -110,6 +144,7 @@ export default function MonitorPage() {
                 <div className="run-item-main">
                   <span className={`run-status ${run.status}`}>● {run.status}</span>
                   <span className="run-session">{run.session_name || run.endpoint || run.trace_id.slice(0, 12)}</span>
+                  {tab === "evolution" && <PurposeBadge purpose={run.run_purpose} />}
                 </div>
                 <div className="run-item-meta">
                   <span>{run.event_count} 事件</span>
@@ -124,7 +159,7 @@ export default function MonitorPage() {
         )}
       </section>
 
-      {/* skill 统计 */}
+      {/* skill 统计（全局，不受 tab 影响） */}
       <section className="monitor-section">
         <h2 className="section-title">Agent 调用统计</h2>
         {skills.length === 0 ? (
@@ -155,7 +190,7 @@ export default function MonitorPage() {
         )}
       </section>
 
-      {/* 失败模式 */}
+      {/* 失败模式（全局） */}
       {failures.length > 0 && (
         <section className="monitor-section">
           <h2 className="section-title">常见失败模式</h2>
@@ -178,6 +213,23 @@ export default function MonitorPage() {
         </section>
       )}
     </div>
+  );
+}
+
+/** 来源标签（进化端内部区分评估/进化） */
+function PurposeBadge({ purpose }: { purpose: string | null }) {
+  if (!purpose) return null;
+  const label =
+    purpose === "evolution_eval" ? "评估"
+      : purpose === "evolution_evolve" ? "进化"
+      : purpose === "user_generation" ? "执行"
+      : purpose;
+  const color =
+    purpose === "evolution_eval" ? "var(--running, #0f766e)"
+      : purpose === "evolution_evolve" ? "#a78bfa"
+      : "var(--muted)";
+  return (
+    <span className="purpose-badge" style={{ color }}>{label}</span>
   );
 }
 

@@ -208,3 +208,69 @@ export async function* evoSseStream(
     await reader.cancel();
   }
 }
+
+// ── trace SSE 专用封装 ──────────────────────────────────────────
+
+/** trace SSE 帧类型（与 sse_stream.py 命名事件一一对应）。 */
+export type TraceSseFrame =
+  | { event: "data"; data: Record<string, unknown> }
+  | { event: "snapshot"; data: { status?: string; event_count?: number } }
+  | { event: "end"; data: Record<string, unknown> }
+  | { event: "error"; data: { reason?: string } };
+
+/**
+ * trace SSE 流式请求（自动加 /evolution-api 前缀）。
+ *
+ * 与 evoSseStream 的差异：trace SSE 同时有 `event:` 行和 `data:` 行
+ * （snapshot/end/error 命名事件 + 默认 data 事件），evoSseStream 只解析 data 行。
+ * 本封装解析完整 SSE 帧，yield `{ event, data }` 统一结构。
+ *
+ * 帧格式（sse_stream.py）：
+ *   data: {TraceLogEvent}       ← 默认事件（逐条增量）
+ *   event: snapshot\ndata: {}   ← run 状态校准
+ *   event: end\ndata: {}        ← 终态信号
+ *   event: error\ndata: {...}   ← 错误降级
+ */
+export async function* evoTraceStream(
+  path: string,
+  init: StreamRequestInit = {}
+): AsyncGenerator<TraceSseFrame, void, unknown> {
+  const EVO_PREFIX = import.meta.env.DEV ? "" : "/evolution-api";
+  const fullPath = path.startsWith("/") ? `${EVO_PREFIX}${path}` : `${EVO_PREFIX}/${path}`;
+  const reader = await streamRequest(fullPath, init);
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      // SSE 帧以 \n\n 分隔
+      let idx: number;
+      while ((idx = buffer.indexOf("\n\n")) >= 0) {
+        const frame = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+
+        // 逐帧解析：收集 event: 行和 data: 行
+        let eventName = "data"; // SSE 默认事件名
+        let dataRaw = "";
+        for (const line of frame.split("\n")) {
+          if (line.startsWith("event:")) {
+            eventName = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            dataRaw = line.slice(5).trim();
+          }
+        }
+        if (!dataRaw) continue;
+        try {
+          const parsed = JSON.parse(dataRaw);
+          yield { event: eventName, data: parsed } as TraceSseFrame;
+        } catch {
+          // 非 JSON（如 keepalive 注释），跳过
+        }
+      }
+    }
+  } finally {
+    await reader.cancel();
+  }
+}
