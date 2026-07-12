@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -280,6 +281,16 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
             "status": "failed", "session_id": ctx.session_id,
             "error": "进化驱动器步数触顶（未收敛）",
         }
+    except asyncio.CancelledError:
+        # 用户手动停止（stop 端点调 task.cancel）：ainvoke 在某个 await 点被中断。
+        # 推进 cancelled 终态 + recorder 收尾。不 re-raise——否则会被 _run_evolve_bg
+        # 的 except Exception 当失败处理，覆盖刚标的 cancelled。
+        logger.info("session %s: 进化驱动器被用户停止", ctx.session_id)
+        ctx.emit_log("进化已被手动停止。")
+        ev_db.update_session(ctx.session_id, status="cancelled")
+        if ctx.recorder and ctx.trace_id_self:
+            ctx.recorder.cancel_run(ctx.trace_id_self, reason="user_stop")
+        return {"status": "cancelled", "session_id": ctx.session_id}
     except Exception as e:
         logger.exception("session %s: 驱动器执行失败", ctx.session_id)
         ev_db.update_session(ctx.session_id, status="failed")
