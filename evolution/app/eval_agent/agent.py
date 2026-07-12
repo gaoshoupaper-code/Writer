@@ -9,7 +9,7 @@
 
 与执行端 MetaAgent 同构——都是 create_deep_agent 顶层 Agent。
 
-工作流：评估 Agent 拿到 trace_id 后自主跑（read_trace → read_surface →
+工作流：评估 Agent 拿到 trace_id 后自主跑（read_trace →
 get_content_score → write_eval_report），产出写入 evaluation_sessions 表（S2 DB 交接）。
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ from langgraph.errors import GraphRecursionError
 
 from app.eval_agent import repo as eval_repo
 from app.eval_agent.ctx import EvaluationContext, set_eval_context
-from app.eval_agent.middleware.no_fs import NoFilesystemToolsMiddleware
+from app.common.middleware.no_fs import NoFilesystemToolsMiddleware
 from app.eval_agent.prompt import EVAL_SYSTEM_PROMPT
 from app.eval_agent.tools import clear_content_tasks, make_eval_tools
 from app.common.model_factory import build_agent_model
@@ -183,7 +183,7 @@ async def run_eval_session(ctx: EvaluationContext) -> dict[str, Any]:
     user_input = (
         f"请评估 trace_id={ctx.input_trace_id} 的执行质量。"
         "按 system prompt 的步骤：看流程硬指标 → 读 trace 摘要 → "
-        "深挖关键节点 → 读设计意图 → 取内容分数 → 产出诊断报告。"
+        "深挖关键节点 → 取内容分数 → 产出诊断报告。"
         "记住只诊断不提方案。"
     )
 

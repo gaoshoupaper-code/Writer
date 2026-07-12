@@ -9,6 +9,8 @@
   events.py        SSE 事件总线（进程内 session→事件队列映射，evolve + eval_agent 共用）
   flow_metrics.py  流程硬指标算子（协作拓扑/错误保障/资源消耗，eval_agent 用）
   evalset.py       评估集加载（测试用例 demand.md 加载，evolve + tests 共用）
+  model_factory.py Agent 模型工厂（build_agent_model，eval_agent + evolve 共用）
+  middleware/      跨 Agent 共用的 DeepAgent 中间件（NoFilesystemToolsMiddleware 等）
 
 不放这里的东西：
   - HarnessConfig 配置对象 → harness_config/（业务语义强）

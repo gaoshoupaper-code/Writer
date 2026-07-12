@@ -11,7 +11,6 @@
   - api.py                评估 API（/api/eval-agent/*）
   - tools/                工具集（按数据源拆分）：
       trace.py            read_trace / read_trace_node / read_trace_range
-      surface.py          read_surface / read_source_file + 版本对齐 helper
       content.py          get_content_score + 后台内容评估任务
       report.py           write_eval_report
   - middleware/           评估 Agent middleware 池：

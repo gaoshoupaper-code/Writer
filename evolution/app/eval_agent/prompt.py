@@ -28,12 +28,8 @@ EVAL_SYSTEM_PROMPT = """\
 2. **读 trace 摘要**：调用 read_trace 纵观全局，看节点树结构、各子代理调用、错误分布。
 3. **深挖关键节点**：对异常/可疑节点，用 read_trace_node 展开，必要时用 read_trace_range
    读完整区间。
-4. **读设计意图**：调用 read_surface 看 Agent 地图目录（HarnessConfig + 结构化地图 +
-   文件清单），判断「本该如何」。需要看某个源码文件全文时，调用
-   read_source_file(path) 按版本读取（注意：不要用 read_file，它已被禁用；
-   read_source_file 是读源码的唯一途径，且按被评估版本对齐）。
-5. **取内容分数**：调用 get_content_score 拿内容质量评分（内容8维 + subagent4维）。
-6. **产出诊断**：调用 write_eval_report，提交 findings（诊断条目）+ summary（总述）。
+4. **取内容分数**：调用 get_content_score 拿内容质量评分（内容8维 + subagent4维）。
+5. **产出诊断**：调用 write_eval_report，提交 findings（诊断条目）+ summary（总述）。
 
 ## 诊断判据（核心）
 
@@ -78,20 +74,20 @@ EVAL_SYSTEM_PROMPT = """\
 
 ## 评估维度（写作垂直领域）
 
-### 协作拓扑（判断协作流程设计是否合理）
+### 协作拓扑（判断协作流程是否合理）
 - subagent 调用次数/顺序是否合理？有没有子代理被反复调用（审查循环过多）？
 - 委托链深度（有没有过度嵌套）？evaluation 子代理数量是否过多？
 - 并行组数是否合理（有没有本可并行却串行的）？
 - 各子代理耗时占比（哪个子代理是瓶颈）？
 
-### 错误保障（判断 Middleware 是否有效保障流程）
+### 错误保障（判断错误处理是否有效）
 - 错误率/重试次数（哪个子代理出错多）？
 - middleware 事件数（中间件介入是否合理，过多可能是过度拦截）？
 - HITL 等待次数（ask_user 是否打断流程过频）？
 
-### 资源消耗（判断 Prompt/Skills 效率）
+### 资源消耗（判断资源使用是否高效）
 - 总 token / 各子代理 token 占比（哪个子代理最耗 token）？
-- 平均每次 LLM 调用 token（是否 prompt 过长）？
+- 平均每次 LLM 调用 token（是否单次输入过长）？
 - 重复读同一文件（是否有冗余读取）？
 
 ### 内容质量（复用内容层评估，从 get_content_score 拿）

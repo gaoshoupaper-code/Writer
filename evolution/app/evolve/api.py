@@ -27,7 +27,7 @@ from pydantic import BaseModel
 from app.eval_agent import repo as eval_repo
 from app.core import db
 from app.evolve import db as ev_db
-from app.evolve.driver.agent import run_evolve_session
+from app.evolve.agent.agent import run_evolve_session
 from app.evolve.ctx import EvolveContext
 from app.trace.recorder import EvolutionTraceRecorder
 
@@ -409,7 +409,7 @@ def _save_session_intent(version: int, session: dict) -> None:
 def _load_session_edits(session: dict) -> list[dict] | None:
     """读取 session 的配置层 edits.json。
 
-    路径 = evolve_workspace/<session_id>/edits.json（与 ctx._edits_path / design_doc 同目录）。
+    路径 = evolve_workspace/<session_id>/edits.json（与 design_doc / change_log 同目录）。
     - 文件不存在 → None（纯源码层改动的 session，发版用 baseline config）。
     - 空数组 → None。
     - 解析/格式异常 → raise（发版失败，避免静默丢弃导致 v1==v2）。

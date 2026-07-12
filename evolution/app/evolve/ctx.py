@@ -17,6 +17,7 @@
   - trace_id_self                      自观测 trace id（本次进化的录像）
 
 emit_step/emit_log 改为代理到 recorder.append_business_event（D3：trace 统一接管）。
+单体化后无阶段概念，emit_step 不再接受 phase 参数。
 """
 from __future__ import annotations
 
@@ -66,23 +67,17 @@ class EvolveContext:
         # 4 态机状态（S6）：running / pending_review / published / discarded
         self.review_status: str = "running"
 
-        # 配置层改动落地文件（apply_edits/validate_changes 读写点）。
-        # 按 session 隔离：与 design_doc.md / change_log.md 同目录（docs.session_dir），
-        # 避免多 session 并发互相覆盖（此前写到 workspace 根的全局共享 edits.json）。
-        from app.evolve.docs import session_dir
-
-        self._edits_path = session_dir(session_id) / "edits.json"
-
     # ── 事件推送便捷方法（D3：代理到 recorder.append_business_event）──
 
-    def emit_step(self, tool: str, status: str, *, phase: str | None = None, **extra: Any) -> None:
-        """推一个 step 事件。phase 指定阶段（plan/execute）。
+    def emit_step(self, tool: str, status: str, **extra: Any) -> None:
+        """推一个 step 事件。
 
         D3 改造：不再写 SessionEvents，改为 recorder.append_business_event。
+        单体化后无阶段概念，不再接受 phase 参数。
         """
         if self.recorder and self.trace_id_self:
             self.recorder.append_business_event(
-                self.trace_id_self, tool, status, phase=phase, **extra
+                self.trace_id_self, tool, status, **extra
             )
 
     def emit_log(self, message: str) -> None:
