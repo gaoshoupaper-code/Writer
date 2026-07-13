@@ -11,11 +11,17 @@ CountingOpenAIClient 做两件事：
      OpenAI 的 Structured Outputs/json_schema，只支持 json_object）
 
 环境变量：
-  SPIKE_LLM_API_KEY   LLM API key（必填）
-  SPIKE_LLM_BASE_URL  OpenAI 兼容 endpoint（可选）
-  SPIKE_LLM_MODEL     模型名（默认 gpt-4o-mini）
-  FALKORDB_PORT       FalkorDB 端口（默认 6380）
-  OPENAI_API_KEY      Graphiti 内部 reranker client 初始化需要（设成和 SPIKE_LLM_API_KEY 一样即可）
+  抽取 LLM（DeepSeek）：
+    SPIKE_LLM_API_KEY   LLM API key（必填）
+    SPIKE_LLM_BASE_URL  OpenAI 兼容 endpoint
+    SPIKE_LLM_MODEL     模型名
+  embedding（智谱）：
+    SPIKE_EMBED_API_KEY   智谱 API key（必填）
+    SPIKE_EMBED_BASE_URL  默认 https://open.bigmodel.cn/api/paas/v4
+    SPIKE_EMBED_MODEL     默认 embedding-3（1024 维，等于 Graphiti 默认）
+  其他：
+    FALKORDB_PORT  FalkorDB 端口（默认 6380）
+    OPENAI_API_KEY Graphiti 内部 reranker client 初始化需要（设成和 SPIKE_LLM_API_KEY 一样即可）
 """
 from __future__ import annotations
 
@@ -220,97 +226,46 @@ class CountingOpenAIClient(OpenAIClient):
 
 # ── 构建带埋点的 Graphiti ────────────────────────────────────────
 
-# bge-small-zh-v1.5 输出 512 维向量（实测确认）。Graphiti 默认 EMBEDDING_DIM=1024，
-# 必须覆盖成 512，否则向量长度不一致（embedder 产 512，embedder_pool 按 1024 处理）报错。
-BGE_EMBEDDING_DIM = 512
-
-
-def override_embedding_dim() -> None:
-    """把 Graphiti 的 EMBEDDING_DIM 常量改成 bge 的 512。
-
-    Graphiti 在 embedder/client.py 定义 EMBEDDING_DIM=1024（0.19.10 版本只此一处）。
-    bge-small-zh 是 512 维，必须覆盖，否则向量长度不一致。
-    在 build_graphiti 内、Graphiti 构造前调用。
-    """
-    import graphiti_core_falkordb.embedder.client as _embedder_client
-
-    _embedder_client.EMBEDDING_DIM = BGE_EMBEDDING_DIM
-    # EmbedderConfig.embedding_dim 是 frozen Field，需绕过 frozen 限制改默认值
-    _embedder_client.EmbedderConfig.model_fields['embedding_dim'].default = BGE_EMBEDDING_DIM
-
-
-class LocalBGEEmbedder:
-    """用 sentence-transformers 本地加载 bge-small-zh-v1.5，替代 OpenAIEmbedder。
-
-    为什么自定义：DeepSeek 没有 embedding API（404），Graphiti 强依赖 embedding
-    （实体向量化是知识图谱基础）。用本地 bge 模型零成本、零依赖外部服务。
-
-    符合 graphiti EmbedderClient 契约：实现 async create() + create_batch()。
-    sentence-transformers 是同步库，用 asyncio.to_thread 包一层避免阻塞事件循环
-    （Graphiti 内部大量并发 embed 调用，阻塞会拖垮整体）。
-    """
-
-    def __init__(self, model_path: str):
-        import asyncio
-        from sentence_transformers import SentenceTransformer
-
-        self._model = SentenceTransformer(model_path)
-        self._to_thread = asyncio.to_thread
-        # 记录 embed 调用次数（spike4 成本统计的一部分）
-        self._call_count = 0
-
-    async def create(
-        self, input_data
-    ) -> list[float]:
-        """单条文本 → 512 维向量。"""
-        if isinstance(input_data, str):
-            texts = [input_data]
-        else:
-            # token id list 等非常规输入，转成可处理的文本；实际 Graphiti 传的都是 str
-            texts = list(input_data) if not isinstance(input_data, (list,)) else [str(input_data)]
-        emb = await self._to_thread(self._model.encode, texts[0] if len(texts) == 1 else texts)
-        self._call_count += 1
-        # 统一返回单条向量（截断到 BGE_EMBEDDING_DIM）
-        if emb.ndim == 2:
-            return emb[0][:BGE_EMBEDDING_DIM].tolist()
-        return emb[:BGE_EMBEDDING_DIM].tolist()
-
-    async def create_batch(self, input_data_list: list[str]) -> list[list[float]]:
-        """批量文本 → 多条 512 维向量。"""
-        embs = await self._to_thread(self._model.encode, input_data_list)
-        self._call_count += len(input_data_list)
-        return [e[:BGE_EMBEDDING_DIM].tolist() for e in embs]
-
-
 def build_graphiti(counter: LLMCallCounter | None = None) -> tuple[Any, LLMCallCounter]:
     """构建连本地 FalkorDB 的 Graphiti。
 
-    LLM 走 DeepSeek（抽取对话），embedding 走本地 bge-small-zh-v1.5。
-    双供应商分离配置——这是 Graphiti 生产环境的推荐用法。
+    双供应商分离配置（Graphiti 生产推荐用法）：
+      - 抽取对话 LLM：DeepSeek（SPIKE_LLM_* 环境变量）
+      - embedding：智谱 embedding-3（SPIKE_EMBED_* 环境变量）
+
+    为什么分两个供应商：DeepSeek 不提供 embedding API，Graphiti 强依赖 embedding。
+    智谱 embedding-3 是 1024 维，正好等于 Graphiti 默认 EMBEDDING_DIM，无需维度覆盖。
     """
     if counter is None:
         counter = COUNTER
 
-    # 覆盖 EMBEDDING_DIM 为 bge 的 512 维（必须在 Graphiti 构造之前）
-    override_embedding_dim()
-
+    # ── 抽取 LLM（DeepSeek）──
     model = os.environ.get("SPIKE_LLM_MODEL", "gpt-4o-mini")
     base_url = os.environ.get("SPIKE_LLM_BASE_URL")
     api_key = os.environ.get("SPIKE_LLM_API_KEY")
     if not api_key:
         raise RuntimeError("SPIKE_LLM_API_KEY 未设置")
 
-    port = os.environ.get("FALKORDB_PORT", "6380")
-    bge_model_path = os.environ.get("BGE_MODEL_PATH", "bge-small-zh-v1.5")
-
-    # LLM client（继承 OpenAIClient，带埋点 + json_schema 降级）
     llm_config = LLMConfig(api_key=api_key, model=model, base_url=base_url)
     llm_client = CountingOpenAIClient(config=llm_config, counter=counter)
 
-    # embedder：本地 bge（512 维）
-    embedder = LocalBGEEmbedder(model_path=bge_model_path)
+    # ── embedding（智谱 embedding-3）──
+    embed_api_key = os.environ.get("SPIKE_EMBED_API_KEY")
+    embed_base_url = os.environ.get("SPIKE_EMBED_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+    embed_model = os.environ.get("SPIKE_EMBED_MODEL", "embedding-3")
+    if not embed_api_key:
+        raise RuntimeError("SPIKE_EMBED_API_KEY 未设置（智谱 embedding key）")
 
-    # FalkorDB 专用 driver（Redis 协议）
+    from graphiti_core_falkordb.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+    embed_config = OpenAIEmbedderConfig(
+        embedding_model=embed_model,
+        api_key=embed_api_key,
+        base_url=embed_base_url,
+    )
+    embedder = OpenAIEmbedder(config=embed_config)
+
+    # ── FalkorDB driver（Redis 协议）──
+    port = os.environ.get("FALKORDB_PORT", "6380")
     from graphiti_core_falkordb.driver.falkordb_driver import FalkorDriver
     driver = FalkorDriver(host="localhost", port=int(port))
 
