@@ -124,29 +124,51 @@ class CountingOpenAIClient(OpenAIClient):
         response.choices[0].message.parsed（pydantic 对象，有 .model_dump()）
         """
         # 1. 从 pydantic response_model 生成字段说明，注入到 system message
-        # 注意：不能用 model_json_schema() 的完整输出——它带 OpenAPI 包装（properties 外层），
-        # 模型会照搬这个包装导致输出 {"properties": {...}} 而非扁平结构。
-        # 这里直接从 model_fields 构造期望的输出结构示例。
+        # 关键：不能用 model_json_schema()（带 OpenAPI properties 外层，模型会照搬包裹）。
+        # 也不能只给字段名+简单类型——list[X] 这种嵌套类型模型会猜错（填 int 而非 list）。
+        # 必须递归展开嵌套结构，生成带真实类型示例值的完整 JSON 模板。
         schema_hint = ""
         if response_model is not None:
-            fields = response_model.model_fields
-            # 构造字段说明 + 期望的输出骨架（用占位符让模型知道结构）
+            from typing import get_args, get_origin
+            from pydantic import BaseModel as PydanticBaseModel
+
+            def make_example(ftype, depth=0):
+                """递归构造类型示例值。list[X]→[示例X]，嵌套BaseModel→递归展开。"""
+                if depth > 5:
+                    return "<值>"
+                origin = get_origin(ftype)
+                if origin is list:
+                    inner = get_args(ftype)[0]
+                    return [make_example(inner, depth + 1)]
+                if isinstance(ftype, type) and issubclass(ftype, PydanticBaseModel):
+                    # 递归展开嵌套 BaseModel 的字段
+                    nested = {}
+                    for nfname, nfinfo in ftype.model_fields.items():
+                        desc = f"（{nfinfo.description}）" if nfinfo.description else ""
+                        nested[nfname] = make_example(nfinfo.annotation, depth + 1)
+                    return nested
+                if ftype is str:
+                    return "示例文本"
+                if ftype is int:
+                    return 0
+                if ftype is float:
+                    return 0.0
+                if ftype is bool:
+                    return False
+                return "<值>"
+
+            # 构造字段说明（含 description）+ 完整示例结构
             field_descs = []
             skeleton = {}
-            for fname, finfo in fields.items():
-                ftype = finfo.annotation
-                # 简化类型描述
-                type_str = getattr(ftype, "__name__", str(ftype))
-                if finfo.description:
-                    field_descs.append(f"  - {fname}（{type_str}）：{finfo.description}")
-                else:
-                    field_descs.append(f"  - {fname}（{type_str}）")
-                skeleton[fname] = "<值>"
+            for fname, finfo in response_model.model_fields.items():
+                desc = finfo.description or ""
+                field_descs.append(f"  - {fname}：{desc}" if desc else f"  - {fname}")
+                skeleton[fname] = make_example(finfo.annotation)
             schema_hint = (
                 "\n\n【输出格式要求】请严格输出一个 JSON 对象，只输出 JSON，不要任何解释文字。\n"
                 f"必须包含以下字段（不要嵌套在 properties 里，直接作为顶层字段）：\n"
                 + "\n".join(field_descs)
-                + "\n\n输出结构示例（把 <值> 替换为实际内容）：\n"
+                + "\n\n输出结构示例（根据实际内容填写，保持结构一致）：\n"
                 + json.dumps(skeleton, ensure_ascii=False, indent=2)
             )
         # 在最后一条 system message 末尾追加 schema 描述
