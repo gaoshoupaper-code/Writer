@@ -4,19 +4,24 @@
   Graphiti(graph_driver=FalkorDriver(...), llm_client, embedder)
   Graphiti.add_episode(name, episode_body, source_description, reference_time,
                        source, group_id, entity_types, ...)
-  LLMClient 调用链：generate_response（模板）→ _generate_response_with_retry → _generate_response（子类实现）
-  继承 OpenAIClient 重写 _generate_response 包埋点（不破坏 schema 注入/clean/retry）
-  依赖：graphiti-core-falkordb + falkordb（Python 客户端）
+
+CountingOpenAIClient 做两件事：
+  1. token 埋点（spike4 成本统计必需）
+  2. json_schema → json_object 降级（让 DeepSeek/GLM 也能跑——它们不支持
+     OpenAI 的 Structured Outputs/json_schema，只支持 json_object）
 
 环境变量：
   SPIKE_LLM_API_KEY   LLM API key（必填）
   SPIKE_LLM_BASE_URL  OpenAI 兼容 endpoint（可选）
   SPIKE_LLM_MODEL     模型名（默认 gpt-4o-mini）
   FALKORDB_PORT       FalkorDB 端口（默认 6380）
+  OPENAI_API_KEY      Graphiti 内部 reranker client 初始化需要（设成和 SPIKE_LLM_API_KEY 一样即可）
 """
 from __future__ import annotations
 
+import json
 import os
+from types import SimpleNamespace
 from typing import Any
 
 from graphiti_core_falkordb.llm_client.config import LLMConfig
@@ -74,18 +79,132 @@ class LLMCallCounter:
 COUNTER = LLMCallCounter()
 
 
-# ── 带埋点的 LLM client（继承 OpenAIClient，只包一层埋点）─────────
+# ── 带埋点 + json_schema→json_object 降级的 LLM client ───────────
+
+import json
+from types import SimpleNamespace
+
 
 class CountingOpenAIClient(OpenAIClient):
-    """继承 OpenAIClient，重写 _generate_response 在返回前埋点 token usage。
+    """继承 OpenAIClient，做两件事：
 
-    保留基类的 schema 注入 / clean / retry / structured completion 全部逻辑，
-    只在拿到响应后从 openai response.usage 提取 token 埋点。
+    1. token 埋点：重写 _generate_response，从底层 openai response 真正取到 usage。
+       （基类的 _handle_*_response 返回的是 model_dump()/json.loads 的纯 dict，
+       不含 usage——原埋点实现取不到，spike4 的 token 统计会全 0。这里在调用
+       _create_*_completion 后直接从返回对象取 usage。）
+
+    2. json_schema → json_object 降级：重写 _create_structured_completion，
+       不用 client.beta.chat.completions.parse（发 json_schema，DeepSeek/GLM 不支持），
+       改用普通 chat.completions.create + response_format=json_object，
+       并在 messages 里注入 schema 描述引导输出结构。
+       风险：json_object 不保证严格遵守 schema，靠 prompt 引导 + pydantic 二次校验兜底。
     """
 
     def __init__(self, config: LLMConfig | None = None, counter: LLMCallCounter | None = None) -> None:
         super().__init__(config=config)
         self._counter = counter or COUNTER
+
+    async def _create_structured_completion(
+        self,
+        model: str,
+        messages: list,
+        temperature: float | None,
+        max_tokens: int,
+        response_model: type | None = None,
+    ):
+        """降级实现：json_object + schema 注入 + pydantic 校验包装。
+
+        返回一个适配基类 _handle_structured_response 的假对象：
+        response.choices[0].message.parsed（pydantic 对象，有 .model_dump()）
+        """
+        # 1. 从 pydantic response_model 生成 schema 描述，注入到 system message
+        schema_hint = ""
+        if response_model is not None:
+            schema = response_model.model_json_schema()
+            schema_hint = (
+                "\n\n【输出格式要求】请严格输出符合以下 JSON Schema 的 JSON 对象，"
+                "只输出 JSON，不要任何解释文字：\n"
+                + json.dumps(schema, ensure_ascii=False, indent=2)
+            )
+        # 在最后一条 system message 末尾追加 schema 描述
+        injected = False
+        patched_messages = []
+        for m in messages:
+            if m.get("role") == "system" and not injected:
+                patched_messages.append({**m, "content": m["content"] + schema_hint})
+                injected = True
+            else:
+                patched_messages.append(m)
+        if not injected:
+            # 没有 system message，作为第一条 system 插入
+            patched_messages.insert(0, {"role": "system", "content": schema_hint})
+
+        # 2. 用 json_object 模式调用（DeepSeek/GLM/OpenAI 通用支持）
+        raw_response = await self.client.chat.completions.create(
+            model=model,
+            messages=patched_messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+        )
+
+        # 3. 埋点 token usage（这里能真正拿到 usage）
+        usage = getattr(raw_response, "usage", None)
+        usage_dict = None
+        if usage is not None:
+            usage_dict = {
+                "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+                "completion_tokens": getattr(usage, "completion_tokens", 0),
+                "total_tokens": getattr(usage, "total_tokens", 0),
+            }
+        label = getattr(response_model, "__name__", "freeform") if response_model else "freeform"
+        self._counter.record_llm(usage_dict, label=str(label)[:40])
+
+        # 4. 解析 JSON + 用 response_model 二次校验，构造假对象返回
+        content = raw_response.choices[0].message.content or "{}"
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as e:
+            # 模型没输出合法 JSON，触发上层 retry
+            raise ValueError(
+                f"json_object 降级模式：模型输出非合法 JSON，无法解析。原始内容前 200 字：{content[:200]}"
+            ) from e
+
+        if response_model is not None:
+            try:
+                parsed_obj = response_model.model_validate(data)
+            except Exception as e:
+                # schema 校验失败，触发上层 retry
+                raise ValueError(
+                    f"json_object 降级模式：模型输出不符合 schema。错误：{e}。原始内容前 200 字：{content[:200]}"
+                ) from e
+        else:
+            parsed_obj = SimpleNamespace(model_dump=lambda: data)
+
+        # 包装成 _handle_structured_response 期望的结构
+        fake_message = SimpleNamespace(parsed=parsed_obj, refusal=None)
+        fake_choice = SimpleNamespace(message=fake_message)
+        return SimpleNamespace(choices=[fake_choice], usage=raw_response.usage)
+
+    async def _create_completion(self, model, messages, temperature, max_tokens, response_model=None):
+        """非结构化补全也埋点 usage。"""
+        response = await self.client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+        )
+        usage = getattr(response, "usage", None)
+        usage_dict = None
+        if usage is not None:
+            usage_dict = {
+                "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+                "completion_tokens": getattr(usage, "completion_tokens", 0),
+                "total_tokens": getattr(usage, "total_tokens", 0),
+            }
+        self._counter.record_llm(usage_dict, label="freeform")
+        return response
 
     async def _generate_response(
         self,
@@ -94,12 +213,8 @@ class CountingOpenAIClient(OpenAIClient):
         max_tokens: int = 8192,
         model_size: str = "medium",
     ) -> dict[str, Any]:
-        # 调基类（保留 schema 注入/retry/structured 全部逻辑）
+        # 调基类：现在基类的 _create_structured_completion/_create_completion 已被重写降级
         result = await super()._generate_response(messages, response_model, max_tokens, model_size)
-        # 埋点：从结果里取 usage（OpenAIClient 的 _handle_* 把 usage 放进返回 dict）
-        usage = result.get("usage") if isinstance(result, dict) else None
-        label = getattr(response_model, "__name__", "freeform") if response_model else "freeform"
-        self._counter.record_llm(usage, label=str(label)[:40])
         return result
 
 
