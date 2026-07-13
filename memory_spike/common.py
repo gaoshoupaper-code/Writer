@@ -123,14 +123,31 @@ class CountingOpenAIClient(OpenAIClient):
         返回一个适配基类 _handle_structured_response 的假对象：
         response.choices[0].message.parsed（pydantic 对象，有 .model_dump()）
         """
-        # 1. 从 pydantic response_model 生成 schema 描述，注入到 system message
+        # 1. 从 pydantic response_model 生成字段说明，注入到 system message
+        # 注意：不能用 model_json_schema() 的完整输出——它带 OpenAPI 包装（properties 外层），
+        # 模型会照搬这个包装导致输出 {"properties": {...}} 而非扁平结构。
+        # 这里直接从 model_fields 构造期望的输出结构示例。
         schema_hint = ""
         if response_model is not None:
-            schema = response_model.model_json_schema()
+            fields = response_model.model_fields
+            # 构造字段说明 + 期望的输出骨架（用占位符让模型知道结构）
+            field_descs = []
+            skeleton = {}
+            for fname, finfo in fields.items():
+                ftype = finfo.annotation
+                # 简化类型描述
+                type_str = getattr(ftype, "__name__", str(ftype))
+                if finfo.description:
+                    field_descs.append(f"  - {fname}（{type_str}）：{finfo.description}")
+                else:
+                    field_descs.append(f"  - {fname}（{type_str}）")
+                skeleton[fname] = "<值>"
             schema_hint = (
-                "\n\n【输出格式要求】请严格输出符合以下 JSON Schema 的 JSON 对象，"
-                "只输出 JSON，不要任何解释文字：\n"
-                + json.dumps(schema, ensure_ascii=False, indent=2)
+                "\n\n【输出格式要求】请严格输出一个 JSON 对象，只输出 JSON，不要任何解释文字。\n"
+                f"必须包含以下字段（不要嵌套在 properties 里，直接作为顶层字段）：\n"
+                + "\n".join(field_descs)
+                + "\n\n输出结构示例（把 <值> 替换为实际内容）：\n"
+                + json.dumps(skeleton, ensure_ascii=False, indent=2)
             )
         # 在最后一条 system message 末尾追加 schema 描述
         injected = False

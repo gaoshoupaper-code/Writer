@@ -50,8 +50,8 @@ async def main() -> None:
 
     # 取出所有实体节点
     print("▶ 查询抽出的实体节点...")
-    from graphiti_core_falkordb.search.search import SearchConfig
-    nodes = await graphiti.get_nodes_by_group(group_id="spike1-chinese")
+    from graphiti_core_falkordb.nodes import EntityNode
+    nodes = await EntityNode.get_by_group_ids(graphiti.driver, ["spike1-chinese"])
 
     entity_nodes = [n for n in nodes if hasattr(n, "summary")]
     print(f"  抽出 {len(entity_nodes)} 个实体节点\n")

@@ -85,7 +85,7 @@ async def main() -> None:
     # 取出所有边，检查 valid_at
     print("▶ 查询抽出的边及其 valid_at...")
     from graphiti_core_falkordb.edges import EntityEdge
-    edges = await graphiti.get_edges_by_group(group_id="spike2-calendar")
+    edges = await EntityEdge.get_by_group_ids(graphiti.driver, ["spike2-calendar"])
     # EntityEdge 有 valid_at / invalid_at
 
     print("─" * 60)

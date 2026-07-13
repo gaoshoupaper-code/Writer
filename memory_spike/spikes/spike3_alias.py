@@ -63,7 +63,8 @@ async def main() -> None:
 
     # 查所有节点
     print("▶ 查询所有实体节点...")
-    nodes = await graphiti.get_nodes_by_group(group_id="spike3-alias")
+    from graphiti_core_falkordb.nodes import EntityNode
+    nodes = await EntityNode.get_by_group_ids(graphiti.driver, ["spike3-alias"])
     entity_nodes = [n for n in nodes if hasattr(n, "summary")]
 
     print("─" * 60)
