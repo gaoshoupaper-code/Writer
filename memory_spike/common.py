@@ -132,6 +132,24 @@ class CountingOpenAIClient(OpenAIClient):
             from typing import get_args, get_origin
             from pydantic import BaseModel as PydanticBaseModel
 
+            def type_label(ftype):
+                """生成可读的类型标签，用于字段说明。"""
+                origin = get_origin(ftype)
+                if origin is list:
+                    inner = get_args(ftype)[0]
+                    return f"列表，元素为{type_label(inner)}"
+                if isinstance(ftype, type) and issubclass(ftype, PydanticBaseModel):
+                    return "对象"
+                if ftype is int:
+                    return "整数（不能是字符串）"
+                if ftype is str:
+                    return "字符串"
+                if ftype is float:
+                    return "数值"
+                if ftype is bool:
+                    return "布尔"
+                return str(ftype)
+
             def make_example(ftype, depth=0):
                 """递归构造类型示例值。list[X]→[示例X]，嵌套BaseModel→递归展开。"""
                 if depth > 5:
@@ -144,7 +162,6 @@ class CountingOpenAIClient(OpenAIClient):
                     # 递归展开嵌套 BaseModel 的字段
                     nested = {}
                     for nfname, nfinfo in ftype.model_fields.items():
-                        desc = f"（{nfinfo.description}）" if nfinfo.description else ""
                         nested[nfname] = make_example(nfinfo.annotation, depth + 1)
                     return nested
                 if ftype is str:
@@ -157,17 +174,23 @@ class CountingOpenAIClient(OpenAIClient):
                     return False
                 return "<值>"
 
-            # 构造字段说明（含 description）+ 完整示例结构
+            # 构造字段说明（含类型标签 + description）+ 完整示例结构
             field_descs = []
             skeleton = {}
             for fname, finfo in response_model.model_fields.items():
+                tlabel = type_label(finfo.annotation)
                 desc = finfo.description or ""
-                field_descs.append(f"  - {fname}：{desc}" if desc else f"  - {fname}")
+                if desc:
+                    field_descs.append(f"  - {fname}（{tlabel}）：{desc}")
+                else:
+                    field_descs.append(f"  - {fname}（{tlabel}）")
                 skeleton[fname] = make_example(finfo.annotation)
             schema_hint = (
                 "\n\n【输出格式要求】请严格输出一个 JSON 对象，只输出 JSON，不要任何解释文字。\n"
                 f"必须包含以下字段（不要嵌套在 properties 里，直接作为顶层字段）：\n"
                 + "\n".join(field_descs)
+                + "\n\n⚠️ 严格遵守类型：整数字段必须填数字（如 0、1、2），"
+                "绝不能填 UUID 或其他字符串；没有匹配项时整数列表填空数组 []。"
                 + "\n\n输出结构示例（根据实际内容填写，保持结构一致）：\n"
                 + json.dumps(skeleton, ensure_ascii=False, indent=2)
             )

@@ -97,6 +97,9 @@ async def main() -> None:
         if not hasattr(e, "valid_at") or e.valid_at is None:
             continue
         va = e.valid_at
+        # Graphiti 返回带时区的 datetime，spike 自己造的是 naive——归一化成 naive 再比较
+        if isinstance(va, datetime) and va.tzinfo is not None:
+            va = va.replace(tzinfo=None)
         gap = t_betrayal - va if isinstance(va, datetime) else None
         gap_str = f"{gap.days}天" if gap else "?"
         # 尝试描述这条边
