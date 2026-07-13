@@ -246,7 +246,11 @@ def build_graphiti(counter: LLMCallCounter | None = None) -> tuple[Any, LLMCallC
     if not api_key:
         raise RuntimeError("SPIKE_LLM_API_KEY 未设置")
 
-    llm_config = LLMConfig(api_key=api_key, model=model, base_url=base_url)
+    # small_model 必须显式设置：Graphiti 有 medium/small 双模型机制，去重等轻量任务
+    # 走 small。small_model 默认 None 时 Graphiti 用内置默认 gpt-4.1-nano（OpenAI 专用），
+    # DeepSeek 不支持会报 model not found。这里默认设成和主模型一样。
+    small_model = os.environ.get("SPIKE_LLM_SMALL_MODEL", model)
+    llm_config = LLMConfig(api_key=api_key, model=model, small_model=small_model, base_url=base_url)
     llm_client = CountingOpenAIClient(config=llm_config, counter=counter)
 
     # ── embedding（智谱 embedding-3）──
