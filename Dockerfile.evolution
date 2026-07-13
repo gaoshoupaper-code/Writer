@@ -74,6 +74,12 @@ COPY --from=frontend-builder /build/out/ ./evolution/frontend/out/
 # 放在 volume 外（/app/evalset_seed/），保证随镜像更新，不受 volume 覆盖影响。
 COPY evolution/data/evalset/golden/ /app/evalset_seed/golden/
 
+# harness repo 种子副本（去 DB 重构）。
+# repo/ 是独立 git 仓库的源码，但 .dockerignore 排除了 .git/，所以这里只有源码文件。
+# 放 volume 外（/app/harness_seed/），entrypoint 在 repo/ 不存在时（首次部署或旧版升级）
+# 从这里复制初始化。已存在的 repo/ 不覆盖（保留进化历史）。
+COPY evolution/harnesses/repo/ /app/harness_seed/repo/
+
 # 容器启动前同步 golden 种子到 volume（rebuild 后新 case 才能生效）
 COPY evolution/docker-entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh

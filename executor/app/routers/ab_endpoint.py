@@ -58,19 +58,28 @@ def prepare_ab_workspace(demand_md: str) -> Path:
     return ws
 
 
+# A/B 与生产两条加载路径各自注册的包名。热加载前必须按前缀清掉这两个包
+# 及其全部子模块（harness_current_ab.subagents.interview 等），否则第二次 A/B
+# import 时 Python 会命中 sys.modules 里第一次的旧模块——旧模块的模块级常量
+# PROMPT_PATH（subagents/interview.py）仍指向已被 cleanup_checkout 删除的目录，
+# 读 prompt 时 FileNotFoundError。靠 "harnesses"/"current" 字符串匹配清不到这些
+# 子模块名，必须按精确包前缀清（与 loader._purge_package_modules 同款做法）。
+_AB_PACKAGE_PREFIXES = ("harness_current_ab", "harness_current")
+
+
 def _clear_package_modules() -> None:
-    """清理 sys.modules 中 harnesses 包的缓存（D11，防同进程版本冲突）。
+    """清理 sys.modules 中 harness 包的缓存（D11，防同进程版本冲突）。
 
     第二次热加载前必须清，否则 import 拿到的是第一次的旧缓存。
     """
     keys_to_del = [
         k for k in list(sys.modules)
-        if "harnesses" in k or k.endswith("current")
+        if any(k == p or k.startswith(p + ".") for p in _AB_PACKAGE_PREFIXES)
     ]
     for k in keys_to_del:
         del sys.modules[k]
     if keys_to_del:
-        logger.info("清理 %d 个 harnesses 包模块缓存", len(keys_to_del))
+        logger.info("清理 %d 个 harness 包模块缓存", len(keys_to_del))
 
 
 def load_package_at(source_root: Path):
