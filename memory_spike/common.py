@@ -228,15 +228,13 @@ BGE_EMBEDDING_DIM = 512
 def override_embedding_dim() -> None:
     """把 Graphiti 的 EMBEDDING_DIM 常量改成 bge 的 512。
 
-    Graphiti 在 embedder/client.py 定义 EMBEDDING_DIM=1024，并在 embedder_pool.py
-    引用它做向量长度相关处理。bge-small-zh 是 512 维，必须全局覆盖这个常量。
+    Graphiti 在 embedder/client.py 定义 EMBEDDING_DIM=1024（0.19.10 版本只此一处）。
+    bge-small-zh 是 512 维，必须覆盖，否则向量长度不一致。
     在 build_graphiti 内、Graphiti 构造前调用。
     """
     import graphiti_core_falkordb.embedder.client as _embedder_client
-    import graphiti_core_falkordb.embedder.embedder_pool as _embedder_pool
 
     _embedder_client.EMBEDDING_DIM = BGE_EMBEDDING_DIM
-    _embedder_pool.EMBEDDING_DIM = BGE_EMBEDDING_DIM
     # EmbedderConfig.embedding_dim 是 frozen Field，需绕过 frozen 限制改默认值
     _embedder_client.EmbedderConfig.model_fields['embedding_dim'].default = BGE_EMBEDDING_DIM
 
