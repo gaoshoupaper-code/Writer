@@ -382,75 +382,15 @@ def _trace_event_to_sse(event: Any) -> dict[str, Any] | None:
 # ── 发版 / 丢弃（Phase 4，S9/S12）────────────────────────────
 
 
-def _save_session_intent(version: int, session: dict) -> None:
-    """从 design_doc 提取改动意图，存入 version_changes 版本级行（D-T1）。
-
-    design_doc 不存在/解析失败 → 跳过（不阻断发版）。
-    """
-    from app.evolve.docs import parse_design_doc_intent
-    from app.versioning import version_changes_repo
-
-    design_doc_path = session.get("design_doc_path")
-    if not design_doc_path:
-        logger.info("session 无 design_doc_path，跳过意图提取（v%s）", version)
-        return
-
-    try:
-        intent = parse_design_doc_intent(design_doc_path)
-        if intent:
-            version_changes_repo.save_intent(version, intent)
-            logger.info("v%s 意图提取完成：%d 条改动", version, len(intent))
-        else:
-            logger.info("v%s design_doc 无 changes，跳过意图存储", version)
-    except Exception:
-        logger.exception("v%s 意图提取失败（不阻断发版）", version)
-
-
-def _load_session_edits(session: dict) -> list[dict] | None:
-    """读取 session 的配置层 edits.json。
-
-    路径 = evolve_workspace/<session_id>/edits.json（与 design_doc / change_log 同目录）。
-    - 文件不存在 → None（纯源码层改动的 session，发版用 baseline config）。
-    - 空数组 → None。
-    - 解析/格式异常 → raise（发版失败，避免静默丢弃导致 v1==v2）。
-    """
-    from app.evolve.docs import session_dir
-
-    session_id = session.get("session_id")
-    if not session_id:
-        return None
-
-    edits_path = session_dir(session_id) / "edits.json"
-    if not edits_path.exists():
-        logger.info("session %s 无 edits.json，发版用 baseline config", session_id)
-        return None
-
-    try:
-        edits = json.loads(edits_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        raise ValueError(f"edits.json 解析失败（{edits_path}）：{e}") from e
-
-    if not isinstance(edits, list):
-        raise ValueError(f"edits.json 必须是数组（{edits_path}），得到 {type(edits).__name__}")
-    if not edits:
-        logger.info("session %s 的 edits.json 为空，发版用 baseline config", session_id)
-        return None
-    return edits
-
-
 @router.post("/evolve/sessions/{session_id}/publish")
 def publish_session(session_id: str) -> dict[str, Any]:
-    """发版：把进化改动固化为新 Agent 版本（S9/S12）。
+    """发版：把进化改动固化为新 Agent 版本（去 DB 重构）。
 
-    流程：
-      1. 校验 session 状态为 pending_review
-      2. git commit + push（产 source_commit）
-      3. 构建 config：bootstrap baseline + 回放 session 的配置层 edits.json
-      4. publish_config（存 harness_snapshots 新 production + 旧 production 降 retired
-         + 算 config diff 存 version_changes）
-      5. 通知执行端
-      6. 提取 design_doc 意图，存 version_changes 版本级行
-      7. 推进 status → published（working 区解锁）
+    流程（4步）：
+      1. 更新 registry.json（publish_version：append 新版本 + 移 production 指针）
+      2. git commit + push（registry 变更 + 源码改动在同一个 commit，单 commit 原子性）
+      3. 通知执行端（/reload）
+      4. 推进 session status → published
     """
     session = ev_db.get_session(session_id)
     if session is None:
@@ -462,56 +402,35 @@ def publish_session(session_id: str) -> dict[str, Any]:
         )
 
     from app.core import git_ops
-    from app.harness_config import edits as edit_ops
-    from app.harness_config.bootstrap import build_v1_config
-    from app.versioning import snapshot_repo
+    from app.versioning import registry_repo
     from app.versioning.snapshot_publisher import notify_executor
 
     try:
-        # 1. git commit + push → source_commit（execute 的源码层改动此时已落盘到 harnesses/current/）
-        commit_msg = f"进化发版: session={session_id} trace={session.get('baseline_trace', '')}"
-        source_commit = git_ops.commit_and_push(commit_msg)
-
-        # 2. 构建 config：bootstrap baseline + 回放 session 的配置层 edits.json。
-        # 源码层改动（write_file 落盘的 .py）已被 bootstrap 读到；配置层改动
-        # （prompt slot / processor 装配）靠这里的 edits 回放。此前缺失回放，
-        # 发版永远产出与上一版逐字节相同的 config（v1==v2 的根因）。
-        base = build_v1_config()
-        edits = _load_session_edits(session)
-        if edits:
-            config = edit_ops.apply_edits(base, edits)
-            edits_applied = len(edits)
-        else:
-            config = base
-            edits_applied = 0
-
-        # 3. publish_config（存快照 + 旧 production 降 retired + 算 diff 存 version_changes）
-        snapshot = snapshot_repo.publish_config(
-            config,
-            source_commit=source_commit,
+        # 1. 更新 registry.json（源码改动已在 repo/ 工作目录，evolve 落盘的）
+        entry = registry_repo.publish_version(
             change_summary=f"进化 session {session_id} 产出的改动",
             source_session=session_id,
         )
 
-        # 4. 通知执行端
-        notified = notify_executor(snapshot["version"])
+        # 2. git commit + push（registry 变更 + 源码改动 → 同一个 commit，原子）
+        commit_msg = f"进化发版 v{entry['version']}: session={session_id}"
+        source_commit = git_ops.commit_and_push(commit_msg)
 
-        # 5. 提取 design_doc 意图，存 version_changes 版本级行（版本差异展示 D-T1）
-        _save_session_intent(snapshot["version"], session)
+        # 3. 通知执行端
+        notified = notify_executor(entry["version"])
 
-        # 6. 推进状态
+        # 4. 推进状态
         ev_db.update_session(session_id, status="published")
 
         logger.info(
-            "进化发版成功: session=%s snapshot_v=%s commit=%s edits_applied=%s",
-            session_id, snapshot["version"], source_commit, edits_applied,
+            "进化发版成功: session=%s v%s commit=%s",
+            session_id, entry["version"], source_commit,
         )
         return {
             "status": "published",
-            "snapshot_version": snapshot["version"],
+            "snapshot_version": entry["version"],
             "source_commit": source_commit,
             "notified": notified,
-            "edits_applied": edits_applied,
         }
     except Exception as e:
         logger.exception("发版失败: session=%s", session_id)
@@ -538,17 +457,22 @@ def discard_session(session_id: str) -> dict[str, Any]:
         )
 
     from app.core import git_ops
-    from app.versioning import snapshot_repo
+    from app.versioning import registry_repo
 
     try:
-        # 取当前 production 的 source_commit
-        prod = snapshot_repo.get_production_snapshot()
-        if prod is None or not prod.get("source_commit"):
+        # 取当前 production 的 commit（git log 推导）
+        prod = registry_repo.get_production_version()
+        if prod is None:
             raise HTTPException(
                 status_code=409,
-                detail="无 production 快照或无 source_commit，无法回退（首次发版前不能丢弃）",
+                detail="无 production 版本，无法回退（首次发版前不能丢弃）",
             )
-        target_commit = prod["source_commit"]
+        target_commit = registry_repo.get_version_commit(prod["version"])
+        if not target_commit:
+            raise HTTPException(
+                status_code=409,
+                detail=f"production v{prod['version']} 无对应 commit，无法回退",
+            )
 
         # git reset --hard 回退 working 区
         import subprocess

@@ -25,7 +25,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # git 配置：harness 卷挂载触发 dubious ownership，预先放行（pull_production 需要）
-RUN git config --global --add safe.directory /app/evolution/harnesses/current \
+# repo/ = 独立 harness 仓库（去 DB 重构）；current/ = 旧目录（过渡期保留）
+RUN git config --global --add safe.directory /app/evolution/harnesses/repo \
+    && git config --global --add safe.directory /app/evolution/harnesses/current \
     && git config --global --add safe.directory /app/evolution/harness.git \
     && git config --global --add safe.directory /app/executor/.harness_checkout/production
 

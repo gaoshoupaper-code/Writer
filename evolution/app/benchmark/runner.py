@@ -160,28 +160,24 @@ def _execute_one(row: dict[str, Any]) -> None:
 
 
 def _get_production_version() -> int | None:
-    """当前 production 快照版本号。"""
-    row = db.query_one(
-        "SELECT version FROM harness_snapshots WHERE status='production' AND config_json IS NOT NULL"
-    )
-    return row["version"] if row else None
+    """当前 production 版本号（从 registry.json）。"""
+    from app.versioning.registry_repo import get_production_version_number
+    return get_production_version_number()
 
 
 def _get_snapshot(version: int) -> dict[str, Any] | None:
-    return db.query_one(
-        "SELECT * FROM harness_snapshots WHERE version=? AND config_json IS NOT NULL",
-        (version,),
-    )
+    """版本元数据（从 registry.json）。"""
+    from app.versioning.registry_repo import get_version
+    return get_version(version)
 
 
 def _trigger_executor(demand_md: str, snapshot: dict[str, Any]) -> str:
     """调 executor /internal/ab/run，返回 task_id。"""
-    config = json.loads(snapshot["config_json"]) if isinstance(snapshot["config_json"], str) else snapshot["config_json"]
+    from app.versioning.registry_repo import get_version_commit
     payload = {
-        "config": config,
         "demand_md": demand_md,
         "baseline": False,
-        "source_commit": snapshot["source_commit"],
+        "source_commit": get_version_commit(snapshot["version"]) or "",
     }
     resp = httpx.post(_executor_url("/internal/ab/run"), json=payload, timeout=_EXEC_TIMEOUT)
     resp.raise_for_status()

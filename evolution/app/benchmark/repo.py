@@ -200,14 +200,10 @@ def get_leaderboard(golden_revision: str | None = None) -> dict[str, Any]:
 
 
 def get_recent_versions(k: int = 3) -> list[int]:
-    """取最近 K 个有快照的版本号（golden 升级重跑用，D18/D20）。"""
-    rows = db.query_all(
-        """SELECT DISTINCT version FROM harness_snapshots
-           WHERE config_json IS NOT NULL
-           ORDER BY version DESC LIMIT ?""",
-        (k,),
-    )
-    return [r["version"] for r in rows]
+    """取最近 K 个版本号（golden 升级重跑用，D18/D20）。从 registry.json。"""
+    from app.versioning.registry_repo import list_versions
+    versions = list_versions()
+    return [v["version"] for v in versions[:k]]
 
 
 # ── 辅助 ────────────────────────────────────────────────────

@@ -27,7 +27,8 @@ services:
       - EVOLUTION_NOTIFY_URL=http://evolution:7789/api/ingestion/notify
       - EVOLUTION_URL=http://evolution:7789
       # harness 共享路径（容器内绝对路径，与下方 volumes 挂载点一致）
-      - HARNESS_PACKAGE_PATH=/app/evolution/harnesses/current
+      # repo/ = 独立 harness 仓库（去 DB 重构），替代旧的 current/
+      - HARNESS_PACKAGE_PATH=/app/evolution/harnesses/repo
       - HARNESS_BARE_REPO=/app/evolution/harness.git
       - HARNESS_CLONE_DIR=/app/executor/.harness_checkout
       - TZ=Asia/Shanghai

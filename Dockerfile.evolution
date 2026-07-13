@@ -41,7 +41,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # git 配置：harness 卷挂载触发 dubious ownership，预先放行 + 配 commit 身份
-RUN git config --global --add safe.directory /app/evolution/harnesses/current \
+# repo/ = 独立 harness 仓库工作目录（去 DB 重构）；current/ = 旧目录（Phase 3 删除前保留）
+RUN git config --global --add safe.directory /app/evolution/harnesses/repo \
+    && git config --global --add safe.directory /app/evolution/harnesses/current \
     && git config --global --add safe.directory /app/evolution/harness.git \
     && git config --global user.email deploy@siyen.site \
     && git config --global user.name deploy \

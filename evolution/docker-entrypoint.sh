@@ -1,23 +1,28 @@
 #!/bin/sh
 # ════════════════════════════════════════════════════════════════════════════
-# docker-entrypoint.sh —— evolution 容器启动前初始化（2026-07-10）
+# docker-entrypoint.sh —— evolution 容器启动前初始化
 # ════════════════════════════════════════════════════════════════════════════
-# 解决"golden 基准层被 volume 覆盖，rebuild 后新 case 不生效"的问题。
+# 两项初始化（均幂等）：
 #
-# 背景：docker-compose 把 data/ 整个挂命名 volume（evolution_data）。Docker 行为
-# 是首次挂载复制镜像内容，之后 volume 覆盖镜像。所以 data/evalset/golden/ 下
-# 新增的 case 即使打进镜像，启动时也会被 volume 旧内容覆盖，看不到。
+# 1. harness 独立 git 仓库初始化（去 DB 重构）
+#    harness_data volume 挂载 /app/evolution/harnesses，首次挂载复制镜像内容
+#    （只拷文件不拷 .git）。entrypoint 调 init_work_repo() 确保：
+#    repo/ 有 .git、remote 配好、main 已 push 到 bare repo（executor 才能 pull）。
 #
-# 方案：镜像构建时把 golden 层额外复制到 volume 外的 seed 目录（/app/evalset_seed/），
-# 容器启动（volume 已挂载）后从这里全量同步覆盖到 data/evalset/golden/。
-# - golden：每次启动从 seed 全量覆盖（镜像只读模板 = 权威源，随 rebuild 更新）
-# - growing：不碰（运行时 promote 写入的数据，持久化在 volume）
-# - evolution.db：不碰（持久化在 volume）
-#
-# 幂等：可重复执行；rm -rf + cp 保证 golden 与镜像完全一致。
+# 2. golden 基准层同步（原有逻辑）
+#    golden 是镜像只读模板，每次启动从 seed 全量覆盖到 volume。
 # ════════════════════════════════════════════════════════════════════════════
 set -e
 
+# ── 1. harness 独立仓库初始化 ──
+echo "[entrypoint] 初始化 harness 独立 git 仓库..."
+cd /app/evolution && python -c "
+from app.core.git_ops import init_work_repo
+init_work_repo()
+print('[entrypoint] harness 仓库初始化完成')
+" || echo "[entrypoint] ⚠ harness 仓库初始化失败（非致命，继续启动）"
+
+# ── 2. golden 基准层同步 ──
 SEED_DIR="/app/evalset_seed/golden"
 TARGET_DIR="/app/evolution/data/evalset/golden"
 

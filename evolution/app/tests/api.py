@@ -25,7 +25,7 @@ from pydantic import BaseModel
 from app.core import db
 from app.core.settings import settings
 from app.common import evalset
-from app.versioning.snapshot_repo import list_snapshots
+from app.versioning.registry_repo import list_versions as list_snapshots
 from app.tests import repo as test_repo
 
 logger = logging.getLogger("evolution.tests.api")
@@ -160,13 +160,14 @@ def list_agents() -> dict[str, Any]:
             "source_commit": _working_commit(),
         }
     ]
+    from app.versioning.registry_repo import get_version_commit
     for snap in list_snapshots():
         agents.append(
             {
                 "type": "snapshot",
                 "version": snap["version"],
                 "label": f"v{snap['version']}",
-                "source_commit": snap.get("source_commit") or "",
+                "source_commit": get_version_commit(snap["version"]) or "",
                 "change_summary": snap.get("change_summary") or "",
             }
         )
@@ -177,22 +178,23 @@ def list_agents() -> dict[str, Any]:
 
 
 def _validate_version(version_type: str, version_id: int | None) -> dict[str, Any] | None:
-    """校验版本选择，返回快照行（snapshot 时）或 None（working 时）。无效 raise 400。"""
+    """校验版本选择，返回版本元数据（snapshot 时）或 None（working 时）。无效 raise 400。"""
     if version_type == "working":
         return None
-    # snapshot：必须有 version_id 且快照存在
     if version_id is None:
         raise HTTPException(status_code=400, detail="snapshot 版本必须指定 version_id")
-    from app.versioning.snapshot_repo import get_snapshot
+    from app.versioning.registry_repo import get_version, get_version_commit
 
-    snap = get_snapshot(version_id)
+    snap = get_version(version_id)
     if snap is None:
         raise HTTPException(status_code=400, detail=f"version not found: {version_id}")
-    if not snap.get("source_commit"):
+    commit = get_version_commit(version_id)
+    if not commit:
         raise HTTPException(
             status_code=400,
-            detail=f"snapshot v{version_id} 无 source_commit，无法执行",
+            detail=f"snapshot v{version_id} 无对应 commit（迁移历史版本，不可执行）",
         )
+    snap["source_commit"] = commit
     return snap
 
 

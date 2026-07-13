@@ -94,6 +94,15 @@ def current_commit() -> str:
     return _git(["rev-parse", "--short", "HEAD"], work_dir())
 
 
+def log_oneline(limit: int = 200) -> list[str]:
+    """工作目录 git log（倒序：最新在前），每行一条 "短hash message"。
+
+    用于 registry 的 version↔commit 映射（version N = 第 N 个 commit）。
+    """
+    out = _git(["log", "--oneline", f"-{limit}"], work_dir())
+    return out.splitlines() if out.strip() else []
+
+
 def show_file(commit: str, file_path: str) -> str:
     """读取指定 commit 版本下的文件内容（git show <commit>:<path>）。
 
@@ -128,31 +137,74 @@ def commit_file(file_path: str, content: str, message: str) -> str:
 
 
 def init_work_repo() -> None:
-    """初始化工作目录为 git 仓库（首次部署用，幂等）。
+    """初始化 harness 独立仓库 + bare repo（首次部署用，幂等）。
 
-    如果工作目录已 git init 且 remote 已配置，跳过。
+    新架构（去 DB 重构）：repo/ 是独立的 harness git 仓库，bare repo 是
+    evolution push / executor pull 的中转。本函数确保两者就绪：
+      1. bare repo 存在（git init --bare）
+      2. 工作目录 repo/ 是 git 仓库（首次/空 volume 时从镜像内容初始化）
+      3. remote origin 指向 bare repo
+      4. main 分支代码已 push 到 bare repo（executor 才能 pull production）
     """
     wd = work_dir()
     bare = settings.harness_bare_repo_path
 
-    # 确保 bare repo 存在
-    if not bare.exists():
-        subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    # 1. 确保 bare repo 存在 + HEAD 指向 main
+    bare.mkdir(parents=True, exist_ok=True)
+    if not (bare / "HEAD").exists():
+        subprocess.run(
+            ["git", "init", "--bare", str(bare)],
+            check=True, capture_output=True,
+        )
         logger.info("bare repo 创建: %s", bare)
+    # bare repo 的 HEAD 必须指向 main，否则 executor clone 时 checkout 失败
+    # （git init --bare 默认 HEAD=master，push main 后 HEAD 仍指向不存在的 master）
+    head_file = bare / "HEAD"
+    if head_file.read_text(encoding="utf-8").strip() != "ref: refs/heads/main":
+        head_file.write_text("ref: refs/heads/main\n", encoding="utf-8")
+        logger.info("bare repo HEAD → refs/heads/main")
 
-    # 初始化工作目录 git
+    # 2. 确保工作目录是 git 仓库
+    #    新部署/空 volume 时 repo/ 可能只有源码文件但没有 .git（docker volume
+    #    首次复制只拷文件不拷 .git），需要重新 init 并做首次 commit。
     git_dir = wd / ".git"
     if not git_dir.exists():
         _git(["init"], wd)
         _git(["branch", "-M", "main"], wd)
-        logger.info("工作目录 git init: %s", wd)
+        # 首次提交：把镜像自带的源码 + registry.json 固化为 v1
+        _git_with_author(["add", "-A"], wd)
+        result = subprocess.run(
+            ["git", "-c", f"user.name={_GIT_AUTHOR[0]}",
+             "-c", f"user.email={_GIT_AUTHOR[1]}",
+             "commit", "-m", "harness 仓库初始化（首次部署）"],
+            cwd=wd, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            logger.info("工作目录首次 commit: %s", wd)
+        # 空目录无文件可提交不是错误（异常情况会日志记录）
 
-    # 配置 remote
+    # 3. 配置 remote（幂等：有则 set-url，无则 add）
     remotes = _git(["remote"], wd)
     if "origin" not in remotes.split():
         _git(["remote", "add", "origin", str(bare)], wd)
     else:
         _git(["remote", "set-url", "origin", str(bare)], wd)
+
+    # 4. 确保 main 已 push 到 bare repo（executor pull 的前提）
+    #    用 --force 只在首次初始化场景：正常演进用 commit_and_push（fast-forward）。
+    #    这里幂等保护：bare repo 无 main 时才 push，避免覆盖已有历史。
+    try:
+        bare_heads = subprocess.run(
+            ["git", "-C", str(bare), "rev-parse", "--verify", "main"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if bare_heads.returncode != 0:
+            # bare repo 无 main，首次 push
+            _git(["push", "origin", "main"], wd)
+            logger.info("首次 push main → bare repo")
+    except Exception:
+        logger.warning("检查 bare repo main 失败，尝试 push", exc_info=True)
+        _git(["push", "origin", "main"], wd)
 
 
 __all__ = [
@@ -160,6 +212,7 @@ __all__ = [
     "has_changes",
     "commit_and_push",
     "current_commit",
+    "log_oneline",
     "show_file",
     "commit_file",
     "init_work_repo",

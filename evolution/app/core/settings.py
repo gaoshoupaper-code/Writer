@@ -57,13 +57,12 @@ class Settings(BaseSettings):
     # growing→golden 升级需维护者校验。留空则不校验（开发模式兼容）。
     maintainer_token: str = ""
 
-    # ── compose Git 传输层（Phase 8，决策 D10b/D11a）──
-    # harness bare repo 路径（同机阶段本地路径，异机时改 URL）。
-    # evolution 工作目录 harnesses/current/ commit → push 到此 bare repo。
-    # executor 从此 bare repo pull/clone。
+    # ── harness 版本管理（独立 git 仓库，去 DB 重构）──
+    # harness 独立 git 仓库的工作目录（evolution 编辑源码 + registry.json 的地方）。
+    # 改动 commit → push 到 bare repo；executor 从 bare repo pull main = production。
+    harness_work_dir: str = "harnesses/repo"
+    # harness bare repo 路径（evolution push → executor pull 的中转）。
     harness_bare_repo: str = "harness.git"
-    # harness 工作目录（evolution 编辑源码的地方）。
-    harness_work_dir: str = "harnesses/current"
 
     @property
     def _evolution_root(self) -> Path:

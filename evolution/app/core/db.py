@@ -175,29 +175,11 @@ def init_db() -> None:
                 PRIMARY KEY (agent_name, prompt_name)
             );
 
-            -- Phase 8（compose 配置化重构，决策 #12/#17/#18）：
-            -- harness_snapshots 从存 tar 整包 → 存 config_json（配置快照全量，tar 废弃）。
-            -- schema_lock 废弃（重跑式 A/B，无 replay 需求，决策 #12）。
-            -- source_commit 记对应 git commit（源码在 bare repo，决策 D7a/D10b）。
-            -- 老库（有 tar_blob 列）由 _migrate_harness_snapshots_config 幂等迁移。
-
-            -- harness_snapshots：配置快照（替代 tar 整包，决策 #18）
-            -- 一份快照 = 某个版本的完整 HarnessConfig JSON（不可变）。
-            -- 同时刻只有一个 status='production'（发布时旧 production 降 retired）。
-            -- config_json 存完整配置对象（prompts/middleware/processors 全在里面）。
-            -- source_commit 记 git commit hash（executor 按此 pull 对应源码）。
-            CREATE TABLE IF NOT EXISTS harness_snapshots (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                version         INTEGER NOT NULL UNIQUE,        -- 配置版本号，单调递增
-                parent_version  INTEGER,                         -- 上一版快照（进化谱系）
-                config_json     TEXT NOT NULL,                   -- 完整 HarnessConfig JSON（不可变快照）
-                source_commit   TEXT,                             -- 对应 git commit hash（executor pull 用）
-                change_summary  TEXT,                             -- 相对 parent 改了哪些
-                status          TEXT NOT NULL DEFAULT 'production', -- production/retired（同时刻只一个 production）
-                created_at      TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_hs_status ON harness_snapshots(status);
-            CREATE INDEX IF NOT EXISTS idx_hs_version ON harness_snapshots(version);
+            -- ── 去_DB 重构：harness_snapshots / version_changes 表已废弃 ──
+            -- 版本管理迁移到 registry.json（独立 git 仓库内）。
+            -- 幂等清理：升级时自动 DROP 旧表（数据已迁移到 registry.json）。
+            DROP TABLE IF EXISTS version_changes;
+            DROP TABLE IF EXISTS harness_snapshots;
 
             -- Phase 8 adapt（AEGIS 进化循环，决策 E3a）：
             -- adapt_rounds 存历轮 landscape/scores/shipped edits，planner 查跨轮连续性。
@@ -209,7 +191,7 @@ def init_db() -> None:
                 landscape       TEXT,                    -- 本轮 landscape（planner 产出）
                 candidates_json TEXT,                    -- 候选摘要 JSON（edits+manifest，不含 config 全量）
                 round_outcome   TEXT,                    -- shipped/rejected/idle
-                shipped_version INTEGER,                 -- ship 了则指向 harness_snapshots.version
+                shipped_version INTEGER,                 -- ship 了则指向 registry.json 的版本号
                 baseline_version INTEGER,                -- 基线 config 版本（E6a）
                 baseline_scores TEXT,                    -- JSON：基线 per-task 分数
                 candidate_scores TEXT,                   -- JSON：候选 per-task 分数
@@ -282,22 +264,6 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_eval_trace ON evaluation_sessions(trace_id);
 
-            -- version_changes：版本间结构化 diff（版本差异展示功能）。
-            -- publish 时算好 v(n-1)→v(n) 的 config diff，按 agent 聚合存库。
-            -- 两种行：
-            --   agent 级行（agent = meta_pipeline/storybuilding/...）：diff_json 存三要素 diff
-            --   版本级行（agent = '__version__'）：intent_json 存 design_doc 意图列表
-            CREATE TABLE IF NOT EXISTS version_changes (
-                version        INTEGER NOT NULL,   -- 版本号（FK→harness_snapshots.version）
-                agent          TEXT    NOT NULL,   -- agent 名；'__version__' = 版本级行
-                diff_json      TEXT,               -- agent 级行：三要素 diff 明细；版本级行：NULL
-                intent_json    TEXT,               -- 版本级行：design_doc 意图列表；agent 级行：NULL
-                computed_at    TEXT    NOT NULL,   -- ISO8601 计算时间
-                PRIMARY KEY (version, agent),
-                FOREIGN KEY (version) REFERENCES harness_snapshots(version)
-            );
-            CREATE INDEX IF NOT EXISTS idx_vc_version ON version_changes(version);
-
             -- ── 数据闭环（设计 20260706）：分层数据集 + promote 闸门 + benchmark 矩阵 + 反思库 ──
 
             -- dataset_meta：评估集 case 元数据（分层 golden/growing + 版本化）。
@@ -341,7 +307,7 @@ def init_db() -> None:
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 batch_id        TEXT NOT NULL,             -- 一次触发（发版/升级）= 一个 batch（uuid）
                 case_id         TEXT NOT NULL,
-                harness_version INTEGER NOT NULL,          -- FK harness_snapshots.version
+                harness_version INTEGER NOT NULL,          -- 版本号（对应 registry.json）
                 golden_revision TEXT NOT NULL,             -- 跑在哪个 golden revision 上
                 trace_id        TEXT,                      -- 跑出来的 trace（NULL=未完成/失败）
                 eval_id         TEXT,                      -- 关联评估 session（NULL=未评估）
@@ -414,10 +380,6 @@ def init_db() -> None:
         _migrate_runs_run_purpose(conn)
         # Phase 4 幂等迁移：prompt 版本管理表（T9 langfuse 式）
         _migrate_prompt_tables(conn)
-        # Phase 8 幂等迁移：harness_snapshots tar→config_json（compose 配置化，决策 #18）
-        _migrate_harness_snapshots_config(conn)
-        # 版本差异展示：harness_snapshots 补 source_session 列（建立 session→version 映射）
-        _migrate_harness_snapshots_source_session(conn)
         # 驱动器模式幂等迁移：evolve_sessions 补 phase + 文档路径列（D16）
         _migrate_evolve_sessions_driver_fields(conn)
         # 三功能解耦：evolve_sessions 补 eval_ref 列（关联评估报告，决策 S6/T2）
@@ -630,80 +592,6 @@ def _migrate_llm_configs_multi(conn: sqlite3.Connection) -> None:
                 conn.execute("DROP TABLE llm_config")
                 conn.commit()
     # 情况 3/4：新表空 + 旧表空/不存在 → 新表已由 CREATE TABLE IF NOT EXISTS 建好，无需动作
-
-
-def _migrate_harness_snapshots_config(conn: sqlite3.Connection) -> None:
-    """幂等迁移：harness_snapshots 从 tar→config_json（Phase 8 compose，决策 #18）。
-
-    老库有 tar_blob(NOT NULL)/tar_size/schema_lock 列。Phase 8 新 schema 用
-    config_json/source_commit，不要 tar_blob/schema_lock。
-
-    迁移策略（SQLite 不支持 ALTER COLUMN 改约束，需重建表）：
-      1. 检测老列（tar_blob）是否存在
-      2. 重建表：新建 Phase 8 schema 的临时表 → 复制老数据（config_json=NULL，标 retired）
-         → DROP 老表 → 重命名临时表
-      3. 老快照行 config_json IS NULL → 视为废弃，新代码查询时过滤
-
-    幂等：检测 config_json 列存在且 tar_blob 列不存在则跳过（已迁移）。
-    """
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(harness_snapshots)").fetchall()}
-
-    # 已迁移：有 config_json 且无 tar_blob
-    if "config_json" in existing and "tar_blob" not in existing:
-        return
-
-    # 新库（CREATE TABLE 已是 Phase 8 schema）：无 tar_blob 也无 config_json 冲突
-    if "tar_blob" not in existing and "config_json" in existing:
-        return
-
-    with _lock:
-        # 老库重建表：tar_blob NOT NULL 阻止新 INSERT，必须去掉
-        conn.executescript(
-            """
-            CREATE TABLE harness_snapshots_new (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                version         INTEGER NOT NULL UNIQUE,
-                parent_version  INTEGER,
-                config_json     TEXT,
-                source_commit   TEXT,
-                change_summary  TEXT,
-                status          TEXT NOT NULL DEFAULT 'production',
-                created_at      TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_hs_status_new ON harness_snapshots_new(status);
-            CREATE INDEX IF NOT EXISTS idx_hs_version_new ON harness_snapshots_new(version);
-
-            INSERT INTO harness_snapshots_new (id, version, parent_version, change_summary, status, created_at)
-            SELECT id, version, parent_version, change_summary,
-                   CASE WHEN 1=1 THEN 'retired' END, created_at
-            FROM harness_snapshots;
-
-            DROP TABLE harness_snapshots;
-            ALTER TABLE harness_snapshots_new RENAME TO harness_snapshots;
-            """
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_hs_status ON harness_snapshots(status)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_hs_version ON harness_snapshots(version)")
-        conn.commit()
-        logger.info(
-            "harness_snapshots 迁移完成：重建表为 config_json schema（Phase 8 compose，决策 #18）。"
-            "老 tar 快照已标 retired（config_json=NULL）。"
-        )
-
-
-def _migrate_harness_snapshots_source_session(conn: sqlite3.Connection) -> None:
-    """幂等迁移：给 harness_snapshots 表补 source_session 列（版本差异展示功能）。
-
-    source_session 记录该版本由哪个 evolve session 产出，建立 session→version 映射。
-    用于 publish 后从 design_doc 提取"改动意图"（reason/expected）回填 version_changes。
-    手动发版（无 session）此列为 NULL。
-    """
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(harness_snapshots)").fetchall()}
-    if "source_session" in existing:
-        return
-    with _lock:
-        conn.execute("ALTER TABLE harness_snapshots ADD COLUMN source_session TEXT")
-        conn.commit()
 
 
 def _drop_legacy_harness_tables(conn: sqlite3.Connection) -> None:

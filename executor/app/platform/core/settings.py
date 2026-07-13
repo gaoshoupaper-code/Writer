@@ -68,11 +68,11 @@ class Settings(BaseSettings):
     # 默认 executor/.llm_config_cache。
     llm_config_cache_dir: str = ".llm_config_cache"
 
-    # Agent 包目录路径（Phase 7 包化重构，D8=X 生产路径）。
+    # Agent 包目录路径（去 DB 重构：独立 harness 仓库）。
     # 执行端同进程 import 此目录作为 Python package，调 assemble(ctx) 装配 agent。
-    # 默认指向 evolution/harnesses/current/（同机部署，真理源在 evolution）。
+    # 默认指向 evolution/harnesses/repo/（独立 git 仓库，evolution 编辑/commit，executor pull）。
     # 相对路径基于项目根 Writer/。
-    harness_package_path: str = "evolution/harnesses/current"
+    harness_package_path: str = "evolution/harnesses/repo"
 
     # ── compose Git 传输层（Phase 8，决策 D10b）──
     # harness bare repo 路径/URL。executor 从此 pull/clone 源码。
