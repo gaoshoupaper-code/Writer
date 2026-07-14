@@ -89,9 +89,10 @@ evolution/data/evolve_workspace/
 evolution/harness.git/
 .harness_checkout/
 
-# harness 独立 git 仓库（去 DB 重构）：独立版本化，主仓库不跟踪其内容。
-# 文件在磁盘上供 Docker COPY 进镜像，但 git 不跟踪（避免双仓库割裂）。
-evolution/harnesses/repo/
+# harness 独立 git 仓库（去 DB 重构）：源码随主仓库分发（Docker COPY 种子需要），
+# 但排除其内部 .git/ 目录（避免双仓库 git 嵌套冲突）。
+evolution/harnesses/repo/.git/
+evolution/harnesses/repo/**/.git/
 
 # 误产物（Windows 保留设备名，无法常规删除，忽略即可）
 nul

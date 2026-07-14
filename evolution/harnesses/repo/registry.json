@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "production": 2,
+  "versions": [
+    {
+      "version": 1,
+      "parent_version": null,
+      "change_summary": "初始包（从 current/ 迁移建立独立 harness 仓库，源码为迁移时 current/ 最终态）",
+      "eval_score": null,
+      "eval_status": "pending",
+      "created_at": "2026-06-27T03:09:22.471310+00:00",
+      "source_session": null,
+      "migrated": true,
+      "migrated_note": "从旧 DB harness_snapshots 迁移。旧 commit 2782f1c/98fc128/b8a171d 属于已废弃的整个项目仓库，源码不可在新仓库精确重建。registry 将旧 v1/v2/v3 合并为新仓库 v1（迁移时的最终态）。"
+    },
+    {
+      "version": 2,
+      "parent_version": 1,
+      "change_summary": "去 DB 重构 Phase 3：删除 use_config 死代码分支（assemble 简化、删 assembler.py 依赖）",
+      "eval_score": null,
+      "eval_status": "pending",
+      "created_at": "2026-07-13T12:30:00+00:00",
+      "source_session": null
+    }
+  ],
+  "rollback_log": []
+}
