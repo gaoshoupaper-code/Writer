@@ -67,6 +67,13 @@ class RuntimeContext:
         credits_middleware_cls: CreditsMiddleware 类（执行端定义，ctx 传入，包内实例化）。
             None 时包不挂载计费中间件（A/B 测试/管理员/interview 路径）。
             与 credits_service 配合，复用 TraceMiddleware 的 T2 注入模式。
+        memory_backend: MemoryBackend 实例（记忆系统 P1，进程内复用）。
+            持有 Graphiti 客户端 + FalkorDB 连接池，执行端懒加载单例注入。
+            None 时包不挂载 MemoryRecallMiddleware（向后兼容，走 ContextAssembler 全量注入）。
+            类型用 object 避免 contracts 硬依赖执行端模块。
+        memory_recall_middleware_cls: MemoryRecallMiddleware 类（harness 定义，ctx 传入，包内实例化）。
+            与 memory_backend 配合，复用 T2 注入模式（实例 + 类双注入）。
+            group_id 在包内 assemble 时从 owner_id + workspace_path 算出（请求级）。
     """
 
     # 请求级（每次 assemble 新建）
@@ -83,6 +90,9 @@ class RuntimeContext:
     # 积分制（AD2/AD6：复用 T2 注入模式）
     credits_service: object | None = None  # CreditsService 实例，None 不计费
     credits_middleware_cls: object | None = None  # CreditsMiddleware 类，执行端注入
+    # 记忆系统（复用 T2 注入模式：实例 + 类双注入，None 时不挂载）
+    memory_backend: object | None = None  # MemoryBackend 实例（进程单例），None 走全量注入
+    memory_recall_middleware_cls: object | None = None  # MemoryRecallMiddleware 类
 
 
 __all__ = ["RuntimeContext"]

@@ -41,6 +41,10 @@ services:
       # 积分制（2026-07-09）：平台代付 key + base_url（优先于 OPENAI_API_KEY）
       - PLATFORM_API_KEY=${PLATFORM_API_KEY:-}
       - PLATFORM_BASE_URL=${PLATFORM_BASE_URL:-}
+      # 记忆系统（2026-07-14）：FalkorDB 连接 + 智谱 embedding
+      # FalkorDB 用 docker 服务名连接（同网络），端口是容器内 6379
+      - FALKORDB_HOST=falkordb
+      - FALKORDB_PORT=6379
     volumes:
       # 持久化：用户库 + workspace + checkpoints（用户数据，不可丢）
       # 源码不挂卷——留在镜像里，rebuild 自动更新（根治旧方案源码被 volume 覆盖的问题）。
@@ -107,6 +111,28 @@ services:
       retries: 3
       start_period: 30s
 
+  # ── 记忆图谱后端：FalkorDB（Graphiti 的时序知识图谱存储）──
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: writer-falkordb
+    expose:
+      - "6379"
+    volumes:
+      - falkordb_data:/data
+    restart: always
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
   # ── 官网 + 下载页（Astro 静态站，nginx 托管）──
   website:
     build:
@@ -154,3 +180,4 @@ volumes:
   evolution_data:   # evolution 的 evolution.db 在此卷内
   harness_data:     # evolution/harnesses/ 共享（executor + evolution 双向读写）
   harness_git:      # evolution/harness.git/ 共享 bare repo
+  falkordb_data:    # FalkorDB 持久化数据（记忆图谱）
