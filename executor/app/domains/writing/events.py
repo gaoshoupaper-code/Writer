@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from app.domains.writing.expert_agent.services.storyline_graph import generate_storyline_graph
+from app.platform.memory import ingest_chapter_sync, ingest_storybuilding_sync
 from app.platform.streaming import sse as _sse
 
 
@@ -186,6 +187,7 @@ class WritingEventSink:
     def __init__(self, thread) -> None:
         self._thread = thread
         self._workspace_path = Path(thread.workspace_path)
+        self._owner_id = getattr(thread, "user_id", None)
         self._active_tasks: dict[str, dict] = {}
         self._subagent_call_counts: dict[str, int] = {}
 
@@ -323,19 +325,39 @@ class WritingEventSink:
                 await self._on_writing_chapter_done(chapter_index, output_payload)
 
     async def _on_storybuilding_done(self) -> None:
-        """storybuilding 完成后派生流程图（写盘副作用）。
+        """storybuilding 完成后派生流程图 + 记忆入图（写盘副作用）。
 
-        确定性、纯后端。失败已被 generate_storyline_graph 内部 try/except 吞掉，
-        这里只读不抛，绝不阻断 SSE 流。
+        两个并行副作用：
+          1. generate_storyline_graph：派生 mermaid 流程图（确定性纯后端）
+          2. ingest_storybuilding_sync：storybuilding 蓝图入记忆图谱（Graphiti）
+
+        两者都是 asyncio.to_thread 异步执行，失败各自内部处理，绝不阻断 SSE 流。
+        入图失败由 ingestion.py 写 .memory_unhealthy flag，阻断后续 memory_recall。
         """
         await asyncio.to_thread(generate_storyline_graph, self._workspace_path)
+        # 记忆系统入图（MemoryBackend 未启用时 ingest_storybuilding_sync 内部直接 return）
+        await asyncio.to_thread(
+            ingest_storybuilding_sync, self._workspace_path, self._owner_id
+        )
 
     async def _on_writing_chapter_done(self, chapter_index: int, output_payload: dict[str, Any]) -> None:
-        """writing 章节完成后算字数，塞进 output_payload（D7，随 tool_output 推前端）。"""
+        """writing 章节完成后算字数 + 章节入图（D7 + 记忆系统 Causal Publish Flow）。
+
+        两个副作用：
+          1. 算字数塞进 output_payload（随 tool_output 推前端，D7）
+          2. 章节正文入记忆图谱（Causal Publish Flow，记忆系统按章节增量入图）
+
+        入图是 asyncio.to_thread 异步执行，失败由 ingestion.py 写 .memory_unhealthy flag，
+        不阻断 SSE 流。
+        """
         word_count = await asyncio.to_thread(_count_chapter_words, self._workspace_path, chapter_index)
         if word_count is not None:
             output_payload["word_count"] = word_count
             output_payload["chapter_index"] = chapter_index
+        # 章节正文入记忆图谱（MemoryBackend 未启用时 ingest_chapter_sync 内部直接 return）
+        await asyncio.to_thread(
+            ingest_chapter_sync, self._workspace_path, self._owner_id, chapter_index
+        )
 
 
 __all__ = ["WritingEventSink"]

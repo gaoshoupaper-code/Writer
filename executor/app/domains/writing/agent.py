@@ -19,6 +19,8 @@ from app.platform.agent.middleware import (
     TraceCallbackHandler,
     TraceMiddleware,
 )
+from app.platform.agent.loader import load_current_package
+from app.platform.memory import get_memory_backend
 from app.platform.core.settings import Settings
 from app.domains.writing.styling.store import CreateTypeStore
 from app.platform.trace import TraceRecorder
@@ -31,6 +33,24 @@ from app.schemas.screenplay import (
 # SSE 心跳间隔已收敛到 platform.streaming.DEFAULT_HEARTBEAT_INTERVAL（PR-07a）。
 
 logger = logging.getLogger("writer.meta_agent")
+
+
+def _get_memory_recall_cls():
+    """从 harness 包动态加载 MemoryRecallMiddleware 类。
+
+    MemoryRecallMiddleware 定义在 harness 包的 middleware/ 下（可进化要素），
+    executor 运行时不硬依赖它——通过 load_current_package 动态获取。
+    harness 包尚未实现该 middleware 时返回 None（向后兼容，走全量注入）。
+    """
+    try:
+        import importlib
+
+        pkg = load_current_package()
+        mw_module = importlib.import_module(f"{pkg.__name__}.middleware.memory_recall_middleware")
+        return getattr(mw_module, "MemoryRecallMiddleware", None)
+    except Exception as e:
+        logger.debug("MemoryRecallMiddleware 加载失败（走全量注入）：%s", e)
+        return None
 
 
 class MetaAgentService(BaseAgentService):
@@ -165,6 +185,8 @@ class MetaAgentService(BaseAgentService):
             trace_middleware_cls=TraceMiddleware,  # T2：类由执行端注入，包内实例化
             credits_service=credits_service,  # AD2：积分制服务，None 不计费
             credits_middleware_cls=CreditsMiddleware,  # AD6：类由执行端注入，包内实例化
+            memory_backend=get_memory_backend(),  # 记忆系统：None 时不挂 memory_recall（向后兼容）
+            memory_recall_middleware_cls=_get_memory_recall_cls(),  # 从 harness 包加载
         )
 
         pkg = load_current_package()
