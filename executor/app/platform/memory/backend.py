@@ -230,16 +230,18 @@ class MemoryBackend:
         *,
         storyline_parser: Any = None,
         story_calendar: Any = None,
-        character_parser: Any = None,
     ) -> None:
         """storybuilding 产物结构化入图。
 
-        解析器（storyline_parser/story_calendar/character_parser）由 harness 包提供
-        （可进化），本方法只负责调 Graphiti 建节点/边。如果解析器为 None（harness
-        还没实现），跳过结构化入图，只做 episode 级入图（全量文件喂入，Graphiti 自行抽取）。
+        storyline_parser 是 harness tools 模块对象（含 parse_storyline/parse_threads/
+        parse_characters 函数 + StoryCalendar 类）。story_calendar 是已实例化的
+        StoryCalendar。两者由 harness 包提供（可进化），本方法只负责调 Graphiti 建节点/边。
+
+        如果 storyline_parser 为 None（harness 还没实现），降级到 episode 级入图
+        （全量文件喂入，Graphiti 自行抽取）。
 
         为什么解析器通过参数传入而非 import：
-        harness 包是 git 独立仓库，executor 运行时动态 import。解析器类由调用方
+        harness 包是 git 独立仓库，executor 运行时动态 import。解析器模块由调用方
         （ingestion.py 管道）从 harness 包加载后传入，保持 executor 不硬依赖 harness。
         """
         await self._ensure_indices()
@@ -247,7 +249,7 @@ class MemoryBackend:
         if storyline_parser is not None:
             # 结构化路径：解析 → 建节点/边
             await self._ingest_structured(
-                workspace_path, group_id, storyline_parser, story_calendar, character_parser
+                workspace_path, group_id, storyline_parser, story_calendar
             )
         else:
             # 降级路径：全量文件作为 episode 喂入，Graphiti 默认抽取
@@ -259,27 +261,45 @@ class MemoryBackend:
         group_id: str,
         storyline_parser: Any,
         story_calendar: Any,
-        character_parser: Any,
     ) -> None:
         """结构化入图：解析 markdown → 建 EntityNode + EntityEdge。"""
         from graphiti_core_falkordb.nodes import EntityNode
 
-        # ── 角色 ──
-        if character_parser is not None:
-            for char in character_parser.parse(workspace_path):
+        # ── 角色（用 storyline_parser.parse_characters）──
+        characters = []
+        if hasattr(storyline_parser, "parse_characters"):
+            characters = storyline_parser.parse_characters(workspace_path)
+        for char in characters:
+            node = EntityNode(
+                name=char.name,
+                group_id=group_id,
+                summary=char.summary,
+                labels=["Character"],
+            )
+            node.attributes = {
+                "aliases": char.aliases,
+                "role_type": char.role_type,
+            }
+            await node.generate_name_embedding(self._client.embedder)
+            await node.save(self._client.driver)
+
+        # ── 故事线 ──
+        if hasattr(storyline_parser, "parse_threads"):
+            for thread in storyline_parser.parse_threads(workspace_path):
                 node = EntityNode(
-                    name=char["name"],
+                    name=f"{thread.thread_id}-{thread.name}",
                     group_id=group_id,
-                    summary=char.get("summary", ""),
-                    labels=["Character"],
+                    summary=thread.global_arc[:500] if thread.global_arc else "",
+                    labels=["Thread"],
                 )
                 node.attributes = {
-                    k: v for k, v in char.items() if k not in ("name", "summary")
+                    "thread_type": thread.thread_type,
+                    "status": thread.status,
                 }
                 await node.generate_name_embedding(self._client.embedder)
                 await node.save(self._client.driver)
 
-        # ── 故事线 + 事件 ──
+        # ── 事件（StoryNode）──
         events = storyline_parser.parse_storyline(workspace_path)
         for evt in events:
             ref_time = (
@@ -302,7 +322,8 @@ class MemoryBackend:
             await node.save(self._client.driver)
 
         logger.info(
-            "storybuilding 结构化入图完成：group=%s events=%d", group_id, len(events)
+            "storybuilding 结构化入图完成：group=%s characters=%d events=%d",
+            group_id, len(characters), len(events),
         )
 
     async def _ingest_episodes(self, workspace_path: Path, group_id: str) -> None:

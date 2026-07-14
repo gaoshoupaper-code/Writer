@@ -53,25 +53,28 @@ def is_unhealthy(workspace_path: Path) -> bool:
     return (workspace_path / _UNHEALTHY_FLAG).exists()
 
 
-def _load_harness_parsers() -> tuple[object | None, object | None, object | None]:
-    """从 harness 包加载可进化的解析器（storyline_parser/story_calendar/character_parser）。
+def _load_harness_tools():
+    """从 harness 包加载 tools 子模块（storyline_parser/story_calendar/narrative_schema）。
 
     harness 包是 git 独立仓库，运行时动态加载为 harness_current 模块。
-    解析器尚未实现时返回 None（降级到 episode 入图）。
+    解析器在 tools/ 子包里，通过 importlib 动态加载（避免包顶层 import 依赖）。
+    tools 子包尚未实现时返回 None（降级到 episode 入图）。
 
-    返回 (storyline_parser, story_calendar, character_parser)。
+    返回 tools 模块对象（含 parse_storyline/parse_threads/parse_characters/
+    StoryCalendar/ENTITY_TYPES/EDGE_TYPES 等）。
     """
     try:
         from app.platform.agent.loader import load_current_package
 
         pkg = load_current_package()
-        storyline_parser = getattr(pkg, "storyline_parser", None)
-        story_calendar = getattr(pkg, "story_calendar", None)
-        character_parser = getattr(pkg, "character_parser", None)
-        return storyline_parser, story_calendar, character_parser
+        # tools 子包可能未被 import，手动加载
+        import importlib
+        pkg_name = pkg.__name__  # harness_current
+        tools = importlib.import_module(f"{pkg_name}.tools")
+        return tools
     except Exception as e:
-        logger.debug("harness 解析器加载失败（降级到 episode 入图）：%s", e)
-        return None, None, None
+        logger.debug("harness tools 加载失败（降级到 episode 入图）：%s", e)
+        return None
 
 
 # ── storybuilding 入图 ──────────────────────────────────────────────
@@ -90,15 +93,14 @@ async def ingest_storybuilding(
         return
 
     group_id = _group_id(owner_id, workspace_path)
-    sp, cal, cp = _load_harness_parsers()
+    tools = _load_harness_tools()
 
     try:
         await backend.ingest_storybuilding(
             workspace_path=workspace_path,
             group_id=group_id,
-            storyline_parser=sp,
-            story_calendar=cal,
-            character_parser=cp,
+            storyline_parser=tools,
+            story_calendar=tools.StoryCalendar() if tools else None,
         )
         clear_unhealthy(workspace_path)
         logger.info("storybuilding 入图成功：workspace=%s", workspace_path.name)
@@ -172,28 +174,17 @@ def ingest_chapter_sync(workspace_path: Path, owner_id: str | None, chapter_inde
 
 
 def _load_harness_schema() -> tuple[dict | None, dict | None]:
-    """从 harness 包加载 narrative_schema（entity_types/edge_types）。
+    """从 harness tools 子包加载 narrative_schema（entity_types/edge_types）。
 
-    解析器尚未实现时返回 (None, None)（降级到 Graphiti 默认抽取）。
+    schema 尚未实现时返回 (None, None)（降级到 Graphiti 默认抽取）。
     """
-    try:
-        from app.platform.agent.loader import load_current_package
-
-        pkg = load_current_package()
-        schema = getattr(pkg, "narrative_schema", None)
-        if schema is None:
-            # 尝试从 tools 子模块加载
-            tools = getattr(pkg, "tools", None)
-            if tools is not None:
-                schema = getattr(tools, "narrative_schema", None)
-        if schema is None:
-            return None, None
-        entity_types = getattr(schema, "ENTITY_TYPES", None)
-        edge_types = getattr(schema, "EDGE_TYPES", None)
-        return entity_types, edge_types
-    except Exception as e:
-        logger.debug("harness schema 加载失败（降级到默认抽取）：%s", e)
+    tools = _load_harness_tools()
+    if tools is None:
         return None, None
+    narrative = getattr(tools, "narrative_schema", None)
+    if narrative is None:
+        return None, None
+    return getattr(narrative, "ENTITY_TYPES", None), getattr(narrative, "EDGE_TYPES", None)
 
 
 __all__ = [
