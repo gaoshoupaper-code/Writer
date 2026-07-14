@@ -270,6 +270,18 @@ def _format_reflections(ctx: EvolveContext) -> str:
     else:
         reflections = reflection_repo.list_by_categories(categories, limit_per_category=3)
 
+    # P4：记忆失败模式（recall_miss/retrieval_fail）不是 eval dimension，
+    # 上面按 dimension 查会遗漏。这里追加查记忆类别，确保 evolution agent 能看到。
+    memory_categories = ["recall_miss", "retrieval_fail", "extraction_gap",
+                         "temporal_violation", "epistemic_violation", "promise_orphan"]
+    existing_ids = {r.get("id") for r in reflections}
+    for mc in memory_categories:
+        mem_reflections = reflection_repo.list_by_categories([mc], limit_per_category=2)
+        for r in mem_reflections:
+            if r.get("id") not in existing_ids:
+                reflections.append(r)
+                existing_ids.add(r.get("id"))
+
     if not reflections:
         return ""
 

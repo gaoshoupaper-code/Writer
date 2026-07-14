@@ -28,6 +28,52 @@ from app.view.traces import get_trace
 logger = logging.getLogger("evolution.evolve.agent.tools.flow")
 
 
+def _read_memory_quality_summary(trace_id: str) -> str:
+    """读 trace 的 memory_quality 埋点，返回可读摘要供 evolve agent 诊断。
+
+    P4 进化闭环：memory_recall middleware 每次检索写一条 run_meta 事件，
+    本函数汇总这些事件的 memory_quality 字段，让 evolution agent 看到记忆系统表现。
+
+    Returns:
+        格式化的 memory_quality 摘要字符串（无数据返回空串）。
+    """
+    import json
+
+    import app.core.db as db
+
+    rows = db.query_all(
+        "SELECT payload_json FROM event_payloads "
+        "WHERE trace_id=? AND type='run_meta' ORDER BY sequence",
+        (trace_id,),
+    )
+    if not rows:
+        return ""
+
+    entries: list[str] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"]) if isinstance(row["payload_json"], str) else row["payload_json"]
+        except (json.JSONDecodeError, TypeError):
+            continue
+        mq = (payload.get("input") or {}).get("memory_quality")
+        if not mq or not isinstance(mq, dict):
+            continue
+        ch = mq.get("chapter_num", "?")
+        ok = mq.get("retrieval_ok", True)
+        nodes = mq.get("evidence_nodes_count", 0)
+        edges = mq.get("evidence_edges_count", 0)
+        tokens = mq.get("evidence_packet_tokens", 0)
+        status = "✓" if ok else "✗"
+        entries.append(f"  第{ch}章 {status} 节点={nodes} 边={edges} token={tokens}")
+        if not ok and mq.get("error"):
+            entries.append(f"    错误: {mq['error'][:100]}")
+
+    if not entries:
+        return ""
+
+    return "\n记忆系统检索质量：\n" + "\n".join(entries)
+
+
 def make_flow_tools() -> list:
     """构建流程工具集（5 个）。"""
 
@@ -99,6 +145,12 @@ def make_flow_tools() -> list:
                 if node.chain_summary:
                     parts.append(f"| {node.chain_summary[:160]}")
                 lines.append(" ".join(parts))
+
+            # P4：追加记忆系统检索质量摘要（从 run_meta 事件读 memory_quality）
+            mq_summary = _read_memory_quality_summary(trace_id)
+            if mq_summary:
+                lines.append(mq_summary)
+
             ctx.emit_step("read_trace", "done", trace_id=trace_id)
             return "\n".join(lines)
         except Exception as e:
@@ -278,11 +330,37 @@ def make_flow_tools() -> list:
 def _import_check_all(pkg_root: Path, errors: list[str]) -> None:
     """尝试 import harness 包内所有 .py 模块，捕获运行时错误。
 
-    harness 包以 harness_current 为模块名加载（与 executor loader 一致）。
-    这里做兜底 import 检查——语法没错但 import 时报错（如引用不存在的模块）
-    会被捕获。
+    用与 executor loader 一致的机制先把包加载为 harness_current
+    （spec_from_file_location + submodule_search_locations），否则裸
+    import_module("harness_current.xxx") 因顶层包未注册必然全部失败，
+    校验形同虚设。这里做兜底 import 检查——语法没错但 import 时报错
+    （如引用不存在的模块）会被捕获。
     """
-    # 收集所有 .py 相对路径 → 模块名
+    import importlib.util
+
+    # 先把包根注册为 harness_current（若未加载），让包内相对 import 生效。
+    # 已加载则先清旧缓存，确保校验的是磁盘当前内容（含本次改动）。
+    _purge = [k for k in list(sys.modules) if k == "harness_current" or k.startswith("harness_current.")]
+    for k in _purge:
+        del sys.modules[k]
+
+    init_path = pkg_root / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        "harness_current", init_path, submodule_search_locations=[str(pkg_root)],
+    )
+    if spec is None or spec.loader is None:
+        errors.append(f"无法创建包加载 spec: {init_path}")
+        return
+    pkg_mod = importlib.util.module_from_spec(spec)
+    sys.modules["harness_current"] = pkg_mod
+    try:
+        spec.loader.exec_module(pkg_mod)
+    except Exception as e:
+        # 包 __init__ 本身执行失败（通常是包内 import 错误），直接记一条
+        errors.append(f"import 错误 __init__.py: {e}")
+        return
+
+    # 收集所有 .py 相对路径 → 模块名（跳过 __init__.py，上面已 exec）
     py_files = [
         p for p in pkg_root.rglob("*.py")
         if "__pycache__" not in p.parts and p.name != "__init__.py"
@@ -294,11 +372,7 @@ def _import_check_all(pkg_root: Path, errors: list[str]) -> None:
         parts[-1] = parts[-1][:-3]  # 去 .py
         mod_name = "harness_current." + ".".join(parts)
         try:
-            # 已加载则 reload（捕获改动后的运行时错误）
-            if mod_name in sys.modules:
-                importlib.reload(sys.modules[mod_name])
-            else:
-                importlib.import_module(mod_name)
+            importlib.import_module(mod_name)
         except Exception as e:
             errors.append(f"import 错误 {rel}: {e}")
 

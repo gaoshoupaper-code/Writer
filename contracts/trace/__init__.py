@@ -44,6 +44,23 @@ class TraceUsage(BaseModel):
     total_tokens: int | None = None
 
 
+class TraceMemoryQuality(BaseModel):
+    """记忆系统检索质量埋点（P4 进化闭环）。
+
+    memory_recall middleware 每次 before_model 检索后记录一条。
+    evolution 侧读 trace 的 run_meta 事件提取此字段，归纳记忆失败模式。
+
+    字段来自设计方案 §7.3 扩展 1（记忆质量 trace 维度）。
+    """
+    chapter_num: int | None = None           # 当前写第几章（查询时的章节号）
+    query: str = ""                          # 实际检索查询（截断前 200 字）
+    evidence_packet_tokens: int = 0          # 注入的证据包估算 token 数
+    evidence_nodes_count: int = 0            # 命中的图节点数
+    evidence_edges_count: int = 0            # 命中的关系边数
+    retrieval_ok: bool = True                # 检索是否成功（False = 异常/图谱为空）
+    error: str | None = None                 # 检索失败时的错误信息
+
+
 class TraceContextRange(BaseModel):
     start_anchor_id: str | None = None
     end_anchor_id: str | None = None
