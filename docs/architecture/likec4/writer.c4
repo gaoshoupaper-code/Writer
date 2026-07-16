@@ -1,3 +1,4 @@
+// ⚠️ 已废弃：由 docs/系统心智模型.md 取代，不再更新。本文件保留作历史归档。
 // Writer 系统 C4 模型
 // 对齐 docs/架构分层图.md 的四层结构: L1 Context / L2 Container / L3 Component
 // 目录名严格对齐代码, 不用别名; LikeC4 用 FQN(点号)表达层级, 不用子 model 块
@@ -139,9 +140,12 @@ model {
         auth = component 'auth/' {
           description '鉴权'
         }
+        memoryBackend = component 'app/platform/memory/ (记忆系统固定基础设施)' {
+          description '记忆系统固定基础设施(不可进化). MemoryBackend 四原语: retrieve(四阶段检索) + add_episode(章节入图) + ingest_storybuilding(蓝图入图) + health_check. 封装 Graphiti+FalkorDB+LLM(json_schema降级)+embedder(智谱embedding-3). 存储=FalkorDB(writer-falkordb docker服务, Redis协议时序知识图谱). 进程单例懒加载, 连不上自动关闭记忆功能降级全量注入'
+        }
       }
       harness = layer 'evolution/harnesses/current/' {
-        description 'Agent 包 (流水线装配 + prompt + skill). 被 platform 加载, 不反向依赖'
+        description 'Agent 包 (流水线装配 + prompt + skill). 被 platform 加载, 不反向依赖. 记忆可进化要素: middleware/memory_recall_middleware.py(查询构造+证据包组装) + tools/narrative_schema(实体/边类型) + tools/storyline_parser + tools/story_calendar(虚构历法)'
       }
 
       // ============= domains/writing 内部组件(L3, 对齐分层图 L3 writing 视图) =============
@@ -195,7 +199,7 @@ model {
         this -> harnessConfig '读 harness 设计意图 (read_surface, 按版本)'
       }
       singleAgent = layer 'app/evolve/ (进化 Agent)' {
-        description '功能③: 按要素分层. driver/(agent+prompt+middleware/phase_guard) 委托 subagents/(plan·execute 各 prompt/tools/build 三件套) + skills/(空壳). 吃评估报告产改动, 不自证比分(T1人工发版)'
+        description '功能③: 按要素分层. driver/(agent+prompt+middleware/phase_guard) 委托 subagents/(plan·execute 各 prompt/tools/build 三件套) + skills/(空壳). 吃评估报告产改动, 不自证比分(T1人工发版). P4: 读 trace memory_quality 摘要(flow.py) + 查 reflection(含记忆失败模式) 注入进化上下文'
         this -> harnessConfig '执行子代理改 harness 源码'
         this -> evoCore '读写 (evolve_sessions 表 + eval_ref 关联评估)'
       }
@@ -203,6 +207,12 @@ model {
       // —— 公共设施(跨 Agent 共用, 不属任一业务 Agent) ——
       common = layer 'app/common/ (公共设施)' {
         description 'events(SSE总线) + flow_metrics(流程指标) + evalset(评估集) + model_factory(LLM模型工厂). eval_agent 与 evolve 平等依赖'
+      }
+
+      // —— 反思库(P4 记忆失败模式归纳) ——
+      reflection = layer 'app/reflection/ (反思库)' {
+        description '归纳评估 badcase + 记忆失败模式(recall_miss 召回空 / retrieval_fail 检索异常) → reflection_library. extract_after_scoring 在评估后调, 从 trace run_meta 事件读 memory_quality 埋点. 被 evolve agent 启动时查询注入(Reflexion 式)'
+        this -> evoCore '读写 (reflection_library 表)'
       }
 
       // —— 底座(被三功能共用) ——
@@ -231,9 +241,18 @@ model {
   writer.frontend -> writer.executor.routers 'HTTP'
   evolution -> writer.executor.routers 'HTTP /internal'
 
+  // ---- 记忆系统关系(跨层, FQN 表达) ----
+  // 写入路径: writing 域事件钩子 → 入图(经 ingestion.py 异步, 不阻断 SSE)
+  writer.executor.events -> writer.executor.platform.memoryBackend 'storybuilding/章节完成入图(asyncio.to_thread)'
+  // 读取路径: harness 的 memory_recall middleware 调 retrieve(经 RuntimeContext 注入, 非 harness 反向 import platform, 不违分层铁律)
+  writer.executor.harness -> writer.executor.platform.memoryBackend 'memory_recall 调 retrieve 四阶段检索(经 ctx 注入)'
+  // 进化闭环: 评估后归纳 + 进化时查询注入
+  writer.evolution.evalAgent -> writer.evolution.reflection '评估后归纳记忆失败模式(extract_from_memory_quality)'
+  writer.evolution.singleAgent -> writer.evolution.reflection '查记忆失败模式注入进化上下文'
+
   // ---- contracts 共享包(独立, 只被依赖不依赖任何一端) ----
   contracts = shared-package 'contracts/' {
-    description '两端的数据合同. 铁律: 只被依赖, 不 import executor 也不 import evolution'
+    description '两端的数据合同. 铁律: 只被依赖, 不 import executor 也不 import evolution. 记忆字段: RuntimeContext.memory_backend + memory_recall_middleware_cls(双注入, 复用T2模式); TraceMemoryQuality(检索质量埋点, P4进化闭环用)'
   }
   writer.executor -> contracts 'import'
   writer.evolution -> contracts 'import'
@@ -275,6 +294,28 @@ views {
   view executorWriting of writer.executor.domains {
     title 'executor · domains/ — Component 视图'
     include *
+  }
+
+  // 记忆系统总览
+  // 记忆系统总览 — 固定基础设施(executor) + 可进化要素(harness) + 进化闭环(evolution)
+  // 跨容器视图: 一个地方看全记忆系统的三层结构(对齐 Phase 1-4 设计)
+  view memoryView {
+    title '记忆系统总览 — 固定基础设施 + 可进化要素 + 进化闭环'
+    description '两层设计: 固定基础设施(executor/platform/memory) + 可进化要素(harness). 三流: 写入/读取/进化闭环. 主色=固定, 次色=可进化'
+    include
+      writer.executor.platform.memoryBackend,
+      writer.executor.harness,
+      writer.executor.events,
+      writer.evolution.reflection,
+      writer.evolution.singleAgent,
+      writer.evolution.evalAgent,
+      writer.evolution.evoCore
+    style writer.executor.platform.memoryBackend {
+      color primary
+    }
+    style writer.executor.harness {
+      color secondary
+    }
   }
 
   // L4 · 跨端进化闭环(动态视图, 对齐三功能解耦)
@@ -343,6 +384,51 @@ views {
     }
     style author {
       color green
+    }
+  }
+
+  // L4 · 记忆系统数据流(动态视图, 三条流: 写入/读取/进化闭环)
+  // 对齐 Phase 1-4 实现: 入图钩子(events.py) → 四阶段检索(retrieve) → 记忆质量埋点→反思→进化
+  dynamic view memoryFlow {
+    title 'L4 · 记忆系统数据流 (写入 / 读取 / 进化闭环)'
+    description '①写入(Causal Publish Flow): storybuilding/章节完成 → events 钩子 → ingestion → MemoryBackend → FalkorDB. ②读取: writing 子代理 → memory_recall middleware(harness可进化) → retrieve 四阶段检索 → EvidencePacket 注入 prompt. ③进化闭环(P4): middleware 写 memory_quality 埋点 → trace → reflection 归纳失败模式 → evolve agent 查注入 → 改 harness 可进化要素.'
+
+    // —— ①写入流: Causal Publish Flow ——
+    writer.executor.events -> writer.executor.platform.memoryBackend 'storybuilding/章节完成触发入图' {
+      notes 'events.py 的 _on_storybuilding_done/_on_writing_chapter_done 钩子, asyncio.to_thread 异步不阻断 SSE'
+    }
+    writer.executor.platform.memoryBackend -> writer.executor.platform.memoryBackend 'ingestion → backend.add_episode/ingest_storybuilding' {
+      notes 'MemoryBackend 调 Graphiti add_episode(章节) 或 结构化建节点(蓝图). 失败写 .memory_unhealthy flag 阻断后续 memory_recall'
+    }
+
+    // —— ②读取流: 四阶段检索注入 ——
+    writer.executor.harness -> writer.executor.platform.memoryBackend 'memory_recall middleware 调 retrieve' {
+      notes '四阶段: Causal Restriction(因果截止) → Hybrid(BM25+Vector) → One-Hop(图扩展) → Bounded Assembly(有界证据包). 经 RuntimeContext 注入, 非 harness 反向 import'
+    }
+    writer.executor.platform.memoryBackend -> writer.executor.harness '返回 EvidencePacket 注入子代理 prompt' {
+      notes '有界证据包(≤budget_chars), 按角色→关系→地点→事件叙事优先级排版'
+    }
+
+    // —— ③进化闭环(P4): 记忆质量 → 反思 → 进化 ——
+    writer.executor.harness -> writer.evolution.evoCore 'memory_recall 写 memory_quality 埋点(run_meta 事件)' {
+      notes 'TraceMemoryQuality: chapter_num/query/evidence_nodes_count/retrieval_ok 等. 随 trace 落库'
+    }
+    writer.evolution.evalAgent -> writer.evolution.reflection '评估后归纳记忆失败模式' {
+      notes 'extract_from_memory_quality: retrieval_ok=False→retrieval_fail; 召回0节点0边→recall_miss'
+    }
+    writer.evolution.singleAgent -> writer.evolution.reflection '查记忆失败模式注入进化上下文' {
+      notes 'evolve agent 启动时按 dimension 查 reflection_library(含记忆类别), flow.py 读 memory_quality 摘要'
+    }
+    writer.evolution.singleAgent -> writer.executor.harness '产改动: 改记忆可进化要素(middleware/tools)' {
+      notes '进化产出的改动落到 harness repo 的 memory_recall_middleware / narrative_schema / storyline_parser 等'
+    }
+
+    // 样式: 固定基础设施主色, 可进化要素次色
+    style writer.executor.platform.memoryBackend {
+      color primary
+    }
+    style writer.executor.harness {
+      color secondary
     }
   }
 }
