@@ -27,9 +27,14 @@ BARE_REPO="/app/evolution/harness.git"
 SEED_REPO="/app/harness_seed/repo"
 if [ -d "$CURRENT_DIR" ] && [ ! -d "$REPO_DIR" ]; then
   echo "[entrypoint] 检测到旧版结构 current/，执行去 DB 重构迁移..."
+  # BARE_REPO 是 docker volume 挂载点（harness_git:/app/evolution/harness.git），
+  # 挂载点目录本身不能 rm（Device or resource busy → 容器崩溃重启循环）。
+  # 清空挂载点内的旧 git 对象（删里面的文件，不删挂载点本身），
+  # 让后面的 init_work_repo() 从种子重新 init --bare + push 新 harness 代码。
+  # 清不空也无妨：init_work_repo 是幂等的，会修正 HEAD 并按需 push。
   if [ -d "$BARE_REPO" ]; then
-    echo "[entrypoint] 清理旧 bare repo（旧 commit 历史已废弃）：$BARE_REPO"
-    rm -rf "$BARE_REPO"
+    echo "[entrypoint] 清空旧 bare repo 内容（旧 commit 历史废弃）：$BARE_REPO"
+    find "$BARE_REPO" -mindepth 1 -delete 2>/dev/null || true
   fi
   echo "[entrypoint] 归档旧 current/ → current.legacy/"
   mv "$CURRENT_DIR" "${CURRENT_DIR}.legacy" 2>/dev/null || true
