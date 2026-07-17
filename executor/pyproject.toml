@@ -21,7 +21,9 @@ dependencies = [
   "uvicorn[standard]>=0.32.0",
   "watchfiles>=0.21.0",
   "cryptography>=43.0.0",
-  "graphiti-core-falkordb>=0.19.0",
+  # ── NWM 记忆系统（去 Graphiti，自研叙事学类型化记忆）──
+  "sqlite-vec>=0.1.6",          # 向量检索 SQLite 扩展（vec0 虚拟表）
+  "pysqlite3-binary>=0.5.4",    # 带扩展加载能力的 SQLite（标准库 sqlite3 默认禁用 load_extension）
 ]
 
 [build-system]

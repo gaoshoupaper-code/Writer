@@ -63,6 +63,16 @@ _checkpoints_root = Path(__file__).resolve().parents[1] / "checkpoints"
 _checkpoint_pool = CheckpointPool(_checkpoints_root)
 init_checkpoint_pool(_checkpoint_pool)
 
+# NWM 记忆系统：MemoryStorePool（一作品一 memory.db，LRU 连接池）。
+# memory_dir 解析跟随 data 目录（resolve_memory_root）。
+from app.platform.memory.store import (
+    MemoryStorePool,
+    init_memory_store_pool,
+    resolve_memory_root,
+)
+_memory_store_pool = MemoryStorePool(resolve_memory_root())
+init_memory_store_pool(_memory_store_pool)
+
 thread_store = ThreadStore(_database, workspace_root)
 style_store = CreateTypeStore(_database, thread_store.workspaces)
 style_optimizer = StyleOptimizer(settings)
@@ -118,6 +128,8 @@ async def _lifespan(application: FastAPI):
     await trace_recorder.aclose()
     await _checkpointer_cm.__aexit__(None, None, None)
     await _checkpoint_pool.aclose_all()
+    # NWM 记忆系统：关闭所有 store 连接。
+    await _memory_store_pool.aclose_all()
 
 
 app = FastAPI(

@@ -100,17 +100,20 @@ def build_writing_deep_subagent(
         编译后的子代理字典 {name, description, runnable}
     """
     # ---- 主代理 system prompt + middleware ----
+    # 双 middleware 兜底链（D-D5-1）：ContextAssembler 总挂载（静态蓝图兜底）+
+    # memory_recall 条件追加（动态记忆）。两者前缀不同（"写作前置上下文：" vs "记忆召回："），
+    # 幂等检测互不干扰，可同时注入。memory_recall 检索失败时 return None 降级，
+    # ContextAssembler 仍提供蓝图上下文，writing 不会零上下文。
     writing_middleware = list(middleware_factory("writing-subagent"))
+    writing_middleware.append(ContextAssemblerMiddleware(
+        workspace_root,
+        file_paths=context_file_paths or [],
+        context_label="写作前置上下文",
+    ))
     if memory_recall_middleware is not None:
-        # 记忆系统已启用：用图谱检索替代全量文件注入
+        # NWM 动态记忆：检索跨章节状态/伏笔/关系，与静态蓝图互补。
+        # 失败时 middleware 内部 return None 降级（D-R5-1），不影响 ContextAssembler。
         writing_middleware.append(memory_recall_middleware)
-    else:
-        # 向后兼容：无记忆系统时走全量文件注入
-        writing_middleware.append(ContextAssemblerMiddleware(
-            workspace_root,
-            file_paths=context_file_paths or [],
-            context_label="写作前置上下文",
-        ))
     primary_spec = build_writing_subagent(writing_middleware, style_suffix)
 
     # ---- review 子代理规格 ----

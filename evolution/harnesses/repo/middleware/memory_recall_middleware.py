@@ -1,22 +1,20 @@
-"""MemoryRecallMiddleware — 写作前从图谱召回记忆，注入 prompt（可进化要素）。
+"""MemoryRecallMiddleware — 写作前从 NWM 记忆库召回证据，注入 prompt（可进化要素）。
 
-替代 ContextAssemblerMiddleware 对 writing 子代理的全量文件注入，
-改为查询条件检索——只召回与当前章节写作意图相关的有界证据包。
+与 ContextAssemblerMiddleware 并存（双 middleware 兜底链，D-D5-1）：
+  - ContextAssembler 总挂载：注入静态蓝图文件（outline/storyline/character）。
+  - MemoryRecall 条件追加：注入动态记忆（跨章节角色状态/伏笔/关系）。
+  两者前缀不同（"写作前置上下文：" vs "记忆召回："），幂等检测互不干扰，可同时注入。
+  MemoryRecall 检索失败时 return None 降级（D-R5-1），ContextAssembler 仍兜底。
 
-设计依据：设计文档 §3.2（接口契约）。
-
-与 ContextAssemblerMiddleware 的同构点：
-  - abefore_model 返回 {"messages": [HumanMessage]}，靠 add_messages reducer append
-  - 幂等检测（context_prefix 前缀匹配，已注入则跳过）
-  - wrap_model_call 把记忆证据重排到消息列表开头（保证 prompt caching 前缀稳定）
+设计依据：NWM 设计文档 D-D4-3（middleware 改动）、D-R5-1（失败降级不中断）。
 
 可进化部分（evolution agent 能改）：
-  - _build_query：查询条件构造逻辑（从 task description + 章节号 → 检索查询）
-  - _format_packet：证据包排版格式
-  - budget / num_results 等检索参数
+  - query_builder（harness tools/query_builder.py）：task → writer query 构造
+  - _format_packet：证据包引导语包装
+  - budget / num_results：检索参数
 
-固定部分（MemoryBackend 提供）：
-  - retrieve 的实际执行（Graphiti BM25+Vector+BFS+reranker + 时间过滤 + 截断）
+固定部分（executor MemoryBackend 提供）：
+  - retrieve 四阶段检索（causal cutoff + FTS5/vec RRF + one-hop JOIN + bounded packet）
 """
 from __future__ import annotations
 
@@ -45,9 +43,10 @@ _CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
 
 
 class MemoryRecallMiddleware(AgentMiddleware):
-    """写作前从 Graphiti 召回相关记忆子图，注入 prompt。
+    """写作前从 NWM 记忆库召回相关动态记忆，注入 prompt。
 
-    替代 ContextAssemblerMiddleware 的全量文件注入，改为查询条件检索。
+    与 ContextAssemblerMiddleware 并存（双 middleware 兜底链）：本中间件提供
+    跨章节的动态记忆（角色状态/伏笔/关系），ContextAssembler 提供静态蓝图。
 
     Args:
         backend: MemoryBackend 实例（执行端注入，提供固定检索原语）
@@ -65,6 +64,7 @@ class MemoryRecallMiddleware(AgentMiddleware):
         budget_chars: int = 12000,
         num_results: int = 10,
         quality_callback: Callable[[dict], None] | None = None,
+        query_builder: Callable[[str, int | None], str] | None = None,
     ) -> None:
         self._backend = backend
         self._group_id = group_id
@@ -74,17 +74,21 @@ class MemoryRecallMiddleware(AgentMiddleware):
         # P4 进化闭环：检索质量埋点回调。executor 侧传入（写 trace run_meta 事件）。
         # None 时不埋点（向后兼容）。回调接收一个 dict（TraceMemoryQuality 字段）。
         self._quality_callback = quality_callback
+        # Phase 5：harness 可进化的 query_builder（task→writer query）。
+        # None 时用内置 _build_query（向后兼容）。
+        self._query_builder = query_builder
 
     # ------------------------------------------------------------------
     # before_model：核心检索 + 注入
     # ------------------------------------------------------------------
 
     async def abefore_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
-        """在 LLM 调用前，从图谱召回记忆并注入 prompt。
+        """在 LLM 调用前，从记忆库召回证据并注入 prompt。
 
-        失败语义（决策 10）：
-          - 图谱不健康（health_check 失败 或 .memory_unhealthy flag 存在）→ 抛错中断
-          - 检索异常 → 抛错中断（不降级到全量注入）
+        失败语义（D-R5-1，推翻旧"决策10硬中断"）：
+          - 记忆不健康（.memory_unhealthy flag / health_check 失败）→ 降级返回 None
+          - 检索异常 → 降级返回 None
+          降级后 ContextAssembler 兜底全量注入（D-D5-1 双 middleware 链），不中断写作。
         """
         messages = state.get("messages", [])
 
@@ -92,23 +96,28 @@ class MemoryRecallMiddleware(AgentMiddleware):
         if self._find_context_index(messages) is not None:
             return None
 
-        # 决策 10：检测 workspace 级不健康 flag
+        # D-R5-1：检测 workspace 级不健康 flag → 降级（不抛错）
         if self._workspace_path is not None:
             try:
                 from pathlib import Path
                 flag = Path(self._workspace_path) / ".memory_unhealthy"
                 if flag.exists():
-                    raise RuntimeError(
-                        f"记忆图谱不可用（存在 .memory_unhealthy flag）"
-                    )
-            except RuntimeError:
-                raise
+                    logger.warning("记忆系统不健康（.memory_unhealthy flag），降级全量注入")
+                    self._record_quality(None, "", packet=None, ok=False, error="unhealthy_flag")
+                    return None
             except Exception:
-                pass  # flag 检测失败不阻断（路径不可访问等）
+                pass  # flag 检测失败不阻断
 
-        # 决策 10：FalkorDB 健康检查（TTL 缓存）
-        if not await self._backend.health_check():
-            raise RuntimeError("FalkorDB 健康检查失败，记忆系统不可用")
+        # D-R5-1：健康检查失败 → 降级（不抛错）
+        try:
+            if not await self._backend.health_check():
+                logger.warning("记忆健康检查失败，降级全量注入")
+                self._record_quality(None, "", packet=None, ok=False, error="health_check_failed")
+                return None
+        except Exception as e:
+            logger.warning("记忆健康检查异常，降级全量注入：%s", e)
+            self._record_quality(None, "", packet=None, ok=False, error=f"health_check_error: {e}")
+            return None
 
         # 提取 task（最后一条 HumanMessage）和章节号
         task = self._extract_task(messages)
@@ -119,20 +128,24 @@ class MemoryRecallMiddleware(AgentMiddleware):
         if not query:
             return None
 
+        # causal cutoff：写第 N 章时只用 ≤ N-1 章的记忆（D-R3-3，杜绝未来泄漏）
+        causal_cutoff = (chapter_num - 1) if chapter_num else None
+
         try:
             packet = await self._backend.retrieve(
                 query=query,
                 group_id=self._group_id,
+                causal_cutoff=causal_cutoff,
                 budget_chars=self._budget_chars,
                 num_results=self._num_results,
             )
         except Exception as e:
-            # P4 埋点：检索失败
+            # D-R5-1：检索失败 → 降级返回 None（不抛错中断）
             self._record_quality(chapter_num, query, packet=None, ok=False, error=str(e))
-            logger.error("记忆检索失败，中断写作：%s", e)
-            raise RuntimeError(f"记忆检索失败：{e}") from e
+            logger.warning("记忆检索失败，降级全量注入：%s", e)
+            return None
 
-        # P4 埋点：检索成功
+        # P4 埋点：检索成功（含完整 trace 审计，D-R1-3）
         self._record_quality(chapter_num, query, packet, ok=True)
 
         if not packet:
@@ -154,18 +167,21 @@ class MemoryRecallMiddleware(AgentMiddleware):
     def _build_query(self, task: str, chapter_num: int | None) -> str:
         """从 task description 构造检索查询（可进化）。
 
-        策略（P1 初版）：提取 task 中的关键实体（角色名、事件）作为查询。
-        task 通常包含 "写第 N 章"、"本章事件 E0XX"、"出场角色 陈远、苏敏" 等。
-        直接用 task 原文做查询（Graphiti BM25 会匹配关键词），
-        前缀加章节号增强时序相关性。
+        Phase 5：优先用 harness 注入的 query_builder（assemble 时从 tools/query_builder.py 加载）。
+        None 时用内置策略（task 原文截断）。
         """
         if not task:
             return ""
 
-        # 去掉过长的系统指令部分，只取核心写作意图
-        # task 通常是 meta agent 的 task description，含章节目标 + 出场角色 + 事件
-        query = task[:2000]  # 截断防超长查询
-        return query
+        # harness 可进化 query_builder 优先
+        if self._query_builder is not None:
+            try:
+                return self._query_builder(task, chapter_num)
+            except Exception:
+                pass  # harness query_builder 异常时回退内置
+
+        # 内置默认：task 原文截断（FTS5 BM25/LIKE 匹配关键词）
+        return task[:2000]
 
     def _format_packet(self, packet: Any, chapter_num: int | None) -> str:
         """把 EvidencePacket 排版成注入文本（可进化）。
@@ -195,22 +211,47 @@ class MemoryRecallMiddleware(AgentMiddleware):
         ok: bool,
         error: str | None = None,
     ) -> None:
-        """记录记忆检索质量（P4 进化闭环信号）。
+        """记录记忆检索质量（P4 进化闭环信号 + D-R1-3 完整检索审计）。
 
         通过 quality_callback 回调上报给 executor（写 trace run_meta 事件）。
         callback 为 None 时跳过（向后兼容）。
+
+        审计字段（让 evolution 看到"召回了什么"而非仅"召回了几个"）：
+          - 基础：chapter_num/query/retrieval_ok/error
+          - 数量：packet tokens/nodes_count/edges_count
+          - 完整审计（D-R1-3）：causal_cutoff/stage1_count/stage3_expanded/truncated/hits 摘要
         """
         if self._quality_callback is None:
             return
 
+        # hits 摘要（只取关键字段，避免 trace 膨胀）
+        hits_summary: list[dict] = []
+        if packet is not None:
+            for h in getattr(packet, "hits", [])[:20]:  # 限制 20 条防膨胀
+                hits_summary.append({
+                    "type": h.get("type"),
+                    "name": h.get("name"),
+                    "source_chapter": h.get("source_chapter"),
+                    "via_join": h.get("via_join", False),
+                })
+
         self._quality_callback({
+            # 基础
             "chapter_num": chapter_num,
             "query": query[:200],
+            "retrieval_ok": ok,
+            "error": error,
+            # 数量（兼容旧 TraceMemoryQuality 字段）
             "evidence_packet_tokens": getattr(packet, "token_estimate", 0) if packet else 0,
             "evidence_nodes_count": len(getattr(packet, "nodes", [])) if packet else 0,
             "evidence_edges_count": len(getattr(packet, "edges", [])) if packet else 0,
-            "retrieval_ok": ok,
-            "error": error,
+            # D-R1-3 完整检索审计
+            "causal_cutoff": getattr(packet, "causal_cutoff", None) if packet else None,
+            "stage1_count": getattr(packet, "stage1_count", 0) if packet else 0,
+            "stage2_anchors": getattr(packet, "stage2_anchors", []) if packet else [],
+            "stage3_expanded": getattr(packet, "stage3_expanded", 0) if packet else 0,
+            "truncated": getattr(packet, "truncated", False) if packet else False,
+            "hits": hits_summary,
         })
 
     # ------------------------------------------------------------------

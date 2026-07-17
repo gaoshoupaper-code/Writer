@@ -81,6 +81,27 @@ class Settings(BaseSettings):
     # harness 源码 clone 缓存目录（executor 本地，pull/clone 到此）。
     harness_clone_dir: str = ".harness_checkout"
 
+    # ── NWM 记忆系统（去 Graphiti 重构，2026-07-17）──
+    # 记忆系统是可选组件：以下配置缺失时 get_memory_backend() 返回 None，
+    # writing 回退 ContextAssembler 全量注入（D-R5-1 降级语义）。
+    #
+    # 存储：SQLite 单文件 + sqlite-vec 向量扩展（executor/app/__init__.py 注入 pysqlite3）。
+    # memory.db 落在 memory_dir 下，按 workspace_id 分文件（一作品一库）。
+    memory_dir: str = "data/memory"
+
+    # 记忆抽取 LLM（独立于写作 ctx.model，D-D2-3：抽取是结构化任务，用快模型不走思考模式）。
+    # 留空时回退到 openai_api_key/openai_base_url/writer_model（兼容无独立配置的部署）。
+    memory_extract_api_key: str = ""
+    memory_extract_base_url: str = ""
+    memory_extract_model: str = ""
+
+    # 记忆 embedding（智谱 embedding-3，NWM 向量检索用）。
+    # DeepSeek 不提供 embedding API，故需独立供应商。
+    # 留空时记忆系统降级（无向量检索能力 → 降级全量注入）。
+    memory_embed_api_key: str = ""
+    memory_embed_base_url: str = ""
+    memory_embed_model: str = "embedding-3"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -92,3 +113,10 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+# 智谱 embedding-3 的输出维度（NWM 记忆系统向量索引维度）。
+# 为什么是常量而非配置：sqlite-vec 虚拟表的 float[N] 维度在建表时固化，
+# 换 embedding 模型必须重建所有向量表。设为常量防止运行时不一致。
+# 智谱 embedding-3 官方输出 2048 维（旧注释误标 1024，已纠正）。
+MEMORY_EMBED_DIMENSION: int = 2048

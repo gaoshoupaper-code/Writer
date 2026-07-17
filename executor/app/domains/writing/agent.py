@@ -185,7 +185,9 @@ class MetaAgentService(BaseAgentService):
             trace_middleware_cls=TraceMiddleware,  # T2：类由执行端注入，包内实例化
             credits_service=credits_service,  # AD2：积分制服务，None 不计费
             credits_middleware_cls=CreditsMiddleware,  # AD6：类由执行端注入，包内实例化
-            memory_backend=get_memory_backend(),  # 记忆系统：None 时不挂 memory_recall（向后兼容）
+            # NWM 记忆系统：per-workspace backend（workspace_id 定位 memory.db）。
+            # pool 未初始化或配置缺失时返回 None → writing 走 ContextAssembler 全量注入。
+            memory_backend=get_memory_backend(f"{owner_id}_{workspace_path.name}"),
             memory_recall_middleware_cls=_get_memory_recall_cls(),  # 从 harness 包加载
         )
 

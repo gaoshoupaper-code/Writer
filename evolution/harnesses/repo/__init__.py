@@ -59,8 +59,13 @@ def _build_memory_recall_middleware(ctx: RuntimeContext):
     """根据 ctx 条件构建 MemoryRecallMiddleware（记忆系统未启用时返回 None）。
 
     复用 T2 注入模式：ctx.memory_backend（实例）+ ctx.memory_recall_middleware_cls（类）
-    都非 None 时，在包内实例化 middleware。group_id 从 owner_id + workspace 名算出。
+    都非 None 时，在包内实例化 middleware。workspace_id 从 owner_id + workspace 名算出。
     None 时返回 None → writing 子代理走 ContextAssembler 全量注入（向后兼容）。
+
+    NWM 重构（Phase 5）：harness 可进化要素注入——
+      - query_builder：harness tools/query_builder.py（task→writer query）
+      - join_rules + packet_formatter：注入 MemoryRetriever（覆盖 executor 默认）
+    注入用 executor 的 set_memory_retriever 全局单例。
 
     P4 进化闭环：构造 quality_callback 闭包，把检索质量写到 trace run_meta 事件。
     trace_recorder 或 trace_id 为 None 时不埋点（向后兼容）。
@@ -68,19 +73,73 @@ def _build_memory_recall_middleware(ctx: RuntimeContext):
     if ctx.memory_backend is None or ctx.memory_recall_middleware_cls is None:
         return None
 
-    # group_id 构成：owner_id:workspace_name（需求决策 8）
+    # workspace_id（与 events.py 一致：owner_id_workspace_name，定位 memory.db）
     ws_name = ctx.workspace_path.name
-    group_id = f"{ctx.owner_id}:{ws_name}" if ctx.owner_id else ws_name
+    workspace_id = f"{ctx.owner_id}_{ws_name}" if ctx.owner_id else ws_name
+    # group_id 兼容旧签名（backend 内部用 workspace_id，group_id 仅日志/兼容）
+    group_id = workspace_id
+
+    # ── Phase 5：注入 harness 可进化检索要素 ──
+    _inject_harness_retriever()
 
     # P4：构造检索质量埋点回调（写 trace run_meta 事件）
     quality_callback = _make_quality_callback(ctx)
+
+    # query_builder 从 harness 加载（middleware _build_query 可被覆盖）
+    query_builder = _load_harness_query_builder()
 
     return ctx.memory_recall_middleware_cls(
         backend=ctx.memory_backend,
         group_id=group_id,
         workspace_path=ctx.workspace_path,
         quality_callback=quality_callback,
+        query_builder=query_builder,  # None 时 middleware 用内置 _build_query
     )
+
+
+_harness_retriever_injected = False
+
+
+def _inject_harness_retriever() -> None:
+    """把 harness 的 join_rules + packet_formatter 注入 executor MemoryRetriever。
+
+    进程级单例注入（set_memory_retriever），只注入一次。harness 要素加载失败时
+    静默回退到 executor 默认（不影响功能）。
+    """
+    global _harness_retriever_injected
+    if _harness_retriever_injected:
+        return
+    _harness_retriever_injected = True
+    try:
+        from app.platform.memory.retriever import MemoryRetriever, set_memory_retriever
+        join_rules = _load_harness_callable("join_rules", "join_rules")
+        packet_formatter = _load_harness_callable("packet_formatter", "packet_formatter")
+        if join_rules is not None or packet_formatter is not None:
+            set_memory_retriever(MemoryRetriever(
+                join_rules=join_rules,
+                packet_formatter=packet_formatter,
+            ))
+    except Exception as e:
+        # harness 要素注入失败不阻断——executor 默认 retriever 仍可用
+        import logging
+        logging.getLogger(__name__).debug("harness retriever 注入失败，用 executor 默认：%s", e)
+
+
+def _load_harness_query_builder():
+    """加载 harness tools/query_builder.build_query（None 用 middleware 内置）。"""
+    return _load_harness_callable("query_builder", "build_query")
+
+
+def _load_harness_callable(module_name: str, func_name: str):
+    """从 harness tools 子包加载可调用对象（失败返回 None，降级到 executor 默认）。"""
+    try:
+        import importlib
+        from app.platform.agent.loader import load_current_package
+        pkg = load_current_package()
+        mod = importlib.import_module(f"{pkg.__name__}.tools.{module_name}")
+        return getattr(mod, func_name, None)
+    except Exception:
+        return None
 
 
 def _make_quality_callback(ctx: RuntimeContext):
