@@ -672,6 +672,35 @@ export async function getElements(version: number): Promise<ElementsView> {
   return evoJson<ElementsView>(`/api/snapshots/${version}/elements`, { method: "GET" });
 }
 
+// ── 记忆子系统要素（NWM 6 要素，独立于按 agent 分组的 ElementsView） ──
+
+/** 记忆协同链中的角色（与后端 versioning.constants.MEMORY_ROLE_ORDER 对齐） */
+export type MemoryFileRole = "extract" | "store" | "retrieve" | "recall";
+
+/** 记忆要素物理类型 */
+export type MemoryElementType = "prompt" | "middleware" | "tool";
+
+/** 单个记忆要素：NWM 协同链的一个环节 */
+export interface MemoryElementView {
+  name: string;
+  path: string; // 相对 harness 包根，如 tools/query_builder.py
+  type: MemoryElementType;
+  file_role: MemoryFileRole;
+  description: string;
+  tags: string[]; // 恒为 ["memory"]
+}
+
+/** GET /api/snapshots/{version}/memory-elements 响应 */
+export interface MemoryElementsView {
+  version: number;
+  has_source: boolean;
+  elements: MemoryElementView[]; // 已按 抽取→存储→检索→回填 排序
+}
+
+export async function getMemoryElements(version: number): Promise<MemoryElementsView> {
+  return evoJson<MemoryElementsView>(`/api/snapshots/${version}/memory-elements`, { method: "GET" });
+}
+
 // ── 版本详情（含升级 diff + 改动意图，来自 GET /api/versions/{version}） ──
 
 /** 行级 diff 的一个 hunk：equal/insert/delete 三种，无 replace（后端已拆为 del+ins） */

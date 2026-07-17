@@ -9,8 +9,9 @@
   含义：展示的是真实运行的 agent（源文件），而非死代码 config 的投影。
 
 端点（/api/snapshots 前缀）：
-  GET /snapshots/{version}/elements   版本要素展示视图
-  GET /snapshots/{version}/source     指定文件源码（middleware 懒加载用）
+  GET /snapshots/{version}/elements          版本要素展示视图
+  GET /snapshots/{version}/memory-elements   记忆子系统要素视图（NWM 6 要素）
+  GET /snapshots/{version}/source            指定文件源码（middleware 懒加载用）
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.core.git_ops import show_file, log_oneline
 from app.versioning import registry_repo
+from app.versioning.constants import MEMORY_FILES, MEMORY_ROLE_ORDER
 
 logger = logging.getLogger("evolution.elements_api")
 
@@ -200,6 +202,59 @@ def build_elements_view(version: int) -> dict[str, Any]:
     }
 
 
+def build_memory_elements_view(version: int) -> dict[str, Any]:
+    """构建记忆子系统要素视图（NWM 6 要素）。
+
+    记忆要素横跨 prompts/middleware/tools 三目录、不属于任何 agent，故独立于
+    build_elements_view（按 agent 分组）。只返回该版本实际存在的文件——老版本可能
+    还没有 NWM 重构，此时 elements 为空，前端显示"此版本无记忆子系统"。
+
+    结构（对齐前端 MemoryElementsView 类型）：
+      {
+        "version": int,
+        "has_source": bool,
+        "elements": [ {name, path, type, file_role, description, tags}, ... ]
+      }
+    elements 按 MEMORY_ROLE_ORDER 排序（抽取→存储→检索→回填）。
+    """
+    commit = _version_to_commit(version)
+    elements: list[dict[str, Any]] = []
+
+    if commit:
+        for path, (f_type, file_role, description) in MEMORY_FILES.items():
+            # 检查文件在该 commit 是否存在（show_file 失败即不存在）
+            if not _file_exists_at_commit(commit, path):
+                continue
+            name = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            elements.append({
+                "name": name,
+                "path": path,
+                "type": f_type,
+                "file_role": file_role,
+                "description": description,
+                "tags": ["memory"],
+            })
+
+        # 按协同链顺序排序（抽取→存储→检索→回填）
+        role_index = {r: i for i, r in enumerate(MEMORY_ROLE_ORDER)}
+        elements.sort(key=lambda e: role_index.get(e["file_role"], 99))
+
+    return {
+        "version": version,
+        "has_source": commit is not None,
+        "elements": elements,
+    }
+
+
+def _file_exists_at_commit(commit: str, path: str) -> bool:
+    """检查某文件在某 commit 是否存在（git show 成功即存在）。"""
+    try:
+        show_file(commit, path)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ── 端点 ────────────────────────────────────────────────────────
 
 
@@ -210,6 +265,19 @@ def get_elements(version: int) -> dict[str, Any]:
     if v is None:
         raise HTTPException(status_code=404, detail=f"版本 v{version} 不存在")
     return build_elements_view(version)
+
+
+@router.get("/{version}/memory-elements")
+def get_memory_elements(version: int) -> dict[str, Any]:
+    """记忆子系统要素视图（NWM 6 要素）。version 不存在则 404。
+
+    与 /elements 独立——记忆要素横跨三目录不属于任何 agent，集中返回。
+    老版本无 NWM 重构时 elements 为空（非 404）。
+    """
+    v = registry_repo.get_version(version)
+    if v is None:
+        raise HTTPException(status_code=404, detail=f"版本 v{version} 不存在")
+    return build_memory_elements_view(version)
 
 
 @router.get("/{version}/source")

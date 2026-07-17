@@ -7501,6 +7501,136 @@ html[data-theme="dark"] {
   font-size: 13px;
 }
 
+/* ── 记忆子系统卡片（NWM 6 要素顶部聚焦视图） ── */
+.memory-card {
+  background: var(--surface, #faf6ec);
+  border: 1px solid var(--border, #d6c9a8);
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin-bottom: 20px;
+}
+.memory-card-empty .memory-empty {
+  margin: 8px 0 0;
+  color: var(--muted, #7d7060);
+  font-size: 13px;
+}
+.memory-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.memory-card-head h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink, #2e2618);
+}
+.memory-card-sub {
+  font-size: 12px;
+  color: var(--muted, #7d7060);
+}
+
+/* 横向流水线：抽取→存储→检索→回填 */
+.memory-pipeline {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  overflow-x: auto;
+}
+.memory-stage {
+  display: flex;
+  align-items: stretch;
+  flex: 1;
+  min-width: 0;
+}
+.memory-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 6px;
+  color: var(--accent, #3a9a7e);
+  font-size: 18px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.memory-stage-inner {
+  flex: 1;
+  min-width: 0;
+  background: var(--accent-soft, rgba(58,154,126,0.08));
+  border: 1px solid rgba(58,154,126,0.25);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.memory-stage-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(58,154,126,0.18);
+}
+.memory-stage-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent, #3a9a7e);
+}
+.memory-stage-hint {
+  font-size: 11px;
+  color: var(--muted, #7d7060);
+  line-height: 1.3;
+}
+.memory-stage-files {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.memory-file {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--surface, #faf6ec);
+  border-radius: 5px;
+  padding: 5px 8px;
+}
+.memory-file-name {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink, #2e2618);
+  word-break: break-all;
+}
+.memory-file-path {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  color: var(--muted, #7d7060);
+  word-break: break-all;
+}
+.memory-file-desc {
+  font-size: 11px;
+  color: var(--text-dim, #7d7060);
+  line-height: 1.35;
+  margin-top: 2px;
+}
+.memory-file-missing {
+  font-size: 11px;
+  color: var(--coral, #c9794e);
+  font-style: italic;
+}
+
+/* 窄屏：流水线转纵向（检索阶段 3 要素时避免挤压） */
+@media (max-width: 760px) {
+  .memory-pipeline {
+    flex-direction: column;
+    gap: 4px;
+  }
+  .memory-arrow {
+    transform: rotate(90deg);
+    padding: 2px 0;
+  }
+}
+
 /* ── tests 页 ── */
 .tests-page {
   max-width: 960px;

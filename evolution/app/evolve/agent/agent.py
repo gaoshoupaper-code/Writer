@@ -29,7 +29,7 @@ from app.core.settings import settings
 from app.common.middleware.no_fs import NoFilesystemToolsMiddleware
 from app.common.model_factory import build_agent_model
 from app.evolve.agent.middleware.flow_guard import FlowGuardMiddleware
-from app.evolve.agent.prompt import evolve_system_prompt
+from app.evolve.agent.prompt import evolve_system_prompt, render_memory_section
 from app.evolve.agent.tools import make_evolve_tools
 from app.evolve.ctx import EvolveContext, set_tool_context
 from app.trace import TraceMiddleware, TraceCallbackHandler
@@ -72,6 +72,7 @@ def build_evolve_agent(ctx: EvolveContext):
         trace_id=ctx.trace_id,
         eval_summary=_format_eval_summary(ctx),
         reflections_summary=_format_reflections(ctx),
+        memory_section=_format_memory_section(ctx),
     )
 
     # middleware：禁框架 fs + 产出约束 + 自观测 trace
@@ -290,6 +291,26 @@ def _format_reflections(ctx: EvolveContext) -> str:
         hit = r.get("hit_count", 0)
         lines.append(f"  • [{r['category']}] (命中{hit}次) {r['pattern'][:120]}")
     return "\n".join(lines)
+
+
+def _format_memory_section(ctx: EvolveContext) -> str:
+    """探测当前 harness 工作副本是否有记忆要素，有则渲染记忆子系统认知节。
+
+    认定"哪些是记忆要素"与 elements_api 同源——都读 versioning.constants.MEMORY_FILES。
+    探测逻辑：检查 settings.harness_work_dir_path 下 MEMORY_FILES 的文件是否存在，
+    任意一个存在即认定该包有记忆子系统（注入认知节），全无则返回空串（老版本兼容）。
+
+    注意与桌面的数据源差异：这里探测的是【工作副本】（Agent 在上面做改动），
+    桌面 memory-elements 接口查的是【git 快照】（已发布版本）。两者数据源不同是合理的——
+    Agent 在工作副本上进化，桌面展示历史版本。
+    """
+    from app.versioning.constants import MEMORY_FILES
+
+    work_dir = settings.harness_work_dir_path
+    has_memory = any((work_dir / path).exists() for path in MEMORY_FILES)
+    if not has_memory:
+        return ""
+    return render_memory_section()
 
 
 __all__ = ["build_evolve_agent", "run_evolve_session"]

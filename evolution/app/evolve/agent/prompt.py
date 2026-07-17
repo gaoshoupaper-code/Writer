@@ -20,6 +20,7 @@ def evolve_system_prompt(
     trace_id: str,
     eval_summary: str,
     reflections_summary: str = "",
+    memory_section: str = "",
 ) -> str:
     """构建进化 Agent 的 system prompt。
 
@@ -28,6 +29,8 @@ def evolve_system_prompt(
         trace_id:           被进化的 trace id
         eval_summary:       评估报告摘要（已加载到 ctx.eval_snapshot，read_eval_report 可读全文）
         reflections_summary: 反思库摘要（历史失败模式，可选）
+        memory_section:     记忆子系统认知节（NWM 6 要素说明，可选）。
+                            当前 harness 工作副本有记忆要素时由调用方注入，无则空串。
     """
     reflections_section = ""
     if reflections_summary:
@@ -89,7 +92,7 @@ Writer 的创作 Agent 打成一个自包含的 **harness 包**（`harnesses/cur
 | **subagents** | `subagents/*.py` | 子代理定义（build_* 函数） | 写作流水线的五个岗位（interview/storybuilding/detail_outline/writing + GP） |
 | **skills** | `skills/*/` | 技能包（markdown + 脚本） | agent 按需加载的"能力包"——分步操作指南 |
 | **assemble** | `__init__.py` | 装配入口函数 `assemble(ctx)` | 把上述要素组合成可运行 agent 的"菜谱" |
-
+{memory_section}
 ### 框架层要素（不在包目录里，但要理解）
 
 | 要素 | 来源 | 是什么 | 起什么作用 |
@@ -226,4 +229,52 @@ name 只允许字母/数字/下划线/连字符/点号（防路径穿越）。
 """
 
 
-__all__ = ["evolve_system_prompt"]
+__all__ = ["evolve_system_prompt", "render_memory_section"]
+
+
+def render_memory_section() -> str:
+    """渲染记忆子系统认知节 markdown（③ 段子节）。
+
+    从 versioning.constants.MEMORY_FILES 读取 6 要素元数据，生成：
+      - 4 列要素表（与 ③ 段包内要素表对齐：要素/目录/是什么/起什么作用）
+      - 一段协同说明（抽取→存储→检索→回填）
+      - 一句软约束总注（D3：放开 + prompt 软约束，提醒改检索要素影响一致性）
+
+    认定"哪些是记忆要素"与 elements_api 同源（都读 MEMORY_FILES），
+    确保前后端认知一致，不漂移。
+    """
+    from app.versioning.constants import (
+        MEMORY_FILES, MEMORY_ROLE_ORDER, MEMORY_ROLE_LABELS,
+    )
+
+    # 按 role 分组要素（抽取→存储→检索→回填），表格行按此顺序排
+    lines = [
+        "",
+        "### 记忆子系统（NWM 可进化要素）",
+        "",
+        "包里还有 6 个要素构成 **NWM 记忆子系统**——它们物理散落在 tools/middleware/prompts",
+        "三个目录，但语义上是一条协同链：",
+        "**抽取**（从正文抽 typed records）→ **存储**（schema 策略决定抽什么）→",
+        "**检索**（构造查询 + JOIN 扩展 + 排版证据包）→ **回填**（写作前注入 prompt）。",
+        "",
+        "| 要素 | 目录 | 是什么 | 起什么作用 |",
+        "|------|------|--------|-----------|",
+    ]
+
+    role_groups: dict[str, list[tuple[str, str, str]]] = {r: [] for r in MEMORY_ROLE_ORDER}
+    for path, (f_type, file_role, description) in MEMORY_FILES.items():
+        name = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        role_groups.setdefault(file_role, []).append((name, path, description))
+
+    for role in MEMORY_ROLE_ORDER:
+        for name, path, description in role_groups.get(role, []):
+            lines.append(f"| **{name}** | `{path}` | {description} | "
+                         f"{MEMORY_ROLE_LABELS.get(role, role)}阶段要素 |")
+
+    lines += [
+        "",
+        "**软约束**：query_builder / join_rules / packet_formatter 这 3 个检索要素遵循 NWM 论文",
+        "（§A.1 四阶段检索 + 因果锚点）的一致性要求，乱改会破坏检索正确性——改前务必",
+        "read_source 读懂现有逻辑，改动应保持四阶段结构与因果锚点不变。",
+    ]
+    return "\n".join(lines)

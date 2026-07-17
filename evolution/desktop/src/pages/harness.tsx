@@ -4,13 +4,16 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import {
   getSnapshots,
   getElements,
+  getMemoryElements,
   getVersionDetail,
   type Snapshot,
   type ElementsView,
+  type MemoryElementView,
   type VersionDetail,
   type AgentDiff,
 } from "@/lib/api";
 import { UpgradeOverview } from "@/components/harness/UpgradeOverview";
+import { MemorySubsystemCard } from "@/components/harness/MemorySubsystemCard";
 import { PromptTab } from "@/components/harness/PromptTab";
 import { SkillsTab } from "@/components/harness/SkillsTab";
 import { MiddlewareTab } from "@/components/harness/MiddlewareTab";
@@ -28,6 +31,7 @@ export default function HarnessPage() {
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
   const [selectedVersion, setSelectedVersion] = useState<number | null>(null);
   const [elements, setElements] = useState<ElementsView | null>(null);
+  const [memoryElements, setMemoryElements] = useState<MemoryElementView[] | null>(null);
   const [versionDetail, setVersionDetail] = useState<VersionDetail | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -51,10 +55,11 @@ export default function HarnessPage() {
     refresh();
   }, [refresh]);
 
-  // 版本切换：并行拉要素 + 升级详情
+  // 版本切换：并行拉要素 + 记忆要素 + 升级详情
   useEffect(() => {
     if (selectedVersion == null) return;
     setElements(null);
+    setMemoryElements(null);
     setVersionDetail(null);
 
     Promise.all([
@@ -62,13 +67,19 @@ export default function HarnessPage() {
         toast.error(err instanceof Error ? err.message : "读取 Agent 要素失败");
         return null;
       }),
+      getMemoryElements(selectedVersion).catch((err) => {
+        // 记忆要素失败不阻断主要素展示（老版本无此接口/无 NWM）
+        console.warn("读取记忆要素失败", err);
+        return null;
+      }),
       getVersionDetail(selectedVersion).catch((err) => {
         // 版本详情失败不阻断要素展示（diff 高亮不可用而已）
         console.warn("读取版本详情失败", err);
         return null;
       }),
-    ]).then(([els, detail]) => {
+    ]).then(([els, memEls, detail]) => {
       setElements(els);
+      setMemoryElements(memEls?.elements ?? []);
       setVersionDetail(detail);
     });
   }, [selectedVersion]);
@@ -120,6 +131,9 @@ export default function HarnessPage() {
         changes={versionDetail?.changes ?? null}
         isBootstrap={isBootstrap}
       />
+
+      {/* 记忆子系统顶部聚焦视图（NWM 6 要素，独立于按 agent 分组的 Tab） */}
+      {memoryElements && <MemorySubsystemCard elements={memoryElements} />}
 
       {/* 要素三 Tab */}
       {elements ? (
