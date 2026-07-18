@@ -355,7 +355,10 @@ def init_db() -> None:
                 created_at   TEXT NOT NULL,
                 updated_at   TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_llm_configs_scope_active ON llm_configs(scope, is_active);
+            -- ⚠️ 索引不在 executescript 里建：CREATE TABLE IF NOT EXISTS 不会给存量库补
+            -- scope 列，若此处建 ON(scope,is_active) 会因列不存在而崩，进而连累整个
+            -- executescript 让服务起不来（2026-07-18 启动崩溃根因）。索引统一由
+            -- _migrate_llm_configs_scope 幂等管理（确保 scope 列已存在后再建）。
 
             -- user_cache：executor 用户列表的本地缓存（trace 历史观测功能）。
             -- evolution 不维护用户主数据，定时从 executor /internal/users 拉取，
@@ -607,41 +610,51 @@ def _migrate_llm_configs_scope(conn: sqlite3.Connection) -> None:
       - scope='evolution'：进化 Agent 做 evaluate/evolve 时用
       - scope='executor'：executor 给用户写正文时用
 
-    迁移策略（D16=C 复制双份，零风险上线）：
-      1. 加 scope 列（DEFAULT 'evolution'，现有行自动归 evolution）
-      2. 复制现有所有行到 executor scope，副本 name 加"（执行端副本）"后缀（T4=b）
-      3. 副本 is_active 保持与原行一致（原本激活的，副本也激活）
-    幂等：scope 列已存在则直接 return。
+    迁移分两阶段（都幂等，新旧库均安全）：
+      阶段 A（仅存量库执行）：加 scope 列 + 复制现有行到 executor scope。
+        - 新库 CREATE TABLE 已含 scope 列 → 阶段 A 跳过。
+        - 存量库无 scope 列 → ALTER 加列（DEFAULT 'evolution'，现有行归 evolution），
+          再把每行复制一份到 executor scope（副本 name 加"（执行端副本）"后缀，
+          副本 is_active 与原行一致）。
+      阶段 B（无条件执行）：DROP 旧单列索引 + 建复合 (scope, is_active) 索引。
+        - 必须在阶段 A 之后，确保 scope 列已存在才建索引（否则 sqlite 报
+          no such column，这正是 2026-07-18 启动崩溃的根因）。
+
+    为什么索引不放进 init_db 的 executescript：CREATE TABLE IF NOT EXISTS 不改
+    存量表结构，若 executescript 里建 ON(scope,is_active)，存量库会在 scope
+    列尚未 ALTER 加上时就崩，且连累整段 executescript 中断，服务起不来。
     """
     existing = {row[1] for row in conn.execute("PRAGMA table_info(llm_configs)").fetchall()}
-    if "scope" in existing:
-        return
 
+    # ── 阶段 A：加列 + 复制数据（仅存量库：scope 列缺失时执行）──
+    if "scope" not in existing:
+        with _lock:
+            conn.execute("ALTER TABLE llm_configs ADD COLUMN scope TEXT NOT NULL DEFAULT 'evolution'")
+            rows = conn.execute(
+                "SELECT name, api_key_enc, base_url, model, is_active, created_at, updated_at "
+                "FROM llm_configs"
+            ).fetchall()
+            for name, api_key_enc, base_url, model, is_active, created_at, updated_at in rows:
+                conn.execute(
+                    """INSERT INTO llm_configs
+                       (name, api_key_enc, base_url, model, is_active, scope, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, 'executor', ?, ?)""",
+                    (f"{name}（执行端副本）", api_key_enc, base_url, model, is_active, created_at, updated_at),
+                )
+            conn.commit()
+        logger.info(
+            "llm_configs 加 scope 列完成，现有 %d 行已复制到 executor scope（含后缀命名）。",
+            len(rows),
+        )
+
+    # ── 阶段 B：索引重建（无条件幂等，确保 scope 列已在）──
+    # 新库首次启动也走这里：executescript 不再建 llm_configs 索引，统一由此补齐。
     with _lock:
-        # 1. 加列（现有行 scope 默认 'evolution'）
-        conn.execute("ALTER TABLE llm_configs ADD COLUMN scope TEXT NOT NULL DEFAULT 'evolution'")
-        # 2. 复制双份：原行已在 evolution，再复制一份到 executor（副本名加后缀）
-        rows = conn.execute(
-            "SELECT name, api_key_enc, base_url, model, is_active, created_at, updated_at "
-            "FROM llm_configs"
-        ).fetchall()
-        for name, api_key_enc, base_url, model, is_active, created_at, updated_at in rows:
-            conn.execute(
-                """INSERT INTO llm_configs
-                   (name, api_key_enc, base_url, model, is_active, scope, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, 'executor', ?, ?)""",
-                (f"{name}（执行端副本）", api_key_enc, base_url, model, is_active, created_at, updated_at),
-            )
-        # 3. 索引调整：单列 is_active → 复合 (scope, is_active)，支撑按 scope 查激活
-        conn.execute("DROP INDEX IF EXISTS idx_llm_configs_active")
+        conn.execute("DROP INDEX IF EXISTS idx_llm_configs_active")  # 旧单列索引（若存在）
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_llm_configs_scope_active ON llm_configs(scope, is_active)"
         )
         conn.commit()
-    logger.info(
-        "llm_configs 加 scope 列完成，现有 %d 行已复制到 executor scope（含后缀命名）。",
-        len(rows),
-    )
 
 
 def _drop_legacy_harness_tables(conn: sqlite3.Connection) -> None:
