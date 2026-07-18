@@ -29,21 +29,23 @@ export default function GoldenTab({ refreshSignal }: { refreshSignal: number }) 
     setLoading(true);
     setError(null);
     setRevError(false);
-    try {
-      const cs = await getDatasetCases("golden");
-      setCases(cs.cases);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "读取 golden 列表失败");
-    } finally {
-      setLoading(false);
+    // 两个请求无依赖关系，并发拉取（原串行 await 让加载时间翻倍）
+    const [csResult, revResult] = await Promise.allSettled([
+      getDatasetCases("golden"),
+      getGoldenRevision(),
+    ]);
+    if (csResult.status === "fulfilled") {
+      setCases(csResult.value.cases);
+    } else {
+      setError(csResult.reason instanceof Error ? csResult.reason.message : "读取 golden 列表失败");
     }
-    // revision 独立拉取，失败不影响 case 列表
-    try {
-      const rev = await getGoldenRevision();
-      setRevision(rev);
-    } catch {
+    // revision 独立处理：失败不影响 case 列表展示
+    if (revResult.status === "fulfilled") {
+      setRevision(revResult.value);
+    } else {
       setRevError(true);
     }
+    setLoading(false);
   }, []);
 
   useEffect(() => {

@@ -89,9 +89,14 @@ export default function HistoryPage() {
     }
   }, [runPurposes, sinceISO, tab, selectedUser, page]);
 
-  // 首次加载用户缓存列表
+  // 首次加载用户缓存列表（失败提示，不静默吞——否则用户筛选下拉消失无报错）
   useEffect(() => {
-    getUserCache().then(setUsers).catch(() => setUsers([]));
+    getUserCache()
+      .then(setUsers)
+      .catch((err) => {
+        setUsers([]);
+        toast.error(err instanceof Error ? err.message : "用户列表加载失败");
+      });
   }, []);
 
   useEffect(() => {

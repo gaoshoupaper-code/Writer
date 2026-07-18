@@ -31,6 +31,8 @@ export default function ReviewTab({ refreshSignal }: { refreshSignal: number }) 
   const navigate = useNavigate();
   const [tasks, setTasks] = useState<PromoteTask[]>([]);
   const [loading, setLoading] = useState(true);
+  // 失败态：区分"真空队列"与"加载失败"，避免用户误以为没数据
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // accept 表单 Sheet
   const [acceptTask, setAcceptTask] = useState<PromoteTask | null>(null);
@@ -40,15 +42,12 @@ export default function ReviewTab({ refreshSignal }: { refreshSignal: number }) 
 
   const refresh = useCallback(async () => {
     try {
-      const resp = await getPromoteTasks({ status: "needs_confirm", page: 1, page_size: 50 }).catch(() => ({
-        tasks: [],
-        total: 0,
-        page: 1,
-        page_size: 50,
-      }));
+      const resp = await getPromoteTasks({ status: "needs_confirm", page: 1, page_size: 50 });
       setTasks(resp.tasks);
+      setLoadError(null);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "读取待标注列表失败");
+      // 失败保留旧数据（轮询场景不刷空），仅首次失败显示错误态
+      setLoadError(err instanceof Error ? err.message : "读取待标注列表失败");
     } finally {
       setLoading(false);
     }
@@ -80,8 +79,9 @@ export default function ReviewTab({ refreshSignal }: { refreshSignal: number }) 
     try {
       const cs = await getDatasetCases("growing");
       setGrowingCases(cs.cases);
-    } catch {
+    } catch (err) {
       setGrowingCases([]);
+      toast.error(err instanceof Error ? err.message : "读取 growing case 列表失败");
     }
   }
 
@@ -89,6 +89,13 @@ export default function ReviewTab({ refreshSignal }: { refreshSignal: number }) 
     <div className="tab-pane">
       {loading ? (
         <div className="page-loading">加载待标注列表…</div>
+      ) : loadError && tasks.length === 0 ? (
+        // 首次加载就失败：明确错误态，区分"真空队列"
+        <div className="page-error">
+          <div className="page-error-title">待标注列表加载失败</div>
+          <div className="page-error-detail">{loadError}</div>
+          <button className="page-error-retry" onClick={refresh}>重试</button>
+        </div>
       ) : tasks.length === 0 ? (
         <div className="monitor-empty">暂无待标注任务（后台调度器 5 分钟扫描一次自动发现）</div>
       ) : (

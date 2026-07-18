@@ -27,6 +27,7 @@ export default function TestsPage() {
   const [tests, setTests] = useState<ManualTest[]>([]);
   const [agents, setAgents] = useState<TestAgentOption[]>([]);
   const [cases, setCases] = useState<DatasetCase[]>([]);
+  const [casesLoadError, setCasesLoadError] = useState(false);
   const [loading, setLoading] = useState(true);
   const [starting, setStarting] = useState(false);
 
@@ -42,10 +43,14 @@ export default function TestsPage() {
     try {
       const resp = await getDatasetCases();
       setCases(resp.cases);
+      setCasesLoadError(false);
       // 默认选中第一个，避免空提交
       setCaseId((prev) => prev || resp.cases[0]?.case_id || "");
-    } catch {
+    } catch (err) {
+      // 失败不静默：标记错误态让下拉显示"加载失败"，并 toast 提示
       setCases([]);
+      setCasesLoadError(true);
+      toast.error(err instanceof Error ? err.message : "数据集 case 加载失败");
     }
   }, []);
 
@@ -149,7 +154,11 @@ export default function TestsPage() {
               onChange={(e) => setCaseId(e.target.value)}
               disabled={starting}
             >
-              {cases.length === 0 && <option value="">（暂无数据集 case）</option>}
+              {casesLoadError ? (
+                <option value="">（数据集加载失败，请稍后重试）</option>
+              ) : cases.length === 0 ? (
+                <option value="">（暂无数据集 case）</option>
+              ) : null}
               {cases.map((c) => (
                 <option key={c.case_id} value={c.case_id}>
                   [{c.layer}] {c.case_id} — {c.title}

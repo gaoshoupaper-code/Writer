@@ -37,21 +37,24 @@ export default function HarnessPage() {
   const [versionDetail, setVersionDetail] = useState<VersionDetail | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // 拉取版本列表（仅首次）
+  // 拉取版本列表（仅首次）。
+  // refresh 不依赖 selectedVersion：用函数式 setSelectedVersion 读最新值，
+  // 保持 refresh 引用稳定（空依赖），避免 effect 重跑导致重复请求。
   const refresh = useCallback(async () => {
     try {
       const snaps = await getSnapshots();
       setSnapshots(snaps);
-      if (snaps.length > 0 && selectedVersion === null) {
+      if (snaps.length > 0) {
         const prod = snaps.find((s) => s.status === "production") ?? snaps[0];
-        setSelectedVersion(prod.version);
+        // 函数式更新：仅在当前仍为 null 时设置默认选中，不覆盖用户已选
+        setSelectedVersion((prev) => prev ?? prod.version);
       }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "读取版本列表失败");
     } finally {
       setLoading(false);
     }
-  }, [selectedVersion]);
+  }, []);
 
   useEffect(() => {
     refresh();
@@ -70,13 +73,13 @@ export default function HarnessPage() {
         return null;
       }),
       getMemoryElements(selectedVersion).catch((err) => {
-        // 记忆要素失败不阻断主要素展示（老版本无此接口/无 NWM）
-        console.warn("读取记忆要素失败", err);
+        // 记忆要素失败不阻断主要素展示（老版本无此接口/无 NWM），但提示用户
+        toast.error(err instanceof Error ? err.message : "读取记忆要素失败");
         return null;
       }),
       getVersionDetail(selectedVersion).catch((err) => {
-        // 版本详情失败不阻断要素展示（diff 高亮不可用而已）
-        console.warn("读取版本详情失败", err);
+        // 版本详情失败不阻断要素展示（diff 高亮不可用而已），但提示用户
+        toast.error(err instanceof Error ? err.message : "读取版本详情失败");
         return null;
       }),
     ]).then(([els, memEls, detail]) => {

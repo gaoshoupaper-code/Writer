@@ -34,19 +34,33 @@ export default function EvolvePage() {
   const [streamingSessionId, setStreamingSessionId] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
   const streamCancelRef = useRef<(() => void) | null>(null);
+  // 失败态：区分"暂无记录"与"加载失败"，失败时保留旧数据不刷空
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    try {
-      const [sess, evals] = await Promise.all([
-        getEvolveSessions(30).catch(() => ({ sessions: [], total: 0 })),
-        getEvaluatedTraces(50).catch(() => ({ traces: [], total: 0 })),
-      ]);
-      setSessions(sess.sessions);
-      setEvaluatedTraces(evals.traces);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "读取数据失败");
+    let sessFailed = false;
+    let evalsFailed = false;
+    const [sess, evals] = await Promise.all([
+      getEvolveSessions(30).catch(() => { sessFailed = true; return null; }),
+      getEvaluatedTraces(50).catch(() => { evalsFailed = true; return null; }),
+    ]);
+    if (sess !== null) setSessions(sess.sessions);
+    if (evals !== null) setEvaluatedTraces(evals.traces);
+
+    if (sessFailed && evalsFailed) {
+      // 全失败：首次显示错误态，轮询中 toast 提示保留旧数据
+      if (sessions.length === 0 && evaluatedTraces.length === 0) {
+        setLoadError("进化数据加载失败（evolution 服务不可达或鉴权失败）");
+      } else {
+        toast.error("进化数据刷新失败，显示的为上次成功拉取的数据");
+      }
+    } else {
+      setLoadError(null);
+      if (sessFailed || evalsFailed) {
+        toast.error("部分进化数据加载失败，已显示可用数据");
+      }
     }
-  }, []);
+  }, [sessions.length, evaluatedTraces.length]);
 
   useEffect(() => {
     refresh();
@@ -157,7 +171,14 @@ export default function EvolvePage() {
                 </div>
               </div>
             ))}
-            {sessions.length === 0 && <div className="monitor-empty">暂无进化记录</div>}
+            {sessions.length === 0 && loadError && (
+              <div className="page-error">
+                <div className="page-error-title">进化记录加载失败</div>
+                <div className="page-error-detail">{loadError}</div>
+                <button className="page-error-retry" onClick={refresh}>重试</button>
+              </div>
+            )}
+            {sessions.length === 0 && !loadError && <div className="monitor-empty">暂无进化记录</div>}
           </div>
         </aside>
 

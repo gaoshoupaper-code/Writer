@@ -5657,6 +5657,45 @@ html[data-theme="dark"] {
   color: var(--muted-foreground, #94a3b8);
 }
 
+/* 整页加载失败态：错误信息 + 重试按钮（区分"真空数据"与"加载失败"） */
+.page-error {
+  padding: 40px;
+  text-align: center;
+  color: var(--muted-foreground, #94a3b8);
+  background: var(--surface, #1a1f2e);
+  border-radius: 12px;
+  border: 1px dashed var(--destructive, #ef4444);
+  margin: 24px 0;
+}
+
+.page-error-title {
+  color: var(--destructive, #ef4444);
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.page-error-detail {
+  font-size: 13px;
+  word-break: break-all;
+  margin-bottom: 16px;
+  line-height: 1.6;
+}
+
+.page-error-retry {
+  padding: 6px 18px;
+  background: var(--primary, #6366f1);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.page-error-retry:hover {
+  filter: brightness(1.1);
+}
+
 /* ── 配置页 ── */
 .config-page {
   max-width: 640px;

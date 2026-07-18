@@ -12,11 +12,17 @@
   GET /snapshots/{version}/harness-elements          Harness 要素展示视图（含 agents + tools）
   GET /snapshots/{version}/harness-elements/memory   记忆子系统要素视图（NWM 6 要素）
   GET /snapshots/{version}/source                    指定文件源码（middleware 懒加载用）
+
+性能（2026-07-18）：build_elements_view / build_memory_elements_view 每次会对每个
+skill/middleware/tool 文件 fork 一个 git show 子进程，一次请求 20-40 个子进程，
+容器内 2-5 秒。因 harness 版本（git commit）不可变，按 version 进程内缓存视图，
+TTL 60s 兜底。版本切换热路径从 N 个 git show 降到 0。
 """
 from __future__ import annotations
 
 import ast
 import logging
+import time
 from typing import Any
 
 import yaml
@@ -27,6 +33,30 @@ from app.versioning import registry_repo
 from app.versioning.constants import MEMORY_FILES, MEMORY_ROLE_ORDER, TOOL_SCOPE_MAP
 
 logger = logging.getLogger("evolution.elements_api")
+
+# ── 视图缓存（2026-07-18）─────────────────────────────────────
+# harness 版本 = git commit，commit 内容不可变 → 同 version 的视图永远一致，
+# 可安全长期缓存。TTL 仅作防御性兜底（防万一有绕过 version 的异常写入）。
+_CACHE_TTL = 60.0  # 秒
+_elements_cache: dict[int, tuple[float, dict[str, Any]]] = {}
+_memory_cache: dict[int, tuple[float, dict[str, Any]]] = {}
+
+
+def _cached_build(
+    version: int,
+    cache: dict[int, tuple[float, dict[str, Any]]],
+    builder: "Any",
+) -> dict[str, Any]:
+    """按 version 命中缓存，过期/缺失则调 builder 构建并写入。
+
+    builder 是无参闭包（捕获 version），返回视图 dict。
+    """
+    hit = cache.get(version)
+    if hit and (time.monotonic() - hit[0]) < _CACHE_TTL:
+        return hit[1]
+    view = builder()
+    cache[version] = (time.monotonic(), view)
+    return view
 
 router = APIRouter(prefix="/snapshots", tags=["snapshots"])
 
@@ -312,16 +342,20 @@ def get_memory_elements(version: int) -> dict[str, Any]:
     v = registry_repo.get_version(version)
     if v is None:
         raise HTTPException(status_code=404, detail=f"版本 v{version} 不存在")
-    return build_memory_elements_view(version)
+    return _cached_build(version, _memory_cache, lambda: build_memory_elements_view(version))
 
 
 @router.get("/{version}/harness-elements")
 def get_elements(version: int) -> dict[str, Any]:
-    """Harness 要素展示视图（从 git 源文件读取）。version 不存在则 404。"""
+    """Harness 要素展示视图（从 git 源文件读取）。version 不存在则 404。
+
+    热路径：前端 harness 页进页面 + 切版本都会打这里。按 version 进程内缓存
+    （commit 不可变，安全），避免每次 fork 几十个 git show 子进程。
+    """
     v = registry_repo.get_version(version)
     if v is None:
         raise HTTPException(status_code=404, detail=f"版本 v{version} 不存在")
-    return build_elements_view(version)
+    return _cached_build(version, _elements_cache, lambda: build_elements_view(version))
 
 
 @router.get("/{version}/source")

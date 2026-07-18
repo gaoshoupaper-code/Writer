@@ -34,14 +34,18 @@ export default function EvaluationPage() {
   const [streamingEvalId, setStreamingEvalId] = useState<string | null>(null);
   const [stopping, setStopping] = useState(false);
   const streamCancelRef = useRef<(() => void) | null>(null);
+  // 失败态：区分"暂无评估记录"与"加载失败"
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    try {
-      const [es, tr] = await Promise.all([
-        getEvalSessions(30).catch(() => ({ sessions: [], total: 0 })),
-        getTraces({ limit: 50 }).catch(() => ({ items: [], total: 0, limit: 50, offset: 0 })),
-      ]);
-      setEvals(es.sessions);
+    let esFailed = false;
+    let trFailed = false;
+    const [es, tr] = await Promise.all([
+      getEvalSessions(30).catch(() => { esFailed = true; return null; }),
+      getTraces({ limit: 50 }).catch(() => { trFailed = true; return null; }),
+    ]);
+    if (es !== null) setEvals(es.sessions);
+    if (tr !== null) {
       // 排除进化端自观测 trace——评估 Agent 只评估创作 Agent 的 trace，
       // 不能评估自己（evolution_eval）或进化 Agent（evolution_evolve）的录像。
       setTraces(
@@ -49,10 +53,21 @@ export default function EvaluationPage() {
           (t) => t.run_purpose !== "evolution_eval" && t.run_purpose !== "evolution_evolve",
         ),
       );
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "读取数据失败");
     }
-  }, []);
+
+    if (esFailed && trFailed) {
+      if (evals.length === 0 && traces.length === 0) {
+        setLoadError("评估数据加载失败（evolution 服务不可达或鉴权失败）");
+      } else {
+        toast.error("评估数据刷新失败，显示的为上次成功拉取的数据");
+      }
+    } else {
+      setLoadError(null);
+      if (esFailed || trFailed) {
+        toast.error("部分评估数据加载失败，已显示可用数据");
+      }
+    }
+  }, [evals.length, traces.length]);
 
   useEffect(() => {
     refresh();
@@ -166,7 +181,14 @@ export default function EvaluationPage() {
                 </div>
               </div>
             ))}
-            {evals.length === 0 && <div className="monitor-empty">暂无评估记录</div>}
+            {evals.length === 0 && loadError && (
+              <div className="page-error">
+                <div className="page-error-title">评估记录加载失败</div>
+                <div className="page-error-detail">{loadError}</div>
+                <button className="page-error-retry" onClick={refresh}>重试</button>
+              </div>
+            )}
+            {evals.length === 0 && !loadError && <div className="monitor-empty">暂无评估记录</div>}
           </div>
         </aside>
 

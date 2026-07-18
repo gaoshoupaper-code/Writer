@@ -28,26 +28,42 @@ export default function MonitorPage() {
   const [failures, setFailures] = useState<FailurePattern[]>([]);
   const [activeRuns, setActiveRuns] = useState<ActiveRun[]>([]);
   const [loading, setLoading] = useState(true);
+  // 全部请求都失败时才显示整页错误态（部分失败走 toast，不阻断展示已拿到的数据）
+  const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<"creation" | "evolution">("creation");
 
   const refresh = useCallback(async () => {
-    try {
-      const [ov, sk, fl, ar] = await Promise.all([
-        getStatsOverview().catch(() => null),
-        getStatsSkills(15).catch(() => []),
-        getStatsFailures(8).catch(() => []),
-        getActiveRuns().catch(() => []),
-      ]);
-      setOverview(ov);
-      setSkills(sk);
-      setFailures(fl);
-      setActiveRuns(ar);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "读取监测数据失败");
-    } finally {
-      setLoading(false);
+    // 每个请求独立 catch：记录成败而非吞掉，便于区分"真空"与"加载失败"
+    let overviewFailed = false;
+    const [ov, sk, fl, ar] = await Promise.all([
+      getStatsOverview().catch(() => { overviewFailed = true; return null; }),
+      getStatsSkills(15).catch(() => null as SkillStat[] | null),
+      getStatsFailures(8).catch(() => null as FailurePattern[] | null),
+      getActiveRuns().catch(() => null as ActiveRun[] | null),
+    ]);
+    setOverview(ov);
+    if (sk !== null) setSkills(sk);
+    if (fl !== null) setFailures(fl);
+    if (ar !== null) setActiveRuns(ar);
+
+    // 首次加载（loading=true）全部失败 → 整页错误态；
+    // 后续轮询全部失败 → toast 提示但保留旧数据（不刷空）
+    const allFailed = ov === null && sk === null && fl === null && ar === null;
+    if (allFailed) {
+      if (loading) {
+        setError("监测数据加载失败（evolution 服务不可达或鉴权失败）");
+      } else {
+        toast.error("监测数据刷新失败，显示的为上次成功拉取的数据");
+      }
+    } else {
+      setError(null);
+      // 部分失败：提示用户某块没更新，但不阻断展示
+      if (overviewFailed || sk === null || fl === null || ar === null) {
+        toast.error("部分监测数据加载失败，已显示可用数据");
+      }
     }
-  }, []);
+    setLoading(false);
+  }, [loading]);
 
   useEffect(() => {
     refresh();
@@ -69,6 +85,18 @@ export default function MonitorPage() {
 
   if (loading) {
     return <div className="page-loading">加载监测数据…</div>;
+  }
+
+  if (error) {
+    return (
+      <div className="page-error">
+        <div className="page-error-title">监测数据加载失败</div>
+        <div className="page-error-detail">{error}</div>
+        <button className="page-error-retry" onClick={() => { setLoading(true); refresh(); }}>
+          重试
+        </button>
+      </div>
+    );
   }
 
   const successRate = overview && overview.total > 0

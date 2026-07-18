@@ -11,10 +11,16 @@
 性能优化（决策点 6，选 B）：进程内 TTL 缓存 session→user_id，默认 60s，
 避免每个请求都内网往返 executor。monitor 2s 轮询场景下，同 session 60s 内
 只回调一次。
+
+并发去重（2026-07-18）：前端 Promise.all 并发多请求时，若都 cache miss，
+会同时回调 executor 多次（缓存来不及写入）。对同一 session 的并发验证用
+per-session asyncio.Lock 合并成一次回调（single-flight），消除并发风暴。
+不同 session 互不阻塞。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -51,6 +57,9 @@ class SSOAuthMiddleware(BaseHTTPMiddleware):
         self._cache_ttl = settings.sso_cache_ttl_seconds
         # session_id → (user_id, is_super_admin, expires_ts)
         self._cache: dict[str, tuple[str, bool, float]] = {}
+        # session_id → asyncio.Lock：并发验证 single-flight 去重。
+        # 桌面端单人场景条目极少（1-2 个 session），无需淘汰。
+        self._verify_locks: dict[str, asyncio.Lock] = {}
         # master_key 未配/白名单空时的降级标记（开发模式兼容）
         self._dev_mode = not settings.allowed_user_ids
 
@@ -79,16 +88,23 @@ class SSOAuthMiddleware(BaseHTTPMiddleware):
         # 查缓存
         user_id, is_super_admin = self._cache_get(session)
         if user_id is None:
-            # 缓存 miss/过期 → 回调 executor 验证
-            result = await self._verify_with_executor(session)
-            # executor 不可达 → 503（不触发前端 401 跳登录）
-            if result is _EXECUTOR_UNAVAILABLE:
-                return _unavailable("认证服务暂时不可达，请稍后重试")
-            # session 真失效 → 401
-            if result is None:
-                return _unauthorized("session 无效或已过期")
-            user_id, is_super_admin = result
-            self._cache_set(session, user_id, is_super_admin)
+            # 缓存 miss/过期 → 回调 executor 验证。
+            # per-session 锁：同 session 的并发请求只回调一次，其余复用结果。
+            # 不同 session 各自独立锁，互不阻塞。
+            lock = self._verify_locks.setdefault(session, asyncio.Lock())
+            async with lock:
+                # 二次查缓存：前一个持锁者可能已写入，跳过重复回调
+                user_id, is_super_admin = self._cache_get(session)
+                if user_id is None:
+                    result = await self._verify_with_executor(session)
+                    # executor 不可达 → 503（不触发前端 401 跳登录）
+                    if result is _EXECUTOR_UNAVAILABLE:
+                        return _unavailable("认证服务暂时不可达，请稍后重试")
+                    # session 真失效 → 401
+                    if result is None:
+                        return _unauthorized("session 无效或已过期")
+                    user_id, is_super_admin = result
+                    self._cache_set(session, user_id, is_super_admin)
 
         # 白名单校验
         if user_id not in self._allowed:
