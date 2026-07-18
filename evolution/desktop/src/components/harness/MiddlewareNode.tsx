@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { ProcessorChange } from "@/lib/api";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 
-/** middleware 展示元信息（AgentElementView.middlewares 的元素类型） */
+/** middleware 展示元信息（HarnessElementView.middlewares 的元素类型） */
 interface MWInfo {
   hook: string | null;
   group: string | null;

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { AgentElementView, AgentDiff } from "@/lib/api";
+import type { HarnessElementView, AgentDiff } from "@/lib/api";
 import { AgentBadge } from "./AgentBadge";
 
 /**
@@ -14,7 +14,7 @@ export function SkillsTab({
   agents,
   diffs,
 }: {
-  agents: AgentElementView[];
+  agents: HarnessElementView[];
   diffs: Map<string, AgentDiff> | null;
 }) {
   const [showDiff, setShowDiff] = useState(false);

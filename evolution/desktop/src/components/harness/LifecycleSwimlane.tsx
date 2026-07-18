@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { AgentElementView, AgentDiff, ProcessorChange } from "@/lib/api";
+import type { HarnessElementView, AgentDiff, ProcessorChange } from "@/lib/api";
 import { HOOK_ORDER, agentLabel } from "@/lib/harness-constants";
 import { MiddlewareNode } from "./MiddlewareNode";
 
@@ -14,7 +14,7 @@ export function LifecycleSwimlane({
   agents,
   diffs,
 }: {
-  agents: AgentElementView[];
+  agents: HarnessElementView[];
   diffs: Map<string, AgentDiff> | null;
 }) {
   return (
@@ -48,7 +48,7 @@ function SwimlaneRow({
   agent,
   processorChanges,
 }: {
-  agent: AgentElementView;
+  agent: HarnessElementView;
   processorChanges?: ProcessorChange[];
 }) {
   const mwCount = agent.middlewares.length;
@@ -83,7 +83,7 @@ function SwimlaneRow({
   });
 
   // 按 hook 分组 middleware
-  const byHook = new Map<string, AgentElementView["middlewares"]>();
+  const byHook = new Map<string, HarnessElementView["middlewares"]>();
   agent.middlewares.forEach((mw) => {
     const hook = mw.hook ?? "__unhooked__";
     if (!byHook.has(hook)) byHook.set(hook, []);

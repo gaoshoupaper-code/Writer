@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { AgentElementView, AgentDiff, Hunk } from "@/lib/api";
+import type { HarnessElementView, AgentDiff, Hunk } from "@/lib/api";
 import { AgentBadge } from "./AgentBadge";
 import { PromptDiffViewer } from "./PromptDiffViewer";
 
@@ -14,7 +14,7 @@ export function PromptTab({
   agents,
   diffs,
 }: {
-  agents: AgentElementView[];
+  agents: HarnessElementView[];
   diffs: Map<string, AgentDiff> | null;
 }) {
   const [showDiff, setShowDiff] = useState(false);

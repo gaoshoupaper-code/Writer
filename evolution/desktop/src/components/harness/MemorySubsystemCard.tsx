@@ -1,16 +1,16 @@
 import type { MemoryElementView, MemoryFileRole } from "@/lib/api";
 
 /**
- * 记忆子系统卡片（NWM 6 要素顶部聚焦视图）。
+ * 记忆子系统视图（Memory Tab body）。
  *
  * 记忆要素物理上散落在 prompts/middleware/tools 三个目录，但语义上是一条协同链：
  *   抽取(extract) → 存储(store) → 检索(retrieve) → 回填(recall)
- * 本卡片把它们按协同链阶段横向排成流水线，一眼看清"记忆系统怎么运转"。
+ * 本组件把它们按协同链阶段横向排成流水线，一眼看清"记忆系统怎么运转"。
  *
- * 数据来自独立接口 GET /memory-elements（不属任何 agent，与 ElementsView 分离）。
+ * 数据来自独立接口 GET /harness-elements/memory（不属任何 agent，与 HarnessElementsView 分离）。
  * 老版本无 NWM 重构时 elements 为空，渲染"此版本无记忆子系统"提示。
  *
- * 设计依据：需求 D2(修订)/D7(修订)/S3/S5。
+ * 原 MemorySubsystemCard 顶部独立卡片形态已降级为 Tab body（保留流水线视图 + 空态）。
  */
 
 // 流水线阶段顺序 + 中文标签（与后端 MEMORY_ROLE_ORDER/MEMORY_ROLE_LABELS 对齐）
@@ -30,15 +30,12 @@ const ROLE_HINTS: Record<MemoryFileRole, string> = {
 };
 
 export function MemorySubsystemCard({ elements }: { elements: MemoryElementView[] }) {
-  // 空状态：老版本无 NWM 记忆系统
+  // 空状态：老版本无 NWM 记忆系统（Tab 始终显示，空态不隐藏 Tab）
   if (elements.length === 0) {
     return (
-      <section className="memory-card memory-card-empty">
-        <div className="memory-card-head">
-          <h3>🧠 记忆子系统</h3>
-        </div>
-        <p className="memory-empty">此版本无记忆子系统（早于 NWM 重构）</p>
-      </section>
+      <div className="memory-tab-empty">
+        此版本无记忆子系统（早于 NWM 重构）
+      </div>
     );
   }
 
@@ -54,13 +51,10 @@ export function MemorySubsystemCard({ elements }: { elements: MemoryElementView[
   }
 
   return (
-    <section className="memory-card">
-      <div className="memory-card-head">
-        <h3>🧠 记忆子系统</h3>
-        <span className="memory-card-sub">
-          NWM 叙事记忆 · {elements.length} 个要素 · 抽取→存储→检索→回填协同链
-        </span>
-      </div>
+    <div className="memory-tab-body">
+      <p className="memory-tab-sub">
+        NWM 叙事记忆 · {elements.length} 个要素 · 抽取→存储→检索→回填协同链
+      </p>
 
       <div className="memory-pipeline">
         {ROLE_ORDER.map((role, idx) => (
@@ -88,6 +82,6 @@ export function MemorySubsystemCard({ elements }: { elements: MemoryElementView[
           </div>
         ))}
       </div>
-    </section>
+    </div>
   );
 }

@@ -3,11 +3,11 @@ import { toast } from "sonner";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import {
   getSnapshots,
-  getElements,
+  getHarnessElements,
   getMemoryElements,
   getVersionDetail,
   type Snapshot,
-  type ElementsView,
+  type HarnessElementsView,
   type MemoryElementView,
   type VersionDetail,
   type AgentDiff,
@@ -16,21 +16,23 @@ import { UpgradeOverview } from "@/components/harness/UpgradeOverview";
 import { MemorySubsystemCard } from "@/components/harness/MemorySubsystemCard";
 import { PromptTab } from "@/components/harness/PromptTab";
 import { SkillsTab } from "@/components/harness/SkillsTab";
+import { ToolsTab } from "@/components/harness/ToolsTab";
 import { MiddlewareTab } from "@/components/harness/MiddlewareTab";
 
 /**
- * Agent 要素透视页（重构版）。
+ * Harness 要素透视页。
  *
- * 选一个版本快照 → 一眼看懂两件事：
- * 1. 这个版本的 Agent 怎么搭的（要素按类型分 Tab：Prompt / Skills / Middleware 泳道图）
- * 2. 这个版本相比父版本改了什么（顶部升级总览条 + 各 Tab 内 diff 高亮）
+ * 选一个版本快照 → 一眼看懂这个版本的 harness 怎么搭的：
+ *   Prompt（说什么）/ Skills（会什么）/ Tools（用什么）/ Middleware（怎么装配）/ Memory（记忆怎么转）
  *
- * 数据流：并行调 getElements（要素）+ getVersionDetail（升级 diff），version 切换时重拉。
+ * Tab 顺序按 Agent 构造的递进。记忆子系统保留 4 阶段流水线叙事，独立接口拉取。
+ * 数据流：并行调 getHarnessElements（主要素）+ getMemoryElements（记忆要素）
+ *       + getVersionDetail（升级 diff，当前 diff 管道失效，作为独立已知问题）。
  */
 export default function HarnessPage() {
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
   const [selectedVersion, setSelectedVersion] = useState<number | null>(null);
-  const [elements, setElements] = useState<ElementsView | null>(null);
+  const [elements, setElements] = useState<HarnessElementsView | null>(null);
   const [memoryElements, setMemoryElements] = useState<MemoryElementView[] | null>(null);
   const [versionDetail, setVersionDetail] = useState<VersionDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -55,7 +57,7 @@ export default function HarnessPage() {
     refresh();
   }, [refresh]);
 
-  // 版本切换：并行拉要素 + 记忆要素 + 升级详情
+  // 版本切换：并行拉主要素 + 记忆要素 + 升级详情
   useEffect(() => {
     if (selectedVersion == null) return;
     setElements(null);
@@ -63,8 +65,8 @@ export default function HarnessPage() {
     setVersionDetail(null);
 
     Promise.all([
-      getElements(selectedVersion).catch((err) => {
-        toast.error(err instanceof Error ? err.message : "读取 Agent 要素失败");
+      getHarnessElements(selectedVersion).catch((err) => {
+        toast.error(err instanceof Error ? err.message : "读取 Harness 要素失败");
         return null;
       }),
       getMemoryElements(selectedVersion).catch((err) => {
@@ -103,9 +105,9 @@ export default function HarnessPage() {
   return (
     <div className="harness-page">
       <header className="page-header">
-        <h1>Agent 要素</h1>
+        <h1>Harness 要素</h1>
         <p className="page-desc">
-          透视各版本 Agent 的内部结构，标注版本升级与 Middleware 生命周期
+          透视各版本 harness 的可进化要素，按 Prompt / Skills / Tools / Middleware / Memory 分层展示
         </p>
       </header>
 
@@ -132,22 +134,24 @@ export default function HarnessPage() {
         isBootstrap={isBootstrap}
       />
 
-      {/* 记忆子系统顶部聚焦视图（NWM 6 要素，独立于按 agent 分组的 Tab） */}
-      {memoryElements && <MemorySubsystemCard elements={memoryElements} />}
-
-      {/* 要素三 Tab */}
+      {/* 五要素 Tab：Prompt → Skills → Tools → Middleware → Memory（构造递进顺序） */}
       {elements ? (
         <Tabs defaultValue="prompt" className="harness-tabs">
           <TabsList>
             <TabsTrigger value="prompt">Prompt</TabsTrigger>
             <TabsTrigger value="skills">Skills</TabsTrigger>
+            <TabsTrigger value="tools">Tools</TabsTrigger>
             <TabsTrigger value="middleware">Middleware</TabsTrigger>
+            <TabsTrigger value="memory">Memory</TabsTrigger>
           </TabsList>
           <TabsContent value="prompt">
             <PromptTab agents={elements.agents} diffs={diffs} />
           </TabsContent>
           <TabsContent value="skills">
             <SkillsTab agents={elements.agents} diffs={diffs} />
+          </TabsContent>
+          <TabsContent value="tools">
+            <ToolsTab tools={elements.tools} />
           </TabsContent>
           <TabsContent value="middleware">
             <MiddlewareTab
@@ -156,9 +160,17 @@ export default function HarnessPage() {
               hasSource={elements.has_source}
             />
           </TabsContent>
+          <TabsContent value="memory">
+            {/* memoryElements 未到位时显示加载态，到位后由组件内部处理空态/流水线 */}
+            {memoryElements ? (
+              <MemorySubsystemCard elements={memoryElements} />
+            ) : (
+              <div className="page-loading">加载记忆要素…</div>
+            )}
+          </TabsContent>
         </Tabs>
       ) : (
-        <div className="page-loading">加载 Agent 要素…</div>
+        <div className="page-loading">加载 Harness 要素…</div>
       )}
     </div>
   );

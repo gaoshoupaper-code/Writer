@@ -57,5 +57,37 @@ MEMORY_ROLE_LABELS: dict[str, str] = {
     "recall": "回填",
 }
 
+# Tool 作用域登记：path → scope 描述。
+#
+# harness 的 tools/ 目录是全局平铺的，不存在"tool → agent"映射——每个文件的真实
+# 归属各不相同（有的全局注入、有的经某 middleware 暴露、有的仅某 agent 间接受益、
+# 有的是记忆系统策略）。这张表把真实归属诚实标注出来，供 Tools Tab 展示 scope 彩签。
+#
+# scope.kind 取值（与前端 ToolScope 类型对齐）：
+#   global     全局注入（如进 MemoryRetriever 单例，所有 agent 间接受益）
+#   middleware 经某 middleware 暴露（via 字段标 middleware 类名）
+#   agent      仅某 agent 间接受益（agent 字段标 agent 名）
+#   memory     记忆系统策略要素（与 MEMORY_FILES 重叠，流水线视角在 Memory Tab）
+#
+# 作用域在 harness 装配代码里查证得到（见 __init__.py 的 assemble()）。
+# 新增 tool 时必须在此登记，否则前端 Tools Tab 会显示"⚠ 未登记作用域"。
+TOOL_SCOPE_MAP: dict[str, dict[str, str]] = {
+    "tools/goal.py": {
+        "kind": "middleware", "via": "GoalMiddleware",
+    },
+    "tools/query_builder.py": {
+        "kind": "agent", "agent": "writing",
+    },
+    "tools/join_rules.py": {
+        "kind": "global",
+    },
+    "tools/packet_formatter.py": {
+        "kind": "global",
+    },
+    "tools/narrative_schema.py": {
+        "kind": "memory",
+    },
+}
 
-__all__ = ["MEMORY_FILES", "MEMORY_ROLE_ORDER", "MEMORY_ROLE_LABELS"]
+
+__all__ = ["MEMORY_FILES", "MEMORY_ROLE_ORDER", "MEMORY_ROLE_LABELS", "TOOL_SCOPE_MAP"]

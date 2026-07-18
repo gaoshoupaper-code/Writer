@@ -111,7 +111,7 @@ app.include_router(traces_router, prefix="/api")
 app.include_router(stats_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
 app.include_router(snapshot_router, prefix="/api")
-# 执行端 Agent 要素展示（前端「Agent 要素」页，D1-D7）
+# Harness 要素展示（前端「Harness 要素」页）
 app.include_router(elements_router, prefix="/api")
 # 监测前端新增端点（D7 active 富化 / D8 agent-package / D9 SSE stream）
 app.include_router(active_api_router, prefix="/api")

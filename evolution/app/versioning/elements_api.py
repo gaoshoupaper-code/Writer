@@ -1,7 +1,7 @@
-"""elements_api —— Agent 要素展示端点（去 DB 重构：数据源从 config → git 源文件）。
+"""elements_api —— Harness 要素展示端点（去 DB 重构：数据源从 config → git 源文件）。
 
 从 harness 独立仓库的 git commit 读取真实源文件，投影成面向展示的结构化视图，
-供前端「Agent 要素」页渲染（Prompt/Skills/Middleware/Subagents 四要素）。
+供前端「Harness 要素」页渲染（Prompt/Skills/Tools/Middleware/Subagents 五要素）。
 
 数据源变更（去 DB 重构）：
   旧：从 DB harness_snapshots.config_json 提取 agent 结构 + git show 读全文
@@ -9,9 +9,9 @@
   含义：展示的是真实运行的 agent（源文件），而非死代码 config 的投影。
 
 端点（/api/snapshots 前缀）：
-  GET /snapshots/{version}/elements          版本要素展示视图
-  GET /snapshots/{version}/memory-elements   记忆子系统要素视图（NWM 6 要素）
-  GET /snapshots/{version}/source            指定文件源码（middleware 懒加载用）
+  GET /snapshots/{version}/harness-elements          Harness 要素展示视图（含 agents + tools）
+  GET /snapshots/{version}/harness-elements/memory   记忆子系统要素视图（NWM 6 要素）
+  GET /snapshots/{version}/source                    指定文件源码（middleware 懒加载用）
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.core.git_ops import show_file, log_oneline
 from app.versioning import registry_repo
-from app.versioning.constants import MEMORY_FILES, MEMORY_ROLE_ORDER
+from app.versioning.constants import MEMORY_FILES, MEMORY_ROLE_ORDER, TOOL_SCOPE_MAP
 
 logger = logging.getLogger("evolution.elements_api")
 
@@ -143,26 +143,69 @@ def _build_middleware_infos(commit: str | None) -> list[dict[str, Any]]:
     return middlewares
 
 
+def _build_tool_infos(commit: str | None) -> list[dict[str, Any]]:
+    """扫 tools/ 目录，读每个 .py 的模块 docstring 首句 + 作用域标注。
+
+    harness 的 tools/ 是全局平铺的，不存在 tool→agent 映射；每个文件的真实作用域
+    各不相同（global/middleware/agent/memory）。作用域从 TOOL_SCOPE_MAP 查得，
+    查不到填 {kind: "unknown"} 兜底，前端会显示"⚠ 未登记作用域"提醒补登记。
+
+    与 _build_middleware_infos 的差异：描述只取 docstring 首句（需求 D8），且
+    多一个 scope 字段；排除 __init__.py（包初始化不是 tool）。
+    """
+    if not commit:
+        return []
+    py_files = [
+        f for f in _list_files_at_commit(commit, "tools")
+        if f.endswith(".py") and not f.endswith("__init__.py")
+    ]
+    tools: list[dict[str, Any]] = []
+    for f in py_files:
+        name = f.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        description: str | None = None
+        load_error: str | None = None
+        try:
+            src = show_file(commit, f)
+            # 首句 = docstring 第一行（harness tool docstring 首行均为一句话概述）
+            full_doc = ast.get_docstring(ast.parse(src))
+            description = full_doc.split("\n", 1)[0].strip() if full_doc else None
+        except Exception as e:  # noqa: BLE001
+            logger.debug("tool docstring 解析失败: %s @ %s", f, commit)
+            load_error = str(e)
+        tools.append({
+            "path": f,
+            "name": name,
+            "description": description,
+            # 查不到作用域兜底 unknown，逼开发者补登记 TOOL_SCOPE_MAP
+            "scope": TOOL_SCOPE_MAP.get(f, {"kind": "unknown"}),
+            "load_error": load_error,
+        })
+    return tools
+
+
 # ── 视图构建 ────────────────────────────────────────────────────
 
 
 def build_elements_view(version: int) -> dict[str, Any]:
     """从 git 仓库构建版本要素展示视图。
 
-    结构（对齐前端 ElementsView 类型）：
+    结构（对齐前端 HarnessElementsView 类型）：
       {
         "version": int,
         "source_commit": str | None,
         "has_source": bool,
         "agents": [ {name, kind, prompt, skills, middlewares}, ... ],
+        "tools": [ {path, name, description, scope, load_error}, ... ],
         "subagent_relations": [ {from, to, role}, ... ]
       }
 
-    meta agent 始终排第一；subagents 按固定装配顺序。
+    agents 按 agent 分组（meta 第一，subagents 按固定装配顺序）；
+    tools 顶层平级——harness 的 tools/ 是全局平铺的，不属于任何 agent。
     """
     commit = _version_to_commit(version)
     skills = _build_skill_infos(commit)
     middlewares = _build_middleware_infos(commit)
+    tools = _build_tool_infos(commit)
 
     agents: list[dict[str, Any]] = []
 
@@ -198,6 +241,7 @@ def build_elements_view(version: int) -> dict[str, Any]:
         "source_commit": commit,
         "has_source": commit is not None,
         "agents": agents,
+        "tools": tools,
         "subagent_relations": relations,
     }
 
@@ -258,26 +302,26 @@ def _file_exists_at_commit(commit: str, path: str) -> bool:
 # ── 端点 ────────────────────────────────────────────────────────
 
 
-@router.get("/{version}/elements")
-def get_elements(version: int) -> dict[str, Any]:
-    """版本要素展示视图（从 git 源文件读取）。version 不存在则 404。"""
-    v = registry_repo.get_version(version)
-    if v is None:
-        raise HTTPException(status_code=404, detail=f"版本 v{version} 不存在")
-    return build_elements_view(version)
-
-
-@router.get("/{version}/memory-elements")
+@router.get("/{version}/harness-elements/memory")
 def get_memory_elements(version: int) -> dict[str, Any]:
     """记忆子系统要素视图（NWM 6 要素）。version 不存在则 404。
 
-    与 /elements 独立——记忆要素横跨三目录不属于任何 agent，集中返回。
+    与 /harness-elements 独立——记忆要素横跨三目录不属于任何 agent，集中返回。
     老版本无 NWM 重构时 elements 为空（非 404）。
     """
     v = registry_repo.get_version(version)
     if v is None:
         raise HTTPException(status_code=404, detail=f"版本 v{version} 不存在")
     return build_memory_elements_view(version)
+
+
+@router.get("/{version}/harness-elements")
+def get_elements(version: int) -> dict[str, Any]:
+    """Harness 要素展示视图（从 git 源文件读取）。version 不存在则 404。"""
+    v = registry_repo.get_version(version)
+    if v is None:
+        raise HTTPException(status_code=404, detail=f"版本 v{version} 不存在")
+    return build_elements_view(version)
 
 
 @router.get("/{version}/source")

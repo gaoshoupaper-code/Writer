@@ -1,5 +1,5 @@
 /**
- * Harness（Agent 要素）页共享常量。
+ * Harness 要素页共享常量。
  *
  * hook 顺序按 DeepAgents AgentMiddleware 生命周期（langchain.agents.middleware.types），
  * 列名直接用英文 hook 标识符，贴合 DeepAgents 原生术语——

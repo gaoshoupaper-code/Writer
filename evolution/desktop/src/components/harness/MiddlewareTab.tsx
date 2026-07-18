@@ -1,4 +1,4 @@
-import type { AgentElementView, AgentDiff } from "@/lib/api";
+import type { HarnessElementView, AgentDiff } from "@/lib/api";
 import { LifecycleSwimlane } from "./LifecycleSwimlane";
 
 /**
@@ -11,7 +11,7 @@ export function MiddlewareTab({
   diffs,
   hasSource,
 }: {
-  agents: AgentElementView[];
+  agents: HarnessElementView[];
   diffs: Map<string, AgentDiff> | null;
   hasSource: boolean;
 }) {
