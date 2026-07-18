@@ -21,6 +21,39 @@
       "eval_status": "pending",
       "created_at": "2026-07-13T12:30:00+00:00",
       "source_session": null
+    },
+    {
+      "version": 3,
+      "parent_version": 2,
+      "change_summary": "feat(memory): Phase 2 可进化记忆要素（补登记：原 commit c08aa65 未走 publish 流程）",
+      "eval_score": null,
+      "eval_status": "pending",
+      "created_at": "2026-07-14T04:37:30+00:00",
+      "source_session": null,
+      "backfilled": true,
+      "backfill_note": "Phase 2 commit 直接进 harness repo 未走 publish_version，导致 registry 漏登记。本次补登记让 version 号对齐 commit 位置映射。"
+    },
+    {
+      "version": 4,
+      "parent_version": 3,
+      "change_summary": "feat(memory): Phase 4 检索质量埋点 + assemble 接线 quality_callback（补登记：原 commit 9478b17 未走 publish 流程）",
+      "eval_score": null,
+      "eval_status": "pending",
+      "created_at": "2026-07-14T04:51:08+00:00",
+      "source_session": null,
+      "backfilled": true,
+      "backfill_note": "Phase 4 commit 同 Phase 2 漏登记，本次补登记。"
+    },
+    {
+      "version": 5,
+      "parent_version": 4,
+      "change_summary": "feat(memory): NWM 记忆系统重构 — 去 Graphiti，自研叙事学类型化记忆（补登记：原 commit 2822cc0）",
+      "eval_score": null,
+      "eval_status": "pending",
+      "created_at": "2026-07-17T16:10:32+00:00",
+      "source_session": null,
+      "backfilled": true,
+      "backfill_note": "NWM 重构改动此前仅落主仓库(25de1a6)未进 harness repo，本次 commit 2822cc0 补进 + 补登记 v5。"
     }
   ],
   "rollback_log": []
