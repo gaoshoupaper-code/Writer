@@ -165,8 +165,9 @@ export default function HarnessPage() {
           </TabsContent>
           <TabsContent value="memory">
             {/* memoryElements 未到位时显示加载态，到位后由组件内部处理空态/流水线 */}
-            {memoryElements ? (
-              <MemorySubsystemCard elements={memoryElements} />
+            {/* version 用于卡片内"查看源码"懒加载 /snapshots/{v}/source */}
+            {memoryElements && selectedVersion != null ? (
+              <MemorySubsystemCard elements={memoryElements} version={selectedVersion} />
             ) : (
               <div className="page-loading">加载记忆要素…</div>
             )}

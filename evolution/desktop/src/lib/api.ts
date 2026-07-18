@@ -727,6 +727,26 @@ export async function getMemoryElements(version: number): Promise<MemoryElements
   return evoJson<MemoryElementsView>(`/api/snapshots/${version}/harness-elements/memory`, { method: "GET" });
 }
 
+// ── 版本源码全文（懒加载，供 Memory Tab 点击展开看要素源码） ──
+
+/** GET /api/snapshots/{version}/source?path= 响应：单文件源码全文 */
+export interface SnapshotSource {
+  path: string;
+  content: string;
+}
+
+/**
+ * 读指定版本指定文件的源码全文。
+ * path 相对 harness 包根（如 tools/narrative_schema.py）。
+ * 后端按 version→commit 映射后 git show，老版本文件不存在返回 404。
+ */
+export async function getSnapshotSource(version: number, path: string): Promise<SnapshotSource> {
+  return evoJson<SnapshotSource>(
+    `/api/snapshots/${version}/source?path=${encodeURIComponent(path)}`,
+    { method: "GET" },
+  );
+}
+
 // ── 版本详情（含升级 diff + 改动意图，来自 GET /api/versions/{version}） ──
 
 /** 行级 diff 的一个 hunk：equal/insert/delete 三种，无 replace（后端已拆为 del+ins） */

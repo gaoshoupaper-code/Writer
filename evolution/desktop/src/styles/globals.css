@@ -7696,6 +7696,86 @@ html[data-theme="dark"] {
   font-style: italic;
 }
 
+/* 文件名行 + 双彩签 */
+.memory-file-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.memory-file-tags {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+/* 通用彩签基类（仿 .tool-scope 模式：rgba(*,0.15) 底 + 同色字） */
+.memory-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+/* type 三色：prompt 灰 / middleware 蓝 / tool 紫（与 tool-scope-* 系对齐） */
+.memory-tag-type-prompt     { background: rgba(125,112,96,0.15);  color: var(--muted, #7d7060); }
+.memory-tag-type-middleware { background: rgba(58,116,154,0.15);  color: #3a749a; }
+.memory-tag-type-tool       { background: rgba(122,78,154,0.15);  color: #7a4e9a; }
+
+/* role 四色：抽取 绿 / 存储 蓝 / 检索 橙 / 回填 粉（与 memory-stage 色系呼应） */
+.memory-tag-role-extract   { background: rgba(58,154,126,0.15);  color: var(--accent, #3a9a7e); }
+.memory-tag-role-store     { background: rgba(58,116,154,0.15);  color: #3a749a; }
+.memory-tag-role-retrieve  { background: rgba(201,121,78,0.15);   color: var(--coral, #c9794e); }
+.memory-tag-role-recall    { background: rgba(154,78,122,0.15);   color: #9a4e7a; }
+
+/* 源码折叠按钮 */
+.memory-source-toggle {
+  margin-top: 4px;
+  padding: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--accent, #3a9a7e);
+  font-family: var(--font-mono, monospace);
+  text-decoration: underline dotted;
+}
+.memory-source-toggle:hover {
+  color: var(--coral, #c9794e);
+}
+
+/* 源码展开容器 */
+.memory-source-body {
+  margin-top: 6px;
+}
+.memory-source-loading,
+.memory-source-error {
+  font-size: 11px;
+  padding: 6px 8px;
+  color: var(--muted, #7d7060);
+}
+.memory-source-error {
+  color: var(--coral, #c9794e);
+}
+/* 源码视图：复用 .prompt-full 的 monospace + 滚动 + 等高模式 */
+.memory-source-view {
+  background: var(--panel-soft, rgba(242,233,212,0.85));
+  border-radius: 6px;
+  padding: 12px;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 500px;
+  overflow-y: auto;
+  color: var(--ink, #2e2618);
+}
+
 /* 窄屏：流水线转纵向（检索阶段 3 要素时避免挤压） */
 @media (max-width: 760px) {
   .memory-pipeline {
