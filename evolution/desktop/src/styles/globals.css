@@ -7353,6 +7353,58 @@ html[data-theme="dark"] {
 .skill-row.diff-del { background: rgba(185,74,64,0.12); text-decoration: line-through; }
 .skill-load-error { color: var(--coral, #c9794e); font-size: 11px; }
 
+/* tools 平铺列表（Tools Tab）—— 与 skill-row 同族，但平铺不分段 + 右侧 scope 彩签 */
+.tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.tool-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  color: var(--ink, #2e2618);
+}
+.tool-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0; /* 让长 path 可截断而非撑开行 */
+}
+.tool-path { font-family: var(--font-mono, monospace); }
+.tool-desc {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted, #7d7060);
+}
+.tool-load-error { color: var(--coral, #c9794e); font-size: 11px; }
+.tool-empty {
+  padding: 24px 8px;
+  font-size: 12px;
+  color: var(--muted, #7d7060);
+  text-align: center;
+}
+
+/* scope 彩签：5 色区分 tool 的真实作用域 */
+.tool-scope {
+  flex-shrink: 0;
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+.tool-scope-global     { background: rgba(125,112,96,0.15);  color: var(--muted, #7d7060); }
+.tool-scope-middleware { background: rgba(58,116,154,0.15);  color: #3a749a; }
+.tool-scope-agent      { background: rgba(122,78,154,0.15);  color: #7a4e9a; }
+.tool-scope-memory     { background: rgba(201,121,78,0.15);  color: var(--coral, #c9794e); }
+.tool-scope-unknown    { background: rgba(185,74,64,0.15);   color: #b94a40; }
+
 /* ── Middleware 泳道图 ── */
 .swimlane {
   border: 1px solid var(--border, #2a3142);
@@ -7501,35 +7553,21 @@ html[data-theme="dark"] {
   font-size: 13px;
 }
 
-/* ── 记忆子系统卡片（NWM 6 要素顶部聚焦视图） ── */
-.memory-card {
-  background: var(--surface, #faf6ec);
-  border: 1px solid var(--border, #d6c9a8);
-  border-radius: 10px;
-  padding: 16px 18px;
-  margin-bottom: 20px;
+/* ── 记忆子系统（Memory Tab body）── */
+/* 原 memory-card 顶部独立卡片形态已降级为 Tab body，流水线视图样式保留 */
+.memory-tab-body {
+  padding-top: 4px;
 }
-.memory-card-empty .memory-empty {
-  margin: 8px 0 0;
-  color: var(--muted, #7d7060);
-  font-size: 13px;
-}
-.memory-card-head {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-bottom: 14px;
-}
-.memory-card-head h3 {
-  margin: 0;
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--ink, #2e2618);
-}
-.memory-card-sub {
+.memory-tab-sub {
+  margin: 0 0 14px;
   font-size: 12px;
   color: var(--muted, #7d7060);
+}
+.memory-tab-empty {
+  padding: 24px 8px;
+  font-size: 13px;
+  color: var(--muted, #7d7060);
+  text-align: center;
 }
 
 /* 横向流水线：抽取→存储→检索→回填 */
@@ -9394,4 +9432,44 @@ html[data-theme="dark"] {
   border: 1px dashed var(--border, #d6c9a8);
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.015);
+}
+
+/* ═══ 管理后台 Layout（scope 分家 + admin 收敛，2026-07-18） ═══ */
+.admin-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.admin-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border, rgba(0, 0, 0, 0.08));
+  padding: 0 4px;
+}
+
+.admin-tab {
+  padding: 10px 16px;
+  font-size: 14px;
+  color: var(--text-soft, rgba(46, 38, 24, 0.65));
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+  cursor: pointer;
+  margin-bottom: -1px;
+}
+
+.admin-tab:hover {
+  color: var(--ink, #2e2618);
+}
+
+.admin-tab.active {
+  color: var(--accent, #3a9a7e);
+  border-bottom-color: var(--accent, #3a9a7e);
+  font-weight: 500;
+}
+
+.admin-content {
+  /* 内容区继承父页面的 padding，这里只做隔离 */
+  min-height: 200px;
 }

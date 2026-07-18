@@ -14,16 +14,16 @@ from app.core import db
 
 
 def judge_enabled() -> bool:
-    """LLM-judge 是否可用（llm_config 表已配置 api_key + base_url + model）。"""
-    return db.LlmConfigRepository.get_active() is not None
+    """LLM-judge 是否可用（evolution scope 已配置 api_key + base_url + model）。"""
+    return db.LlmConfigsRepository.get_active("evolution") is not None
 
 
 def _get_config() -> tuple[str, str, str]:
-    """读取当前 LLM 配置（api_key, base_url, model）。未配置抛 RuntimeError。"""
-    config = db.LlmConfigRepository.get_active()
+    """读取当前 LLM 配置（evolution scope，api_key, base_url, model）。未配置抛 RuntimeError。"""
+    config = db.LlmConfigsRepository.get_active("evolution")
     if config is None:
         raise RuntimeError(
-            "LLM 未配置。请在桌面端「配置」页填写大模型 API（base_url / api_key / model）。"
+            "LLM 未配置。请在桌面端「进化端模型」页填写大模型 API（base_url / api_key / model）。"
         )
     return config
 

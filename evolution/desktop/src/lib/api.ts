@@ -221,7 +221,11 @@ export async function fetchMeOrNull(): Promise<AuthMe | null> {
 
 // ════════════════════════════════════════════════════════════
 //  LLM 配置（走 evolution /evolution-api/api/config）
+//  scope 分家（2026-07-18）：'evolution'=评估 / 'executor'=写作，各自独立激活
 // ════════════════════════════════════════════════════════════
+
+/** LLM 配置归属 scope：进化 Agent 评估用 / executor 写作用。 */
+export type LlmConfigScope = "evolution" | "executor";
 
 export interface LlmConfigOut {
   has_key: boolean;
@@ -240,6 +244,7 @@ export interface LlmConfigItem {
   has_key: boolean;
   key_hint: string | null;
   is_active: boolean;
+  scope: LlmConfigScope;
   created_at: string;
   updated_at: string;
 }
@@ -250,31 +255,34 @@ export interface LlmConfigTestResult {
   error: string | null;
 }
 
-/** 读取激活配置安全视图（旧契约，首页 status 用）。 */
-export async function getLlmConfig(): Promise<LlmConfigOut> {
-  return evoJson<LlmConfigOut>("/api/config/llm", { method: "GET" });
+/** 读取指定 scope 的激活配置安全视图。 */
+export async function getLlmConfig(scope: LlmConfigScope): Promise<LlmConfigOut> {
+  return evoJson<LlmConfigOut>(`/api/config/llm?scope=${scope}`, { method: "GET" });
 }
 
-/** 读取所有配置列表。 */
-export async function listLlmConfigs(): Promise<LlmConfigItem[]> {
-  return evoJson<LlmConfigItem[]>("/api/config/llm/list", { method: "GET" });
+/** 读取指定 scope 的所有配置列表。 */
+export async function listLlmConfigs(scope: LlmConfigScope): Promise<LlmConfigItem[]> {
+  return evoJson<LlmConfigItem[]>(`/api/config/llm/list?scope=${scope}`, { method: "GET" });
 }
 
-/** 新建配置。首条自动激活。 */
-export async function createLlmConfig(payload: {
-  name: string;
-  api_key: string;
-  base_url: string;
-  model: string;
-}): Promise<LlmConfigItem> {
-  return evoJson<LlmConfigItem>("/api/config/llm", {
+/** 新建配置（按 scope 归属，该 scope 首条自动激活）。 */
+export async function createLlmConfig(
+  scope: LlmConfigScope,
+  payload: {
+    name: string;
+    api_key: string;
+    base_url: string;
+    model: string;
+  },
+): Promise<LlmConfigItem> {
+  return evoJson<LlmConfigItem>(`/api/config/llm?scope=${scope}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
 }
 
-/** 更新配置。api_key 传空串=不改 key。 */
+/** 更新配置。api_key 传空串=不改 key。按 id 操作，scope 由 id 隐含。 */
 export async function updateLlmConfig(
   id: number,
   payload: {
@@ -291,14 +299,14 @@ export async function updateLlmConfig(
   });
 }
 
-/** 删除配置。删激活项会自动激活剩余中 id 最小的一条。 */
+/** 删除配置。删激活项会自动激活同 scope 剩余中 id 最小的一条。 */
 export async function deleteLlmConfig(id: number): Promise<{ ok: boolean }> {
   return evoJson<{ ok: boolean }>(`/api/config/llm/${id}`, {
     method: "DELETE",
   });
 }
 
-/** 设为激活（全局唯一）。 */
+/** 设为激活（scope 内唯一，scope 由 id 隐含）。 */
 export async function activateLlmConfig(id: number): Promise<LlmConfigItem> {
   return evoJson<LlmConfigItem>(`/api/config/llm/${id}/activate`, {
     method: "POST",
@@ -309,7 +317,7 @@ export async function activateLlmConfig(id: number): Promise<LlmConfigItem> {
  * 测试连通性。两条路径二选一：
  * - 测已存配置：传 { id }，后端读库解密。
  * - 测草稿：传 { api_key, base_url, model }。
- * 同时传时 id 优先。
+ * 同时传时 id 优先。测试逻辑与 scope 正交（T3），故不带 scope 参数。
  */
 export async function testLlmConfig(payload: {
   id?: number;
@@ -626,7 +634,7 @@ export async function deleteTest(testId: string): Promise<{ status: string; dele
 }
 
 // ════════════════════════════════════════════════════════════
-//  Agent 要素（snapshots/elements）
+//  Harness 要素（snapshots/harness-elements）
 // ════════════════════════════════════════════════════════════
 
 export interface Snapshot {
@@ -638,7 +646,7 @@ export interface Snapshot {
   created_at: string;
 }
 
-export interface AgentElementView {
+export interface HarnessElementView {
   name: string;
   kind: string; // meta | subagent
   prompt: { body: string };
@@ -653,10 +661,28 @@ export interface AgentElementView {
   }[];
 }
 
-export interface ElementsView {
+/** Tool 作用域——诚实反映 harness 里 tool 的真实归属（非全局即 agent） */
+export type ToolScope =
+  | { kind: "global" }                  // 全局注入（如进 MemoryRetriever 单例）
+  | { kind: "middleware"; via: string } // 经某 middleware 暴露
+  | { kind: "agent"; agent: string }    // 仅某 agent 间接受益
+  | { kind: "memory" }                  // 记忆系统策略要素
+  | { kind: "unknown" };                // TOOL_SCOPE_MAP 未登记，前端显示提醒
+
+/** tools/ 目录下一个可进化 tool 文件 */
+export interface ToolInfo {
+  path: string;                  // 如 "tools/goal.py"
+  name: string;                  // 文件名去后缀，如 "goal"
+  description: string | null;    // 模块 docstring 首句
+  scope: ToolScope;              // 作用域标注
+  load_error: string | null;     // 解析失败时填
+}
+
+export interface HarnessElementsView {
   source_commit: string | null;
   has_source: boolean;
-  agents: AgentElementView[];
+  agents: HarnessElementView[];
+  tools: ToolInfo[]; // 顶层平级——tools/ 是全局平铺的，不属于任何 agent
   subagent_relations: { from: string; to: string; role: string }[];
 }
 
@@ -668,11 +694,11 @@ export async function getProductionSnapshot(): Promise<Snapshot> {
   return evoJson<Snapshot>(`/api/snapshots/production`, { method: "GET" });
 }
 
-export async function getElements(version: number): Promise<ElementsView> {
-  return evoJson<ElementsView>(`/api/snapshots/${version}/elements`, { method: "GET" });
+export async function getHarnessElements(version: number): Promise<HarnessElementsView> {
+  return evoJson<HarnessElementsView>(`/api/snapshots/${version}/harness-elements`, { method: "GET" });
 }
 
-// ── 记忆子系统要素（NWM 6 要素，独立于按 agent 分组的 ElementsView） ──
+// ── 记忆子系统要素（NWM 6 要素，独立于按 agent 分组的 HarnessElementsView） ──
 
 /** 记忆协同链中的角色（与后端 versioning.constants.MEMORY_ROLE_ORDER 对齐） */
 export type MemoryFileRole = "extract" | "store" | "retrieve" | "recall";
@@ -690,7 +716,7 @@ export interface MemoryElementView {
   tags: string[]; // 恒为 ["memory"]
 }
 
-/** GET /api/snapshots/{version}/memory-elements 响应 */
+/** GET /api/snapshots/{version}/harness-elements/memory 响应 */
 export interface MemoryElementsView {
   version: number;
   has_source: boolean;
@@ -698,7 +724,7 @@ export interface MemoryElementsView {
 }
 
 export async function getMemoryElements(version: number): Promise<MemoryElementsView> {
-  return evoJson<MemoryElementsView>(`/api/snapshots/${version}/memory-elements`, { method: "GET" });
+  return evoJson<MemoryElementsView>(`/api/snapshots/${version}/harness-elements/memory`, { method: "GET" });
 }
 
 // ── 版本详情（含升级 diff + 改动意图，来自 GET /api/versions/{version}） ──

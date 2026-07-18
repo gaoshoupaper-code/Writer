@@ -342,17 +342,20 @@ def init_db() -> None:
             -- 可保存多个配置（deepseek/glm/openai 各一条），其中 is_active=1 的唯一一条
             -- 被 runtime 读取（llm.py judge + model_factory.py agent）。api_key AES-256-GCM 加密。
             -- 桌面端配置页 CRUD，测试连通性时按 id 读库解密。
+            -- scope 分家（2026-07-18）：'evolution'=进化 Agent 评估用 / 'executor'=executor 写作用，
+            -- 两个 scope 各自维护独立的 is_active=1 激活项。
             CREATE TABLE IF NOT EXISTS llm_configs (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 name        TEXT NOT NULL,                   -- 配置名（用户起，如 "deepseek-主力"）
                 api_key_enc TEXT,                             -- AES-256-GCM 加密（nonce||ciphertext+tag, urlsafe-b64）；空=待填
                 base_url    TEXT NOT NULL,                    -- 如 https://api.deepseek.com
                 model       TEXT NOT NULL,                    -- 如 deepseek-chat
-                is_active    INTEGER NOT NULL DEFAULT 0,      -- 1=当前激活，全局唯一（事务保证）
+                is_active    INTEGER NOT NULL DEFAULT 0,      -- 1=当前激活（scope 内唯一，事务保证）
+                scope       TEXT NOT NULL DEFAULT 'evolution', -- evolution=评估 / executor=写作
                 created_at   TEXT NOT NULL,
                 updated_at   TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_llm_configs_active ON llm_configs(is_active);
+            CREATE INDEX IF NOT EXISTS idx_llm_configs_scope_active ON llm_configs(scope, is_active);
 
             -- user_cache：executor 用户列表的本地缓存（trace 历史观测功能）。
             -- evolution 不维护用户主数据，定时从 executor /internal/users 拉取，
@@ -390,6 +393,8 @@ def init_db() -> None:
         _seed_agent_prompt_map(conn)
         # 多配置管理：llm_config（单数，单行）→ llm_configs（复数，多行 + is_active）
         _migrate_llm_configs_multi(conn)
+        # scope 分家：llm_configs 加 scope 列 + 现有数据复制成双份（evolution + executor）
+        _migrate_llm_configs_scope(conn)
         # user_cache 表由 executescript CREATE IF NOT EXISTS 直接建（新表无需 ALTER 迁移）
 
 
@@ -594,6 +599,51 @@ def _migrate_llm_configs_multi(conn: sqlite3.Connection) -> None:
     # 情况 3/4：新表空 + 旧表空/不存在 → 新表已由 CREATE TABLE IF NOT EXISTS 建好，无需动作
 
 
+def _migrate_llm_configs_scope(conn: sqlite3.Connection) -> None:
+    """幂等迁移：给 llm_configs 加 scope 列，并把现有数据复制成两份（D16 + T4）。
+
+    背景：原本进化端 Agent（评估）与 executor（写作）共用同一份激活配置。
+    分家后两个 scope 各自维护独立的激活配置：
+      - scope='evolution'：进化 Agent 做 evaluate/evolve 时用
+      - scope='executor'：executor 给用户写正文时用
+
+    迁移策略（D16=C 复制双份，零风险上线）：
+      1. 加 scope 列（DEFAULT 'evolution'，现有行自动归 evolution）
+      2. 复制现有所有行到 executor scope，副本 name 加"（执行端副本）"后缀（T4=b）
+      3. 副本 is_active 保持与原行一致（原本激活的，副本也激活）
+    幂等：scope 列已存在则直接 return。
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(llm_configs)").fetchall()}
+    if "scope" in existing:
+        return
+
+    with _lock:
+        # 1. 加列（现有行 scope 默认 'evolution'）
+        conn.execute("ALTER TABLE llm_configs ADD COLUMN scope TEXT NOT NULL DEFAULT 'evolution'")
+        # 2. 复制双份：原行已在 evolution，再复制一份到 executor（副本名加后缀）
+        rows = conn.execute(
+            "SELECT name, api_key_enc, base_url, model, is_active, created_at, updated_at "
+            "FROM llm_configs"
+        ).fetchall()
+        for name, api_key_enc, base_url, model, is_active, created_at, updated_at in rows:
+            conn.execute(
+                """INSERT INTO llm_configs
+                   (name, api_key_enc, base_url, model, is_active, scope, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'executor', ?, ?)""",
+                (f"{name}（执行端副本）", api_key_enc, base_url, model, is_active, created_at, updated_at),
+            )
+        # 3. 索引调整：单列 is_active → 复合 (scope, is_active)，支撑按 scope 查激活
+        conn.execute("DROP INDEX IF EXISTS idx_llm_configs_active")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_configs_scope_active ON llm_configs(scope, is_active)"
+        )
+        conn.commit()
+    logger.info(
+        "llm_configs 加 scope 列完成，现有 %d 行已复制到 executor scope（含后缀命名）。",
+        len(rows),
+    )
+
+
 def _drop_legacy_harness_tables(conn: sqlite3.Connection) -> None:
     """幂等迁移：DROP 废弃的 surface_versions + harness_manifests（Phase 7，D10=b1）。
 
@@ -698,43 +748,53 @@ def get_master_key() -> bytes:
 
 
 class LlmConfigsRepository:
-    """LLM 配置访问层（多配置管理，2026-07-08）。
+    """LLM 配置访问层（多配置管理 + scope 分家，2026-07-18）。
 
-    支持 save 多个配置（deepseek/glm/openai 各一条），其中 is_active=1 的唯一一条
-    被 runtime 读取。api_key AES-256-GCM 加密存储。
-
-    不变量：is_active=1 全局唯一（activate/自动激活均用事务保证）。
+    支持 save 多个配置（deepseek/glm/openai 等），api_key AES-256-GCM 加密存储。
+    scope 维度（2026-07-18 分家）：
+      - 'evolution'：进化 Agent 做 evaluate/evolve 时用（默认，向后兼容）
+      - 'executor'：executor 给用户写正文时用
+    每个 scope 各自维护一条 is_active=1 激活项（activate/自动激活均用事务保证 scope 内唯一）。
 
     消费方：
-      - llm.py + model_factory.py → get_active()（解密明文，运行时用）
-      - config/api.py → list_all()/get_active_safe()/create/update/delete/activate/get_decrypted
+      - llm.py + model_factory.py → get_active('evolution')（评估侧，默认）
+      - ingestion.py active-key → get_active('executor')（executor 写作侧）
+      - config/api.py → list_all(scope)/get_active_safe(scope)/create(scope)/...
     """
 
     @staticmethod
-    def list_all() -> list[dict[str, Any]]:
-        """返回所有配置（不回显 key 明文）。
+    def list_all(scope: str = "evolution") -> list[dict[str, Any]]:
+        """返回指定 scope 下所有配置（不回显 key 明文）。
 
+        Args:
+            scope: 'evolution'（默认）或 'executor'
         Returns:
-            [{id, name, base_url, model, has_key, key_hint, is_active, created_at, updated_at}, ...]
+            [{id, name, base_url, model, has_key, key_hint, is_active, scope, created_at, updated_at}, ...]
             key_hint 为 key 尾 4 位脱敏（供用户辨识），无 key 时为 None。
             按 is_active DESC, created_at ASC 排序（激活项置顶）。
         """
         rows = query_all(
-            """SELECT id, name, api_key_enc, base_url, model, is_active, created_at, updated_at
+            """SELECT id, name, api_key_enc, base_url, model, is_active, scope, created_at, updated_at
                FROM llm_configs
-               ORDER BY is_active DESC, created_at ASC"""
+               WHERE scope = ?
+               ORDER BY is_active DESC, created_at ASC""",
+            (scope,),
         )
         return [_row_to_safe(r) for r in rows]
 
     @staticmethod
-    def get_active() -> tuple[str, str, str] | None:
-        """读取激活配置（解密后的明文）。
+    def get_active(scope: str = "evolution") -> tuple[str, str, str] | None:
+        """读取指定 scope 的激活配置（解密后的明文）。
 
+        Args:
+            scope: 'evolution'（默认）或 'executor'
         Returns:
             (api_key, base_url, model) 三元组；未配置（无激活行或 key 为空）返回 None。
         """
         row = query_one(
-            "SELECT api_key_enc, base_url, model FROM llm_configs WHERE is_active = 1 LIMIT 1"
+            "SELECT api_key_enc, base_url, model FROM llm_configs "
+            "WHERE scope = ? AND is_active = 1 LIMIT 1",
+            (scope,),
         )
         if not row or not row["api_key_enc"]:
             return None
@@ -745,15 +805,18 @@ class LlmConfigsRepository:
         return api_key, base_url, model
 
     @staticmethod
-    def get_active_safe() -> dict[str, Any]:
-        """读取激活配置（不回显 key，供桌面端 GET /config/llm 用）。
+    def get_active_safe(scope: str = "evolution") -> dict[str, Any]:
+        """读取指定 scope 的激活配置（不回显 key，供桌面端 GET /config/llm 用）。
 
+        Args:
+            scope: 'evolution'（默认）或 'executor'
         Returns:
             {has_key, name, base_url, model, updated_at}；无激活配置时 has_key=False 兜底。
         """
         row = query_one(
             """SELECT name, api_key_enc, base_url, model, updated_at
-               FROM llm_configs WHERE is_active = 1 LIMIT 1"""
+               FROM llm_configs WHERE scope = ? AND is_active = 1 LIMIT 1""",
+            (scope,),
         )
         if not row or not row["api_key_enc"]:
             return {"has_key": False, "name": None, "base_url": "", "model": "", "updated_at": None}
@@ -769,6 +832,8 @@ class LlmConfigsRepository:
     def get_decrypted(id: int) -> tuple[str, str, str] | None:
         """按 id 读取配置（解密明文），供测试连通性用。
 
+        注意：按 id 操作，与 scope 无关（id 全局唯一）。测试逻辑正交于归属 scope。
+
         Returns:
             (api_key, base_url, model)；不存在或 key 为空返回 None。
         """
@@ -783,9 +848,29 @@ class LlmConfigsRepository:
         return api_key, row["base_url"] or "", row["model"] or ""
 
     @staticmethod
-    def create(*, name: str, api_key: str, base_url: str, model: str) -> int:
-        """新建配置（加密 key）。若表为空则自动设为激活。
+    def get_safe_by_id(id: int) -> dict[str, Any] | None:
+        """按 id 读取配置安全视图（不回显 key 明文，含 scope）。
 
+        供按 id 的端点（update/activate）回读完整项用——避免依赖 list_all(scope)，
+        因为 update/activate 按 id 操作时调用方不一定知道 scope。
+        Returns:
+            安全视图 dict；不存在返回 None。
+        """
+        row = query_one(
+            """SELECT id, name, api_key_enc, base_url, model, is_active, scope, created_at, updated_at
+               FROM llm_configs WHERE id = ?""",
+            (id,),
+        )
+        if not row:
+            return None
+        return _row_to_safe(row)
+
+    @staticmethod
+    def create(*, name: str, api_key: str, base_url: str, model: str, scope: str = "evolution") -> int:
+        """新建配置（加密 key）。若该 scope 下为空则自动设为激活。
+
+        Args:
+            scope: 'evolution'（默认）或 'executor'
         Returns:
             新行 id。
         """
@@ -794,14 +879,16 @@ class LlmConfigsRepository:
         now = datetime.now(UTC).isoformat()
         conn = get_conn()
         with _lock:
-            # 是否首条 → 自动激活
-            cnt = conn.execute("SELECT count(*) FROM llm_configs").fetchone()[0]
+            # 该 scope 是否首条 → 自动激活
+            cnt = conn.execute(
+                "SELECT count(*) FROM llm_configs WHERE scope = ?", (scope,)
+            ).fetchone()[0]
             is_active = 1 if cnt == 0 else 0
             cur = conn.execute(
                 """INSERT INTO llm_configs
-                   (name, api_key_enc, base_url, model, is_active, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (name, encrypted, base_url, model, is_active, now, now),
+                   (name, api_key_enc, base_url, model, is_active, scope, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (name, encrypted, base_url, model, is_active, scope, now, now),
             )
             conn.commit()
             return cur.lastrowid
@@ -853,24 +940,27 @@ class LlmConfigsRepository:
 
     @staticmethod
     def delete(id: int) -> bool:
-        """删除配置。若删的是激活项且还有其它行 → 自动激活 id 最小的一条。
+        """删除配置。若删的是激活项且该 scope 下还有其它行 → 自动激活同 scope id 最小的一条。
 
+        注意：scope 归属由被删行的 scope 字段决定，自动补激活也只在同 scope 内进行。
         Returns:
             True 表示命中行已删；False 表示 id 不存在。
         """
         conn = get_conn()
         with _lock:
             row = conn.execute(
-                "SELECT is_active FROM llm_configs WHERE id = ?", (id,)
+                "SELECT is_active, scope FROM llm_configs WHERE id = ?", (id,)
             ).fetchone()
             if not row:
                 return False
             was_active = row[0] == 1
+            scope = row[1]
             conn.execute("DELETE FROM llm_configs WHERE id = ?", (id,))
             if was_active:
-                # 自动激活剩余中 id 最小的一条
+                # 自动激活同 scope 剩余中 id 最小的一条
                 nxt = conn.execute(
-                    "SELECT id FROM llm_configs ORDER BY id ASC LIMIT 1"
+                    "SELECT id FROM llm_configs WHERE scope = ? ORDER BY id ASC LIMIT 1",
+                    (scope,),
                 ).fetchone()
                 if nxt:
                     conn.execute("UPDATE llm_configs SET is_active = 1 WHERE id = ?", (nxt[0],))
@@ -879,17 +969,20 @@ class LlmConfigsRepository:
 
     @staticmethod
     def activate(id: int) -> bool:
-        """设为激活（事务内先全置 0 再置 1，保证 is_active 全局唯一）。
+        """设为激活（事务内先把同 scope 全置 0 再置 1，保证 is_active 在 scope 内唯一）。
 
+        注意：scope 由被激活行的 scope 字段隐含决定，无需调用方传。
         Returns:
             True 表示命中行已激活；False 表示 id 不存在。
         """
         conn = get_conn()
         with _lock:
-            row = conn.execute("SELECT id FROM llm_configs WHERE id = ?", (id,)).fetchone()
+            row = conn.execute("SELECT scope FROM llm_configs WHERE id = ?", (id,)).fetchone()
             if not row:
                 return False
-            conn.execute("UPDATE llm_configs SET is_active = 0")
+            scope = row[0]
+            # 只清零同 scope 的激活项，不影响另一 scope 的激活状态
+            conn.execute("UPDATE llm_configs SET is_active = 0 WHERE scope = ?", (scope,))
             conn.execute("UPDATE llm_configs SET is_active = 1 WHERE id = ?", (id,))
             conn.commit()
             return True
@@ -919,6 +1012,7 @@ def _row_to_safe(row: dict[str, Any]) -> dict[str, Any]:
         "has_key": has_key,
         "key_hint": key_hint,
         "is_active": bool(row["is_active"]),
+        "scope": row["scope"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -933,21 +1027,21 @@ class LlmConfigRepository:
 
     @staticmethod
     def get_active() -> tuple[str, str, str] | None:
-        """读激活配置（委托新仓库）。"""
-        return LlmConfigsRepository.get_active()
+        """读激活配置（委托新仓库，默认 evolution scope）。"""
+        return LlmConfigsRepository.get_active("evolution")
 
     @staticmethod
     def get_safe() -> dict[str, Any]:
-        """读激活配置安全视图（委托新仓库）。"""
-        return LlmConfigsRepository.get_active_safe()
+        """读激活配置安全视图（委托新仓库，默认 evolution scope）。"""
+        return LlmConfigsRepository.get_active_safe("evolution")
 
     @staticmethod
     def save(*, api_key: str, base_url: str, model: str, name: str = "default") -> None:
-        """保存配置（向后兼容：若已存在激活项则更新它，否则新建并激活）。"""
+        """保存配置（向后兼容：若已存在 evolution 激活项则更新它，否则新建并激活）。"""
         conn = get_conn()
         with _lock:
             row = conn.execute(
-                "SELECT id FROM llm_configs WHERE is_active = 1 LIMIT 1"
+                "SELECT id FROM llm_configs WHERE scope = 'evolution' AND is_active = 1 LIMIT 1"
             ).fetchone()
         if row:
             LlmConfigsRepository.update(
@@ -955,7 +1049,7 @@ class LlmConfigRepository:
             )
         else:
             LlmConfigsRepository.create(
-                api_key=api_key, base_url=base_url, model=model, name=name
+                api_key=api_key, base_url=base_url, model=model, name=name, scope="evolution"
             )
 
     @staticmethod

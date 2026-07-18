@@ -4,29 +4,31 @@ import { fetchMeOrNull, logout, type AuthMe } from "@/lib/api";
 import UpdateBanner from "@/components/UpdateBanner";
 
 /**
- * Evolution 桌面端主布局（桌面化改造 2026-07-07）。
+ * Evolution 桌面端主布局（scope 分家 + 管理后台收敛，2026-07-18）。
  *
  * 侧栏导航 + 内容区。登录守卫：未登录跳 /login。
- * 信息架构（设计文档）：监测 / 配置 已实现；核心工作区 / 试验台 Phase 5 扩展。
+ * 信息架构：
+ *   - 基础 8 项（所有用户可见）
+ *   - 超管专属 3 项：进化端模型 / 执行端模型 / 管理后台（仅 super_admin）
  */
 const BASE_NAV_ITEMS = [
   { to: "/", label: "监测", end: true, icon: "📊" },
   { to: "/history", label: "历史", end: false, icon: "📜" },
   { to: "/evaluation", label: "评估", end: false, icon: "📝" },
   { to: "/evolve", label: "进化", end: false, icon: "🧬" },
-  { to: "/harness", label: "Agent 要素", end: false, icon: "🔧" },
+  { to: "/harness", label: "Harness 要素", end: false, icon: "🔧" },
   { to: "/versions", label: "版本谱系", end: false, icon: "🌳" },
   { to: "/dataset", label: "数据集", end: false, icon: "🗂️" },
   { to: "/tests", label: "单次测试", end: false, icon: "🧪" },
-  { to: "/config", label: "配置", end: false, icon: "⚙️" },
 ];
 
-// 管理后台导航（仅 super_admin 可见）。
-const ADMIN_NAV_ITEMS = [
-  { to: "/admin/users", label: "用户管理", end: false, icon: "👤" },
-  { to: "/admin/invite-codes", label: "邀请码", end: false, icon: "🎟️" },
-  { to: "/admin/credits", label: "积分流水", end: false, icon: "💧" },
-  { to: "/admin/credits/settings", label: "积分设置", end: false, icon: "🎛️" },
+// 超管专属导航（仅 super_admin 可见，D20 + D8：两个配置项和管理后台都仅超管）。
+// 原"配置"项（/config，所有用户可见）拆为两个超管项：进化端模型 / 执行端模型。
+// 原 admin 4 项（用户/邀请码/积分流水/积分设置）收敛为"管理后台"父入口，进入后 tab 切换。
+const SUPER_ADMIN_NAV_ITEMS = [
+  { to: "/config/evolution", label: "进化端模型", end: false, icon: "🧠" },
+  { to: "/config/executor", label: "执行端模型", end: false, icon: "✍️" },
+  { to: "/admin", label: "管理后台", end: false, icon: "🛡️" },
 ];
 
 export default function Shell() {
@@ -63,7 +65,7 @@ export default function Shell() {
   }
 
   const navItems = me.is_super_admin
-    ? [...BASE_NAV_ITEMS, ...ADMIN_NAV_ITEMS]
+    ? [...BASE_NAV_ITEMS, ...SUPER_ADMIN_NAV_ITEMS]
     : BASE_NAV_ITEMS;
 
   async function handleLogout() {

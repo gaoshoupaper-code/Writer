@@ -62,10 +62,10 @@ def build_agent_model(*, temperature: float = 0.2) -> BaseChatModel:
     Raises:
         RuntimeError: LLM 未配置（llm_config 表无 key）
     """
-    config = db.LlmConfigRepository.get_active()
+    config = db.LlmConfigsRepository.get_active("evolution")
     if config is None:
         raise RuntimeError(
-            "Agent 模型未配置：请在桌面端「配置」页填写大模型 API"
+            "Agent 模型未配置：请在桌面端「进化端模型」页填写大模型 API"
             "（base_url / api_key / model）"
         )
     api_key, base_url_raw, model_raw = config

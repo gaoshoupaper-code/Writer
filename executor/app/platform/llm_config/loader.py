@@ -93,17 +93,20 @@ class LlmConfigLoader:
         return None
 
     def _fetch_from_evolution(self) -> LlmConfig | None:
-        """从 evolution HTTP 拉取激活配置明文。失败返回 None（触发降级）。"""
+        """从 evolution HTTP 拉取激活配置明文（executor scope）。失败返回 None（触发降级）。"""
         try:
             import httpx
 
-            url = f"{self._evolution_url}{_ACTIVE_KEY_PATH}"
+            # 显式 scope=executor：拉"执行端模型"配置页激活的那条（D14 分家）。
+            # 向后兼容：进化端迁移把老激活配置复制了一份到 executor scope，
+            # 故即使老库升级，这里也能拉到原配置，不会断服。
+            url = f"{self._evolution_url}{_ACTIVE_KEY_PATH}?scope=executor"
             # 明文 key 端点必须带鉴权（与 prompt loader 不带 token 的区别）
             headers = {"X-Notify-Token": self._notify_token} if self._notify_token else None
             resp = httpx.get(url, timeout=3.0, headers=headers)
             if resp.status_code == 404:
-                # evolution 还没配 LLM（用户没在桌面端填 key）
-                logger.warning("evolution 未配置激活的 LLM 配置（404）")
+                # evolution 还没配 executor scope 的 LLM（用户没在"执行端模型"页填 key）
+                logger.warning("evolution 未配置 executor scope 的激活 LLM 配置（404）")
                 return None
             resp.raise_for_status()
             data = resp.json()

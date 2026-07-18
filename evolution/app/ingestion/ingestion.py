@@ -179,27 +179,31 @@ async def notify(body: NotifyBody, background_tasks: BackgroundTasks) -> dict[st
 
 
 @router.get("/ingestion/active-key")
-def get_active_llm_key() -> dict[str, str]:
+def get_active_llm_key(scope: str = "evolution") -> dict[str, str]:
     """executor 拉取激活 LLM 配置明文（内网专用，X-Notify-Token 鉴权）。
 
-    executor 的 build_writer_model 优先从这里取 (api_key, base_url, model)，
-    替代空的 PLATFORM_API_KEY/OPENAI_API_KEY 环境变量。
+    scope 维度（2026-07-18 分家）：
+      - 'evolution'（缺省，向后兼容）：进化 Agent 评估侧配置
+      - 'executor'：executor 写作侧配置
+    executor loader 应显式传 scope=executor 拉写作侧配置。
 
     鉴权：挂 /api/ingestion/ 前缀 → SSO 放行 → NotifyTokenMiddleware 校验
     X-Notify-Token（与 notify 端点同保护级）。明文 key 只在内网传给 executor，
-    不暴露给桌面端。
+    不暴露给桌面端。scope 只是数据切片，不引入新鉴权维度（T6）。
 
     Returns:
-        {api_key, base_url, model}；未配置激活配置返回 404（executor 据此降级）。
+        {api_key, base_url, model}；该 scope 未配置激活配置返回 404（executor 据此降级）。
     """
+    if scope not in ("evolution", "executor"):
+        raise HTTPException(400, f"scope 非法：{scope}")
     config = None
     try:
-        config = db.LlmConfigsRepository.get_active()
+        config = db.LlmConfigsRepository.get_active(scope)
     except Exception:
         # 表未建/迁移中（init_db 尚未跑完）→ 当作未配置，让 executor 走环境变量降级
         logger.warning("读取激活 LLM 配置异常（表可能未迁移），返回 404", exc_info=True)
     if config is None:
-        raise HTTPException(status_code=404, detail="未配置激活的 LLM 配置")
+        raise HTTPException(status_code=404, detail=f"未配置激活的 LLM 配置（scope={scope}）")
     api_key, base_url, model = config
     return {"api_key": api_key, "base_url": base_url, "model": model}
 
