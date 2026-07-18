@@ -9,6 +9,7 @@ import Evolve from "@/pages/evolve";
 import ReviewReport from "@/pages/review-report";
 import Evaluation from "@/pages/evaluation";
 import Harness from "@/pages/harness";
+import Versions from "@/pages/versions";
 import Dataset from "@/pages/dataset";
 import Tests from "@/pages/tests";
 import TraceDetail from "@/pages/trace-detail";
@@ -47,6 +48,7 @@ function App() {
           <Route path="/evolve/:sessionId/review" element={<ReviewReport />} />
           <Route path="/evaluation" element={<Evaluation />} />
           <Route path="/harness" element={<Harness />} />
+          <Route path="/versions" element={<Versions />} />
           <Route path="/dataset" element={<Dataset />} />
           <Route path="/tests" element={<Tests />} />
           <Route path="/history" element={<History />} />

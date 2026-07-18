@@ -15,7 +15,6 @@ venv/
 **/.next/
 
 # ── 前端构建产物（由容器内构建产生，避免宿主污染）──
-evolution/frontend/out/
 frontend/.next/
 frontend/out/
 

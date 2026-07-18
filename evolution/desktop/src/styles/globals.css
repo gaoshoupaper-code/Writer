@@ -9260,3 +9260,138 @@ html[data-theme="dark"] {
   font-size: 13px;
   color: var(--muted, #888);
 }
+
+/* ── 版本谱系页（/versions）── */
+.versions-page {
+  max-width: 1100px;
+}
+.versions-layout {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+@media (max-width: 880px) {
+  .versions-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* 左：版本链 */
+.versions-list {
+  background: var(--surface, #faf6ec);
+  border: 1px solid var(--border, #d6c9a8);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.versions-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border, #d6c9a8);
+  background: rgba(0, 0, 0, 0.02);
+}
+.versions-chain {
+  padding: 6px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+.versions-link-line {
+  width: 2px;
+  height: 8px;
+  margin: 0 auto;
+  background: var(--border, #d6c9a8);
+}
+.version-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 4px;
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.version-item:hover {
+  background: var(--accent-soft, rgba(58, 154, 126, 0.08));
+}
+.version-item.selected {
+  border-color: var(--accent, #3a9a7e);
+  background: var(--accent-soft, rgba(58, 154, 126, 0.12));
+}
+.version-item.production {
+  border-left: 3px solid var(--accent, #3a9a7e);
+}
+.version-item-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.version-num {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ink, #2e2618);
+}
+.version-prod-tag {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--accent, #3a9a7e);
+  color: #fff;
+  letter-spacing: 0.5px;
+}
+.version-retired-tag {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.08);
+  color: var(--muted, #7d7060);
+}
+.version-item .version-summary {
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* 右：版本概要 */
+.version-detail {
+  min-width: 0;
+}
+.version-summary-card {
+  padding: 18px 20px;
+}
+.version-summary-head {
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border, #d6c9a8);
+}
+.version-summary-head h2 {
+  margin: 0 0 6px;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--ink, #2e2618);
+}
+.version-summary-meta {
+  font-size: 11px;
+  line-height: 1.5;
+}
+.version-change-summary {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text, #2e2618);
+  padding: 12px 14px;
+  background: var(--accent-soft, rgba(58, 154, 126, 0.06));
+  border-radius: 8px;
+  margin: 12px 0;
+}
+.version-diff-placeholder {
+  margin-top: 16px;
+  padding: 10px 14px;
+  border: 1px dashed var(--border, #d6c9a8);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.015);
+}

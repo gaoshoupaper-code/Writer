@@ -766,6 +766,33 @@ export async function getVersionDetail(version: number): Promise<VersionDetail> 
   return evoJson<VersionDetail>(`/api/versions/${version}`, { method: "GET" });
 }
 
+// ── 版本谱系列表（GET /api/versions）──
+// 注意：后端端点仍含旧 adapt 残留字段（reward/source_round/critic_verdict），
+// 此类型只取 registry 谱系字段，忽略 adapt 残留。完整 diff 待 version_changes 写入层修复后另做。
+
+/** 版本谱系单条（只用 registry 谱系字段） */
+export interface VersionListItem {
+  version: number;
+  parent_version: number | null;
+  status: string; // production | retired
+  change_summary: string | null;
+  created_at: string;
+  source_session: string | null;
+}
+
+/** GET /api/versions 响应 */
+export interface VersionsListResponse {
+  items: VersionListItem[];
+  total: number;
+  production_version: number;
+  limit: number;
+  offset: number;
+}
+
+export async function getVersions(): Promise<VersionsListResponse> {
+  return evoJson<VersionsListResponse>(`/api/versions?limit=200`, { method: "GET" });
+}
+
 // ════════════════════════════════════════════════════════════
 //  数据集（dataset）— golden/growing 评估集
 // ════════════════════════════════════════════════════════════

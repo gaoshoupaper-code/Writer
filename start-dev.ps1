@@ -4,12 +4,10 @@ $rootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $executorDir = Join-Path $rootDir "executor"
 $frontendDir = Join-Path $rootDir "frontend"
 $evolutionDir = Join-Path $rootDir "evolution"
-$monitorFrontendDir = Join-Path $evolutionDir "frontend"
 $executorActivate = Join-Path $executorDir ".venv\Scripts\Activate.ps1"
 $executorEntry = Join-Path $executorDir "app\main.py"
 $frontendPackage = Join-Path $frontendDir "package.json"
 $evolutionEntry = Join-Path $evolutionDir "app\main.py"
-$monitorPackage = Join-Path $monitorFrontendDir "package.json"
 
 if (-not (Test-Path -LiteralPath $executorEntry)) { throw "Executor entry file not found: $executorEntry" }
 if (-not (Test-Path -LiteralPath $frontendPackage)) { throw "Frontend package.json not found: $frontendPackage" }
@@ -56,19 +54,7 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 7789 *>&1 | Tee-Object -F
     Write-Host "  evolution   -> http://127.0.0.1:7789  （进化/监测后端）"
 }
 
-if (Test-Path -LiteralPath $monitorPackage) {
-    $monitorScript = @"
-Set-Location -LiteralPath '$monitorFrontendDir'
-`$env:NEXT_PUBLIC_API_BASE_URL = 'http://localhost:7789'
-npm.cmd run dev
-"@
-    Start-Process powershell.exe -ArgumentList ($psArgs + $monitorScript) -WorkingDirectory $monitorFrontendDir -WindowStyle Normal
-    Start-Sleep -Seconds 1
-    Write-Host "  monitor     -> http://127.0.0.1:3457  （监测前端 dev）"
-}
-
 Write-Host ""
 Write-Host "联调观测：" -ForegroundColor Cyan
 Write-Host "  写作：http://127.0.0.1:3456（用户界面）"
-Write-Host "  监测：http://127.0.0.1:3457（开发者，dev 直连 evolution 7789）"
-Write-Host "  生产监测：evolution/frontend 执行 npm run build 后，http://127.0.0.1:7789 直接访问（StaticFiles 托管）"
+Write-Host "  进化/监测：http://127.0.0.1:7789（后端 API，监测用桌面 App 连接）"

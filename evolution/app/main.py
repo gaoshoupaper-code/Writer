@@ -154,18 +154,6 @@ def config() -> dict[str, str]:
     }
 
 
-# StaticFiles 托管 Next.js 前端静态产物（next build 的 out/）。
-# 挂在根路径 /，html=True 实现 SPA fallback（未知路由回落 index.html）。
-# 必须在所有 API 之后挂（否则会吞掉 /api 路径）。
-# 开发模式（无 out 目录）跳过——dev 用 next dev --port 3457 独立跑。
-from pathlib import Path as _Path
-_frontend_out = _Path(__file__).resolve().parent.parent / "frontend" / "out"
-if _frontend_out.is_dir():
-    from starlette.staticfiles import StaticFiles
-    app.mount("/", StaticFiles(directory=str(_frontend_out), html=True), name="frontend")
-else:
-    import logging as _logging
-    _logging.getLogger("evolution").info(
-        "监测前端静态产物未找到（%s），跳过 StaticFiles 托管。"
-        "生产模式需先在 evolution/frontend/ 执行 npm run build。", _frontend_out
-    )
+# 监测前端 web 版（evolution/frontend/）已废弃，只留桌面 App。
+# 原 StaticFiles 托管块已移除——桌面 App 走 nginx /evolution-api 反代调 API，
+# 不需要容器内托管 web 静态产物。

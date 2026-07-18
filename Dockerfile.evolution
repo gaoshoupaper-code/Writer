@@ -3,30 +3,13 @@
 # 端口：7789（不挂 nginx，docker 内网 + SSH 隧道访问）
 # ─────────────────────────────────────────────────────────────
 # 设计要点：
-#   1. 多阶段构建：先 node 阶段 build 监测前端静态产物（out/），
-#      再 python 阶段 COPY 进 evolution/frontend/out/，由 StaticFiles 托管。
+#   1. 监测前端 web 版（evolution/frontend/）已废弃，只留桌面 App（evolution/desktop/）。
+#      桌面 App 走 nginx /evolution-api 反代调 API，不依赖容器内 web 静态产物。
 #   2. 共享 contracts 契约包（evolution import contracts.trace 等）。
 #   3. pyproject 未声明 packages.find，COPY 源码 + 工作目录依赖运行。
-#   4. prod 模式 NEXT_PUBLIC_API_BASE_URL 留空（同源）。
 # ─────────────────────────────────────────────────────────────
 
-# ════════════ 阶段 1：构建监测前端静态产物 ════════════
-# npm 换淘宝镜像（国内服务器拉 npm 包快）
-FROM node:22-alpine AS frontend-builder
-
-RUN npm config set registry https://registry.npmmirror.com
-
-WORKDIR /build
-COPY evolution/frontend/package.json evolution/frontend/package-lock.json ./
-RUN npm ci
-
-COPY evolution/frontend/ ./
-# prod 同源：NEXT_PUBLIC_API_BASE_URL 留空（StaticFiles 托管，无跨域）
-ENV NEXT_PUBLIC_API_BASE_URL=""
-RUN npm run build
-# 产物在 /build/out/
-
-# ════════════ 阶段 2：Python 运行时 ════════════
+# ════════════ Python 运行时 ════════════
 FROM python:3.12-slim AS base
 
 # 国内镜像加速：换阿里云 Debian 源
@@ -65,10 +48,8 @@ COPY evolution/pyproject.toml ./evolution/
 RUN pip install --no-cache-dir ./evolution \
     && rm -rf /app/evolution
 
-# ── COPY 业务源码 + 监测前端静态产物 ──
+# ── COPY 业务源码 ──
 COPY evolution/ ./evolution/
-# 从阶段 1 拿前端 build 产物（覆盖宿主可能残留的 out/，.dockerignore 已排除）
-COPY --from=frontend-builder /build/out/ ./evolution/frontend/out/
 
 # golden 基准层种子副本（volume 挂载会覆盖 data/，启动时由 entrypoint 从种子同步）。
 # 放在 volume 外（/app/evalset_seed/），保证随镜像更新，不受 volume 覆盖影响。
