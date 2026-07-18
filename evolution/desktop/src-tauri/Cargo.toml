@@ -1,6 +1,6 @@
 [package]
 name = "evolution-desktop"
-version = "0.2.17"
+version = "0.2.18"
 description = "Writer Evolution 桌面端（进化/监测/评估）"
 authors = ["siyen"]
 edition = "2021"
