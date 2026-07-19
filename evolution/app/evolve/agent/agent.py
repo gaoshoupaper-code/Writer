@@ -119,7 +119,10 @@ async def build_evolve_agent(ctx: EvolveContext):
 
 
 async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any]:
-    """跑一次完整的进化 session（单体 Agent 自主编排）。
+    """跑一次完整的进化 session（单体 Agent 自主编排，兼容入口）。
+
+    Phase 2B 重构：内部走「inspect round + finalize round」串联（conversing round
+    留给 Phase 3 API 触发）。从外部 API 视角行为不变——仍是一锤子跑完。
 
     Args:
         ctx: 进化上下文（eval_snapshot 已加载评估报告）
@@ -143,9 +146,11 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
         )
         ctx.trace_id_self = handle.trace_id
 
+    # ── 阶段 1：inspect round（探查 + 设计 + 落地，单体兼容模式）──
+    # 单体模式下 status 保持 running，FlowGuard 不做阶段门控（conversing 才拦），
+    # Agent 一气呵成跑完探查→设计→落地→产出。
     agent = await build_evolve_agent(ctx)
 
-    # config 注入 TraceCallbackHandler（构建调用树）+ thread_id（Phase 2A：checkpoint 多轮对话）。
     config: dict[str, Any] = {
         "configurable": {"thread_id": ctx.thread_id},
     }
@@ -222,6 +227,260 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
     except Exception as e:
         logger.exception("session %s: 进化 Agent 执行失败", ctx.session_id)
         ev_db.update_session(ctx.session_id, status="failed")
+        if ctx.recorder and ctx.trace_id_self:
+            ctx.recorder.fail_run(ctx.trace_id_self, e)
+        return {"status": "failed", "error": str(e), "session_id": ctx.session_id}
+
+
+# ════════════════════════════════════════════════════════════
+#  对话式共创 round 函数（Phase 2B，决策 T2/T10）
+# ────────────────────────────────────────────────────────────
+#  Phase 3 API 改造后，三个 round 各自挂到独立端点：
+#    POST /evolve/start         → run_inspect_round（探查 + Agent 开场白）
+#    POST /evolve/sessions/:id/messages → run_converse_round（一轮对话）
+#    POST /evolve/sessions/:id/finalize → run_finalize_round（落地）
+#
+#  Phase 2B 阶段：这些函数已就绪但未被 API 调用，靠单元测试保证可用。
+# ════════════════════════════════════════════════════════════
+
+
+async def run_inspect_round(ctx: EvolveContext, trace_id: str) -> dict[str, Any]:
+    """探查阶段 round（决策 T2，conversing 之前的准备）。
+
+    流程：
+      1. 创建 recorder run + 构建 agent（带 checkpointer + thread_id）
+      2. status = running（FlowGuard 不拦，探查工具 + 设计工具可用）
+      3. Agent 自动跑：读评估报告 → 读 trace → 探查要素 → 发开场白
+         （开场白里总结评估 + 提出本次要讨论的问题，决策 J）
+      4. Agent 调 read_eval_report / read_trace / inspect_* 完成探查后，
+         自然结束（不进入落地，因为没用户对话）
+      5. 探查完成 → status 转 conversing，等用户第一条消息
+
+    与 run_evolve_session 的区别：不跑落地（design_doc/落地编码留给 finalize round）。
+    Agent 开场白作为 assistant 消息持久化到 evolve_messages 表（Phase 3 接入时）。
+
+    Returns:
+        {"status": "conversing"|"failed"|"cancelled", "session_id": ...}
+    """
+    from app.evolve import db as ev_db
+    from app.evolve.ctx import STATUS_RUNNING, STATUS_CONVERSING, STATUS_FAILED, STATUS_CANCELLED
+
+    ctx.trace_id = trace_id
+    ctx.session_status = STATUS_RUNNING
+    ev_db.update_session(ctx.session_id, status=STATUS_RUNNING)
+
+    # create_run 拿自观测 trace_id
+    if ctx.recorder:
+        handle = ctx.recorder.create_run(
+            session_id=ctx.session_id,
+            run_purpose="evolution_evolve",
+            endpoint="evolve-agent.inspect",
+        )
+        ctx.trace_id_self = handle.trace_id
+
+    agent = await build_evolve_agent(ctx)
+    config: dict[str, Any] = {
+        "configurable": {"thread_id": ctx.thread_id},
+    }
+    if ctx.recorder and ctx.trace_id_self:
+        config["callbacks"] = [TraceCallbackHandler(ctx.recorder, ctx.trace_id_self)]
+
+    ctx.emit_log("进化 Agent 启动探查阶段...")
+    logger.info("session %s: inspect round 启动 trace=%s", ctx.session_id, trace_id)
+
+    user_input = (
+        f"请开始进化流程的探查阶段。trace_id={trace_id}，case_id={ctx.case_id}。\n"
+        f"本阶段任务：\n"
+        f"1. 调 read_eval_report 读取评估诊断，理解主要问题\n"
+        f"2. 调 read_trace 看实际执行流程（对诊断里提到的关键节点）\n"
+        f"3. 调 list_elements / read_source 探查 harness 包要素，理解 Agent 当前怎么搭\n"
+        f"4. 探查完后，给用户发一条开场白——总结评估发现的主要问题，"
+        f"提出本次进化要讨论的核心方向（不要直接 propose 进化点，先让用户了解全貌）\n\n"
+        f"重要约束：\n"
+        f"- 不要在本阶段调 write_design_doc / write_* / edit_source（落地工具）\n"
+        f"- 不要急于 propose 进化点——先让用户了解评估发现，再逐个讨论\n"
+        f"- 开场白里清晰说明：发现了什么问题、你建议讨论哪些方向、让用户决定从哪开始"
+    )
+
+    try:
+        await agent.ainvoke(
+            {"messages": [{"role": "user", "content": user_input}]},
+            config=config,
+        )
+        # 探查完成，转 conversing 等用户对话
+        ctx.session_status = STATUS_CONVERSING
+        ev_db.update_session(ctx.session_id, status=STATUS_CONVERSING)
+        ctx.emit_log("探查阶段完成，进入对话共创阶段。")
+        logger.info("session %s: inspect round 完成，转 conversing", ctx.session_id)
+        return {"status": "conversing", "session_id": ctx.session_id}
+
+    except asyncio.CancelledError:
+        logger.info("session %s: inspect round 被用户停止", ctx.session_id)
+        ev_db.update_session(ctx.session_id, status=STATUS_CANCELLED)
+        if ctx.recorder and ctx.trace_id_self:
+            ctx.recorder.cancel_run(ctx.trace_id_self, reason="user_stop")
+        return {"status": "cancelled", "session_id": ctx.session_id}
+    except Exception as e:
+        logger.exception("session %s: inspect round 失败", ctx.session_id)
+        ev_db.update_session(ctx.session_id, status=STATUS_FAILED)
+        if ctx.recorder and ctx.trace_id_self:
+            ctx.recorder.fail_run(ctx.trace_id_self, e)
+        return {"status": "failed", "error": str(e), "session_id": ctx.session_id}
+
+
+async def run_converse_round(ctx: EvolveContext, user_message: str) -> dict[str, Any]:
+    """对话共创 round（决策 T2，单条用户消息触发一轮）。
+
+    按需触发模型（决策 T2）——每条用户消息启动一次 ainvoke，跑完即止。
+    LangGraph 通过 thread_id + checkpoint 自动恢复完整对话史（决策 T1）。
+    Agent 在本轮里可以：
+      - 自由文本探讨（不进浮窗）
+      - 调 propose/update/reject 进化点工具（状态权威变更，进浮窗）
+      - 调只读探查工具补充信息
+    不能调落地工具（FlowGuard 在 conversing 阶段拦截，决策 T9）。
+
+    Args:
+        ctx: 进化上下文（session_status 必须是 conversing）
+        user_message: 用户输入的消息内容（markdown）
+
+    Returns:
+        {"status": "conversing"|"failed"|"cancelled", "session_id": ...}
+    """
+    from app.evolve import db as ev_db
+    from app.evolve.ctx import STATUS_CONVERSING, STATUS_FAILED, STATUS_CANCELLED
+
+    # 状态校验：只 conversing 状态能跑对话 round
+    ctx.reload_session_status()
+    if ctx.session_status != STATUS_CONVERSING:
+        return {
+            "status": "failed",
+            "error": f"当前状态 {ctx.session_status} 不能跑对话 round（需 conversing）",
+            "session_id": ctx.session_id,
+        }
+
+    agent = await build_evolve_agent(ctx)
+    config: dict[str, Any] = {
+        "configurable": {"thread_id": ctx.thread_id},
+    }
+    if ctx.recorder and ctx.trace_id_self:
+        config["callbacks"] = [TraceCallbackHandler(ctx.recorder, ctx.trace_id_self)]
+
+    logger.info("session %s: converse round 启动", ctx.session_id)
+    ctx.emit_log("用户消息触发对话 round。")
+
+    try:
+        await agent.ainvoke(
+            {"messages": [{"role": "user", "content": user_message}]},
+            config=config,
+        )
+        logger.info("session %s: converse round 完成", ctx.session_id)
+        return {"status": "conversing", "session_id": ctx.session_id}
+
+    except asyncio.CancelledError:
+        # 用户停止输出（决策 L）：会话保留，status 不变
+        logger.info("session %s: converse round 被用户停止（会话保留）", ctx.session_id)
+        return {"status": "cancelled", "session_id": ctx.session_id}
+    except Exception as e:
+        logger.exception("session %s: converse round 失败", ctx.session_id)
+        return {"status": "failed", "error": str(e), "session_id": ctx.session_id}
+
+
+async def run_finalize_round(ctx: EvolveContext) -> dict[str, Any]:
+    """落地 round（决策 T2/T10/D，拍板后触发）。
+
+    流程：
+      1. 从 accepted 进化点生成 design_doc.md（决策 T3/U）
+      2. status = finalizing（FlowGuard 解锁落地工具）
+      3. Agent 跑：按 design_doc 落地（write_*/edit_source）→ validate → change_log
+      4. 成功 → pending_review（Phase 3 自动跳 review-report，决策 AA）
+         失败 → failed（用户丢弃重开，决策 I）
+
+    无用户交互——一个 finalizing task 跑完即终态（决策 D）。
+
+    Returns:
+        {"status": "pending_review"|"failed"|"cancelled", "session_id": ...}
+    """
+    from app.evolve import db as ev_db
+    from app.evolve.ctx import (
+        STATUS_FINALIZING, STATUS_PENDING_REVIEW, STATUS_FAILED, STATUS_CANCELLED,
+    )
+    from app.evolve.docs import generate_design_doc_from_points
+    from app.evolve.evolve_repo import EvolvePointsRepo
+
+    # 前置：必须有 accepted 进化点
+    if EvolvePointsRepo.count_accepted(ctx.session_id) == 0:
+        return {
+            "status": "failed",
+            "error": "拍板失败：没有 accepted 进化点（至少需要 1 个）",
+            "session_id": ctx.session_id,
+        }
+
+    # 从 accepted 进化点生成 design_doc
+    design_path = generate_design_doc_from_points(ctx.session_id)
+    if not design_path:
+        return {
+            "status": "failed",
+            "error": "生成 design_doc 失败（无 accepted 进化点）",
+            "session_id": ctx.session_id,
+        }
+    ctx.design_doc_path = design_path
+    ev_db.update_session(ctx.session_id, design_doc_path=design_path)
+
+    # 切到 finalizing（FlowGuard 解锁落地工具）
+    ctx.session_status = STATUS_FINALIZING
+    ev_db.update_session(ctx.session_id, status=STATUS_FINALIZING)
+    ctx.emit_log("进入落地阶段，按已拍板的进化点开始改代码。")
+
+    agent = await build_evolve_agent(ctx)
+    config: dict[str, Any] = {
+        "configurable": {"thread_id": ctx.thread_id},
+    }
+    if ctx.recorder and ctx.trace_id_self:
+        config["callbacks"] = [TraceCallbackHandler(ctx.recorder, ctx.trace_id_self)]
+
+    logger.info("session %s: finalize round 启动", ctx.session_id)
+
+    # system 触发消息：指示 Agent 按 design_doc 落地
+    accepted = EvolvePointsRepo.list_by_status(ctx.session_id, "accepted")
+    user_input = (
+        f"用户已拍板 {len(accepted)} 个进化点，design_doc 已生成：{design_path}\n"
+        f"现在进入落地阶段。请：\n"
+        f"1. 按 design_doc 的改动清单，逐个用 write_*（新建）或 edit_source（修改）落地\n"
+        f"2. 全部落地后调 validate_changes 校验\n"
+        f"3. 校验后调 write_change_log 产出记录（FlowGuard 要求 design_doc 在前，已满足）\n"
+        f"4. 完成后流程结束，进入 pending_review 等用户发布"
+    )
+
+    try:
+        await agent.ainvoke(
+            {"messages": [{"role": "user", "content": user_input}]},
+            config=config,
+        )
+
+        # 产出检查
+        if ctx.change_log_path:
+            ctx.session_status = STATUS_PENDING_REVIEW
+            ev_db.update_session(ctx.session_id, status=STATUS_PENDING_REVIEW)
+            ctx.emit_log("落地完成，进入 pending_review 等待发布审查。")
+            if ctx.recorder and ctx.trace_id_self:
+                ctx.recorder.complete_run(ctx.trace_id_self)
+            return {"status": "pending_review", "session_id": ctx.session_id}
+        else:
+            ctx.emit_log("落地结束但未产出 change_log。")
+            ev_db.update_session(ctx.session_id, status=STATUS_FAILED)
+            if ctx.recorder and ctx.trace_id_self:
+                ctx.recorder.fail_run(ctx.trace_id_self, "未产出 change_log")
+            return {"status": "failed", "error": "未产出 change_log", "session_id": ctx.session_id}
+
+    except asyncio.CancelledError:
+        logger.info("session %s: finalize round 被用户停止", ctx.session_id)
+        ev_db.update_session(ctx.session_id, status=STATUS_CANCELLED)
+        if ctx.recorder and ctx.trace_id_self:
+            ctx.recorder.cancel_run(ctx.trace_id_self, reason="user_stop")
+        return {"status": "cancelled", "session_id": ctx.session_id}
+    except Exception as e:
+        logger.exception("session %s: finalize round 失败", ctx.session_id)
+        ev_db.update_session(ctx.session_id, status=STATUS_FAILED)
         if ctx.recorder and ctx.trace_id_self:
             ctx.recorder.fail_run(ctx.trace_id_self, e)
         return {"status": "failed", "error": str(e), "session_id": ctx.session_id}
@@ -328,4 +587,10 @@ def _format_memory_section(ctx: EvolveContext) -> str:
     return render_memory_section()
 
 
-__all__ = ["build_evolve_agent", "run_evolve_session"]
+__all__ = [
+    "build_evolve_agent",
+    "run_evolve_session",
+    "run_inspect_round",
+    "run_converse_round",
+    "run_finalize_round",
+]

@@ -227,10 +227,105 @@ def write_change_log(
     return _dump_doc(path, meta, body)
 
 
+# ── design_doc 从进化点表生成（Phase 2B，决策 T3/U）──────────────
+
+
+def generate_design_doc_from_points(session_id: str) -> str | None:
+    """从 accepted 进化点表生成 design_doc.md（拍板时调用，决策 T3/U）。
+
+    对话式共创下，进化点的权威源是 evolve_points 表（Agent 通过
+    propose/update/reject 工具维护）。用户拍板后（POST /finalize），
+    从 accepted 状态的进化点导出 design_doc.md，供 review-report /
+    publish_session / registry 流程使用——保持向后兼容。
+
+    每个 accepted 进化点映射为 design_doc.changes 的一条：
+        - target ← point.target
+        - change_desc ← point.options[point.chosen_option].description
+        - reason ← point.problem + point.options[chosen].pros/cons
+        - evidence_ref ← 从 point.problem 解析（如 "finding fXX"）
+        - expected_up ← point.options[chosen].expected_impact
+        - expected_down ← point.options[chosen].cons 合并
+    同时回填 point.design_ref（1-based change 序号）。
+
+    Args:
+        session_id: 进化 session id
+
+    Returns:
+        design_doc.md 路径；无 accepted 进化点返回 None（finalize 应先校验）。
+    """
+    from app.evolve.evolve_repo import EvolvePointsRepo
+
+    accepted = EvolvePointsRepo.list_by_status(session_id, "accepted")
+    if not accepted:
+        return None
+
+    changes: list[dict[str, Any]] = []
+    for point in accepted:
+        chosen_idx = point.get("chosen_option")
+        options = point.get("options") or []
+        chosen = options[chosen_idx] if chosen_idx is not None and 0 <= chosen_idx < len(options) else {}
+
+        # 从 problem 字段解析 evidence_ref（如 "finding f01 ..." → ["f01"]）
+        evidence_refs = _extract_finding_refs(point.get("problem", ""))
+
+        pros = chosen.get("pros") or []
+        cons = chosen.get("cons") or []
+        reason_parts = [point.get("problem", "")]
+        if pros:
+            reason_parts.append("优点：" + "；".join(pros))
+        change = {
+            "target": point.get("target", ""),
+            "change_desc": chosen.get("description", ""),
+            "reason": " ".join(p for p in reason_parts if p),
+            "evidence_ref": evidence_refs,
+            "expected_up": chosen.get("expected_impact", ""),
+            "expected_down": "；".join(cons) if cons else "",
+        }
+        changes.append(change)
+
+    rationale = (
+        f"本次发版基于对话式共创——用户在进化工作台与 Agent 对齐了 {len(accepted)} 个改进点，"
+        f"逐个拍板后落地。详见各改动的方案选择与用户备注。"
+    )
+    path = write_design_doc(session_id, changes=changes, rationale=rationale)
+
+    # 回填 design_ref（1-based 序号）到进化点表
+    for i, point in enumerate(accepted, 1):
+        EvolvePointsRepo.set_design_ref(point["id"], i)
+
+    return path
+
+
+def _extract_finding_refs(text: str) -> list[str]:
+    """从文本中提取 finding 引用 id（如 f01/f02）。
+
+    匹配 "finding f01"、"f01"、"F-001"、"f001" 等常见格式，归一化为 f01 形式。
+    用于从进化点 problem 字段反推 design_doc.evidence_ref（保持审查链路兼容）。
+    """
+    import re
+    if not text:
+        return []
+    # 匹配 fXX / F-XX / finding fXX 等格式
+    matches = re.findall(r"[fF][-\s]?0*(\d{1,4})", text)
+    if not matches:
+        return []
+    # 去重 + 归一化为 f01 形式（保留前导 0 两位）
+    seen: set[str] = set()
+    refs: list[str] = []
+    for num in matches:
+        normalized = f"f{int(num):02d}"
+        if normalized not in seen:
+            seen.add(normalized)
+            refs.append(normalized)
+    return refs
+
+
 __all__ = [
     "session_dir",
     "write_design_doc",
     "read_design_doc",
     "parse_design_doc_intent",
     "write_change_log",
+    "generate_design_doc_from_points",
+    "_extract_finding_refs",
 ]
