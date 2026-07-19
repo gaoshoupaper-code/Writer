@@ -13,7 +13,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-TraceStatus = Literal["running", "awaiting_input", "completed", "failed", "cancelled"]
+TraceStatus = Literal["running", "awaiting_input", "completed", "failed", "cancelled", "interrupted"]
 TraceEventType = Literal[
     "run_start",
     "run_end",
@@ -80,6 +80,11 @@ class TraceRunSummary(BaseModel):
     event_count: int = 0
     path: str
     error: str | None = None
+    # trace 稳定性重构（设计 20260720_203000）：Pull 主导架构下 runs.status 是唯一真相源，
+    # 心跳字段供前端判断"还在跑"，interrupted_reason 供排查中断来源。
+    # 可选字段：executor 端构造时不传即 None，向后兼容。
+    last_heartbeat_at: str | None = None
+    interrupted_reason: str | None = None
 
 
 class TraceLogEvent(BaseModel):

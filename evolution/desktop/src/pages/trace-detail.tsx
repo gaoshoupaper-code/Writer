@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { useTraceStream } from "@/hooks/useTraceStream";
+import { useTracePolling } from "@/hooks/useTraceStream";
 import { TraceChainTimeline } from "@/components/trace/TraceChainTimeline";
 import { TraceChainDrawer } from "@/components/trace/TraceChainDrawer";
 import { TokenChartPanel } from "@/components/trace/TokenChartPanel";
 import { Badge } from "@/components/ui/badge";
-import { getTraceEvents, getTraceContext } from "@/lib/api";
+import {
+  getTraceEvents,
+  getTraceContext,
+  stopActiveSession,
+  resolveTrace,
+} from "@/lib/api";
 import type { TraceNode, TraceRunSummary, TraceContextSegment, TraceLogEvent } from "@/lib/types";
 
 /**
@@ -25,13 +30,19 @@ export default function TraceDetailPage() {
   const { traceId } = useParams<{ traceId: string }>();
   const navigate = useNavigate();
 
-  const { detail, isLive, loading, error } = useTraceStream(traceId ?? null);
+  const { detail, isLive, activeSession, loading, error } = useTracePolling(traceId ?? null);
 
   // ── 页面壳状态 ──
   const [activeTab, setActiveTab] = useState<"trace" | "chart">("trace");
   const [drawerNodeId, setDrawerNodeId] = useState<string | null>(null);
   const [highlightedNodeId, setHighlightedNodeId] = useState<string | null>(null);
   const [highlightedLoopIndex, setHighlightedLoopIndex] = useState<number | null>(null);
+
+  // ── trace 稳定性重构：停止 / interrupted 收敛状态 ──
+  // activeSession 由 useTracePolling 每次轮询顺便反查（保证 self_trace_id 写入后立即可见）。
+  const [stopping, setStopping] = useState(false);
+  const [resolving, setResolving] = useState<"failed" | "completed" | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const activeRun: TraceRunSummary | null = detail?.run ?? null;
   const nodes = detail?.nodes ?? [];
@@ -167,6 +178,46 @@ export default function TraceDetailPage() {
     setActiveTab("trace");
   }, [traceId, clearHighlight]);
 
+  // 点"停止"：调 stopActiveSession 分发到对应 stop 接口。
+  const handleStop = useCallback(async () => {
+    if (!activeSession || stopping) return;
+    if (!window.confirm("确认停止当前 trace 对应的 session？")) return;
+    setStopping(true);
+    setActionError(null);
+    try {
+      const result = await stopActiveSession(activeSession);
+      if (!result.ok) {
+        setActionError(result.error ?? "停止失败");
+      }
+      // 停止成功后：下个轮询 tick（≤1s）会看到状态变 cancelled，按钮自动隐藏。
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "停止失败");
+    } finally {
+      setStopping(false);
+    }
+  }, [activeSession, stopping]);
+
+  // 点"标记为失败/完成"：收敛 interrupted trace。
+  const handleResolve = useCallback(
+    async (target: "failed" | "completed") => {
+      if (!traceId || resolving) return;
+      const hint = target === "failed" ? "失败" : "完成";
+      if (!window.confirm(`确认将此 trace 标记为${hint}？`)) return;
+      setResolving(target);
+      setActionError(null);
+      try {
+        await resolveTrace(traceId, target);
+        // 收敛成功后：下个轮询 tick 会看到状态变化（但 interrupted 是终态，轮询已停；
+        // 这里手动 refresh 一次确保 UI 立即更新）。
+        window.location.reload();
+      } catch (err) {
+        setActionError(err instanceof Error ? err.message : "收敛失败");
+        setResolving(null);
+      }
+    },
+    [traceId, resolving],
+  );
+
   // ── 渲染 ──
 
   if (loading) {
@@ -208,7 +259,48 @@ export default function TraceDetailPage() {
           {isLive && (
             <span className="streaming-badge"><span className="pulse" /> 实时</span>
           )}
+          {/* trace 稳定性重构：running 时显示停止按钮；interrupted 时显示收敛按钮 */}
+          {run.status === "running" && activeSession?.session_id && (
+            <button
+              type="button"
+              className="stop-button"
+              disabled={stopping}
+              onClick={handleStop}
+              title={`停止 ${activeSession.session_type} session`}
+            >
+              {stopping ? "停止中…" : "停止"}
+            </button>
+          )}
+          {run.status === "interrupted" && (
+            <div className="resolve-actions">
+              <button
+                type="button"
+                className="resolve-button resolve-failed"
+                disabled={resolving !== null}
+                onClick={() => handleResolve("failed")}
+              >
+                {resolving === "failed" ? "标记中…" : "标记为失败"}
+              </button>
+              <button
+                type="button"
+                className="resolve-button resolve-completed"
+                disabled={resolving !== null}
+                onClick={() => handleResolve("completed")}
+              >
+                {resolving === "completed" ? "标记中…" : "标记为完成"}
+              </button>
+            </div>
+          )}
         </div>
+        {actionError && (
+          <div className="action-error">{actionError}</div>
+        )}
+        {run.status === "interrupted" && run.interrupted_reason && (
+          <div className="interrupted-hint">
+            此 trace 已中断（原因：{interruptedReasonLabel(run.interrupted_reason)}）。
+            trace 数据完整保留，请根据实际情况手动标记结果。
+          </div>
+        )}
       </header>
 
       {/* run 概要条 */}
@@ -295,9 +387,28 @@ export default function TraceDetailPage() {
 // ── 辅助组件 ──
 
 function StatusBadge({ status }: { status: string }) {
-  const variant = status === "completed" ? "completed" : status === "failed" ? "failed" : "running";
-  const label = status === "completed" ? "完成" : status === "failed" ? "失败" : status === "awaiting_input" ? "等待输入" : status === "cancelled" ? "已取消" : "运行中";
+  const variant =
+    status === "completed" ? "completed"
+    : status === "failed" ? "failed"
+    : status === "interrupted" ? "interrupted"
+    : status === "cancelled" ? "cancelled"
+    : "running";
+  const label =
+    status === "completed" ? "完成"
+    : status === "failed" ? "失败"
+    : status === "interrupted" ? "已中断"
+    : status === "cancelled" ? "已取消"
+    : status === "awaiting_input" ? "等待输入"
+    : "运行中";
   return <Badge variant={variant as any}>{label}</Badge>;
+}
+
+/** interrupted_reason 中文标签（trace 稳定性重构）。 */
+function interruptedReasonLabel(reason: string): string {
+  if (reason === "process_restart") return "进程重启";
+  if (reason === "heartbeat_timeout") return "心跳超时";
+  if (reason === "user_marked") return "用户标记";
+  return reason;
 }
 
 function formatDuration(ms: number): string {

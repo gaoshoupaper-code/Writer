@@ -16,6 +16,11 @@ const badgeVariants = cva(
         running: "bg-blue-500/10 text-blue-700 border border-blue-500/20",
         completed: "bg-emerald-500/10 text-emerald-700 border border-emerald-500/20",
         failed: "bg-red-500/10 text-red-700 border border-red-500/20",
+        // trace 稳定性重构新增（设计 20260720_203000）：
+        //   interrupted = 橙色（警示色，提示用户需手动收敛）
+        //   cancelled = 灰色（中性色，用户主动放弃）
+        interrupted: "bg-orange-500/10 text-orange-700 border border-orange-500/20",
+        cancelled: "bg-foreground/10 text-muted-foreground border border-border",
       },
     },
     defaultVariants: {

@@ -2960,6 +2960,55 @@ a {
   transform: none;
 }
 
+/* trace 稳定性重构：trace 详情页收敛按钮 + 提示（设计 20260720_203000） */
+.resolve-actions {
+  display: inline-flex;
+  gap: 8px;
+  margin-left: 8px;
+}
+.resolve-button {
+  min-height: 32px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 0 12px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  transition: opacity 140ms ease, transform 140ms ease;
+}
+.resolve-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+.resolve-failed {
+  color: #b42318;
+  background: rgba(185, 28, 28, 0.08);
+  border-color: rgba(185, 28, 28, 0.3);
+}
+.resolve-completed {
+  color: #157f3d;
+  background: rgba(21, 127, 61, 0.08);
+  border-color: rgba(21, 127, 61, 0.3);
+}
+.action-error {
+  margin-top: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: #b42318;
+  background: rgba(185, 28, 28, 0.06);
+  border-radius: 6px;
+}
+.interrupted-hint {
+  margin-top: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: #92400e;
+  background: rgba(224, 164, 88, 0.1);
+  border: 1px solid rgba(224, 164, 88, 0.3);
+  border-radius: 6px;
+  line-height: 1.5;
+}
+
 .status-copy {
   margin: 0;
   color: var(--muted);
@@ -6209,6 +6258,10 @@ html[data-theme="dark"] {
 .run-status.running { color: var(--teal, #3a9a7e); }
 .run-status.completed { color: #6ecfb8; }
 .run-status.failed { color: var(--coral, #c9794e); }
+/* trace 稳定性重构：interrupted 橙色（警示需收敛），cancelled 灰色（中性），awaiting_input 蓝 */
+.run-status.interrupted { color: #e0a458; }
+.run-status.cancelled { color: var(--muted-foreground, #94a3b8); }
+.run-status.awaiting_input { color: #6b8cff; }
 
 .run-session {
   font-size: 13px;

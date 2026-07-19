@@ -20,7 +20,9 @@ class Overview(BaseModel):
     total: int
     success: int
     failed: int
-    error_rate: float          # 0~1
+    interrupted: int           # trace 稳定性重构：interrupted 独立一类（决策 9A）
+    cancelled: int             # cancelled 也单独返回（原口径未含，现在补全）
+    error_rate: float          # 0~1，= failed / (success + failed)，不含 interrupted/cancelled
     duration_p50: int | None   # ms
     duration_p90: int | None
     duration_p99: int | None
@@ -79,6 +81,8 @@ def overview(
     total = len(runs)
     success = sum(1 for r in runs if r["status"] == "completed")
     failed = sum(1 for r in runs if r["status"] == "failed")
+    interrupted = sum(1 for r in runs if r["status"] == "interrupted")
+    cancelled = sum(1 for r in runs if r["status"] == "cancelled")
     durations = [r["duration_ms"] for r in runs if r["duration_ms"] is not None]
 
     # token：只统计 LLM 节点（同一 trace 的多 LLM 节点 token 求和）
@@ -95,9 +99,13 @@ def overview(
         tuple(trace_ids),
     )
 
+    # error_rate = failed / (success + failed)，不含 interrupted/cancelled（决策 9A）
+    # interrupted 是"未知状态"，cancelled 是"用户主动放弃"，都不是执行失败。
+    success_or_failed = success + failed
     return Overview(
         total=total, success=success, failed=failed,
-        error_rate=failed / total if total else 0.0,
+        interrupted=interrupted, cancelled=cancelled,
+        error_rate=failed / success_or_failed if success_or_failed else 0.0,
         duration_p50=_percentile(durations, 0.5),
         duration_p90=_percentile(durations, 0.9),
         duration_p99=_percentile(durations, 0.99),

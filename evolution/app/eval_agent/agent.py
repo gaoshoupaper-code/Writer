@@ -166,6 +166,7 @@ async def run_eval_session(ctx: EvaluationContext) -> dict[str, Any]:
             session_id=ctx.eval_id,
             run_purpose="evolution_eval",
             endpoint="eval-agent.run",
+            session_type="eval",  # trace 稳定性重构：持久化 self_trace_id
         )
         ctx.trace_id_self = handle.trace_id
 

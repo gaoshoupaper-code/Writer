@@ -416,6 +416,62 @@ export async function getTraceContext(
   );
 }
 
+// ── trace 稳定性重构（Pull 模式新接口，设计 20260720_203000）──
+
+/** trace 当前被哪个活跃 session 跑（详情页停止按钮反查用）。 */
+export interface ActiveSession {
+  session_type: "evolve" | "eval" | "test" | null;
+  session_id: string | null;
+  /** 后端算好的 stop 端点路径（如 /api/evolve/sessions/xxx/stop），前端直接 POST。 */
+  stop_endpoint: string | null;
+}
+
+export async function getActiveSession(traceId: string): Promise<ActiveSession> {
+  return evoJson<ActiveSession>(`/api/traces/${traceId}/active-session`, { method: "GET" });
+}
+
+/** 用户手动收敛 interrupted trace 为 failed/completed。 */
+export async function resolveTrace(
+  traceId: string,
+  targetStatus: "failed" | "completed",
+  note?: string,
+): Promise<{ status: string; resolved_to: string; trace_id: string }> {
+  return evoJson(`/api/traces/${traceId}/resolve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target_status: targetStatus, note: note ?? null }),
+  });
+}
+
+/**
+ * 按 session_type 分发停止调用（trace 详情页停止按钮用）。
+ *
+ * trace 详情页点"停止"时，先调 getActiveSession 拿到 {session_type, session_id}，
+ * 再用本函数按 type 分发到对应的 stop 接口。用户不需要知道 session 类型。
+ */
+export async function stopActiveSession(session: {
+  session_type: "evolve" | "eval" | "test" | null;
+  session_id: string | null;
+}): Promise<{ ok: boolean; error?: string }> {
+  if (!session.session_type || !session.session_id) {
+    return { ok: false, error: "无活跃 session 可停止" };
+  }
+  try {
+    if (session.session_type === "evolve") {
+      await stopEvolve(session.session_id);
+    } else if (session.session_type === "eval") {
+      await stopEval(session.session_id);
+    } else if (session.session_type === "test") {
+      await stopTest(session.session_id);
+    } else {
+      return { ok: false, error: `未知 session_type: ${session.session_type}` };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "停止失败" };
+  }
+}
+
 // ════════════════════════════════════════════════════════════
 //  评估（eval-agent）
 // ════════════════════════════════════════════════════════════

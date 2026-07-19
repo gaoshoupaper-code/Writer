@@ -28,7 +28,7 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
 from typing import Any, Literal
@@ -54,6 +54,13 @@ _FLUSH_BATCH_MAX = 200  # 单批最多写多少行
 # WAL 落盘根目录（evolution/data/traces/）。
 _WAL_ROOT = Path(__file__).resolve().parent.parent.parent / "data" / "traces"
 
+# ── 心跳与超时（trace 稳定性重构，设计 20260720_203000）──
+# runs.status 为 Pull 单一真相源，需要周期性刷新 last_heartbeat_at 让前端能读到
+# "还在跑"的信号；后台扫描器检测超过 _HEARTBEAT_TIMEOUT 秒未刷新的 running trace
+# 标为 interrupted（不再像旧版 recover_pending 那样强标 failed）。
+_HEARTBEAT_TIMEOUT = 10  # 秒；running 状态超过此值未刷新心跳 → interrupted
+_SCANNER_INTERVAL = 5   # 秒；后台超时扫描器轮询间隔
+
 # trace 终态的取消来源（与执行端对齐）。
 CancelReason = Literal["client_disconnect", "timeout", "crash_recovery", "user_stop"]
 _CANCEL_REASON_MESSAGES: dict[str, str] = {
@@ -62,6 +69,9 @@ _CANCEL_REASON_MESSAGES: dict[str, str] = {
     "crash_recovery": "Recovered from crash (process restart)",
     "user_stop": "Stopped by user",
 }
+
+# interrupted 来源（trace 稳定性重构）：仅 interrupted 状态下写入 runs.interrupted_reason。
+InterruptedReason = Literal["process_restart", "heartbeat_timeout", "user_marked"]
 
 
 @dataclass
@@ -96,6 +106,8 @@ class EvolutionTraceRecorder:
         self._pending_writes: deque[tuple[str, str]] = deque()  # (trace_id, json_line)
         self._pending_lock = RLock()
         self._drain_task: asyncio.Task[None] | None = None
+        # trace 稳定性重构：心跳超时扫描器（检测卡死的 running trace 标 interrupted）。
+        self._scanner_task: asyncio.Task[None] | None = None
 
     # ── 生命周期 ──────────────────────────────────────────────
 
@@ -103,14 +115,22 @@ class EvolutionTraceRecorder:
         """启动后台 drain 协程（lifespan 调用，幂等）。"""
         if self._drain_task is None or self._drain_task.done():
             self._drain_task = asyncio.create_task(self._drain_loop())
+        # 启动心跳超时扫描器（trace 稳定性重构）。
+        if self._scanner_task is None or self._scanner_task.done():
+            self._scanner_task = asyncio.create_task(self._heartbeat_timeout_scanner())
 
     async def aclose(self) -> None:
-        """关闭：停 drain + flush 残余事件落盘。"""
+        """关闭：停 drain + 停 scanner + flush 残余事件落盘。"""
         if self._drain_task is not None:
             self._drain_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._drain_task
             self._drain_task = None
+        if self._scanner_task is not None:
+            self._scanner_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._scanner_task
+            self._scanner_task = None
         self._flush_all_sync()
 
     # ── run 生命周期 ──────────────────────────────────────────
@@ -121,6 +141,7 @@ class EvolutionTraceRecorder:
         run_purpose: str,
         *,
         endpoint: str = "",
+        session_type: str | None = None,
     ) -> TraceRunHandle:
         """创建一条 trace run（D8：立即写 runs 行 status=running）。
 
@@ -128,6 +149,9 @@ class EvolutionTraceRecorder:
             session_id: 评估/进化 session id（作为 session_name）
             run_purpose: evolution_eval / evolution_evolve
             endpoint: 可选，记录触发端点
+            session_type: 可选，trace 稳定性重构——持久化 self_trace_id 到 session 表。
+                'evolve' → evolve_sessions；'eval' → evaluation_sessions；None → 不写（向后兼容）。
+                有了持久化映射，trace 详情页停止按钮才能在进程重启后反查到 session。
         """
         trace_id = f"trace-{uuid4().hex}"
         started_at = datetime.now(UTC)
@@ -152,8 +176,9 @@ class EvolutionTraceRecorder:
         db.execute(
             """INSERT INTO runs
                (trace_id, workspace_id, thread_id, session_name, endpoint,
-                status, started_at, event_count, ingested_at, run_purpose)
-               VALUES (?, ?, ?, ?, ?, 'running', ?, 0, ?, ?)""",
+                status, started_at, event_count, ingested_at, run_purpose,
+                last_heartbeat_at)
+               VALUES (?, ?, ?, ?, ?, 'running', ?, 0, ?, ?, ?)""",
             (
                 trace_id,
                 "evolution",       # workspace_id：进化端固定标识
@@ -163,8 +188,13 @@ class EvolutionTraceRecorder:
                 started_iso,
                 started_iso,       # ingested_at
                 run_purpose,
+                started_iso,       # last_heartbeat_at：创建即首次心跳
             ),
         )
+
+        # trace 稳定性重构：持久化 self_trace_id 到 session 表（进程重启后仍可反查）。
+        if session_type:
+            self._persist_self_trace_id(session_type, session_id, trace_id)
 
         handle = TraceRunHandle(trace_id=trace_id, queue=self._queues[trace_id])
 
@@ -183,6 +213,48 @@ class EvolutionTraceRecorder:
             },
         )
         return handle
+
+    # trace 稳定性重构：session_type → (表名, 主键列名) 映射。
+    # manual_tests 不在此表——测试用 executor 跑 trace，evolution 端不自观测录像。
+    _SESSION_TABLE_MAP: dict[str, tuple[str, str]] = {
+        "evolve": ("evolve_sessions", "session_id"),
+        "eval": ("evaluation_sessions", "eval_id"),
+    }
+
+    def _persist_self_trace_id(
+        self, session_type: str, session_id: str, self_trace_id: str
+    ) -> None:
+        """持久化 self_trace_id 到对应 session 表（trace 稳定性重构）。
+
+        原映射纯内存（_session_trace），进程重启即丢，导致 stop 端点无法收敛 trace
+        状态。落 DB 后，trace 详情页停止按钮可通过 self_trace_id 反查活跃 session。
+
+        失败不抛错（session 行可能尚未 INSERT，如 eval/evolve session 先于 trace 创建
+        的边界场景）；只记 WARNING 级日志（含 rowcount）——主流程（trace 录像）不应被
+        映射写入阻断，但 rowcount=0（session 行不存在）要让运维能看到。
+        """
+        mapping = self._SESSION_TABLE_MAP.get(session_type)
+        if mapping is None:
+            logger.warning("未知 session_type=%s，跳过 self_trace_id 持久化", session_type)
+            return
+        table, key_col = mapping
+        try:
+            cur = db.execute(
+                f"UPDATE {table} SET self_trace_id=? WHERE {key_col}=?",
+                (self_trace_id, session_id),
+            )
+            if cur.rowcount == 0:
+                # session 行不存在——可能是调用顺序问题（create_run 早于 session INSERT），
+                # 或 session_type 传错。记 WARNING 便于排查"停止按钮不出现"类问题。
+                logger.warning(
+                    "self_trace_id UPDATE 命中 0 行：table=%s %s=%s（session 行不存在）",
+                    table, key_col, session_id,
+                )
+        except Exception:
+            logger.exception(
+                "持久化 self_trace_id 失败 session_type=%s session_id=%s（不影响 trace 录像）",
+                session_type, session_id,
+            )
 
     def complete_run(self, trace_id: str) -> TraceLogEvent | None:
         """正常完成：写 run_end + 终态投影 + UPDATE runs。
@@ -544,13 +616,14 @@ class EvolutionTraceRecorder:
         )
         return [TraceLogEvent.model_validate(json.loads(r["payload_json"])) for r in rows]
 
-    # ── 崩溃恢复（D8 R1）──
+    # ── 崩溃恢复（D8 R1 / 稳定性重构：interrupted 不再强标 failed）──
 
     def recover_pending(self) -> int:
-        """进程重启后扫描 status=running 的 runs，补终态（D8 崩溃恢复 R1）。
+        """进程重启后扫描 status=running 的 runs，标为 interrupted（设计 20260720_203000）。
 
-        扫描 runs 表所有 status=running 的行 → 每条标 failed（crash_recovery）。
-        event_payloads 已实时写入（数据不丢），nodes 在 _finalize_run 里投影。
+        旧版强标 failed 是"运行中显示失败"的头号元凶——进程一重启（部署/OOM/容器漂移），
+        所有 running trace 全被批量改 failed。新版标 interrupted：trace 数据完整
+        （event_payloads 实时写入），只是没正常收尾，用户可在 UI 手动收敛为 failed/completed。
 
         Returns: 恢复的 trace 数量。
         """
@@ -558,41 +631,29 @@ class EvolutionTraceRecorder:
         count = 0
         for row in rows:
             trace_id = row["trace_id"]
-            logger.warning("崩溃恢复：trace %s 标记为 failed", trace_id)
-            # 重建最小活跃态让 _finalize_run 能 append run_error 事件。
-            self._rebuild_minimal_state(trace_id)
+            logger.warning("崩溃恢复：trace %s 标记为 interrupted（待用户收敛）", trace_id)
+            # 不调 _finalize_run——那会清内存活跃态 + 投影 nodes + 写终态事件，
+            # 对 interrupted 不合适（trace 数据已完整，只需 UPDATE runs）。
+            # 直接 UPDATE：status=interrupted + interrupted_reason=process_restart。
             try:
-                self._finalize_run(trace_id, "failed", 0, _CANCEL_REASON_MESSAGES["crash_recovery"])
+                db.execute(
+                    """UPDATE runs
+                       SET status='interrupted',
+                           interrupted_reason='process_restart',
+                           ended_at=?,
+                           error=?
+                       WHERE trace_id=?""",
+                    (
+                        self._now(),
+                        _CANCEL_REASON_MESSAGES["crash_recovery"],
+                        trace_id,
+                    ),
+                )
                 count += 1
             except Exception:
                 logger.exception("崩溃恢复失败 trace=%s", trace_id)
-                # 兜底：直接 UPDATE runs。
-                db.execute(
-                    "UPDATE runs SET status='failed', error=? WHERE trace_id=?",
-                    (_CANCEL_REASON_MESSAGES["crash_recovery"], trace_id),
-                )
-            finally:
-                self._cleanup_run_state(trace_id)
+            # 不 _cleanup_run_state：重启后内存本就是空的，无需清理。
         return count
-
-    def _rebuild_minimal_state(self, trace_id: str) -> None:
-        """重建最小活跃态让 append_event 能工作（崩溃恢复用）。"""
-        row = db.query_one("SELECT * FROM runs WHERE trace_id=?", (trace_id,))
-        if row is None:
-            return
-        started_at = row["started_at"] or datetime.now(UTC).isoformat()
-        try:
-            dt = datetime.fromisoformat(started_at)
-        except (ValueError, TypeError):
-            dt = datetime.now(UTC)
-        wal_path = self._wal_path(trace_id, dt)
-        self._locks[trace_id] = RLock()
-        self._sequences[trace_id] = row["event_count"] or 0
-        self._queues[trace_id] = asyncio.Queue()
-        self._started_monotonic[trace_id] = time.perf_counter()
-        self._wal_paths[trace_id] = wal_path
-        self._run_purposes[trace_id] = row.get("run_purpose") or "unknown"
-        # _increment_states 不重建 → 退化为全量（安全降级）。
 
     # ── 写盘解耦（drain + flush）──
 
@@ -600,12 +661,100 @@ class EvolutionTraceRecorder:
         return self._drain_task is not None and not self._drain_task.done()
 
     async def _drain_loop(self) -> None:
-        """后台循环：周期性成批写 DB + WAL。"""
+        """后台循环：周期性成批写 DB + WAL，并刷新活跃 trace 心跳。
+
+        心跳与事件批写绑同一 tick（设计 A1）：即便 Agent 长时间不产事件（如卡在
+        长耗时 LLM 调用），心跳也每 0.5s 刷新一次，保证 running 状态不被超时扫描
+        误判。心跳走 _heartbeat_sync 独立 UPDATE（非空 active 集合才查 DB）。
+        """
         while True:
             await asyncio.sleep(_DRAIN_INTERVAL)
             batch = self._take_pending_batch()
             if batch:
                 await asyncio.to_thread(self._write_batch_sync, batch)
+            # 心跳刷新：无论是否有事件待写，都刷新一次活跃 trace 的 last_heartbeat_at。
+            await asyncio.to_thread(self._heartbeat_sync)
+
+    def _heartbeat_sync(self) -> None:
+        """同步刷新所有活跃 trace 的心跳 + event_count（drain_loop 每 0.5s 调一次）。
+
+        合并到 drain_loop 的 tick 而非独立 task，避免新增 task；UPDATE 走全局 _lock，
+        与事件批写串行（SQLite 单连接 + 全局 RLock，无写锁竞争，设计 A1 解决 R9）。
+
+        刷新两个字段：
+        - last_heartbeat_at：超时扫描器据此判断 running 是否卡死（设计 A5）
+        - event_count：从 _sequences 取当前最大 sequence，让前端轮询能看到事件数实时增长
+          （根因 C 的解法——原 SSE 时代 event_count 不更新，Pull 时代靠心跳刷新）
+
+        只在 _sequences 非空时执行（无活跃 trace 直接 return，零 DB 开销）。
+        """
+        if not self._sequences:
+            return
+        # 快照活跃 trace_id + 当前 sequence（_sequences 是 trace_id → seq 的 dict）。
+        # 逐条 UPDATE（SQLite 不支持 VALUES 多行 UPDATE），但 active 数量极少（同时跑的 trace）。
+        now_iso = datetime.now(UTC).isoformat()
+        for trace_id, seq in self._sequences.items():
+            try:
+                db.execute(
+                    """UPDATE runs
+                       SET status='running', last_heartbeat_at=?, event_count=?
+                       WHERE trace_id=? AND status='running'""",
+                    (now_iso, seq, trace_id),
+                )
+            except Exception:
+                # 心跳失败不能影响主流程（事件批写 / Agent 执行）。
+                logger.exception("心跳刷新失败 trace=%s", trace_id)
+
+    async def _heartbeat_timeout_scanner(self) -> None:
+        """后台扫描器：检测心跳超时的 running trace 标 interrupted（设计 20260720_203000）。
+
+        每 _SCANNER_INTERVAL 秒扫一次 runs 表，找出：
+          status='running' AND last_heartbeat_at < now - _HEARTBEAT_TIMEOUT
+        的 trace，标为 interrupted（reason=heartbeat_timeout）。
+
+        误判防护（R11）：心跳由 _drain_loop 每 0.5s 刷新，只要 Agent 还在产事件
+        或 drain_loop 还在跑，last_heartbeat_at 就持续刷新。10s 超时意味着：
+        drain_loop 连续 20 个 tick（10s/0.5s）都没刷新——只有进程卡死 / 协程阻塞
+        才会发生，正常长任务（哪怕几十分钟）不会误判。
+        """
+        while True:
+            await asyncio.sleep(_SCANNER_INTERVAL)
+            try:
+                await asyncio.to_thread(self._scan_timeout_sync)
+            except Exception:
+                # 扫描器自身异常不能崩（否则再也无人检测超时）。
+                logger.exception("心跳超时扫描异常")
+
+    def _scan_timeout_sync(self) -> None:
+        """同步执行一次心跳超时扫描（scanner task 调用）。"""
+        now = datetime.now(UTC)
+        threshold = (now - timedelta(seconds=_HEARTBEAT_TIMEOUT)).isoformat()
+        # 查找超时 trace（只取必要列）。
+        rows = db.query_all(
+            """SELECT trace_id FROM runs
+               WHERE status='running'
+                 AND last_heartbeat_at IS NOT NULL
+                 AND last_heartbeat_at < ?""",
+            (threshold,),
+        )
+        if not rows:
+            return
+        now_iso = now.isoformat()
+        trace_ids = [r["trace_id"] for r in rows]
+        placeholders = ",".join("?" * len(trace_ids))
+        logger.warning(
+            "心跳超时：%d 条 running trace 标记为 interrupted（>%ds 未刷新）",
+            len(trace_ids), _HEARTBEAT_TIMEOUT,
+        )
+        # 批量标 interrupted（单事务）。
+        db.execute(
+            f"""UPDATE runs
+                SET status='interrupted',
+                    interrupted_reason='heartbeat_timeout',
+                    ended_at=?
+                WHERE trace_id IN ({placeholders}) AND status='running'""",
+            (now_iso, *trace_ids),
+        )
 
     def _take_pending_batch(self) -> list[tuple[str, str]]:
         """从缓冲区取出一批待写行（最多 _FLUSH_BATCH_MAX 条）。"""

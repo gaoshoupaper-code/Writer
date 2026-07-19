@@ -1,6 +1,12 @@
 // ── Trace 类型（搬迁自 evolution/frontend/lib/types.ts，仅保留 trace 相关 + 新增监测类型）──
 
-export type TraceStatus = "running" | "awaiting_input" | "completed" | "failed" | "cancelled";
+export type TraceStatus =
+  | "running"
+  | "awaiting_input"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted"; // trace 稳定性重构：进程重启/心跳超时后的中间态，用户手动收敛
 
 export type TraceEventType =
   | "run_start"
@@ -127,6 +133,9 @@ export type TraceRunSummary = {
   event_count: number;
   path: string;
   error?: string | null;
+  // trace 稳定性重构：Pull 主导架构下前端判断"还在跑"的依据 + interrupted 来源
+  last_heartbeat_at?: string | null;
+  interrupted_reason?: string | null;
 };
 
 export type TraceDetail = {

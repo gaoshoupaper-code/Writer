@@ -63,14 +63,14 @@ async def lifespan(app: FastAPI):
     # 用户映射同步：定时从 executor 拉取用户列表 → user_cache 表（trace 历史列表展示用户名）
     start_user_sync_scheduler()
 
-    # D5/D8：创建 recorder 单例 + 崩溃恢复 + 启动 drain。
+    # D5/D8：创建 recorder 单例 + 崩溃恢复 + 启动 drain + 心跳扫描。
     # 顺序保证：init_db 先于 recorder（recorder 写 DB 依赖表已建）。
     recorder = EvolutionTraceRecorder()
     recovered = recorder.recover_pending()
     if recovered:
         import logging
         logging.getLogger("evolution.trace.recorder").info(
-            "崩溃恢复：%d 条 running trace 补终态", recovered
+            "崩溃恢复：%d 条 running trace 标为 interrupted（待用户收敛）", recovered
         )
     recorder.start_drain()
     app.state.trace_recorder = recorder

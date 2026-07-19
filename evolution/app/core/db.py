@@ -63,7 +63,7 @@ def init_db() -> None:
                 thread_id     TEXT,
                 session_name  TEXT,
                 endpoint      TEXT,
-                status        TEXT NOT NULL,          -- awaiting_input / completed / failed / cancelled (running 不入库)
+                status        TEXT NOT NULL,          -- running / completed / failed / cancelled / interrupted（recorder.create_run 即写 running 行）
                 started_at    TEXT,
                 ended_at      TEXT,
                 duration_ms   INTEGER,
@@ -425,6 +425,10 @@ def init_db() -> None:
         _migrate_runs_ingested_seq(conn)
         # 进化端自观测：给 runs 表补 run_purpose 列（区分 executor/evolution trace）
         _migrate_runs_run_purpose(conn)
+        # trace 稳定性重构：runs 表补心跳 + interrupted_reason 列（设计 20260720_203000）
+        _migrate_runs_heartbeat(conn)
+        # trace 稳定性重构：session 三表补 self_trace_id 列（设计 20260720_203000）
+        _migrate_self_trace_id_columns(conn)
         # Phase 4 幂等迁移：prompt 版本管理表（T9 langfuse 式）
         _migrate_prompt_tables(conn)
         # 驱动器模式幂等迁移：evolve_sessions 补 phase + 文档路径列（D16）
@@ -524,6 +528,63 @@ def _migrate_runs_run_purpose(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE runs ADD COLUMN run_purpose TEXT NOT NULL DEFAULT 'user_generation'")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_purpose ON runs(run_purpose)")
         conn.commit()
+
+
+def _migrate_runs_heartbeat(conn: sqlite3.Connection) -> None:
+    """幂等迁移：给 runs 表补 last_heartbeat_at + interrupted_reason 列。
+
+    trace 稳定性重构（设计 20260720_203000）：Pull 主导架构下 runs.status 成为
+    唯一真相源，需要两个配套字段：
+
+    - last_heartbeat_at：recorder.drain_loop 每次写事务合并刷新（心跳），后台
+      _heartbeat_timeout_scanner 检测超过 10s 未刷新的 running trace 标 interrupted。
+      存量数据 NULL（已结束的 trace 不需要心跳）。
+    - interrupted_reason：进入 interrupted 状态的来源，便于排查：
+      process_restart（进程重启时 recover_pending 标记）/
+      heartbeat_timeout（后台扫描标记）/
+      user_marked（用户在 UI 手动收敛）。仅 interrupted 状态下非 NULL。
+
+    不加索引：_heartbeat_timeout_scanner 查 WHERE status='running'，running 行数
+    极少（只有正在跑的 trace），全表扫描几毫秒，无需为低频查询加索引。
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    missing = [c for c in ("last_heartbeat_at", "interrupted_reason") if c not in existing]
+    if not missing:
+        return
+    with _lock:
+        if "last_heartbeat_at" in missing:
+            conn.execute("ALTER TABLE runs ADD COLUMN last_heartbeat_at TEXT")
+        if "interrupted_reason" in missing:
+            conn.execute("ALTER TABLE runs ADD COLUMN interrupted_reason TEXT")
+        conn.commit()
+
+
+def _migrate_self_trace_id_columns(conn: sqlite3.Connection) -> None:
+    """幂等迁移：给 evolve_sessions / evaluation_sessions / manual_tests 补 self_trace_id 列。
+
+    trace 稳定性重构（设计 20260720_203000）：原 session_id → trace_id 映射纯内存
+    （recorder._session_trace），进程重启即丢，导致 stop 端点无法收敛 trace 状态。
+    持久化到 DB 后，trace 详情页停止按钮可通过 self_trace_id 反查活跃 session。
+
+    语义说明（命名分裂 R5）：
+    - self_trace_id：本次进化/评估/测试过程的**自观测录像** trace_id（recorder 生成）
+    - evolve_sessions.baseline_trace / manual_tests.trace_id：被改进/被测的**对象** trace_id
+      两者语义不同，不能混用。evolve_sessions.candidate_trace 也是"对象"语义（run_test 产）。
+
+    存量数据 NULL（符合 D6：只保证新数据准确，不回填历史）。
+    """
+    table_columns = {
+        "evolve_sessions": "self_trace_id",
+        "evaluation_sessions": "self_trace_id",
+        "manual_tests": "self_trace_id",
+    }
+    for table, col in table_columns.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if col in existing:
+            continue
+        with _lock:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+            conn.commit()
 
 
 def _migrate_manual_tests_origin_layer(conn: sqlite3.Connection) -> None:

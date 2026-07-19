@@ -203,6 +203,7 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
             session_id=ctx.session_id,
             run_purpose="evolution_evolve",
             endpoint="evolve-agent.run",
+            session_type="evolve",  # trace 稳定性重构：持久化 self_trace_id
         )
         ctx.trace_id_self = handle.trace_id
 
@@ -335,6 +336,7 @@ async def run_inspect_round(ctx: EvolveContext, trace_id: str) -> dict[str, Any]
             session_id=ctx.session_id,
             run_purpose="evolution_evolve",
             endpoint="evolve-agent.inspect",
+            session_type="evolve",  # trace 稳定性重构：持久化 self_trace_id
         )
         ctx.trace_id_self = handle.trace_id
 
