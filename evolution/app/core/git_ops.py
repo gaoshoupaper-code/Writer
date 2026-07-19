@@ -82,7 +82,7 @@ def commit_and_push(message: str) -> str:
 
     _git_with_author(["add", "-A"], wd)
     _git_with_author(["commit", "-m", message], wd)
-    _git(["push", "origin", "main"], wd)
+    _push_to_bare(wd, settings.harness_bare_repo_path)
 
     commit_hash = current_commit()
     logger.info("harness 变更已 commit + push: %s (%s)", message, commit_hash)
@@ -134,6 +134,70 @@ def commit_file(file_path: str, content: str, message: str) -> str:
     abs_path.parent.mkdir(parents=True, exist_ok=True)
     abs_path.write_text(content, encoding="utf-8")
     return commit_and_push(message)
+
+
+def _push_to_bare(wd: Path, bare: Path) -> None:
+    """把工作目录 main 推到 bare repo，处理非 fast-forward 漂移。
+
+    正常情况 bare repo main 是工作目录的祖先，push 即可。但容器重建 /
+    volume 漂移会让 bare 停在分叉的旧 commit 上，普通 push 报 non-fast-forward。
+    此时用 --force-with-lease 兜底：工作目录是 harness 源码的唯一写入方，
+    evolution 是单一真相源，强制对齐不会丢别处的提交。
+
+    失败再 raise（commit_and_push 把异常透出，调用方按发版失败处理）。
+    """
+    try:
+        _git(["push", "origin", "main"], wd)
+    except RuntimeError as exc:
+        if "non-fast-forward" not in exc.args[0] and "non fast-forward" not in exc.args[0]:
+            raise
+        logger.warning(
+            "push 检测到 non-fast-forward（bare repo 漂移），用 --force-with-lease 对齐: %s",
+            exc.args[0],
+        )
+        _git(["push", "--force-with-lease", "origin", "main"], wd)
+
+
+def _sync_bare_to_head(wd: Path, bare: Path) -> None:
+    """启动时对齐 bare repo main 与工作目录 HEAD。
+
+    bare repo 是 executor clone 的源；只要它落后于 evolution 工作目录，
+    executor 就拉不到 evolution 推导出的 commit hash，checkout 时报
+    "pathspec did not match"。所以每次容器启动都要做一次对齐。
+
+    策略（按从轻到重，统一交给 _push_to_bare 处理 fast-forward / 漂移）：
+      1. bare 无 main（首次/被清空）→ 直接 push
+      2. bare main == 工作目录 HEAD → 已同步，跳过
+      3. 否则 → _push_to_bare（fast-forward 优先，分叉时 --force-with-lease）
+
+    任何一步异常都记 warning 但不抛——启动不应被 git 同步卡死（自愈可延后）。
+    """
+    try:
+        bare_heads = subprocess.run(
+            ["git", "-C", str(bare), "rev-parse", "--verify", "main"],
+            capture_output=True, text=True, timeout=10,
+        )
+        head = _git(["rev-parse", "HEAD"], wd)
+
+        if bare_heads.returncode != 0:
+            # bare repo 无 main（首次/被清空），首次 push
+            _git(["push", "origin", "main"], wd)
+            logger.info("首次 push main → bare repo")
+            return
+
+        bare_main = bare_heads.stdout.strip()
+        if bare_main == head:
+            return  # 已同步
+
+        # bare 落后或分叉，统一交给 _push_to_bare（内部按 fast-forward / force-with-lease 处理）
+        logger.info(
+            "启动同步：bare repo 落后/分叉 (%s → %s)，触发 push",
+            bare_main[:7], head[:7],
+        )
+        _push_to_bare(wd, bare)
+    except Exception:
+        logger.warning("启动时同步 bare repo 失败（不影响启动，后续 commit_and_push 会重试）",
+                       exc_info=True)
 
 
 def init_work_repo() -> None:
@@ -190,21 +254,14 @@ def init_work_repo() -> None:
     else:
         _git(["remote", "set-url", "origin", str(bare)], wd)
 
-    # 4. 确保 main 已 push 到 bare repo（executor pull 的前提）
-    #    用 --force 只在首次初始化场景：正常演进用 commit_and_push（fast-forward）。
-    #    这里幂等保护：bare repo 无 main 时才 push，避免覆盖已有历史。
-    try:
-        bare_heads = subprocess.run(
-            ["git", "-C", str(bare), "rev-parse", "--verify", "main"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if bare_heads.returncode != 0:
-            # bare repo 无 main，首次 push
-            _git(["push", "origin", "main"], wd)
-            logger.info("首次 push main → bare repo")
-    except Exception:
-        logger.warning("检查 bare repo main 失败，尝试 push", exc_info=True)
-        _git(["push", "origin", "main"], wd)
+    # 4. 确保 bare repo 的 main 与工作目录 HEAD 一致（executor pull 的前提）。
+    #    旧逻辑只在 bare repo 完全没有 main 时才 push，无法自愈漂移——
+    #    容器重建 / volume 重建 / 手动 commit 未 push 后，bare repo 会停在旧 commit，
+    #    而 evolution 用 git log 推导版本→commit 时仍拿得到新 commit hash，
+    #    发给 executor checkout 时就 pathspec did not match（线上已踩）。
+    #    新逻辑：启动时强制对齐一次，保证 main 永远追上 HEAD（fast-forward 优先，
+    #    漂移到工作目录更老时才需要 --force，但 init 阶段工作目录是真相源）。
+    _sync_bare_to_head(wd, bare)
 
 
 __all__ = [

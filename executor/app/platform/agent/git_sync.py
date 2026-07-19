@@ -119,14 +119,35 @@ def checkout_commit(commit: str) -> Path:
 
     Returns:
         临时 checkout 目录（含指定 commit 的源码）。调用方用完应 cleanup。
+
+    Raises:
+        RuntimeError: commit 在 bare repo 中不存在。错误信息附带 bare repo 最近
+            几条 commit hash，帮助定位（evolution push 缺失 / commit hash 错写）。
     """
     bare = _bare_repo()
     tmp = Path(tempfile.mkdtemp(prefix=f"harness_{commit}_", dir=str(_clone_dir())))
 
     # clone 到临时目录
     _git(["clone", bare, str(tmp)])
-    # checkout 指定 commit
-    _git(["checkout", commit], tmp)
+    # checkout 指定 commit；失败时附 bare repo 当前可见的 commit 列表辅助定位
+    # （线上踩过：evolution 端 commit 后未 push，executor clone 出来的仓库无此 commit）
+    try:
+        _git(["checkout", commit], tmp)
+    except RuntimeError as exc:
+        # 列出 bare repo 最近 10 个 commit，附在错误信息里方便诊断
+        try:
+            log = _git(["log", "--oneline", "-10"], tmp)
+            available = "\n  ".join(log.splitlines()) if log else "(空仓库)"
+        except Exception:  # noqa: BLE001
+            available = "(无法读取 commit 列表)"
+        # 清理失败的 checkout 临时目录，避免 _clone_dir 累积空目录
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError(
+            f"checkout commit {commit} 失败（bare repo 无此 commit）。"
+            f"通常是 evolution 端 commit 未 push 到 bare repo 导致。\n"
+            f"  原始错误: {exc.args[0]}\n"
+            f"  bare repo 最近 commit:\n  {available}"
+        ) from exc
     logger.info("候选 harness checkout: commit=%s → %s", commit, tmp)
     return tmp
 
