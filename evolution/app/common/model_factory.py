@@ -88,8 +88,15 @@ def build_agent_model(*, temperature: float = 0.2) -> BaseChatModel:
         # prompt 里的「单次单文件」铁律（串行写入，避免单次响应塞多个文件）。
         max_tokens=8192,
         # 防止单次模型调用无限期挂起/无限重试。
-        # 单请求 60s 超时（含 deepseek 等兼容端点的偶发抖动）；503 等最多重试 1 次。
-        request_timeout=60,
+        #
+        # 300s 超时：进化 Agent 要产出大体积源码（write_middleware/write_tool/
+        # write_subagent 参数就是整个文件）+ design_doc + change_log，单次响应
+        # 经常贴着 max_tokens=8192 跑，DeepSeek 兼容端点实测 30~50s 是常态，
+        # 叠加偶发抖动常超 60s。原 60s 仅对评估 Agent（小体积 JSON findings）够用，
+        # 对进化 Agent 稳定撞线报 APITimeoutError。300s 给足余量，对评估 Agent
+        # 无副作用（它实际几秒返回，timeout 只是上限）。max_retries=1 保留——
+        # 真断网/服务端 5xx 时仍能及时放弃，不会无限挂起。
+        request_timeout=300,
         max_retries=1,
     )
 
