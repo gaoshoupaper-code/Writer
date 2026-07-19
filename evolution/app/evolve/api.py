@@ -28,7 +28,13 @@ from app.eval_agent import repo as eval_repo
 from app.core import db
 from app.evolve import db as ev_db
 from app.evolve.agent.agent import run_evolve_session
-from app.evolve.ctx import EvolveContext
+from app.evolve.ctx import (
+    ACTIVE_STATUSES,
+    STATUS_CONVERSING,
+    STATUS_FINALIZING,
+    STATUS_RUNNING,
+    EvolveContext,
+)
 from app.trace.recorder import EvolutionTraceRecorder
 
 logger = logging.getLogger("evolution.evolve.api")
@@ -102,14 +108,16 @@ async def evolve_start(
             ),
         )
 
-    # working 区锁定校验（S6/4.3）：存在 pending_review 的 session 时禁止开新进化
-    pending = _find_pending_review_session()
-    if pending:
+    # working 区锁定校验（决策 G 单会话锁）：存在活跃 session 时禁止开新进化。
+    # 活跃 = running / conversing / finalizing / pending_review（ACTIVE_STATUSES）。
+    # 对话式共创下 conversing/finalizing 同样占用 working 区（改 harness repo），必须锁。
+    active = _find_active_session()
+    if active:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"当前有待审改动未处理（session {pending}），"
-                f"请先发版或丢弃后再启动新进化"
+                f"当前有未结束的进化会话（session {active}，状态 {active['status']}），"
+                f"请先发布/丢弃/取消后再启动新进化"
             ),
         )
 
@@ -149,12 +157,16 @@ async def evolve_start(
     )
 
 
-def _find_pending_review_session() -> str | None:
-    """查是否有 pending_review 状态的进化 session（working 区锁定，S6）。"""
+def _find_active_session() -> dict[str, Any] | None:
+    """查是否有活跃的进化 session（决策 G 单会话锁）。
+
+    活跃 = status ∈ ACTIVE_STATUSES（running/conversing/finalizing/pending_review）。
+    返回 session dict（含 session_id + status），无活跃返回 None。
+    """
     sessions = ev_db.list_sessions(limit=50)
     for s in sessions:
-        if isinstance(s, dict) and s.get("status") == "pending_review":
-            return s.get("session_id")
+        if isinstance(s, dict) and s.get("status") in ACTIVE_STATUSES:
+            return s
     return None
 
 
@@ -277,11 +289,15 @@ def _try_load_eval_snapshot(eval_ref: str | None) -> dict[str, Any] | None:
 
 @router.post("/evolve/sessions/{session_id}/stop")
 def stop_session(session_id: str) -> dict[str, Any]:
-    """手动停止运行中的进化 session（task.cancel → CancelledError 中断 ainvoke）。
+    """手动停止运行中的进化 session。
 
-    非阻塞：只取消 task + 标 cancelled，不等 Agent 真正退出。
-    真正的状态收尾（recorder.cancel_run + DB）由 run_evolve_session 的
-    CancelledError 分支处理。
+    双路收敛，避免状态分裂（session 表 cancelled 但 runs 表 running）：
+      1. task.cancel()：让 Agent 在下一个 await 点抛 CancelledError，
+         run_evolve_session 的 except 分支会调 recorder.cancel_run 正常收尾。
+      2. recorder.cancel_run(trace_id_self)：强制收敛——即便 Agent 卡在
+         无 await 的底层（同步阻塞/吞 CancelledError 的循环）导致 task.cancel
+         无效，也能立即把 runs.status 推进到 cancelled 并清内存活跃集合。
+         幂等：trace 已被路径 1 收敛时 no-op。
 
     已知边界：Agent 若停在改源码中途，harnesses/current/ 下可能留脏文件，
     本端点不清理（由用户手动 stash / 重置）。
@@ -289,10 +305,18 @@ def stop_session(session_id: str) -> dict[str, Any]:
     session = ev_db.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"session {session_id} 不存在")
-    if session.get("status") != "running":
+    # 可停止的状态：running / conversing / finalizing（pending_review 走 publish/discard）。
+    # Phase 1（状态机骨架）：统一标 cancelled，与原 running 单体行为一致。
+    # Phase 3（对话式 API 改造）会按决策 L 细化——conversing 的 stop 只取消当前输出
+    # task、不推进 status，会话保留可继续输入。
+    stoppable = {STATUS_RUNNING, STATUS_CONVERSING, STATUS_FINALIZING}
+    if session.get("status") not in stoppable:
         raise HTTPException(
             status_code=400,
-            detail=f"session 状态为 {session.get('status')}，只有 running 可停止",
+            detail=(
+                f"session 状态为 {session.get('status')}，"
+                f"只有 running/conversing/finalizing 可停止"
+            ),
         )
 
     task = _running_tasks.get(session_id)
@@ -304,6 +328,16 @@ def stop_session(session_id: str) -> dict[str, Any]:
         logger.warning(
             "进化 session %s 未找到活跃 task，仅标记 cancelled", session_id
         )
+
+    # 强制收敛 recorder trace 状态：即便 task.cancel 无效，runs.status 也立即收敛。
+    # 必须在 task.cancel 之后调——若 Agent 真在 await 点退出，run_evolve_session 的
+    # except 分支会再次调 cancel_run，幂等保护兜底。
+    recorder = get_recorder()
+    if recorder is not None:
+        trace_id_self = recorder.get_trace_id_by_session(session_id)
+        if trace_id_self:
+            recorder.cancel_run(trace_id_self, reason="user_stop")
+            logger.info("进化 session %s trace %s 已强制收敛 cancelled", session_id, trace_id_self)
 
     ev_db.update_session(session_id, status="cancelled")
     return {"status": "cancelled", "session_id": session_id}
