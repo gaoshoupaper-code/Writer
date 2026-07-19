@@ -41,8 +41,15 @@ logger = logging.getLogger("evolution.evolve.agent")
 # 避免正常进化因步数上限被误杀。GraphRecursionError 分支仅作极端死循环的防御性兜底。
 
 
-def build_evolve_agent(ctx: EvolveContext):
-    """构建单体进化 Agent（决策 S1/S3/S5/S11）。
+async def build_evolve_agent(ctx: EvolveContext):
+    """构建进化 Agent（决策 S1/S3/S5/S11 + Phase 2A T1/T2）。
+
+    Phase 2A 改造：加 checkpointer（per-session AsyncSqliteSaver），为对话式
+    共创工作台的多轮对话铺地基。thread_id = session_id，LangGraph 据此从
+    checkpoint 自动恢复对话史。
+
+    当前仍是单体模式（run_evolve_session 单次 ainvoke），Phase 2B 拆 round 后
+    才真正利用多轮对话能力。
 
     Args:
         ctx: 进化上下文（trace_id + eval_snapshot 已作为输入填入）
@@ -89,6 +96,12 @@ def build_evolve_agent(ctx: EvolveContext):
     if trace_middleware:
         middleware_list.append(trace_middleware)
 
+    # Phase 2A：checkpointer 从 pool 取（per-session，决策 T5）。
+    # 对话式共创下每轮 ainvoke 复用同 thread_id 的 checkpoint，自动恢复对话史。
+    # 单体模式下 checkpoint 仍会落盘（无害——单次 ainvoke 只产 1 个 checkpoint）。
+    from app.evolve.agent.checkpoint_pool import get_checkpoint_pool
+    checkpointer = await get_checkpoint_pool().get(ctx.session_id)
+
     agent = create_deep_agent(
         model=model,
         tools=tools,
@@ -96,11 +109,11 @@ def build_evolve_agent(ctx: EvolveContext):
         middleware=middleware_list,
         subagents=None,
         backend=backend,
-        checkpointer=None,
+        checkpointer=checkpointer,
     )
     logger.info(
-        "单体进化 Agent 构建完成: session=%s trace=%s",
-        ctx.session_id, ctx.trace_id,
+        "进化 Agent 构建完成: session=%s trace=%s thread_id=%s",
+        ctx.session_id, ctx.trace_id, ctx.thread_id,
     )
     return agent
 
@@ -130,10 +143,12 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
         )
         ctx.trace_id_self = handle.trace_id
 
-    agent = build_evolve_agent(ctx)
+    agent = await build_evolve_agent(ctx)
 
-    # config 注入 TraceCallbackHandler（构建调用树）。
-    config: dict[str, Any] = {}
+    # config 注入 TraceCallbackHandler（构建调用树）+ thread_id（Phase 2A：checkpoint 多轮对话）。
+    config: dict[str, Any] = {
+        "configurable": {"thread_id": ctx.thread_id},
+    }
     if ctx.recorder and ctx.trace_id_self:
         config["callbacks"] = [TraceCallbackHandler(ctx.recorder, ctx.trace_id_self)]
 

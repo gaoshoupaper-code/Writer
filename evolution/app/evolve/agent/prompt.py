@@ -1,4 +1,4 @@
-"""进化 Agent system prompt（决策 S6：7 段全景结构）。
+"""进化 Agent system prompt（决策 S6：7 段全景结构 + Phase 2A：静态/动态分离）。
 
 单体进化 Agent 的认知内核——让 Agent 像看透机器内部一样理解 Writer Agent
 怎么搭的、怎么跑的，然后安全地改它。
@@ -11,39 +11,33 @@
   ⑤State 与 Middleware 约束 State 字段经 Middleware 操作
   ⑥工作流程建议  软引导，非强制
   ⑦工具说明      15 工具按 inspect/writers/flow 分组
+
+Phase 2A 拆分（决策 T8）：
+  - STATIC_BLUEPRINT：模块级常量，7 段全景静态部分（不依赖 session 上下文）。
+    **普通字符串**（非 f-string），用 HTML 注释占位符标记动态注入位置
+    （markdown 渲染时不可见）。蓝图 API 直接返回它，前端展示干净。
+  - evolve_system_prompt(...)：用 str.replace 把动态部分（session_id /
+    eval_summary / reflections / memory）替换进占位符。
+
+为什么 STATIC_BLUEPRINT 不是 f-string：f-string 会触发 {x} 转义，蓝图里的
+字面花括号（如 Command(update={...})）需要双重转义，且蓝图不能独立展示
+（含未替换的 {var}）。普通字符串 + 占位符替换让蓝图可作为纯文本独立展示。
 """
 from __future__ import annotations
 
 
-def evolve_system_prompt(
-    session_id: str,
-    trace_id: str,
-    eval_summary: str,
-    reflections_summary: str = "",
-    memory_section: str = "",
-) -> str:
-    """构建进化 Agent 的 system prompt。
+# ── 占位符（HTML 注释，markdown 渲染时不可见）──────────────────────
+# STATIC_BLUEPRINT 是普通字符串，占位符直接以字面量嵌入。
+# evolve_system_prompt 用 str.replace 注入动态内容。
+_PLACEHOLDER_MEMORY = "<!-- MEMORY_SECTION -->"
+_PLACEHOLDER_REFLECTIONS = "<!-- REFLECTIONS_SECTION -->"
+_PLACEHOLDER_CURRENT_SESSION = "<!-- CURRENT_SESSION -->"
 
-    Args:
-        session_id:         session id
-        trace_id:           被进化的 trace id
-        eval_summary:       评估报告摘要（已加载到 ctx.eval_snapshot，read_eval_report 可读全文）
-        reflections_summary: 反思库摘要（历史失败模式，可选）
-        memory_section:     记忆子系统认知节（NWM 6 要素说明，可选）。
-                            当前 harness 工作副本有记忆要素时由调用方注入，无则空串。
-    """
-    reflections_section = ""
-    if reflections_summary:
-        reflections_section = f"""
-## 历史失败反思
 
-以下是历史评估中归纳的失败模式（按命中频率排序），设计改进方案时应参考：
-
-{reflections_summary}
-"""
-
-    return f"""\
-# ① 角色定位
+# ── 静态蓝图（决策 T8）──────────────────────────────────────────
+# 7 段全景 + 占位符。打开进化页即可看到（决策 Q），不依赖 session 上下文。
+# 普通字符串（非 f-string），花括号字面量原样显示。
+STATIC_BLUEPRINT = """# ① 角色定位
 
 你是 Writer 项目的「进化专家」——一个懂整台 Agent 机器内部结构的工程师。
 
@@ -68,7 +62,7 @@ def evolve_system_prompt(
 **你不能直接改的：**
 - **State 字段**（messages/todos/goal 等）→ 没有直接改 State 的工具。
   操作 State 的唯一合法途径 = 定义/修改 Middleware（write_middleware / edit_source），
-  让 Middleware 通过 hook 返回 dict 或工具返回 Command(update={{...}}) 来操作 State。
+  让 Middleware 通过 hook 返回 dict 或工具返回 Command(update={...}) 来操作 State。
   详见第 ⑤ 段。
 - **assemble 装配入口**（`__init__.py`）→ 只读（read_assemble），不可改。
   它是 executor 与包的唯一交互点，改它 = 改 agent 骨架，风险最高。
@@ -92,7 +86,7 @@ Writer 的创作 Agent 打成一个自包含的 **harness 包**（`harnesses/cur
 | **subagents** | `subagents/*.py` | 子代理定义（build_* 函数） | 写作流水线的五个岗位（interview/storybuilding/detail_outline/writing + GP） |
 | **skills** | `skills/*/` | 技能包（markdown + 脚本） | agent 按需加载的"能力包"——分步操作指南 |
 | **assemble** | `__init__.py` | 装配入口函数 `assemble(ctx)` | 把上述要素组合成可运行 agent 的"菜谱" |
-{memory_section}
+""" + _PLACEHOLDER_MEMORY + """
 ### 框架层要素（不在包目录里，但要理解）
 
 | 要素 | 来源 | 是什么 | 起什么作用 |
@@ -141,7 +135,7 @@ user 消息进 State.messages
 │   └─ 结束 → 返回 State
 │
 │ Middleware 通过 hook 返回 dict 改 State（如注入消息、跳转 jump_to）。
-│ 工具通过 Command(update={{...}}) 改 State。
+│ 工具通过 Command(update={...}) 改 State。
 │ State 字段由 reducer 合并，不能直接赋值。
 └─ 循环直到 AI 决定结束或 jump_to="end"
 ```
@@ -163,7 +157,7 @@ State 的核心字段（inspect_state_schema 可查完整文档）：
 
 **操作 State 的唯一合法途径 = Middleware**：
 1. Middleware 的 hook（before_model/after_model/wrap_tool_call 等）返回 `dict` → reducer 合并进 State。
-2. 工具函数返回 `Command(update={{...}})` → 等价于 hook 返回 dict。
+2. 工具函数返回 `Command(update={...})` → 等价于 hook 返回 dict。
 3. Middleware 的 wrap_model_call/wrap_tool_call 用 `request.override(...)` 改请求（不改 State）。
 
 所以：如果你要操作 State（如加一个新字段、改 todos 逻辑），产出物是一个
@@ -190,7 +184,7 @@ State 的核心字段（inspect_state_schema 可查完整文档）：
 
 **收敛提示**：validate_changes 最多调用 2 次。若 2 次仍失败，如实 write_change_log 收尾，
 applied 里失败的改动 result 填 "failed"，不要无限重试。
-{reflections_section}
+""" + _PLACEHOLDER_REFLECTIONS + """
 # ⑦ 工具说明（15 个）
 
 ### 探查工具（只读，给认知）
@@ -200,11 +194,11 @@ applied 里失败的改动 result 填 "failed"，不要无限重试。
 - `read_assemble()` — 读 assemble() 装配入口源码
 
 ### 写工具（受控写，封装 backend）
-- `write_prompt(name, content)` — 新建提示词（prompts/{{name}}.md，仅新建）
-- `write_middleware(name, code)` — 新建中间件（middleware/{{name}}.py，仅新建）
-- `write_tool(name, code)` — 新建工具定义（tools/{{name}}.py，仅新建）
-- `write_skill(path, content)` — 新建技能包文件（skills/{{path}}）
-- `write_subagent(name, code)` — 新建子代理定义（subagents/{{name}}.py，仅新建）
+- `write_prompt(name, content)` — 新建提示词（prompts/{name}.md，仅新建）
+- `write_middleware(name, code)` — 新建中间件（middleware/{name}.py，仅新建）
+- `write_tool(name, code)` — 新建工具定义（tools/{name}.py，仅新建）
+- `write_skill(path, content)` — 新建技能包文件（skills/{path}）
+- `write_subagent(name, code)` — 新建子代理定义（subagents/{name}.py，仅新建）
 - `edit_source(path, old_string, new_string)` — 修改已有文件（精确替换）
 
 write_* 仅新建，文件已存在会报错 → 改用 edit_source 修改。
@@ -218,7 +212,38 @@ name 只允许字母/数字/下划线/连字符/点号（防路径穿越）。
 - `write_change_log(applied_json, summary)` — 产 change_log.md（最后一步）
 
 ---
+""" + _PLACEHOLDER_CURRENT_SESSION
 
+
+def evolve_system_prompt(
+    session_id: str,
+    trace_id: str,
+    eval_summary: str,
+    reflections_summary: str = "",
+    memory_section: str = "",
+) -> str:
+    """构建进化 Agent 的 system prompt（Phase 2A：静态/动态拼接，决策 T8）。
+
+    Args:
+        session_id:         session id
+        trace_id:           被进化的 trace id
+        eval_summary:       评估报告摘要（已加载到 ctx.eval_snapshot，read_eval_report 可读全文）
+        reflections_summary: 反思库摘要（历史失败模式，可选）
+        memory_section:     记忆子系统认知节（NWM 6 要素说明，可选）。
+                            当前 harness 工作副本有记忆要素时由调用方注入，无则空串。
+    """
+    # 动态部分构建
+    reflections_block = ""
+    if reflections_summary:
+        reflections_block = f"""
+## 历史失败反思
+
+以下是历史评估中归纳的失败模式（按命中频率排序），设计改进方案时应参考：
+
+{reflections_summary}
+"""
+
+    current_session_block = f"""
 ## 当前 session
 - session_id: {session_id}
 - 被进化的 trace_id: {trace_id}
@@ -228,8 +253,16 @@ name 只允许字母/数字/下划线/连字符/点号（防路径穿越）。
 （评估报告全文已加载到上下文，read_eval_report 可读）
 """
 
+    # 占位符替换（保持 STATIC_BLUEPRINT 为纯字符串可独立展示）
+    return (
+        STATIC_BLUEPRINT
+        .replace(_PLACEHOLDER_MEMORY, memory_section)
+        .replace(_PLACEHOLDER_REFLECTIONS, reflections_block)
+        .replace(_PLACEHOLDER_CURRENT_SESSION, current_session_block)
+    )
 
-__all__ = ["evolve_system_prompt", "render_memory_section"]
+
+__all__ = ["evolve_system_prompt", "render_memory_section", "STATIC_BLUEPRINT"]
 
 
 def render_memory_section() -> str:

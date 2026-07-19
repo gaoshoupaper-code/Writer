@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     # harness bare repo 路径（evolution push → executor pull 的中转）。
     harness_bare_repo: str = "harness.git"
 
+    # ── 进化对话式共创工作台 checkpointer（Phase 2A，决策 T5）──
+    # 每个 evolve session 一个独立 SQLite 文件（evolve_<session_id>.db），
+    # LangGraph 通过 thread_id 自动恢复对话史。discarded session 删文件清理。
+    evolve_checkpoints_dir: str = "data/checkpoints"
+
     @property
     def _evolution_root(self) -> Path:
         """evolution/ 目录（本文件在 app/core/ 下，上三级是 evolution/）。"""
@@ -114,6 +119,19 @@ class Settings(BaseSettings):
         if not path.is_absolute():
             path = self._evolution_root / path
         return path.resolve()
+
+    @property
+    def evolve_checkpoints_path(self) -> Path:
+        """进化对话 checkpointer 根目录绝对路径（Phase 2A，决策 T5）。
+
+        每 session 一个 SQLite 文件，自动创建父目录。
+        """
+        path = Path(self.evolve_checkpoints_dir)
+        if not path.is_absolute():
+            path = self._evolution_root / path
+        path = path.resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
 
 settings = Settings()

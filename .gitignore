@@ -84,6 +84,7 @@ evolution/frontend/.next/
 # evalset/ 已跟踪的测试数据集不受影响（git 对已跟踪文件优先于 ignore）
 evolution/data/traces/
 evolution/data/evolve_workspace/
+evolution/data/checkpoints/
 
 # evolution adapt 运行时产物（bare repo + checkout 缓存，动态生成）
 evolution/harness.git/

@@ -75,10 +75,20 @@ async def lifespan(app: FastAPI):
     recorder.start_drain()
     app.state.trace_recorder = recorder
 
+    # Phase 2A：初始化进化对话 checkpointer 池（决策 T5）。
+    # 每 session 一个 SQLite 文件，LangGraph 通过 thread_id 自动恢复对话史。
+    from app.evolve.agent.checkpoint_pool import (
+        EvolveCheckpointPool,
+        init_checkpoint_pool,
+    )
+    checkpoint_pool = EvolveCheckpointPool(settings.evolve_checkpoints_path)
+    init_checkpoint_pool(checkpoint_pool)
+
     yield
 
-    # 关闭：停 recorder drain + flush 残余事件落盘（D5）。
+    # 关闭：停 recorder drain + flush 残余事件落盘（D5）+ 关闭所有 checkpoint saver。
     await recorder.aclose()
+    await checkpoint_pool.aclose_all()
 
 
 app = FastAPI(title="Writer Evolution", version="0.1.0", lifespan=lifespan)
