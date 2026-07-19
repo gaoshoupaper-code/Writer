@@ -619,15 +619,23 @@ class EvolutionTraceRecorder:
     # ── 崩溃恢复（D8 R1 / 稳定性重构：interrupted 不再强标 failed）──
 
     def recover_pending(self) -> int:
-        """进程重启后扫描 status=running 的 runs，标为 interrupted（设计 20260720_203000）。
+        """进程重启后扫描 evolution 自观测 running trace，标为 interrupted。
 
-        旧版强标 failed 是"运行中显示失败"的头号元凶——进程一重启（部署/OOM/容器漂移），
-        所有 running trace 全被批量改 failed。新版标 interrupted：trace 数据完整
-        （event_payloads 实时写入），只是没正常收尾，用户可在 UI 手动收敛为 failed/completed。
+        设计修正（2026-07-20 实施反馈）：原版无差别扫描所有 status='running'，
+        会误标 executor 跑的 trace（run_purpose='user_generation'）。但 evolution
+        重启只影响 evolution 自己的 recorder——executor 的 trace 生命周期归 executor 管，
+        evolution 重启不影响它。executor 权威状态通过兜底摄入同步。
+
+        所以只标 evolution 自观测 trace（run_purpose=evolution_eval/evolution_evolve），
+        不碰 executor trace。
 
         Returns: 恢复的 trace 数量。
         """
-        rows = db.query_all("SELECT trace_id FROM runs WHERE status='running'")
+        rows = db.query_all(
+            """SELECT trace_id FROM runs
+               WHERE status='running'
+                 AND run_purpose IN ('evolution_eval', 'evolution_evolve')"""
+        )
         count = 0
         for row in rows:
             trace_id = row["trace_id"]
@@ -726,13 +734,19 @@ class EvolutionTraceRecorder:
                 logger.exception("心跳超时扫描异常")
 
     def _scan_timeout_sync(self) -> None:
-        """同步执行一次心跳超时扫描（scanner task 调用）。"""
+        """同步执行一次心跳超时扫描（scanner task 调用）。
+
+        只扫 evolution 自观测 trace（run_purpose=evolution_*）——executor trace 没有
+        心跳（recorder 没在录像），扫了必然误判超时。executor trace 的状态由兜底摄入
+        从 executor 同步。
+        """
         now = datetime.now(UTC)
         threshold = (now - timedelta(seconds=_HEARTBEAT_TIMEOUT)).isoformat()
-        # 查找超时 trace（只取必要列）。
+        # 查找超时 trace（只取必要列）。限定 evolution 自观测 trace。
         rows = db.query_all(
             """SELECT trace_id FROM runs
                WHERE status='running'
+                 AND run_purpose IN ('evolution_eval', 'evolution_evolve')
                  AND last_heartbeat_at IS NOT NULL
                  AND last_heartbeat_at < ?""",
             (threshold,),
