@@ -203,26 +203,25 @@ def _trigger_executor(
 ) -> str:
     """调 executor /internal/ab/run，返回 task_id。
 
-    working: baseline=true（executor 用硬编码 config，D-Q13）
-    snapshot: baseline=false + config_json + source_commit（D-Q4）
+    working: baseline=true + source_commit=None（executor 用 harnesses/current 硬编码装配）
+    snapshot: baseline=false + source_commit（executor 按 commit checkout 源码装配，
+              config=None 用源码包内硬编码 assemble）
+
+    去 DB 重构后版本 = git commit，"配置"即源码本身，不再需要序列化的 config_json
+    （与 benchmark/runner.py._trigger_executor 对齐）。
     """
     if version_type == "working":
-        payload: dict[str, Any] = {
-            "config": None,
-            "demand_md": demand_md,
-            "baseline": True,
-            "source_commit": None,
-        }
+        source_commit = None
     else:
-        import json
+        # _validate_version 已校验过 commit 非空并塞进 snapshot["source_commit"]
+        source_commit = snapshot["source_commit"] if snapshot else None
 
-        config = json.loads(snapshot["config_json"]) if isinstance(snapshot["config_json"], str) else snapshot["config_json"]
-        payload = {
-            "config": config,
-            "demand_md": demand_md,
-            "baseline": False,
-            "source_commit": snapshot["source_commit"],
-        }
+    payload: dict[str, Any] = {
+        "config": None,
+        "demand_md": demand_md,
+        "baseline": version_type == "working",
+        "source_commit": source_commit,
+    }
 
     resp = httpx.post(_executor_url("/internal/ab/run"), json=payload, timeout=_EXEC_TIMEOUT)
     resp.raise_for_status()
