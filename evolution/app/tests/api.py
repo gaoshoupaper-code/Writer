@@ -362,14 +362,21 @@ def retry_test(test_id: str) -> StartTestResponse:
 
 @router.post("/{test_id}/stop")
 def stop_test(test_id: str) -> dict[str, Any]:
-    """停止运行中的测试（super-step 边界停，非立即）。
+    """停止测试。
+
+    覆盖两种场景：
+      - pending/running：正常停止（super-step 边界停，非立即）。
+      - failed/cancelled：强制停止。测试状态可能已被 _poll_task_status 因轮询
+        超时/异常/连续 404 标记 failed，但 executor 端的 task 可能仍在跑
+        （trace 真卡住或通知丢失）。此时用户仍需要能停掉 executor task，
+        所以不拒绝，只要有 task_id 就尝试通知 executor 取消。
 
     流程：
-      1. 校验记录存在且 status ∈ {pending, running}（终态不可停）
+      1. 校验记录存在；status 为 done 时拒绝（已成功，无可停）。
       2. 调 executor POST /internal/ab/stop/{task_id} 设取消标志（失败仅记日志，
          不阻塞——executor 不可达时本地仍标 cancelled，executor 侧任务会自然结束
-         或被轮询超时兜底）
-      3. mark_cancelled 本地标记
+         或被轮询超时兜底）。
+      3. mark_cancelled 本地标记。
 
     真正中断发生在 executor 的 run_ab_generation 下一个 super-step 边界（数秒延迟），
     轮询线程随后会确认 cancelled 终态。已生成的部分内容保留在 trace 中。
@@ -377,10 +384,18 @@ def stop_test(test_id: str) -> dict[str, Any]:
     row = test_repo.get_test(test_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"test not found: {test_id}")
-    if row["status"] not in ("pending", "running"):
+    if row["status"] == "done":
+        # done 是唯一真正不可停的终态：任务已成功结束，executor task 已退出。
         raise HTTPException(
             status_code=400,
-            detail=f"测试已终态（{row['status']}），无需停止",
+            detail=f"测试已完成（done），无需停止",
+        )
+
+    force = row["status"] in ("failed", "cancelled")
+    if force:
+        logger.info(
+            "测试 %s 当前状态 %s，执行强制停止（尝试通知 executor 取消）",
+            test_id, row["status"],
         )
 
     task_id = row.get("task_id")
@@ -390,7 +405,8 @@ def stop_test(test_id: str) -> dict[str, Any]:
                 _executor_url(f"/internal/ab/stop/{task_id}"), timeout=10.0
             )
             if resp.status_code == 409:
-                # executor 认为已终态——可能竞态（任务刚好结束）。本地以实际为准。
+                # executor 认为已终态——可能竞态（任务刚好结束），也可能 executor
+                # 重启后内存 task 表丢失。本地以实际为准，仍标记 cancelled。
                 logger.info(
                     "executor task %s 已终态（409），本地仍标记 cancelled", task_id
                 )
@@ -404,8 +420,8 @@ def stop_test(test_id: str) -> dict[str, Any]:
             logger.warning("调用 executor stop 失败（本地仍标记 cancelled）: %s", exc)
 
     test_repo.mark_cancelled(test_id, row.get("trace_id"))
-    logger.info("测试 %s 已标记 cancelled", test_id)
-    return {"status": "cancelled", "test_id": test_id}
+    logger.info("测试 %s 已标记 cancelled（force=%s）", test_id, force)
+    return {"status": "cancelled", "test_id": test_id, "forced": force}
 
 
 @router.delete("/{test_id}")

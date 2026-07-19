@@ -210,11 +210,15 @@ def list_evaluated_traces(limit: int = 100) -> dict[str, Any]:
 
 @router.post("/sessions/{eval_id}/stop")
 def stop_session(eval_id: str) -> dict[str, Any]:
-    """手动停止运行中的评估 session（task.cancel → CancelledError 中断 ainvoke）。
+    """手动停止运行中的评估 session。
 
-    非阻塞：只取消 task + 标 cancelled，不等 Agent 真正退出。
-    真正的状态收尾（recorder.cancel_run + DB）由 run_eval_session 的
-    CancelledError 分支处理。
+    双路收敛，避免状态分裂（session 表 cancelled 但 runs 表 running）：
+      1. task.cancel()：让 Agent 在下一个 await 点抛 CancelledError，
+         run_eval_session 的 except 分支会调 recorder.cancel_run 正常收尾。
+      2. recorder.cancel_run(trace_id_self)：强制收敛——即便 Agent 卡在
+         无 await 的底层（同步阻塞/吞 CancelledError 的循环）导致 task.cancel
+         无效，也能立即把 runs.status 推进到 cancelled 并清内存活跃集合。
+         幂等：trace 已被路径 1 收敛时 no-op。
     """
     session = eval_repo.get_session(eval_id)
     if session is None:
@@ -233,6 +237,16 @@ def stop_session(eval_id: str) -> dict[str, Any]:
         logger.warning(
             "评估 session %s 未找到活跃 task，仅标记 cancelled", eval_id
         )
+
+    # 强制收敛 recorder trace 状态：即便 task.cancel 无效，runs.status 也立即收敛。
+    # 必须在 task.cancel 之后调——若 Agent 真在 await 点退出，run_eval_session 的
+    # except 分支会再次调 cancel_run，幂等保护兜底。
+    recorder = get_recorder()
+    if recorder is not None:
+        trace_id_self = recorder.get_trace_id_by_session(eval_id)
+        if trace_id_self:
+            recorder.cancel_run(trace_id_self, reason="user_stop")
+            logger.info("评估 session %s trace %s 已强制收敛 cancelled", eval_id, trace_id_self)
 
     eval_repo.update_session(eval_id, status="cancelled")
     return {"status": "cancelled", "eval_id": eval_id}

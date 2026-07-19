@@ -244,6 +244,9 @@ export default function TestsPage() {
                     {(t.status === "pending" || t.status === "running") && (
                       <button className="action-link warn" onClick={() => handleStop(t.test_id)}>停止</button>
                     )}
+                    {t.status === "failed" && (
+                      <button className="action-link warn" onClick={() => handleStop(t.test_id)}>强制停止</button>
+                    )}
                     {(t.status === "done" || t.status === "failed" || t.status === "cancelled") && (
                       <button className="action-link danger" onClick={() => handleDelete(t.test_id)}>删除</button>
                     )}

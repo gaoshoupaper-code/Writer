@@ -184,8 +184,15 @@ class EvolutionTraceRecorder:
         )
         return handle
 
-    def complete_run(self, trace_id: str) -> TraceLogEvent:
-        """正常完成：写 run_end + 终态投影 + UPDATE runs。"""
+    def complete_run(self, trace_id: str) -> TraceLogEvent | None:
+        """正常完成：写 run_end + 终态投影 + UPDATE runs。
+
+        幂等：trace 已终态（队列已清）时 no-op 返回 None，避免 stop_session 强制
+        收敛与 Agent 正常收尾的二次调用冲突（_sequences 已被清理会 raise KeyError）。
+        """
+        if self.is_terminal(trace_id):
+            logger.info("complete_run 跳过：trace %s 已终态", trace_id)
+            return None
         duration_ms = self._duration_ms(trace_id)
         event = self.append_event(
             trace_id,
@@ -199,8 +206,14 @@ class EvolutionTraceRecorder:
         self._finalize_run(trace_id, "completed", duration_ms, None)
         return event
 
-    def fail_run(self, trace_id: str, error: BaseException | str) -> TraceLogEvent:
-        """失败收尾：写 run_error + 终态投影 + UPDATE runs。"""
+    def fail_run(self, trace_id: str, error: BaseException | str) -> TraceLogEvent | None:
+        """失败收尾：写 run_error + 终态投影 + UPDATE runs。
+
+        幂等：trace 已终态时 no-op 返回 None（理由同 complete_run）。
+        """
+        if self.is_terminal(trace_id):
+            logger.info("fail_run 跳过：trace %s 已终态", trace_id)
+            return None
         error_msg = (
             f"{error.__class__.__name__}: {error}"
             if isinstance(error, BaseException)
@@ -222,8 +235,16 @@ class EvolutionTraceRecorder:
 
     def cancel_run(
         self, trace_id: str, reason: CancelReason = "client_disconnect"
-    ) -> TraceLogEvent:
-        """取消收尾（终态 cancelled）。"""
+    ) -> TraceLogEvent | None:
+        """取消收尾（终态 cancelled）。
+
+        幂等：trace 已终态时 no-op 返回 None。stop_session 会主动调本方法强制
+        收敛（即便 task.cancel 未生效），而 Agent 后续若在 await 点抛 CancelledError
+        会再次调本方法——必须容忍这种正常的双重调用。
+        """
+        if self.is_terminal(trace_id):
+            logger.info("cancel_run 跳过：trace %s 已终态", trace_id)
+            return None
         error_message = _CANCEL_REASON_MESSAGES.get(reason, "Cancelled")
         duration_ms = self._duration_ms(trace_id)
         event = self.append_event(
