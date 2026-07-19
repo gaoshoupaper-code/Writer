@@ -276,16 +276,16 @@ def reload_harness() -> dict[str, Any]:
 class ABRunRequest(BaseModel):
     """候选执行请求（evolve 的 run_baseline/run_candidate 工具调用，D2 同进程热加载）。
 
-    字段对齐新设计（.claude/md/20260627_135113）：
-    - config：候选 HarnessConfig JSON（baseline=True 时可省略，用硬编码）
     - demand_md：预置 demand.md 内容（interview 直通用）
-    - baseline：True=跑当前 Agent（无 config），False=跑进化后 Agent（用 config）
-    - source_commit：快照版本 git commit；None=用 harnesses/current（working 包）
+    - source_commit：快照版本 git commit；None=working 包（harnesses/repo）
+    - baseline / config：遗留字段（去 DB 重构后不再驱动装配——
+      候选/工作版本都走 assemble(ctx) 单参数契约，版本差异由 source_root 决定）。
+      保留只为 HTTP 契约向后兼容，内部已忽略。
     """
-    config: dict | None = None  # 候选 HarnessConfig JSON（baseline=True 时可省略）
+    config: dict | None = None  # 遗留字段，内部已忽略（保留向后兼容）
     demand_md: str = ""  # 预置 demand.md 内容（interview 直通）
-    baseline: bool = True  # True=当前 Agent，False=候选 Agent
-    source_commit: str | None = None  # 快照版本 git commit；None=working 包（harnesses/current）
+    baseline: bool = True  # 遗留字段，内部已忽略（保留向后兼容）
+    source_commit: str | None = None  # 快照版本 git commit；None=working 包（harnesses/repo）
 
 
 class ABRunResponse(BaseModel):
@@ -356,7 +356,6 @@ def _execute_ab(task_id: str, req: "ABRunRequest") -> None:
                 source_root = Path(__file__).resolve().parents[3] / "evolution" / "harnesses" / "current"
 
         trace_id = run_ab_generation(
-            config=req.config if not req.baseline else None,
             source_root=source_root,
             demand_md=req.demand_md,
             trace_recorder=trace_recorder,
@@ -380,8 +379,11 @@ def _execute_ab(task_id: str, req: "ABRunRequest") -> None:
             logger.info("候选执行任务完成: task=%s trace=%s", task_id, trace_id)
     except BaseException as exc:
         logger.exception("候选执行任务失败: task=%s", task_id)
-        _ab_tasks[task_id] = {"status": "failed", "trace_ids": [], "error": str(exc),
-                              "cancel_event": cancel_event}
+        # 保留 on_trace_created 回调已回填的 trace_id（assemble 抛异常但 trace 已创建的
+        # 场景——evolution 端能据此关联 trace 详情；粗暴清空会让 trace 永远查不到）。
+        prior_trace_ids = (_ab_tasks.get(task_id) or {}).get("trace_ids", [])
+        _ab_tasks[task_id] = {"status": "failed", "trace_ids": prior_trace_ids,
+                              "error": str(exc), "cancel_event": cancel_event}
         # 失败兜底通知 evolution（trace 可能尚未创建，ingest 链路收不到）
         _notify_evolution_task_failed(task_id, str(exc))
     finally:

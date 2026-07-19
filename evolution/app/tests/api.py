@@ -95,7 +95,14 @@ def _poll_task_status(test_id: str, task_id: str) -> None:
                     test_repo.mark_done(test_id, trace_ids[0] if trace_ids else "")
                 return
             if data["status"] == "failed":
-                test_repo.mark_failed(test_id, data.get("error") or "executor task failed")
+                # trace 可能已创建（assemble 前的 create_run）但后续抛异常；回填 trace_id
+                # 让用户能从失败记录点进去看部分 trace。
+                failed_trace_ids = data.get("trace_ids") or []
+                test_repo.mark_failed(
+                    test_id,
+                    data.get("error") or "executor task failed",
+                    failed_trace_ids[0] if failed_trace_ids else None,
+                )
                 return
             if data["status"] == "cancelled":
                 # executor 在边界处停了（run_ab_generation 已 cancel_run 收尾）

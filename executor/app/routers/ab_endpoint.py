@@ -1,16 +1,16 @@
-"""A/B 候选执行端点（补全骨架，D2 同进程热加载）。
+"""A/B 候选执行端点（D2 同进程热加载）。
 
 POST /internal/ab/run 的实际执行逻辑：
   1. 准备隔离 workspace（写 demand.md，interview 直通）
   2. importlib 加载候选 source_root（同进程热加载，清理 sys.modules）
-  3. assemble(ctx, config, source_root) 装配候选 Agent
+  3. assemble(ctx) 装配候选 Agent
   4. 同步跑一次生成（非 SSE），取 trace_id
   5. 存到 _ab_tasks 供 /ab/status 轮询
 
-与生产路径的区别：
-  - 生产：MetaAgentService → load_current_package() → assemble(ctx)（无 config，硬编码）
-  - A/B：本模块 → load_package_at(source_root) → assemble(ctx, config, source_root)
-  装配入口统一是 package.assemble，只是是否传 config。
+与生产路径的区别只在 source_root 来源：
+  - 生产：load_current_package()（固定 harnesses/repo）
+  - A/B：load_package_at(source_root)（snapshot 模式按 commit checkout；working 用 harnesses/repo）
+  装配入口统一是 package.assemble(ctx)，单参数契约。
 
 设计依据：.claude/md/20260627_135113_进化端单Agent设计.md（D2 同进程热加载）
 """
@@ -109,7 +109,6 @@ def load_package_at(source_root: Path):
 
 def run_ab_generation(
     *,
-    config: dict | None,
     source_root: Path,
     demand_md: str,
     trace_recorder,
@@ -120,8 +119,8 @@ def run_ab_generation(
     """跑一次候选生成（同步，非 SSE），返回 trace_id。
 
     Args:
-        config: 候选 HarnessConfig（None = 用硬编码 assemble）
-        source_root: harness 包根目录
+        source_root: harness 包根目录（snapshot 模式来自 git checkout，
+                     working 模式来自 harnesses/repo）
         demand_md: 预置 demand.md 内容
         trace_recorder: TraceRecorder 实例
         writer_settings: writer settings（构建 model 用）
@@ -191,8 +190,8 @@ def run_ab_generation(
             trace_middleware_cls=TraceMiddleware,
         )
 
-        # 5. assemble（config 驱动）
-        agent = pkg.assemble(ctx, config, source_root)
+        # 5. assemble（单参数契约，与生产路径 agent.py 一致）
+        agent = pkg.assemble(ctx)
 
         # 6. 构造输入（简单 prompt，interview 直通后会进 storybuilding）
         user_prompt = (

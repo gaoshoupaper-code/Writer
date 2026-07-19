@@ -1,7 +1,7 @@
 """Agent 包加载器（Phase 7 T3.1 + Phase 8 compose 热加载升级）。
 
 执行端通过 importlib 加载 harness 包目录作为 Python package，
-调 package.assemble(ctx, config, source_root) 装配完整 agent。
+调用方取 mod.assemble(ctx) 装配完整 agent（单参数契约）。
 
 加载机制（关键）：
   importlib.util.spec_from_file_location + submodule_search_locations。
@@ -43,7 +43,7 @@ def load_package(pkg_path: Path, mod_name: str = "harness_current") -> ModuleTyp
         mod_name: 模块注册名（生产用 harness_current，候选用唯一名避免冲突）
 
     Returns:
-        包模块对象，调用方取 mod.assemble(ctx, config, source_root) 装配 agent。
+        包模块对象，调用方取 mod.assemble(ctx) 装配 agent。
 
     Raises:
         FileNotFoundError: 包目录或 __init__.py 不存在。
