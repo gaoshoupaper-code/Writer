@@ -77,6 +77,12 @@ def _scan_once() -> int:
         # 跳过条件：已摄入且 status 一致（无变迁）
         if local_status is not None and local_status == executor_status:
             continue
+        # trace 稳定性重构（设计 20260720_203000）：evolution 的 interrupted 状态是
+        # 进程重启/心跳超时的本地判定，executor 不知道。兜底摄入不能覆盖它——
+        # 否则 recover_pending 标的 interrupted 会被 executor 的 running 立即覆盖。
+        # interrupted 只能由用户在 UI 手动收敛（POST /traces/{id}/resolve）。
+        if local_status == "interrupted":
+            continue
         # 新 trace 或 status 变迁 → 拉取摄入
         tid = _fetch_and_ingest(trace_id, item.get("workspace_id"))
         if tid:
