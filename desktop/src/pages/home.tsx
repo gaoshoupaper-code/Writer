@@ -143,6 +143,7 @@ export default function Home() {
       addThread: (thread) => useWorkspaceStore.getState().setThreads((current) => [thread, ...current.filter((t) => t.thread_id !== thread.thread_id)]),
       getTraceRuns: () => useTraceStore.getState().traceRuns,
       getActiveTraceId: () => useTraceStore.getState().activeTraceId,
+      getLiveTraceId: () => useTraceStore.getState().liveTraceId,
       setTraceRuns: (updater) => useTraceStore.getState().setTraceRuns(updater as any),
       setTraceDetail: (updater) => useTraceStore.getState().setTraceDetail(updater as any),
       setActiveTraceId: (id) => useTraceStore.getState().setActiveTraceId(id),

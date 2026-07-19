@@ -263,6 +263,9 @@ export interface ExecutionDeps {
   // trace actions
   getTraceRuns: () => any[];
   getActiveTraceId: () => string;
+  // liveTraceId = 当前正在跑的 trace（区别于 activeTraceId = 面板里选中查看的那条）。
+  // 停止/重试必须用 liveTraceId，否则用户在看历史 trace 时点停止，会停成已结束的旧 trace。
+  getLiveTraceId: () => string;
   setTraceRuns: (updater: any) => void;
   setTraceDetail: (updater: any) => void;
   setActiveTraceId: (id: string) => void;
@@ -702,7 +705,7 @@ async function performSubmit(
 function handleStopGeneration(set: any, get: () => ExecutionState) {
   const d = requireDeps();
   const activeThreadId = d.getActiveThreadId();
-  const liveTraceId = d.getActiveTraceId(); // 用 activeTraceId 作为 liveTraceId 的近似（liveTraceId 在 traceStore 里）
+  const liveTraceId = d.getLiveTraceId();
 
   if (activeThreadId && liveTraceId) {
     apiFetch(`${API_BASE_URL}/api/screenplay/stop`, {
@@ -716,7 +719,7 @@ function handleStopGeneration(set: any, get: () => ExecutionState) {
 
 function handleRetry(set: any, get: () => ExecutionState) {
   const d = requireDeps();
-  const liveTraceId = d.getActiveTraceId();
+  const liveTraceId = d.getLiveTraceId();
   if (liveTraceId) {
     trackRegenerate(liveTraceId);
   }
