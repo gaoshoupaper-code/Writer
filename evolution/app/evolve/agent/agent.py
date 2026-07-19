@@ -36,6 +36,66 @@ from app.trace import TraceMiddleware, TraceCallbackHandler
 
 logger = logging.getLogger("evolution.evolve.agent")
 
+
+async def _run_agent_streamed(
+    agent: Any,
+    user_input: str,
+    config: dict[str, Any],
+    ctx: "EvolveContext",
+) -> None:
+    """Phase 6 token 级流式 helper：astream_events + EvolveEventSink → recorder 桥接。
+
+    替代 round 函数里的 `await agent.ainvoke(...)`。功能等价（跑完一轮 Agent），
+    但额外把 LangGraph astream_events 的 token 级事件经 sink 转换后 push 到 recorder
+    队列，SSE 端点消费时产出 model_stream / tool_call / tool_output 等帧，前端打字机效果。
+
+    设计：保持「按需触发模型」（Agent 在后台 task 跑）+ 「token 级流式」（事件经 recorder
+    桥接到 SSE 端点）。recorder 同时承担持久化（trace DB）+ 实时（SSE 队列）双重通道。
+
+    桥接协议：sink.on_event_dicts 返回结构化 dict（含 type 字段），
+    本函数把每个 dict 通过 ctx.emit_step 以 tool='sse_frame' 注入 recorder。
+    SSE 端 _trace_event_to_sse 识别 sse_frame 包装，原样产出对应 SSE 帧。
+    """
+    from app.evolve.agent.event_sink import EvolveEventSink
+
+    sink = EvolveEventSink(session_id=ctx.session_id)
+    agent_events = agent.astream_events(
+        {"messages": [{"role": "user", "content": user_input}]},
+        config=config,
+        version="v2",
+    )
+
+    async for event in agent_events:
+        # 把 LangGraph 事件交给 sink 转换为结构化帧 dict
+        try:
+            frame_dicts = await sink.on_event_dicts(event)
+        except Exception:
+            logger.exception(
+                "session %s: sink 转换事件异常，跳过",
+                ctx.session_id,
+            )
+            continue
+
+        # 每个帧 dict 通过 recorder 桥接到 SSE 端
+        for frame in frame_dicts:
+            frame_type = frame.pop("type", None)
+            if not frame_type:
+                continue
+            # sink 帧的 'tool' 字段会与 append_business_event 的 tool 参数冲突，
+            # 重命名为 tool_name 避免重复关键字。
+            if "tool" in frame:
+                frame["tool_name"] = frame.pop("tool")
+            # tool='sse_frame' 是 Phase 6 协议标记，status=frame_type，
+            # 剩余字段通过 **extra 透传（content/text/tool_name/call_id 等）。
+            if ctx.recorder and ctx.trace_id_self:
+                ctx.recorder.append_business_event(
+                    ctx.trace_id_self,
+                    "sse_frame",
+                    frame_type,
+                    **frame,
+                )
+
+
 # 不设总超时护栏（asyncio.wait_for）——进化时长不设上限，让它自然跑完。
 # 不设 recursion_limit 步数限制：步数交给框架默认（≈10007，事实上的不限制），
 # 避免正常进化因步数上限被误杀。GraphRecursionError 分支仅作极端死循环的防御性兜底。
@@ -304,10 +364,7 @@ async def run_inspect_round(ctx: EvolveContext, trace_id: str) -> dict[str, Any]
     )
 
     try:
-        await agent.ainvoke(
-            {"messages": [{"role": "user", "content": user_input}]},
-            config=config,
-        )
+        await _run_agent_streamed(agent, user_input, config, ctx)
         # 探查完成，转 conversing 等用户对话
         ctx.session_status = STATUS_CONVERSING
         ev_db.update_session(ctx.session_id, status=STATUS_CONVERSING)
@@ -371,10 +428,7 @@ async def run_converse_round(ctx: EvolveContext, user_message: str) -> dict[str,
     ctx.emit_log("用户消息触发对话 round。")
 
     try:
-        await agent.ainvoke(
-            {"messages": [{"role": "user", "content": user_message}]},
-            config=config,
-        )
+        await _run_agent_streamed(agent, user_message, config, ctx)
         logger.info("session %s: converse round 完成", ctx.session_id)
         return {"status": "conversing", "session_id": ctx.session_id}
 
@@ -455,10 +509,7 @@ async def run_finalize_round(ctx: EvolveContext) -> dict[str, Any]:
     )
 
     try:
-        await agent.ainvoke(
-            {"messages": [{"role": "user", "content": user_input}]},
-            config=config,
-        )
+        await _run_agent_streamed(agent, user_input, config, ctx)
 
         # 产出检查
         if ctx.change_log_path:

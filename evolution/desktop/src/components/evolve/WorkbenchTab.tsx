@@ -79,24 +79,34 @@ export default function WorkbenchTab() {
   }, [refreshLists]);
 
   // ── 拉取会话详情（messages + points）────────────────────────
-  const loadSessionDetail = useCallback(async (sessionId: string) => {
+  // 拉取进化点（独立于消息——proposal 事件时只刷进化点，避免覆盖流式 token）
+  const loadPoints = useCallback(async (sessionId: string) => {
     try {
-      const [msgResp, ptsResp] = await Promise.all([
-        getEvolveMessages(sessionId).catch(() => null),
-        getEvolvePoints(sessionId).catch(() => null),
-      ]);
-      if (msgResp) setMessages(msgResp.messages);
+      const ptsResp = await getEvolvePoints(sessionId);
       if (ptsResp) {
         setPoints(ptsResp.points);
         setAcceptedCount(ptsResp.accepted_count);
       }
     } catch {
-      // 旧版会话无 messages/points，前端 R8 容错——空列表也能渲染
-      setMessages([]);
       setPoints([]);
       setAcceptedCount(0);
     }
   }, []);
+
+  // 拉取消息（只在 phase 切换/选会话/SSE end 时调用——避免覆盖流式 token）
+  const loadMessages = useCallback(async (sessionId: string) => {
+    try {
+      const msgResp = await getEvolveMessages(sessionId);
+      if (msgResp) setMessages(msgResp.messages);
+    } catch {
+      setMessages([]);
+    }
+  }, []);
+
+  const loadSessionDetail = useCallback(async (sessionId: string) => {
+    // 选会话时同时拉消息 + 进化点（不涉及流式，安全）
+    await Promise.all([loadMessages(sessionId), loadPoints(sessionId)]);
+  }, [loadMessages, loadPoints]);
 
   // ── 选会话 ──────────────────────────────────────────────────
   function selectSession(s: EvolveSession) {
@@ -151,12 +161,86 @@ export default function WorkbenchTab() {
     switch (frame.type) {
       case "heartbeat":
         break;
+      case "model_stream": {
+        // Phase 6 token 级流式：增量 token 拼接到当前 Agent 消息（打字机效果）
+        const delta = frame.content;
+        if (typeof delta !== "string" || !delta) break;
+        setMessages((prev) => {
+          // 找最后一条临时 assistant 消息（id 以 stream- 开头）
+          const last = prev[prev.length - 1];
+          if (last && last.role === "assistant" && last.id.startsWith("stream-")) {
+            const updated = { ...last, content: last.content + delta };
+            return [...prev.slice(0, -1), updated];
+          }
+          // 没有正在流的 assistant 消息，新建一条
+          return [
+            ...prev,
+            {
+              id: `stream-${Date.now()}`,
+              session_id: sessionId,
+              role: "assistant",
+              content: delta,
+              seq: prev.length + 1,
+              created_at: new Date().toISOString(),
+            },
+          ];
+        });
+        break;
+      }
+      case "model_output": {
+        // 一轮回复完整文本（含工具调用意图）——替换临时流式消息为持久版本
+        const text = frame.text;
+        if (typeof text !== "string") break;
+        setMessages((prev) => {
+          // 移除最后一条 stream- 消息（如果存在），追加完整消息
+          const without = prev[prev.length - 1]?.id.startsWith("stream-")
+            ? prev.slice(0, -1)
+            : prev;
+          if (!text) return without;
+          return [
+            ...without,
+            {
+              id: `asst-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              session_id: sessionId,
+              role: "assistant",
+              content: text,
+              seq: without.length + 1,
+              created_at: new Date().toISOString(),
+            },
+          ];
+        });
+        break;
+      }
+      case "tool_call": {
+        // 工具调用开始——注入为系统消息（不阻塞主流程）
+        // 后端 sse_frame 包装时 tool → tool_name（避免与外层 tool 参数冲突）
+        const tn = frame.tool_name || frame.tool;
+        if (!tn) break;
+        // 进化点工具的 tool_call 已被 sink 同时产 proposal 帧，不重复显示
+        if (["propose_evolution_point", "update_evolution_point", "reject_evolution_point"].includes(tn)) {
+          break;
+        }
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `tool-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            session_id: sessionId,
+            role: "system",
+            content: `[工具] ${tn}`,
+            seq: prev.length + 1,
+            created_at: new Date().toISOString(),
+          },
+        ]);
+        break;
+      }
       case "phase": {
         // 阶段切换（inspect → conversing → finalizing）
         setSelectedStatus(frame.phase);
-        // 切到 conversing 时拉一次消息（Agent 开场白已落库）
+        // 切到 conversing 时拉一次消息（Agent 开场白已落库）。
+        // 注意：inspect round 跑完才会 conversing，此时不会与 token 流冲突。
         if (frame.phase === "conversing") {
-          void loadSessionDetail(sessionId);
+          void loadMessages(sessionId);
+          void loadPoints(sessionId);
         }
         break;
       }
@@ -180,8 +264,8 @@ export default function WorkbenchTab() {
         break;
       }
       case "proposal": {
-        // 进化点状态变更 → 刷新浮窗（决策 B/M）
-        void loadSessionDetail(sessionId);
+        // 进化点状态变更 → 只刷浮窗（决策 B/M），不动消息避免覆盖流式 token
+        void loadPoints(sessionId);
         break;
       }
       case "finalizing": {

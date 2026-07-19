@@ -554,11 +554,26 @@ def _trace_event_to_sse(event: Any) -> dict[str, Any] | None:
       - tool="finalizing"       → {type:"finalizing", event, target, ...}
       - 含 message 字段（无 tool） → {type:"log", message}
       - 含 tool 字段（其他）       → {type:"step", **data}（保留原行为）
+
+    Phase 6 流式扩展：识别 tool="sse_frame"（token 级流式桥接）：
+      - _run_agent_streamed 把 EvolveEventSink 产出的帧 dict 包装为 sse_frame 注入 recorder
+      - 此处解包：status 字段是真实帧 type（model_stream/model_output/tool_call/...），
+        其余字段透传到 SSE 帧。
     """
     if event.type != "run_meta" or not event.input:
         return None
     data = event.input if isinstance(event.input, dict) else {}
     tool = data.get("tool", "")
+
+    # Phase 6：流式帧桥接（token 级流式，决策 Y）
+    if tool == "sse_frame":
+        frame_type = data.get("status")
+        if not frame_type:
+            return None
+        # 透传除 tool/status 外的所有字段（content/text/tool/call_id 等）
+        frame = {k: v for k, v in data.items() if k not in ("tool", "status")}
+        frame["type"] = frame_type
+        return frame
 
     # Phase 5：阶段切换事件
     if tool == "phase":
