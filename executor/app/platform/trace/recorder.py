@@ -91,6 +91,14 @@ class TraceRecorder:
         # 区分"用户主动停止"（走 cancel reason=user_stop）与"连接断开"
         # （走 cancel reason=client_disconnect）。cancel 收尾时清除。
         self._user_stop_requested: dict[str, bool] = {}
+        # trace_id → SSE 生成器 task 注册表（D-停止真生效）。
+        # _user_stop_requested 只是标志位，本身不停止执行——真正终止靠前端 abort SSE
+        # 触发 CancelledError。但浏览器刷新/关闭/cloudflared 掐断后前端 abortController
+        # 丢失，那个还在后台跑的 trace 就再也停不掉。此注册表让 POST /stop 能跨请求
+        # task.cancel()，把 CancelledError 主动注入生成器，走原 except 三路分流。
+        # generate_stream 入口 create_run 后登记（register_run_task），
+        # finally 清理（unregister_run_task），_cleanup_run_state 兜底。
+        self._run_tasks: dict[str, asyncio.Task] = {}
 
     def create_run(self, thread: ThreadSummary, endpoint: str, run_purpose: str = "user_generation") -> TraceRunHandle:
         trace_id = f"trace-{uuid4().hex}"
@@ -367,6 +375,35 @@ class TraceRecorder:
     def is_user_stop_requested(self, trace_id: str) -> bool:
         """用户是否请求了停止（D6）。CancelledError 分支读它分流收尾。"""
         return self._user_stop_requested.get(trace_id, False)
+
+    def register_run_task(self, trace_id: str, task: asyncio.Task) -> None:
+        """登记 SSE 生成器 task（D-停止真生效）。
+
+        generate_stream 在 create_run 之后调用，把当前 asyncio.Task 注册进来。
+        POST /stop 据此 task.cancel() 主动注入 CancelledError，不再依赖前端
+        abort SSE 连接——浏览器刷新/cloudflared 掐断后仍能停止后台执行。
+        幂等：重复登记覆盖旧引用（同一 trace 不会并发跑两个 task）。
+        """
+        self._run_tasks[trace_id] = task
+
+    def unregister_run_task(self, trace_id: str) -> None:
+        """清理 task 注册（generate_stream finally 调，幂等）。"""
+        self._run_tasks.pop(trace_id, None)
+
+    def cancel_run_task(self, trace_id: str) -> bool:
+        """主动 cancel SSE 生成器 task（POST /stop 调）。
+
+        返回是否命中并发出 cancel：trace 已结束/未登记返回 False，不抛错。
+        task.cancel() 把 CancelledError 注入生成器，走 generate_stream 的
+        except asyncio.CancelledError 三路分流（user_stop/awaiting_input/
+        client_disconnect），收尾成 cancelled 终态。与 _user_stop_requested
+        标志位配合：标志位决定 reason 文案，task.cancel 决定真的停止生效。
+        """
+        task = self._run_tasks.get(trace_id)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
 
     def complete_run(self, thread: ThreadSummary, trace_id: str) -> TraceLogEvent:
         duration_ms = self._duration_ms(trace_id)
@@ -965,6 +1002,9 @@ class TraceRecorder:
         self._sequences.pop(trace_id, None)
         self._increment_states.pop(trace_id, None)
         self._run_endpoints.pop(trace_id, None)
+        # task 注册兜底清理：正常路径 generate_stream finally 已 unregister，
+        # 这里是极端兜底（finally 未执行 / 进程内异常路径）。
+        self._run_tasks.pop(trace_id, None)
 
     def _read_run_index(self, thread: ThreadSummary) -> dict[str, dict[str, Any]]:
         index_path = self._index_path(thread)

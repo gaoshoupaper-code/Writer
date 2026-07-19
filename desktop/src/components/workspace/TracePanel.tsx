@@ -19,8 +19,10 @@ type TracePanelProps = {
   loading: boolean;
   hasActiveThread: boolean;
   deletingTraceId: string;
+  stoppingTraceId: string;
   onSelectTrace: (traceId: string) => void;
   onDeleteTrace: (traceId: string) => void;
+  onStopTrace: (traceId: string) => void;
 };
 
 const NODE_LABELS: Record<string, string> = {
@@ -32,7 +34,7 @@ const NODE_LABELS: Record<string, string> = {
   error: "Error",
 };
 
-export function TracePanel({ runs, detail, activeTraceId, loading, hasActiveThread, deletingTraceId, onSelectTrace, onDeleteTrace }: TracePanelProps) {
+export function TracePanel({ runs, detail, activeTraceId, loading, hasActiveThread, deletingTraceId, stoppingTraceId, onSelectTrace, onDeleteTrace, onStopTrace }: TracePanelProps) {
   const [activeNodeId, setActiveNodeId] = useState("");
   const [activeTab, setActiveTab] = useState<"trace" | "chart">("trace");
   const [drawerNodeId, setDrawerNodeId] = useState<string | null>(null);
@@ -120,10 +122,25 @@ export function TracePanel({ runs, detail, activeTraceId, loading, hasActiveThre
           <h2>检测系统</h2>
         </div>
         <div className="trace-heading-actions">
-          <TraceDropdownSelector runs={runs} activeTraceId={activeTraceId} onSelect={onSelectTrace} />
+          <TraceDropdownSelector
+            runs={runs}
+            activeTraceId={activeTraceId}
+            stoppingTraceId={stoppingTraceId}
+            onSelect={onSelectTrace}
+            onStop={onStopTrace}
+          />
           <Badge variant={activeRun ? statusVariant(activeRun.status) : "muted"}>
             {activeRun ? statusLabel(activeRun.status) : "等待 Trace"}
           </Badge>
+          <button
+            className="trace-stop-button"
+            type="button"
+            onClick={() => onStopTrace(activeTraceId)}
+            disabled={!activeRun || activeRun.status !== "running" || stoppingTraceId === activeTraceId}
+            title={activeRun?.status === "running" ? "停止当前运行中的 Trace" : "仅运行中的 Trace 可停止"}
+          >
+            {stoppingTraceId === activeTraceId ? "停止中..." : "停止 Trace"}
+          </button>
           <button
             className="trace-delete-button"
             type="button"
@@ -197,7 +214,7 @@ export function TracePanel({ runs, detail, activeTraceId, loading, hasActiveThre
 
 // ── TraceDropdownSelector: 使用 shadcn DropdownMenu ──
 
-function TraceDropdownSelector({ runs, activeTraceId, onSelect }: { runs: TraceRunSummary[]; activeTraceId: string; onSelect: (traceId: string) => void }) {
+function TraceDropdownSelector({ runs, activeTraceId, stoppingTraceId, onSelect, onStop }: { runs: TraceRunSummary[]; activeTraceId: string; stoppingTraceId: string; onSelect: (traceId: string) => void; onStop: (traceId: string) => void }) {
   const activeRun = runs.find((r) => r.trace_id === activeTraceId);
 
   if (runs.length === 0) {
@@ -224,12 +241,28 @@ function TraceDropdownSelector({ runs, activeTraceId, onSelect }: { runs: TraceR
             <span className="flex-shrink-0 text-xs">
               {run.trace_id === activeTraceId ? "●" : "○"}
             </span>
-            <span className="flex flex-col gap-0.5 min-w-0">
+            <span className="flex flex-col gap-0.5 min-w-0 flex-1">
               <strong className="text-xs truncate">{run.session_name || run.endpoint}</strong>
               <small className="text-[11px] text-muted-foreground">
                 {formatTime(run.started_at)} · {statusLabel(run.status)} · {run.event_count} events
               </small>
             </span>
+            {run.status === "running" ? (
+              <button
+                className="trace-item-stop-button"
+                type="button"
+                // 阻止 DropdownMenuItem 的点击冒泡（否则会同时触发 onSelect 切 trace）
+                onClick={(e) => {
+                  e.stopPropagation();
+                  e.preventDefault();
+                  onStop(run.trace_id);
+                }}
+                disabled={stoppingTraceId === run.trace_id}
+                title="停止此运行中的 Trace"
+              >
+                {stoppingTraceId === run.trace_id ? "..." : "停止"}
+              </button>
+            ) : null}
           </DropdownMenuItem>
         ))}
       </DropdownMenuContent>
@@ -242,6 +275,8 @@ function TraceDropdownSelector({ runs, activeTraceId, onSelect }: { runs: TraceR
 function statusLabel(status: TraceRunSummary["status"]) {
   if (status === "completed") return "完成";
   if (status === "failed") return "失败";
+  if (status === "cancelled") return "已停止";
+  if (status === "awaiting_input") return "待回复";
   return "运行中";
 }
 

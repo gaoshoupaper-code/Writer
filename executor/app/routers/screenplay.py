@@ -90,15 +90,22 @@ class StopRequest(BaseModel):
 
 @router.post("/screenplay/stop")
 def stop_screenplay(req: StopRequest, user: CurrentUser = Depends(current_user)):
-    """标记用户请求停止某条 trace（D6）。
+    """标记用户请求停止某条 trace（D6 + D-停止真生效）。
 
-    前端"停止"按钮先调此端点（fire-and-forget），再 abort SSE 连接。
-    recorder 打 _user_stop_requested 标记，generate_stream 的 CancelledError
-    分支据此区分 user_stop / client_disconnect（两种都收尾成 cancelled，
-    仅 error 文案来源不同）。
+    两步：
+    1. request_user_stop 打 _user_stop_requested 标记——决定 cancel reason 文案
+       （user_stop vs client_disconnect），原有逻辑保留。
+    2. cancel_run_task 真正 task.cancel()——把 CancelledError 注入生成器，
+       走 generate_stream 的 except 三路分流收尾成 cancelled。
+
+    第 2 步是关键补丁：原来"真停止"完全依赖前端 abort SSE 连接，浏览器刷新/关闭/
+    cloudflared 掐断后 abortController 丢失，后台 trace 就停不掉。现在后端主动 kill，
+    不依赖前端连接状态。幂等：trace 已结束/未登记返回 task_cancelled=False，不抛错。
     """
-    get_trace_recorder().request_user_stop(req.trace_id)
-    return {"status": "accepted", "trace_id": req.trace_id}
+    recorder = get_trace_recorder()
+    recorder.request_user_stop(req.trace_id)
+    cancelled = recorder.cancel_run_task(req.trace_id)
+    return {"status": "accepted", "trace_id": req.trace_id, "task_cancelled": cancelled}
 
 
 # ── 数据闭环 E2：隐式反馈信号埋点 ──────────────────────────

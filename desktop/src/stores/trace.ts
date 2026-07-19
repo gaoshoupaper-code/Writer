@@ -8,7 +8,7 @@
 import { create } from "zustand";
 import { toast } from "sonner";
 import type { TraceDetail, TraceRunSummary } from "@/lib/types";
-import { deleteTrace as deleteTraceRequest, fetchThreadTraces, fetchTraceDetail } from "@/lib/api";
+import { deleteTrace as deleteTraceRequest, fetchThreadTraces, fetchTraceDetail, stopScreenplay as stopScreenplayRequest } from "@/lib/api";
 
 interface TraceState {
   traceRuns: TraceRunSummary[];
@@ -18,12 +18,14 @@ interface TraceState {
   historyDetails: Map<string, TraceDetail>;
   traceLoading: boolean;
   deletingTraceId: string;
+  stoppingTraceId: string;
 
   // actions
   loadTraceRuns: (threadId: string) => Promise<void>;
   loadTraceDetail: (threadId: string, traceId: string) => Promise<void>;
   loadHistoryDetails: (threadId: string, traceIds: string[]) => Promise<void>;
   deleteTrace: (threadId: string, traceId: string) => Promise<void>;
+  stopTrace: (threadId: string, traceId: string) => Promise<void>;
   clearTrace: () => void;
   resetForThread: () => void;
 
@@ -42,6 +44,7 @@ export const useTraceStore = create<TraceState>((set, get) => ({
   historyDetails: new Map(),
   traceLoading: false,
   deletingTraceId: "",
+  stoppingTraceId: "",
 
   loadTraceRuns: async (threadId) => {
     if (!threadId) {
@@ -127,6 +130,35 @@ export const useTraceStore = create<TraceState>((set, get) => ({
       toast.error(message.includes("409") ? "运行中的 Trace 不能删除。" : "无法删除 Trace。");
     } finally {
       set({ deletingTraceId: "" });
+    }
+  },
+
+  stopTrace: async (threadId, traceId) => {
+    // D-停止真生效：调 POST /stop（后端 request_user_stop + cancel_run_task 真终止）。
+    // 停的是当前 liveTraceId 时，同步触发 executionStore.stop() 关闭前端 SSE，
+    // 走常规 client 收尾避免 SSE 继续推已作废事件；否则只靠后端 task.cancel。
+    if (!threadId || !traceId || get().stoppingTraceId) return;
+    const run = get().traceRuns.find((item) => item.trace_id === traceId);
+    if (!run || run.status !== "running") {
+      toast.error("仅运行中的 Trace 可停止。");
+      return;
+    }
+    set({ stoppingTraceId: traceId });
+    try {
+      await stopScreenplayRequest(threadId, traceId);
+      if (get().liveTraceId === traceId) {
+        // 延迟 import 避免循环依赖（execution.ts 通过 deps 反向引用 trace store）
+        const { useExecutionStore } = await import("./execution");
+        useExecutionStore.getState().stop();
+      }
+      // 刷新 trace 列表让状态从 running 变 cancelled
+      await get().loadTraceRuns(threadId);
+      toast.success("已停止运行中的 Trace。");
+    } catch (stopError) {
+      const message = stopError instanceof Error ? stopError.message : "";
+      toast.error(message || "停止 Trace 失败。");
+    } finally {
+      set({ stoppingTraceId: "" });
     }
   },
 

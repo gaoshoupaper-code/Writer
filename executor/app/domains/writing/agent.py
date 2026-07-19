@@ -272,6 +272,10 @@ class MetaAgentService(BaseAgentService):
         trace_queue = self.trace_recorder.get_active_queue(trace.trace_id)
         if trace_queue is None:
             raise RuntimeError(f"Trace queue was not created: {trace.trace_id}")
+        # 登记 SSE 生成器 task，让 POST /stop 能跨请求 task.cancel()（弥补浏览器
+        # 刷新/关闭/cloudflared 掐断后 abortController 丢失导致后台 trace 停不掉的缺口）。
+        # 清理由下方 try/finally 保证（正常/异常/CancelledError 三路都 unregister）。
+        self.trace_recorder.register_run_task(trace.trace_id, asyncio.current_task())
         for trace_update in self._trace_updates(trace_queue):
             yield trace_update
 
@@ -384,6 +388,10 @@ class MetaAgentService(BaseAgentService):
             for trace_update in self._trace_updates(trace_queue):
                 yield trace_update
             raise
+        finally:
+            # 兜底清理 task 注册（正常/异常/CancelledError 三路都走到）。
+            # _cleanup_run_state 也会兜底，但这里更早执行避免泄漏窗口。
+            self.trace_recorder.unregister_run_task(trace.trace_id)
 
     def _trace_updates(self, trace_queue) -> list[str]:
         trace_events = _drain_trace_queue(trace_queue)

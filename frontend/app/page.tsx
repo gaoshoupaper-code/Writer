@@ -40,6 +40,7 @@ import {
   fetchWorkspaces,
   logout as logoutRequest,
   optimizeStyle as optimizeStyleRequest,
+  stopScreenplay as stopScreenplayRequest,
   updateStyle as updateStyleRequest,
   updateThread as updateThreadRequest,
   trackCopy,
@@ -374,6 +375,7 @@ export default function Home() {
   const [creatingThread, setCreatingThread] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deletingTraceId, setDeletingTraceId] = useState("");
+  const [stoppingTraceId, setStoppingTraceId] = useState("");
   const [deletingWorkspace, setDeletingWorkspace] = useState(false);
   const [theme, setTheme] = useState<ThemeMode>("light");
   const [themeReady, setThemeReady] = useState(false);
@@ -1044,6 +1046,43 @@ export default function Home() {
     }
   }
 
+  async function handleStopTrace(traceId: string) {
+    // D-停止真生效：调 POST /stop（后端 request_user_stop + cancel_run_task 真终止）。
+    // 与 handleStopGeneration 的区别：那个是 ChatPanel 输入框停止当前生成（带 abort SSE），
+    // 这个是 TracePanel 停任意一个 running trace（可能不是当前 liveTraceId ——
+    // 例如刷新页面后 abortControllerRef 已丢，此时只靠后端 task.cancel 终止）。
+    if (!activeThreadId || !traceId || stoppingTraceId) return;
+    const run = traceRuns.find((item) => item.trace_id === traceId);
+    if (!run || run.status !== "running") {
+      toast.error("仅运行中的 Trace 可停止。");
+      return;
+    }
+
+    setStoppingTraceId(traceId);
+
+    try {
+      await stopScreenplayRequest(activeThreadId, traceId);
+      // 若停的正是当前 liveTraceId，同步 abortController 关闭前端 SSE 连接
+      // （走常规 client 收尾，避免 SSE 流继续往 UI 推已经作废的事件）。
+      if (liveTraceId === traceId) {
+        abortControllerRef.current?.abort();
+      }
+      // 刷新 trace 列表，让状态从 running 变 cancelled 反映到 UI
+      try {
+        const runs = await fetchThreadTraces(activeThreadId);
+        setTraceRuns(runs);
+      } catch {
+        /* 列表刷新失败不影响停止结果（用户已被告知） */
+      }
+      toast.success("已停止运行中的 Trace。");
+    } catch (stopError) {
+      const message = stopError instanceof Error ? stopError.message : "";
+      toast.error(message || "停止 Trace 失败。");
+    } finally {
+      setStoppingTraceId("");
+    }
+  }
+
   function handleStopGeneration() {
     // D6 停止信号：先发显式 POST /stop（fire-and-forget），再 abort SSE。
     // 后端据 _user_stop_requested 标记区分"用户主动停止"vs"连接断开"，
@@ -1700,8 +1739,10 @@ export default function Home() {
             loading={traceLoading}
             hasActiveThread={Boolean(activeThreadId)}
             deletingTraceId={deletingTraceId}
+            stoppingTraceId={stoppingTraceId}
             onSelectTrace={setActiveTraceId}
             onDeleteTrace={handleDeleteTrace}
+            onStopTrace={handleStopTrace}
           />
         ) : null}
 

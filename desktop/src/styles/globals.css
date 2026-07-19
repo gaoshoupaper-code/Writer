@@ -901,6 +901,53 @@ a {
   opacity: 0.54;
 }
 
+/* 停止 Trace 按钮（顶部 header，运行中才可点）。与 trace-delete-button 同色系，
+   但更"实时/警示"——加 1px 实线红边 + 浅红底，区别于删除按钮的常态轮廓。 */
+.trace-stop-button {
+  border: 1px solid rgba(229, 72, 77, 0.55);
+  border-radius: 999px;
+  padding: 7px 11px;
+  color: var(--danger);
+  background: rgba(252, 226, 221, 0.78);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.trace-stop-button:hover:not(:disabled) {
+  color: #fff;
+  background: var(--danger);
+}
+
+.trace-stop-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* 下拉列表项内的小停止按钮（仅 running 项出现） */
+.trace-item-stop-button {
+  flex-shrink: 0;
+  border: 1px solid rgba(229, 72, 77, 0.45);
+  border-radius: 999px;
+  padding: 2px 8px;
+  color: var(--danger);
+  background: rgba(252, 226, 221, 0.5);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.4;
+}
+
+.trace-item-stop-button:hover:not(:disabled) {
+  color: #fff;
+  background: var(--danger);
+}
+
+.trace-item-stop-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
 .trace-run-item {
   display: grid;
   gap: 5px;
@@ -3341,6 +3388,8 @@ html[data-theme="dark"] :is(
   .workspace-menu-popover,
   .message,
   .trace-delete-button,
+  .trace-stop-button,
+  .trace-item-stop-button,
   .trace-run-item,
   .trace-node-item,
   .trace-context-segment,

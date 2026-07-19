@@ -92,6 +92,7 @@ export default function Home() {
   const historyDetails = useTraceStore((s) => s.historyDetails);
   const traceLoading = useTraceStore((s) => s.traceLoading);
   const deletingTraceId = useTraceStore((s) => s.deletingTraceId);
+  const stoppingTraceId = useTraceStore((s) => s.stoppingTraceId);
 
   // contentStore
   const outlineMarkdown = useContentStore((s) => s.outlineMarkdown);
@@ -490,8 +491,14 @@ export default function Home() {
             loading={traceLoading}
             hasActiveThread={Boolean(activeThreadId)}
             deletingTraceId={deletingTraceId}
+            stoppingTraceId={stoppingTraceId}
             onSelectTrace={(id) => useTraceStore.getState().setActiveTraceId(id)}
             onDeleteTrace={handleDeleteTrace}
+            onStopTrace={(id) => {
+              if (activeThreadId) {
+                void useTraceStore.getState().stopTrace(activeThreadId, id);
+              }
+            }}
           />
         ) : null}
       </AppShell>

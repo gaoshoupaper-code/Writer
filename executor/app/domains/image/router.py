@@ -65,6 +65,9 @@ async def _image_event_generator(payload: ImageGenerateRequest, thread, *, owner
     model = _image_service._resolve_model(owner_id)
     checkpointer = await _image_service._resolve_checkpointer(owner_id)
     trace = trace_recorder.create_run(thread, "image.generate.stream")
+    # 登记 SSE 生成器 task，让 POST /stop 能跨请求 task.cancel()（与 writing 域对称，
+    # 弥补浏览器刷新/关闭后 abortController 丢失导致后台 trace 停不掉的缺口）。
+    trace_recorder.register_run_task(trace.trace_id, asyncio.current_task())
     yield _sse("status", {"status": "started", "trace_id": trace.trace_id})
 
     agent = _image_service._build_agent(
@@ -147,6 +150,9 @@ async def _image_event_generator(payload: ImageGenerateRequest, thread, *, owner
         trace_recorder.fail_run(thread, trace.trace_id, exc)
         yield _sse("error", {"error": str(exc)[:500]})
         raise
+    finally:
+        # 兜底清理 task 注册（正常/异常/CancelledError 三路都走到）。
+        trace_recorder.unregister_run_task(trace.trace_id)
 
 
 @router.post("/api/image/generate/stream")

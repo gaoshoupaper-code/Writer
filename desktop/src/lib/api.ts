@@ -556,6 +556,18 @@ export async function deleteTrace(threadId: string, traceId: string) {
   return parseJsonResponse<{ status: string; deleted: string }>(response);
 }
 
+export async function stopScreenplay(threadId: string, traceId: string) {
+  // D-停止真生效：后端 request_user_stop（设 reason 标记）+ cancel_run_task（真 task.cancel）。
+  // 幂等：trace 已结束也返回 200，task_cancelled=false。
+  const response = await apiFetch(`${API_BASE_URL}/api/screenplay/stop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ thread_id: threadId, trace_id: traceId }),
+  });
+
+  return parseJsonResponse<{ status: string; trace_id: string; task_cancelled: boolean }>(response);
+}
+
 export async function fetchThreadCheckpoint(threadId: string): Promise<CheckpointState> {
   const response = await apiFetch(`${API_BASE_URL}/api/threads/${threadId}/checkpoint`);
   if (!response.ok) throw new Error("Failed to fetch checkpoint");
