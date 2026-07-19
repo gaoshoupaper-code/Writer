@@ -101,9 +101,13 @@ def make_points_tools() -> list:
                 recommendation=recommendation or None,
                 note=note or None,
             )
+            # Phase 5 协议：emit proposal 事件供前端浮窗实时同步（决策 B/M）
             ctx.emit_step(
-                "propose_evolution_point", "done",
-                point_id=point["id"], target=target,
+                "proposal", "propose",
+                action="propose",
+                point_id=point["id"],
+                seq=point["seq"],
+                target=target,
             )
             return (
                 f"已提出进化点 #{point['seq']}（id={point['id']}）：{target}\n"
@@ -160,8 +164,12 @@ def make_points_tools() -> list:
                 point_id, chosen_option=chosen_option, user_note=user_note or None,
             )
             ctx.emit_step(
-                "update_evolution_point", "done",
-                point_id=point_id, chosen=chosen_option,
+                "proposal", "update",
+                action="update",
+                point_id=point_id,
+                seq=updated["seq"],
+                target=updated["target"],
+                chosen_option=chosen_option,
             )
             chosen_desc = updated["options"][chosen_option]["description"] if updated else "?"
             return (
@@ -202,7 +210,13 @@ def make_points_tools() -> list:
                 return f"进化点 {point_id} 不属于当前 session"
 
             updated = EvolvePointsRepo.reject(point_id, user_note=reason or None)
-            ctx.emit_step("reject_evolution_point", "done", point_id=point_id)
+            ctx.emit_step(
+                "proposal", "reject",
+                action="reject",
+                point_id=point_id,
+                seq=updated["seq"],
+                target=updated["target"],
+            )
             return (
                 f"进化点 #{updated['seq']} 已否决（{point['target']}）。"
                 f"用户可在右侧浮窗看到状态变为 ✗ 已否决。"

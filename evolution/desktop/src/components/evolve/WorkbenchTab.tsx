@@ -184,6 +184,27 @@ export default function WorkbenchTab() {
         void loadSessionDetail(sessionId);
         break;
       }
+      case "finalizing": {
+        // 落地进度事件（决策 W）——注入为系统消息显示
+        const evt = frame.event || "";
+        const tgt = frame.target || "";
+        const result = frame.result ? ` ${frame.result}` : "";
+        const text = evt ? `[落地] ${evt} ${tgt}${result}`.trim() : "";
+        if (text) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `fin-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              session_id: sessionId,
+              role: "system",
+              content: text,
+              seq: prev.length + 1,
+              created_at: new Date().toISOString(),
+            },
+          ]);
+        }
+        break;
+      }
       case "end": {
         // 流结束 → 刷新会话详情（拿最终 status）
         void refreshLists();

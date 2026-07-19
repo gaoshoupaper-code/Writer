@@ -285,6 +285,7 @@ async def run_inspect_round(ctx: EvolveContext, trace_id: str) -> dict[str, Any]
     if ctx.recorder and ctx.trace_id_self:
         config["callbacks"] = [TraceCallbackHandler(ctx.recorder, ctx.trace_id_self)]
 
+    ctx.emit_phase("running")
     ctx.emit_log("进化 Agent 启动探查阶段...")
     logger.info("session %s: inspect round 启动 trace=%s", ctx.session_id, trace_id)
 
@@ -310,6 +311,7 @@ async def run_inspect_round(ctx: EvolveContext, trace_id: str) -> dict[str, Any]
         # 探查完成，转 conversing 等用户对话
         ctx.session_status = STATUS_CONVERSING
         ev_db.update_session(ctx.session_id, status=STATUS_CONVERSING)
+        ctx.emit_phase("conversing")
         ctx.emit_log("探查阶段完成，进入对话共创阶段。")
         logger.info("session %s: inspect round 完成，转 conversing", ctx.session_id)
         return {"status": "conversing", "session_id": ctx.session_id}
@@ -429,6 +431,7 @@ async def run_finalize_round(ctx: EvolveContext) -> dict[str, Any]:
     # 切到 finalizing（FlowGuard 解锁落地工具）
     ctx.session_status = STATUS_FINALIZING
     ev_db.update_session(ctx.session_id, status=STATUS_FINALIZING)
+    ctx.emit_phase("finalizing")
     ctx.emit_log("进入落地阶段，按已拍板的进化点开始改代码。")
 
     agent = await build_evolve_agent(ctx)
@@ -461,6 +464,7 @@ async def run_finalize_round(ctx: EvolveContext) -> dict[str, Any]:
         if ctx.change_log_path:
             ctx.session_status = STATUS_PENDING_REVIEW
             ev_db.update_session(ctx.session_id, status=STATUS_PENDING_REVIEW)
+            ctx.emit_phase("pending_review")
             ctx.emit_log("落地完成，进入 pending_review 等待发布审查。")
             if ctx.recorder and ctx.trace_id_self:
                 ctx.recorder.complete_run(ctx.trace_id_self)

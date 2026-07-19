@@ -546,13 +546,52 @@ async def stream_session(session_id: str) -> StreamingResponse:
 
 
 def _trace_event_to_sse(event: Any) -> dict[str, Any] | None:
-    """trace 事件 → 前端 SSE 帧派生（与 eval_agent/api.py 对称）。"""
-    if event.type == "run_meta" and event.input:
-        data = event.input if isinstance(event.input, dict) else {}
-        if "message" in data and "tool" not in data:
-            return {"type": "log", "message": data["message"]}
-        if "tool" in data:
-            return {"type": "step", **data}
+    """trace 事件 → 前端 SSE 帧派生（与 eval_agent/api.py 对称）。
+
+    Phase 5 事件协议扩展：识别 emit_step 的特殊 tool 名，派生对应 SSE 帧类型：
+      - tool="phase"            → {type:"phase", phase}
+      - tool="proposal"         → {type:"proposal", action, point_id, seq, target, ...}
+      - tool="finalizing"       → {type:"finalizing", event, target, ...}
+      - 含 message 字段（无 tool） → {type:"log", message}
+      - 含 tool 字段（其他）       → {type:"step", **data}（保留原行为）
+    """
+    if event.type != "run_meta" or not event.input:
+        return None
+    data = event.input if isinstance(event.input, dict) else {}
+    tool = data.get("tool", "")
+
+    # Phase 5：阶段切换事件
+    if tool == "phase":
+        phase = data.get("phase")
+        if phase:
+            return {"type": "phase", "phase": phase}
+        return None
+
+    # Phase 5：进化点状态变更（决策 B/M 浮窗实时同步）
+    if tool == "proposal":
+        return {
+            "type": "proposal",
+            "action": data.get("action"),
+            "point_id": data.get("point_id"),
+            "seq": data.get("seq"),
+            "target": data.get("target"),
+            "chosen_option": data.get("chosen_option"),
+        }
+
+    # Phase 5：落地进度事件（决策 W）
+    if tool == "finalizing":
+        return {
+            "type": "finalizing",
+            "event": data.get("status"),  # edit/validate/change_log
+            "target": data.get("target"),
+            "result": data.get("result"),
+        }
+
+    # 旧协议：log + step（保留向后兼容）
+    if "message" in data and not tool:
+        return {"type": "log", "message": data["message"]}
+    if tool:
+        return {"type": "step", **data}
     return None
 
 

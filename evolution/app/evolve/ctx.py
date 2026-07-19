@@ -129,11 +129,28 @@ class EvolveContext:
 
         D3 改造：不再写 SessionEvents，改为 recorder.append_business_event。
         单体化后无阶段概念，不再接受 phase 参数。
+
+        Phase 5 事件协议（extra 字段约定，供 _trace_event_to_sse 派生 SSE 帧）：
+          - phase 事件：emit_step("phase", "switched", phase="conversing")
+            → SSE: {type:"phase", phase}
+          - proposal 事件（进化点状态变更）：
+            emit_step("proposal", "propose|update|reject",
+                      point_id=..., seq=..., target=..., action=..., chosen_option=...)
+            → SSE: {type:"proposal", action, point_id, ...}
+          - finalizing 事件（落地进度）：
+            emit_step("finalizing", "edit|validate|change_log", target=..., result=...)
+            → SSE: {type:"finalizing", event, target, ...}
+          - 普通 step：emit_step("read_eval_report", "running"/"done")
+            → SSE: {type:"step", tool, ...}
         """
         if self.recorder and self.trace_id_self:
             self.recorder.append_business_event(
                 self.trace_id_self, tool, status, **extra
             )
+
+    def emit_phase(self, phase: str) -> None:
+        """便捷方法：推阶段切换事件（Phase 5 协议）。"""
+        self.emit_step("phase", "switched", phase=phase)
 
     def emit_log(self, message: str) -> None:
         if self.recorder and self.trace_id_self:
