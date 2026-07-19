@@ -118,7 +118,7 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
     from app.evolve import db as ev_db
 
     ctx.trace_id = trace_id
-    ctx.review_status = "running"
+    ctx.session_status = "running"
     ev_db.update_session(ctx.session_id, status="running")
 
     # 先 create_run 拿自观测 trace_id，再构建 agent（middleware 需要 trace_id）。
@@ -158,7 +158,7 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
 
         # 产出检查：design_doc + change_log 都齐才算完成。
         if ctx.change_log_path and ctx.design_doc_path:
-            ctx.review_status = "pending_review"
+            ctx.session_status = "pending_review"
             ev_db.update_session(ctx.session_id, status="pending_review")
             ctx.emit_log("进化流程完成，改动已落地，等待人工 review 发版。")
             if ctx.recorder and ctx.trace_id_self:

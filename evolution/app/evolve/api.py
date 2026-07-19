@@ -28,7 +28,13 @@ from app.eval_agent import repo as eval_repo
 from app.core import db
 from app.evolve import db as ev_db
 from app.evolve.agent.agent import run_evolve_session
-from app.evolve.ctx import EvolveContext
+from app.evolve.ctx import (
+    ACTIVE_STATUSES,
+    STATUS_CONVERSING,
+    STATUS_FINALIZING,
+    STATUS_RUNNING,
+    EvolveContext,
+)
 from app.trace.recorder import EvolutionTraceRecorder
 
 logger = logging.getLogger("evolution.evolve.api")
@@ -102,14 +108,16 @@ async def evolve_start(
             ),
         )
 
-    # working 区锁定校验（S6/4.3）：存在 pending_review 的 session 时禁止开新进化
-    pending = _find_pending_review_session()
-    if pending:
+    # working 区锁定校验（决策 G 单会话锁）：存在活跃 session 时禁止开新进化。
+    # 活跃 = running / conversing / finalizing / pending_review（ACTIVE_STATUSES）。
+    # 对话式共创下 conversing/finalizing 同样占用 working 区（改 harness repo），必须锁。
+    active = _find_active_session()
+    if active:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"当前有待审改动未处理（session {pending}），"
-                f"请先发版或丢弃后再启动新进化"
+                f"当前有未结束的进化会话（session {active}，状态 {active['status']}），"
+                f"请先发布/丢弃/取消后再启动新进化"
             ),
         )
 
@@ -149,12 +157,16 @@ async def evolve_start(
     )
 
 
-def _find_pending_review_session() -> str | None:
-    """查是否有 pending_review 状态的进化 session（working 区锁定，S6）。"""
+def _find_active_session() -> dict[str, Any] | None:
+    """查是否有活跃的进化 session（决策 G 单会话锁）。
+
+    活跃 = status ∈ ACTIVE_STATUSES（running/conversing/finalizing/pending_review）。
+    返回 session dict（含 session_id + status），无活跃返回 None。
+    """
     sessions = ev_db.list_sessions(limit=50)
     for s in sessions:
-        if isinstance(s, dict) and s.get("status") == "pending_review":
-            return s.get("session_id")
+        if isinstance(s, dict) and s.get("status") in ACTIVE_STATUSES:
+            return s
     return None
 
 
@@ -293,10 +305,18 @@ def stop_session(session_id: str) -> dict[str, Any]:
     session = ev_db.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"session {session_id} 不存在")
-    if session.get("status") != "running":
+    # 可停止的状态：running / conversing / finalizing（pending_review 走 publish/discard）。
+    # Phase 1（状态机骨架）：统一标 cancelled，与原 running 单体行为一致。
+    # Phase 3（对话式 API 改造）会按决策 L 细化——conversing 的 stop 只取消当前输出
+    # task、不推进 status，会话保留可继续输入。
+    stoppable = {STATUS_RUNNING, STATUS_CONVERSING, STATUS_FINALIZING}
+    if session.get("status") not in stoppable:
         raise HTTPException(
             status_code=400,
-            detail=f"session 状态为 {session.get('status')}，只有 running 可停止",
+            detail=(
+                f"session 状态为 {session.get('status')}，"
+                f"只有 running/conversing/finalizing 可停止"
+            ),
         )
 
     task = _running_tasks.get(session_id)

@@ -369,6 +369,47 @@ def init_db() -> None:
                 disabled    INTEGER NOT NULL DEFAULT 0,       -- 1=executor 侧已禁用
                 synced_at   TEXT NOT NULL                     -- 最近同步时间（ISO8601）
             );
+
+            -- evolve_messages：进化对话消息（对话式共创工作台，决策 T6）。
+            -- 一个 session 的全部对话消息（user/assistant/system/tool），按 seq 排序。
+            -- role=user 为用户输入；role=assistant 为 Agent 回复（含 markdown + 内嵌引用）。
+            -- tool_events 存该消息触发的工具调用摘要（assistant 消息专属）。
+            -- related_points 存该消息涉及的进化点 id 列表（用于浮窗↔对话双向高亮联动）。
+            CREATE TABLE IF NOT EXISTS evolve_messages (
+                id              TEXT PRIMARY KEY,             -- uuid
+                session_id      TEXT NOT NULL,                -- FK evolve_sessions（逻辑外键）
+                role            TEXT NOT NULL,                -- user / assistant / system / tool
+                content         TEXT NOT NULL,                -- 消息正文（markdown）
+                tool_events     TEXT,                         -- JSON：工具调用列表（assistant 专属）
+                related_points  TEXT,                         -- JSON：涉及的进化点 id 列表（联动高亮）
+                seq             INTEGER NOT NULL,             -- 会话内序号（从 1 递增）
+                created_at      TEXT NOT NULL,
+                UNIQUE(session_id, seq)
+            );
+            CREATE INDEX IF NOT EXISTS idx_em_session ON evolve_messages(session_id, seq);
+
+            -- evolve_points：进化点（对话式共创工作台，决策 T7）。
+            -- Agent 在 conversing 阶段通过工具调用 propose/update/reject 进化点，
+            -- 用户在对话中拍板每个点的方案。status 三态：proposed/accepted/rejected。
+            -- 拍板（finalize）后从 accepted 进化点生成 design_doc.md（决策 T3）。
+            CREATE TABLE IF NOT EXISTS evolve_points (
+                id              TEXT PRIMARY KEY,             -- uuid，Agent 调 propose 时生成
+                session_id      TEXT NOT NULL,                -- FK evolve_sessions
+                seq             INTEGER NOT NULL,             -- 会话内序号（浮窗排序）
+                target          TEXT NOT NULL,                -- 要改的要素（meta_system.md / RetryMiddleware 等）
+                problem         TEXT NOT NULL,                -- 为什么改（含 finding 引用）
+                options         TEXT NOT NULL,                -- JSON：[{description, pros, cons, expected_impact}, ...]
+                recommendation  TEXT,                         -- 推荐哪个 option + 理由
+                note            TEXT,                         -- Agent 补充说明
+                status          TEXT NOT NULL DEFAULT 'proposed',  -- proposed / accepted / rejected
+                chosen_option   INTEGER,                      -- 用户选了第几个 option（accepted 时，0-based）
+                user_note       TEXT,                         -- 用户附加说明
+                accepted_at     TEXT,                         -- accept/reject 时间
+                design_ref      INTEGER,                      -- 拍板后映射到 design_doc 的 change 序号
+                created_at      TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ep_session ON evolve_points(session_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_ep_status ON evolve_points(session_id, status);
             """
         )
         conn.commit()
