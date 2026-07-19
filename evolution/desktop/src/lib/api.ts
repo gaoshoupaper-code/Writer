@@ -565,6 +565,98 @@ export async function discardEvolve(sessionId: string): Promise<{ status: string
   return evoJson(`/api/evolve/sessions/${sessionId}/discard`, { method: "POST" });
 }
 
+// ── 对话式共创工作台（Phase 4，决策 T2/T10）──────────────────────
+
+/** 进化对话消息（evolve_messages 表，决策 T6） */
+export interface EvolveMessage {
+  id: string;
+  session_id: string;
+  role: "user" | "assistant" | "system" | "tool";
+  content: string; // markdown
+  tool_events?: any[] | null; // assistant 消息触发的工具调用列表
+  related_points?: string[] | null; // 涉及的进化点 id（双向高亮联动）
+  seq: number;
+  created_at: string;
+}
+
+/** 进化点 option（备选方案，决策 T） */
+export interface EvolvePointOption {
+  description: string;
+  pros: string[];
+  cons: string[];
+  expected_impact: string;
+}
+
+/** 进化点（evolve_points 表，决策 T7/B/T） */
+export interface EvolvePoint {
+  id: string;
+  session_id: string;
+  seq: number;
+  target: string;
+  problem: string;
+  options: EvolvePointOption[];
+  recommendation?: string | null;
+  note?: string | null;
+  status: "proposed" | "accepted" | "rejected";
+  chosen_option?: number | null; // 0-based，accepted 时
+  user_note?: string | null;
+  accepted_at?: string | null;
+  design_ref?: number | null;
+  created_at: string;
+}
+
+/** 架构蓝图 API 返回（决策 Q） */
+export interface EvolveSystemPrompt {
+  blueprint: string; // markdown
+  version: string;
+}
+
+export async function getEvolveSystemPrompt(): Promise<EvolveSystemPrompt> {
+  return evoJson<EvolveSystemPrompt>(`/api/evolve/system-prompt`, { method: "GET" });
+}
+
+/** 对话式启动进化（决策 T2，inspect round + 转 conversing） */
+export async function startEvolveConverse(
+  traceId: string,
+): Promise<{ session_id: string; trace_id: string; eval_id: string; status: string }> {
+  return evoJson(`/api/evolve/start-converse`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ trace_id: traceId }),
+  });
+}
+
+export async function getEvolveMessages(
+  sessionId: string,
+  afterSeq?: number,
+): Promise<{ messages: EvolveMessage[] }> {
+  const qs = afterSeq !== undefined ? `?after_seq=${afterSeq}` : "";
+  return evoJson(`/api/evolve/sessions/${sessionId}/messages${qs}`, { method: "GET" });
+}
+
+export async function sendEvolveMessage(
+  sessionId: string,
+  content: string,
+): Promise<{ message_id: string; seq: number; session_id: string; status: string }> {
+  return evoJson(`/api/evolve/sessions/${sessionId}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+}
+
+export async function getEvolvePoints(
+  sessionId: string,
+): Promise<{ points: EvolvePoint[]; accepted_count: number }> {
+  return evoJson(`/api/evolve/sessions/${sessionId}/points`, { method: "GET" });
+}
+
+export async function finalizeEvolve(
+  sessionId: string,
+): Promise<{ session_id: string; status: string; accepted_count: number }> {
+  return evoJson(`/api/evolve/sessions/${sessionId}/finalize`, { method: "POST" });
+}
+
 // ════════════════════════════════════════════════════════════
 //  单次测试（tests）
 // ════════════════════════════════════════════════════════════
