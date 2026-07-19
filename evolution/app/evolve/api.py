@@ -73,88 +73,115 @@ class EvolveStartResponse(BaseModel):
 async def evolve_start(
     req: EvolveStartRequest,
 ) -> EvolveStartResponse:
-    """触发一次进化（方案→执行两阶段，产出待审改动）。
+    """触发一次进化（方案→执行两阶段，产出待审改动，单体兼容入口）。
 
     强前置校验（S8）：trace 必须已有评估 Agent 产出的 done 评估报告。
+
+    注意：Phase 3 新增对话式入口 POST /start-converse，本端点保留单体行为不变
+    （决策：新老并存，零回归）。Phase 4 新前端就绪后可废弃本端点。
     """
-    # 校验 trace 存在
-    from app.view.traces import get_trace
-    try:
-        get_trace(req.trace_id)
-    except Exception:
-        raise HTTPException(
-            status_code=404,
-            detail=f"trace {req.trace_id} 不存在",
-        )
-
-    # 强前置校验（S8）：trace 必须已评估
-    eval_session = eval_repo.get_done_by_trace(req.trace_id)
-    if eval_session is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"trace {req.trace_id} 尚未评估，请先在评估功能中评估后再启动进化",
-        )
-
-    # 强前置校验（S8+）：评估报告必须有结构化 findings，否则 plan 端 evidence_ref 校验
-    # 会因"合法 id：（无）"变成不可能完成的约束（评估基础设施故障时产出的降级报告
-    # status=done 但 findings=NULL）。此时拒绝启动，提示重新评估。
-    findings = eval_session.get("findings")
-    if not findings or not isinstance(findings, list):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"trace {req.trace_id} 的评估报告缺少结构化诊断（findings 为空），"
-                f"可能是评估时基础设施故障产出的降级报告。请重新评估后再启动进化"
-            ),
-        )
-
-    # working 区锁定校验（决策 G 单会话锁）：存在活跃 session 时禁止开新进化。
-    # 活跃 = running / conversing / finalizing / pending_review（ACTIVE_STATUSES）。
-    # 对话式共创下 conversing/finalizing 同样占用 working 区（改 harness repo），必须锁。
+    # 强前置校验 + working 区锁
+    eval_session = _resolve_evaluated_trace(req.trace_id)
     active = _find_active_session()
     if active:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"当前有未结束的进化会话（session {active}，状态 {active['status']}），"
+                f"当前有未结束的进化会话（session {active['session_id']}，状态 {active['status']}），"
                 f"请先发布/丢弃/取消后再启动新进化"
             ),
         )
 
     session_id = uuid.uuid4().hex[:12]
-
-    # 落库 session
     ev_db.create_session(session_id, case_id="")
-
-    # 构建上下文：加载评估报告快照到 ctx.eval_snapshot（S2 DB 交接）+ 注入 recorder（D6）
-    ctx = EvolveContext(session_id=session_id)
-    ctx.recorder = get_recorder()
-    ctx.trace_id = req.trace_id
-    # 数据闭环 F1：查 trace 所属数据集层（golden验证/growing探索），注入进化上下文。
-    ctx.origin_layer = _resolve_origin_layer(req.trace_id)
-    ctx.eval_snapshot = {
-        "eval_id": eval_session["eval_id"],
-        "trace_id": eval_session.get("trace_id"),
-        "scores": eval_session.get("scores"),
-        "findings": eval_session.get("findings"),
-        "report_md": eval_session.get("report_md"),
-    }
-
-    # 关联评估报告（eval_ref）
-    ev_db.update_session(session_id, eval_ref=eval_session["eval_id"])
+    ctx = _build_evolve_ctx(session_id, req.trace_id, eval_session)
 
     # 后台跑进化驱动器（create_task 拿到 task 引用，存注册表供 stop 端点取消）
     task = asyncio.create_task(_run_evolve_bg(ctx, req.trace_id))
     _running_tasks[session_id] = task
 
     logger.info(
-        "进化 session 启动: session=%s trace=%s eval=%s",
+        "进化 session 启动（单体）: session=%s trace=%s eval=%s",
         session_id, req.trace_id, eval_session["eval_id"],
     )
     return EvolveStartResponse(
         session_id=session_id, trace_id=req.trace_id,
         eval_id=eval_session["eval_id"], status="started",
     )
+
+
+@router.post("/evolve/start-converse", response_model=EvolveStartResponse, status_code=202)
+async def evolve_start_converse(req: EvolveStartRequest) -> EvolveStartResponse:
+    """触发对话式共创进化（Phase 3，决策 T2/T10）。
+
+    与单体 /start 的差异：内部走 inspect round（探查 + Agent 开场白），
+    跑完后 status 自动转 conversing，等用户在对话区发消息（POST /messages）。
+
+    强前置校验、working 区锁定、上下文构建与 /start 完全一致（共用 helper）。
+    新前端「进化工作台」Tab 应调本端点而非 /start。
+    """
+    eval_session = _resolve_evaluated_trace(req.trace_id)
+    active = _find_active_session()
+    if active:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"当前有未结束的进化会话（session {active['session_id']}，状态 {active['status']}），"
+                f"请先发布/丢弃/取消后再启动新进化"
+            ),
+        )
+
+    session_id = uuid.uuid4().hex[:12]
+    ev_db.create_session(session_id, case_id="")
+    ctx = _build_evolve_ctx(session_id, req.trace_id, eval_session)
+
+    # 后台跑 inspect round（探查 + 开场白 → 转 conversing）
+    from app.evolve.agent.agent import run_inspect_round
+    task = asyncio.create_task(_run_round_bg(ctx, run_inspect_round, req.trace_id))
+    _running_tasks[session_id] = task
+
+    logger.info(
+        "进化 session 启动（对话式）: session=%s trace=%s eval=%s",
+        session_id, req.trace_id, eval_session["eval_id"],
+    )
+    return EvolveStartResponse(
+        session_id=session_id, trace_id=req.trace_id,
+        eval_id=eval_session["eval_id"], status="started_converse",
+    )
+
+
+async def _run_round_bg(
+    ctx: EvolveContext,
+    round_fn,
+    *args,
+) -> None:
+    """通用后台 round 执行器（决策 T2 按需触发）。
+
+    与 _run_evolve_bg 对称，但跑的是任意 round 函数（inspect/converse/finalize）。
+    round 函数自己负责状态推进 + recorder 收尾，本函数只做异常兜底 + task 注册表清理。
+
+    Args:
+        ctx: 进化上下文
+        round_fn: round 函数（run_inspect_round / run_converse_round / run_finalize_round）
+        *args: 传给 round_fn 的位置参数（如 trace_id / user_message）
+    """
+    try:
+        result = await round_fn(ctx, *args)
+        # cancelled 是用户停止的合法终态，不算失败
+        if result.get("status") not in (
+            "done", "conversing", "pending_review", "cancelled", None,
+        ):
+            ev_db.update_session(ctx.session_id, status="failed")
+    except asyncio.CancelledError:
+        logger.info("进化 session %s round %s 被取消", ctx.session_id, round_fn.__name__)
+        # round 函数自己处理 cancelled；这里兜底（取消在进入 round 前命中）
+        ev_db.update_session(ctx.session_id, status="cancelled")
+        raise
+    except Exception as e:
+        logger.exception("进化 session %s round %s 异常", ctx.session_id, round_fn.__name__)
+        ev_db.update_session(ctx.session_id, status="failed")
+    finally:
+        _running_tasks.pop(ctx.session_id, None)
 
 
 def _find_active_session() -> dict[str, Any] | None:
@@ -168,6 +195,62 @@ def _find_active_session() -> dict[str, Any] | None:
         if isinstance(s, dict) and s.get("status") in ACTIVE_STATUSES:
             return s
     return None
+
+
+def _resolve_evaluated_trace(trace_id: str) -> dict[str, Any]:
+    """校验 trace 存在 + 已有 done 评估报告 + findings 结构化（决策 S8）。
+
+    Raises:
+        HTTPException: trace 不存在 / 未评估 / findings 缺失。
+    Returns:
+        评估 session dict（含 eval_id/findings/scores/report_md）。
+    """
+    from app.view.traces import get_trace
+    try:
+        get_trace(trace_id)
+    except Exception:
+        raise HTTPException(
+            status_code=404,
+            detail=f"trace {trace_id} 不存在",
+        )
+
+    eval_session = eval_repo.get_done_by_trace(trace_id)
+    if eval_session is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"trace {trace_id} 尚未评估，请先在评估功能中评估后再启动进化",
+        )
+
+    findings = eval_session.get("findings")
+    if not findings or not isinstance(findings, list):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"trace {trace_id} 的评估报告缺少结构化诊断（findings 为空），"
+                f"可能是评估时基础设施故障产出的降级报告。请重新评估后再启动进化"
+            ),
+        )
+    return eval_session
+
+
+def _build_evolve_ctx(session_id: str, trace_id: str, eval_session: dict[str, Any]) -> EvolveContext:
+    """构建进化上下文：加载评估快照 + 注入 recorder + 关联 eval_ref。
+
+    单体 /start 和对话式 /start-converse 共用。
+    """
+    ctx = EvolveContext(session_id=session_id)
+    ctx.recorder = get_recorder()
+    ctx.trace_id = trace_id
+    ctx.origin_layer = _resolve_origin_layer(trace_id)
+    ctx.eval_snapshot = {
+        "eval_id": eval_session["eval_id"],
+        "trace_id": eval_session.get("trace_id"),
+        "scores": eval_session.get("scores"),
+        "findings": eval_session.get("findings"),
+        "report_md": eval_session.get("report_md"),
+    }
+    ev_db.update_session(session_id, eval_ref=eval_session["eval_id"])
+    return ctx
 
 
 def _resolve_origin_layer(trace_id: str) -> str | None:
@@ -207,6 +290,66 @@ async def _run_evolve_bg(ctx: EvolveContext, trace_id: str) -> None:
 
 
 # ── 查询 ────────────────────────────────────────────────────
+
+
+@router.get("/evolve/system-prompt")
+def get_system_prompt() -> dict[str, Any]:
+    """返回进化 Agent 的静态架构蓝图（决策 F/Q/R）。
+
+    前端「架构蓝图」Tab 的数据源——打开进化页即可调用，不依赖任何 session。
+    返回 STATIC_BLUEPRINT（7 段全景 + 角色定位 + 能力边界 + 对创作 Agent 的理解）。
+    动态注入部分（session_id / eval_summary / reflections / memory）不在此返回。
+
+    Returns:
+        {blueprint: <markdown 字符串>, version: <服务版本>}
+    """
+    from app.evolve.agent.prompt import STATIC_BLUEPRINT
+    return {
+        "blueprint": STATIC_BLUEPRINT,
+        "version": "v0.2.24",
+    }
+
+
+@router.get("/evolve/sessions/{session_id}/messages")
+def get_messages(session_id: str, after_seq: int | None = None) -> dict[str, Any]:
+    """列出 session 的对话消息（决策 H/T6，前端刷新恢复）。
+
+    旧会话（无 evolve_messages 记录）返回空列表——前端据此识别"旧版会话"
+    并提示用户（决策 S）。
+
+    Args:
+        session_id: session id
+        after_seq: 增量拉取——只返回 seq > after_seq 的消息；None = 全量
+    Returns:
+        {messages: [EvolveMessage, ...]}
+    """
+    session = ev_db.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"session {session_id} 不存在")
+
+    from app.evolve.evolve_repo import EvolveMessagesRepo
+    messages = EvolveMessagesRepo.list_by_session(session_id, after_seq=after_seq)
+    return {"messages": messages}
+
+
+@router.get("/evolve/sessions/{session_id}/points")
+def get_points(session_id: str) -> dict[str, Any]:
+    """列出 session 的进化点清单（决策 M/T7，右侧浮窗数据源）。
+
+    返回全部进化点（含 proposed/accepted/rejected 状态），按 seq 升序。
+    前端浮窗据此渲染状态图标 + 双向高亮联动（决策 N）。
+
+    Returns:
+        {points: [EvolvePoint, ...], accepted_count: <int>}
+    """
+    session = ev_db.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"session {session_id} 不存在")
+
+    from app.evolve.evolve_repo import EvolvePointsRepo
+    points = EvolvePointsRepo.list_by_session(session_id)
+    accepted_count = sum(1 for p in points if p.get("status") == "accepted")
+    return {"points": points, "accepted_count": accepted_count}
 
 
 @router.get("/evolve/sessions")
@@ -472,8 +615,8 @@ def publish_session(session_id: str) -> dict[str, Any]:
 
 
 @router.post("/evolve/sessions/{session_id}/discard")
-def discard_session(session_id: str) -> dict[str, Any]:
-    """丢弃：回退 working 区到上一 production 版本（S9）。
+async def discard_session(session_id: str) -> dict[str, Any]:
+    """丢弃：回退 working 区到上一 production 版本（S9）+ 清 checkpoint（Phase 3）。
 
     流程：
       1. 校验 session 状态为 pending_review
@@ -521,6 +664,10 @@ def discard_session(session_id: str) -> dict[str, Any]:
         # 推进状态
         ev_db.update_session(session_id, status="discarded")
 
+        # Phase 3：清理 checkpoint db（决策 I/T5）——discarded session 的对话状态
+        # 不再需要，删文件释放空间。失败不影响主流程（最多留个孤儿文件）。
+        await _cleanup_checkpoint(session_id)
+
         logger.info(
             "进化丢弃: session=%s reset to %s",
             session_id, target_commit,
@@ -534,6 +681,188 @@ def discard_session(session_id: str) -> dict[str, Any]:
     except Exception as e:
         logger.exception("丢弃失败: session=%s", session_id)
         raise HTTPException(status_code=500, detail=f"丢弃失败：{e}")
+
+
+# ── 对话式共创（Phase 3，决策 T2/T10）─────────────────────────
+
+
+class EvolveMessageRequest(BaseModel):
+    """用户发消息请求体。"""
+
+    content: str  # 用户消息正文（markdown，决策 X）
+
+
+@router.post("/evolve/sessions/{session_id}/messages", status_code=202)
+async def send_message(session_id: str, req: EvolveMessageRequest) -> dict[str, Any]:
+    """用户发消息，触发一轮对话（决策 T2 按需触发）。
+
+    行为（决策 T2/H/J）：
+      1. 校验 session 存在 + status=conversing
+      2. 持久化用户消息到 evolve_messages（决策 H 完全持久化）
+      3. 启动后台 task 跑 converse round（Agent 回复 + 可能调进化点工具）
+      4. 立即返回 message_id（不阻塞，Agent 回复通过 SSE 推送）
+
+    Args:
+        session_id: session id
+        req.content: 用户消息正文
+    Returns:
+        {message_id, seq, session_id, status}
+    """
+    session = ev_db.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"session {session_id} 不存在")
+    if session.get("status") != STATUS_CONVERSING:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"session 状态为 {session.get('status')}，"
+                f"只有 conversing 可发消息（启动会话调 /start-converse）"
+            ),
+        )
+
+    # 持久化用户消息（决策 H）
+    from app.evolve.evolve_repo import EvolveMessagesRepo
+    msg = EvolveMessagesRepo.append(
+        session_id, role="user", content=req.content,
+    )
+
+    # 重建 ctx（按需触发模型——不持有进程内 ctx，每次从 DB 重建）
+    ctx = _rebuild_ctx_from_db(session_id)
+    if ctx is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"重建 ctx 失败（session {session_id} 缺 eval_ref 或评估报告）",
+        )
+
+    # 启动 converse round（不传整条对话历史——LangGraph 通过 thread_id 从 checkpoint 取）
+    from app.evolve.agent.agent import run_converse_round
+    task = asyncio.create_task(_run_round_bg(ctx, run_converse_round, req.content))
+    _running_tasks[session_id] = task
+
+    logger.info("session %s: 用户消息触发 converse round (seq=%d)", session_id, msg["seq"])
+    return {
+        "message_id": msg["id"],
+        "seq": msg["seq"],
+        "session_id": session_id,
+        "status": "conversing",
+    }
+
+
+@router.post("/evolve/sessions/{session_id}/finalize", status_code=202)
+async def finalize_session(session_id: str) -> dict[str, Any]:
+    """用户拍板，触发落地（决策 C/D/T10）。
+
+    前置（决策 C/A）：
+      - session.status = conversing
+      - 至少 1 个 accepted 进化点
+
+    行为：
+      1. 从 accepted 进化点生成 design_doc.md（决策 T3/U）
+      2. status = finalizing（FlowGuard 解锁落地工具）
+      3. 后台 task 跑 finalize round（Agent 落地 → validate → change_log）
+      4. 成功 → pending_review → 前端自动跳 review-report（决策 AA，前端实现）
+         失败 → failed
+
+    Returns:
+        {session_id, status, accepted_count, design_doc_path}
+    """
+    session = ev_db.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"session {session_id} 不存在")
+    if session.get("status") != STATUS_CONVERSING:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"session 状态为 {session.get('status')}，"
+                f"只有 conversing 可拍板（先 /start-converse + 对话）"
+            ),
+        )
+
+    # 校验至少 1 个 accepted 进化点（决策 C/A）
+    from app.evolve.evolve_repo import EvolvePointsRepo
+    accepted_count = EvolvePointsRepo.count_accepted(session_id)
+    if accepted_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="拍板失败：没有 accepted 进化点（至少需要 1 个，决策 A）",
+        )
+
+    # 重建 ctx
+    ctx = _rebuild_ctx_from_db(session_id)
+    if ctx is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"重建 ctx 失败（session {session_id} 缺 eval_ref 或评估报告）",
+        )
+
+    # 启动 finalize round（内部会生成 design_doc + 切 finalizing + Agent 落地）
+    from app.evolve.agent.agent import run_finalize_round
+    task = asyncio.create_task(_run_round_bg(ctx, run_finalize_round))
+    _running_tasks[session_id] = task
+
+    logger.info(
+        "session %s: 用户拍板触发 finalize round（%d 个 accepted 进化点）",
+        session_id, accepted_count,
+    )
+    return {
+        "session_id": session_id,
+        "status": "finalizing",
+        "accepted_count": accepted_count,
+    }
+
+
+def _rebuild_ctx_from_db(session_id: str) -> EvolveContext | None:
+    """从 DB 重建进化上下文（决策 T2 按需触发——每次请求都重建）。
+
+    按需触发模型下，ctx 不在进程内常驻。每条用户消息/拍板请求都重建：
+      - session 元数据（status / trace_id / design_doc_path 等）
+      - eval_snapshot（从 eval_ref 反查 evaluation_sessions）
+      - recorder 注入
+
+    缺 eval_ref 或评估报告缺失时返回 None（调用方报 500）。
+    """
+    session = ev_db.get_session(session_id)
+    if session is None:
+        return None
+
+    ctx = EvolveContext(session_id=session_id)
+    ctx.recorder = get_recorder()
+    ctx.trace_id = session.get("baseline_trace") or ""
+    ctx.design_doc_path = session.get("design_doc_path") or ""
+    ctx.change_log_path = session.get("change_log_path") or ""
+    ctx.session_status = session.get("status") or STATUS_RUNNING
+    ctx.thread_id = session_id  # thread_id 始终 = session_id（决策 T1）
+    ctx.origin_layer = _resolve_origin_layer(ctx.trace_id) if ctx.trace_id else None
+
+    # 从 eval_ref 反查评估快照
+    eval_ref = session.get("eval_ref")
+    if eval_ref:
+        ev = eval_repo.get_session(eval_ref)
+        if ev:
+            ctx.eval_snapshot = {
+                "eval_id": ev.get("eval_id"),
+                "trace_id": ev.get("trace_id"),
+                "scores": ev.get("scores"),
+                "findings": ev.get("findings"),
+                "report_md": ev.get("report_md"),
+            }
+            if not ctx.trace_id:
+                ctx.trace_id = ev.get("trace_id") or ""
+
+    return ctx
+
+
+async def _cleanup_checkpoint(session_id: str) -> None:
+    """清理 session 的 checkpoint db（决策 I/T5）。
+
+    discarded/failed session 不再需要对话状态，删文件释放空间。
+    失败不影响主流程（最多留个孤儿文件，下次进程重启或手动清理）。
+    """
+    try:
+        from app.evolve.agent.checkpoint_pool import get_checkpoint_pool
+        await get_checkpoint_pool().drop(session_id)
+    except Exception:
+        logger.warning("清理 checkpoint 失败: session=%s", session_id, exc_info=True)
 
 
 __all__ = ["router"]
