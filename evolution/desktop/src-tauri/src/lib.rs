@@ -2,9 +2,13 @@
 //
 // 复用写作 desktop 的 Rust 基建层（桌面化改造 2026-07-07）：
 // - state:  app 级 reqwest Client 单例 + server_url 管理（cookie jar 自动带 session）
-// - http:   http_request / stream_request command（绕 WebView CORS，SSE 中继）
+// - http:   http_request command（绕 WebView CORS）
 // - config: server_url 读写 command
 // - updater: 自动更新检查 + 安装（2026-07-08 新增，独立 latest-evo.json 发布渠道）
+//
+// trace 稳定性重构（设计 20260720_203000）：stream_request command 已从 invoke_handler
+// 注销（SSE 物理删除）。http.rs/state.rs 的 stream 相关代码保留但不再对外暴露——
+// 大面积 Rust 删除编译风险高，且 dead code 不影响运行。
 
 mod config;
 mod http;
@@ -39,7 +43,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             http::http_request,
-            http::stream_request,
             config::get_server_url,
             config::set_server_url,
             config::reset_server_url,

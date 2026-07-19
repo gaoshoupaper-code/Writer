@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { evoSseStream } from "@/lib/stream";
 import {
   finalizeEvolve,
   getEvolveMessages,
@@ -9,6 +8,7 @@ import {
   getEvolveSession,
   getEvolveSessions,
   getEvaluatedTraces,
+  getEvolveSessionEventsSince,
   sendEvolveMessage,
   startEvolveConverse,
   stopEvolve,
@@ -141,19 +141,64 @@ export default function WorkbenchTab() {
     }
   }
 
-  // ── SSE 订阅（决策 W：实时事件）─────────────────────────────
+  // ── trace 稳定性重构：Pull 轮询（替代 SSE，设计 20260720_203000）──
+  // 评估进行中每 1s 拉增量事件帧；has_more=true 立即续拉（保持 token 流实时性）。
   async function subscribeStream(sessionId: string) {
     streamCancelRef.current?.();
-    try {
-      const gen = evoSseStream(`/api/evolve/sessions/${sessionId}/stream`, {
-        method: "GET",
-      });
-      for await (const frame of gen) {
-        handleSseFrame(sessionId, frame);
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let sinceSeq = 0;
+
+    streamCancelRef.current = () => {
+      cancelled = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
       }
-    } catch {
-      // SSE 断开（用户离开/网络问题），静默处理
-    }
+    };
+
+    const POLL_INTERVAL_MS = 1000;
+    const ERROR_BACKOFF_MS = 3000;
+
+    const poll = async () => {
+      if (cancelled) return;
+      try {
+        const resp = await getEvolveSessionEventsSince(sessionId, sinceSeq);
+        if (cancelled) return;
+
+        // 派发每帧到 handleSseFrame（复用 SSE 时代的帧处理逻辑，零改动）。
+        for (const frame of resp.frames) {
+          handleSseFrame(sessionId, frame);
+        }
+        sinceSeq = resp.max_seq;
+
+        // has_more=true：事件积压（token 流），立即续拉（不等 1s，保实时性）。
+        if (resp.has_more) {
+          timer = setTimeout(poll, 0);
+          return;
+        }
+
+        // session_status 终态：派发 end 帧（复用 handleSseFrame 的 end 处理逻辑：
+        // 刷新列表 + 跳转 review），然后停止轮询。SSE 时代 end 帧由后端额外 yield，
+        // Pull 模式靠 session_status 判定终态后在前端模拟派发。
+        const terminal = ["published", "discarded", "failed", "cancelled"].includes(
+          resp.session_status,
+        );
+        if (terminal) {
+          handleSseFrame(sessionId, { type: "end" });
+          return;
+        }
+
+        // running 中：安排下次轮询。
+        timer = setTimeout(poll, POLL_INTERVAL_MS);
+      } catch {
+        if (cancelled) return;
+        // 网络抖动：退避后继续（不丢已拉帧）。
+        timer = setTimeout(poll, ERROR_BACKOFF_MS);
+      }
+    };
+
+    poll();
   }
 
   function handleSseFrame(sessionId: string, frame: any) {

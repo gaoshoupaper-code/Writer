@@ -20,8 +20,7 @@ import logging
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from app.eval_agent import repo as eval_repo
@@ -489,59 +488,72 @@ def stop_session(session_id: str) -> dict[str, Any]:
 # ── SSE 实时流 ──────────────────────────────────────────────
 
 
-@router.get("/evolve/sessions/{session_id}/stream")
-async def stream_session(session_id: str) -> StreamingResponse:
-    """SSE 实时推送进化 Agent 的执行步骤（D3/D4：从 recorder trace 事件流派生）。"""
-    recorder = get_recorder()
-    if recorder is None:
-        raise HTTPException(status_code=503, detail="trace recorder 未启动")
+# ── trace 稳定性重构：Pull 模式事件流（替代 SSE，设计 20260720_203000）──
 
-    # 按 session_id 查自观测 trace_id。
-    trace_id_self = recorder.get_trace_id_by_session(session_id)
-    if trace_id_self is None:
-        raise HTTPException(status_code=404, detail=f"session {session_id} 事件流不存在")
 
-    queue = recorder.get_active_queue(trace_id_self)
+class EvolveEventsSinceResponse(BaseModel):
+    """进化 session 事件游标拉取响应（替代 SSE /stream）。"""
+    frames: list[dict[str, Any]]   # 从 run_meta 派生的 step/log/model_stream/... 帧（按 sequence 升序）
+    max_seq: int                    # 本次返回的最大 sequence（前端下次 since_seq）；无事件时 = since_seq
+    has_more: bool                  # 是否还有更多事件未拉（前端立即续拉，token 流不丢实时性）
+    session_status: str             # session 当前状态（running/conversing/...），前端据此判断是否继续轮询
 
-    async def event_generator():
-        try:
-            yield f"data: {json.dumps({'type': 'start', 'session_id': session_id}, ensure_ascii=False)}\n\n"
 
-            while True:
-                if queue is None:
-                    yield f"data: {json.dumps({'type': 'end'}, ensure_ascii=False)}\n\n"
-                    break
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    if recorder.is_terminal(trace_id_self):
-                        yield f"data: {json.dumps({'type': 'end'}, ensure_ascii=False)}\n\n"
-                        break
-                    yield f"data: {json.dumps({'type': 'heartbeat'}, ensure_ascii=False)}\n\n"
-                    continue
+@router.get("/evolve/sessions/{session_id}/events/since", response_model=EvolveEventsSinceResponse)
+def get_session_events_since(
+    session_id: str,
+    since_seq: int = Query(0, ge=0, description="返回 sequence > since_seq 的事件"),
+    limit: int = Query(500, ge=1, le=1000, description="单次返回上限"),
+) -> EvolveEventsSinceResponse:
+    """按 sequence 游标拉取进化 session 的事件帧（Pull 主导，替代 SSE /stream）。
 
-                # trace 事件 → SSE 帧派生。
-                frame = _trace_event_to_sse(event)
+    实现：从 evolve_sessions.self_trace_id 反查 trace_id → 查 event_payloads 表的
+    run_meta 事件 → 用 _trace_event_to_sse 派生成 model_stream/model_output/tool_call/
+    phase/log/step/proposal/finalizing 帧。
+
+    token 级流式（model_stream）：前端检测 has_more=true 时立即续拉（不等 1s），
+    延迟只有网络 RTT（几十 ms），打字机效果几乎保留。
+    """
+    session = ev_db.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"session {session_id} 不存在")
+
+    self_trace_id = session.get("self_trace_id")
+    frames: list[dict[str, Any]] = []
+    max_seq = since_seq
+
+    if self_trace_id:
+        rows = db.query_all(
+            """SELECT sequence, payload_json FROM event_payloads
+               WHERE trace_id=? AND sequence>?
+               ORDER BY sequence LIMIT ?""",
+            (self_trace_id, since_seq, limit + 1),
+        )
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+
+        for r in rows:
+            seq = r["sequence"]
+            if seq > max_seq:
+                max_seq = seq
+            try:
+                from app.core.models import TraceLogEvent
+                evt = TraceLogEvent.model_validate(json.loads(r["payload_json"]))
+                frame = _trace_event_to_sse(evt)
                 if frame:
-                    yield f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"
+                    frame["_seq"] = seq
+                    frames.append(frame)
+            except Exception:
+                # 单条解析失败不阻断其它事件。
+                continue
+    else:
+        has_more = False
 
-                if event.type in ("run_end", "run_error", "run_cancelled"):
-                    end_type = "end" if event.type == "run_end" else "error"
-                    yield f"data: {json.dumps({'type': end_type}, ensure_ascii=False)}\n\n"
-                    break
-        except asyncio.CancelledError:
-            logger.info("session %s SSE 流被取消", session_id)
-        except Exception:
-            logger.exception("session %s SSE 流异常", session_id)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+    return EvolveEventsSinceResponse(
+        frames=frames,
+        max_seq=max_seq,
+        has_more=has_more,
+        session_status=session.get("status", "running"),
     )
 
 

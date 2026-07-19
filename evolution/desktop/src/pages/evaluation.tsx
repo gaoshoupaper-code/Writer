@@ -3,15 +3,16 @@ import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { evoSseStream } from "@/lib/stream";
 import {
   getEvalSessions,
   getEvalSession,
   startEval,
   stopEval,
   getTraces,
+  getEvalSessionEventsSince,
   type EvalSession,
   type TraceListItem,
+  type EvalFrame,
 } from "@/lib/api";
 
 /**
@@ -115,36 +116,66 @@ export default function EvaluationPage() {
   }
 
   async function subscribeStream(evalId: string) {
+    // trace 稳定性重构（设计 20260720_203000）：从 SSE 改为 Pull 轮询。
+    // 评估进行中每 1s 拉一次增量事件帧；eval_status 非 running 时停止。
     if (streamCancelRef.current) streamCancelRef.current();
     let cancelled = false;
-    streamCancelRef.current = () => { cancelled = true; };
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let sinceSeq = 0;
 
-    try {
-      const gen = evoSseStream(`/api/eval-agent/sessions/${evalId}/stream`, { method: "GET" });
-      for await (const frame of gen) {
-        if (cancelled) break;
-        if (frame.type === "heartbeat") continue;
-        setLiveLogs((prev) => [...prev, frame]);
-        if (frame.type === "end" || frame.type === "error") {
+    streamCancelRef.current = () => {
+      cancelled = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+
+    const POLL_INTERVAL_MS = 1000;
+    const ERROR_BACKOFF_MS = 3000;
+
+    const poll = async () => {
+      if (cancelled) return;
+      try {
+        const resp = await getEvalSessionEventsSince(evalId, sinceSeq);
+        if (cancelled) return;
+
+        if (resp.frames.length > 0) {
+          setLiveLogs((prev) => [...prev, ...resp.frames]);
+          sinceSeq = resp.max_seq;
+        }
+
+        // has_more=true 时立即续拉（事件积压时不等 1s）。
+        if (resp.has_more) {
+          timer = setTimeout(poll, 0);
+          return;
+        }
+
+        // eval_status 非 running：评估结束，拉详情 + 停止轮询。
+        if (resp.eval_status !== "running") {
           setStreaming(false);
           setStreamingEvalId(null);
-          // 拉取最新评估详情（含报告），确保 selectedEval 更新为带 report_md 的完整数据
           try {
             const detail = await getEvalSession(evalId);
-            setSelectedEval(detail);
+            if (!cancelled) setSelectedEval(detail);
           } catch {
             // 详情拉取失败时退回列表刷新
           }
-          refresh();
-          break;
+          if (!cancelled) refresh();
+          return;
         }
+
+        // running 中：安排下次轮询。
+        timer = setTimeout(poll, POLL_INTERVAL_MS);
+      } catch (err) {
+        if (cancelled) return;
+        // 网络抖动 / 后端临时不可达：退避后继续轮询（不崩，不丢失已拉日志）。
+        timer = setTimeout(poll, ERROR_BACKOFF_MS);
       }
-    } catch (err) {
-      if (!cancelled) {
-        toast.error(err instanceof Error ? err.message : "实时流中断");
-        setStreaming(false);
-      }
-    }
+    };
+
+    // 立即拉一次（不等 1s）。
+    poll();
   }
 
   return (

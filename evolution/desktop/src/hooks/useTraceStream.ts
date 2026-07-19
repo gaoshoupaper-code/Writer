@@ -1,21 +1,17 @@
 // useTracePolling —— trace 详情轮询生命周期 hook（trace 稳定性重构）。
 //
 // 设计变更（设计 20260720_203000）：从 SSE 主导改为 Pull 主导。
-//   旧版（SSE）：getTraceDetail 打底 → 探活 → 开 evoTraceStream 收 node patch
-//                → 断了永久停在旧值，无重连，event_count 不更新
 //   新版（Pull）：1s 轮询 /traces/{id} 拿全量 detail（含后端投影的 nodes）
 //                → running 持续轮询；终态停止；error 退避下个 tick 恢复
 //
-// 为什么 Pull 比 SSE 稳（根因 B/C 的解法）：
+// 为什么 Pull 比 SSE 稳：
 //   - 幂等：每次轮询都是完整快照，断了下个 tick 自动恢复
-//   - event_count 实时：detail.run.event_count 每次轮询都从 DB 读，不再卡住
-//   - 状态准：runs.status 是后端 recorder 心跳刷新的单一真相源，前端直接读
-//   - 零状态协调：前端不需要 SSE hub / queue / source 判定，逻辑极简
+//   - event_count 实时：detail.run.event_count 每次轮询都从 DB 读
+//   - 状态准：runs.status 是后端 recorder 心跳刷新的真相源
+//   - 零状态协调：前端不需要 SSE hub / queue / source 判定
 //
-// 为什么不需要 events/since 接口：
-//   详情页主视图只需 run + nodes（后端投影），events 只给抽屉懒加载用
-//   （点开 LLM 节点看 input/output 时走 /events?event_ids= 老接口）。
-//   投影完全由后端 /traces/{id} 负责，前端零投影逻辑。
+// 详情页主视图只需 run + nodes（后端投影），events 给抽屉懒加载用
+// （点开 LLM 节点看 input/output 时走 /events?event_ids= 接口）。
 
 import { useEffect, useRef, useState } from "react";
 import { getTraceDetail, getActiveSession, type ActiveSession } from "@/lib/api";

@@ -501,6 +501,35 @@ export async function stopEval(evalId: string): Promise<{ status: string; eval_i
   return evoJson(`/api/eval-agent/sessions/${evalId}/stop`, { method: "POST" });
 }
 
+/**
+ * 按 sequence 游标拉取评估 session 的事件帧（Pull 替代 SSE，设计 20260720_203000）。
+ * 返回从 run_meta 派生的 step/log 帧，前端轮询消费。
+ */
+export interface EvalFrame {
+  type: "step" | "log" | "start" | "end" | "error";
+  [key: string]: unknown;
+  /** 事件 sequence（前端去重用，轮询重试不会重复渲染）。 */
+  _seq?: number;
+}
+
+export interface EvalEventsSinceResponse {
+  frames: EvalFrame[];
+  max_seq: number;
+  has_more: boolean;
+  eval_status: string; // running / done / failed
+}
+
+export async function getEvalSessionEventsSince(
+  evalId: string,
+  sinceSeq: number,
+  limit = 500,
+): Promise<EvalEventsSinceResponse> {
+  return evoJson<EvalEventsSinceResponse>(
+    `/api/eval-agent/sessions/${evalId}/events/since?since_seq=${sinceSeq}&limit=${limit}`,
+    { method: "GET" },
+  );
+}
+
 export async function getEvalSessions(limit = 50): Promise<{ sessions: EvalSession[]; total: number }> {
   return evoJson(`/api/eval-agent/sessions?limit=${limit}`, { method: "GET" });
 }
@@ -603,6 +632,46 @@ export async function startEvolve(traceId: string): Promise<{ session_id: string
 
 export async function stopEvolve(sessionId: string): Promise<{ status: string; session_id: string }> {
   return evoJson(`/api/evolve/sessions/${sessionId}/stop`, { method: "POST" });
+}
+
+/**
+ * 按 sequence 游标拉取进化 session 的事件帧（Pull 替代 SSE，设计 20260720_203000）。
+ * 返回从 run_meta 派生的 model_stream/model_output/tool_call/phase/log/step/proposal/finalizing 帧。
+ * token 级流式（model_stream）通过 has_more 立即续拉保持实时性。
+ */
+export interface EvolveFrame {
+  type:
+    | "model_stream"
+    | "model_output"
+    | "tool_call"
+    | "phase"
+    | "log"
+    | "step"
+    | "proposal"
+    | "finalizing"
+    | "start"
+    | "end"
+    | "error";
+  [key: string]: unknown;
+  _seq?: number;
+}
+
+export interface EvolveEventsSinceResponse {
+  frames: EvolveFrame[];
+  max_seq: number;
+  has_more: boolean;
+  session_status: string; // running / conversing / finalizing / pending_review / published / ...
+}
+
+export async function getEvolveSessionEventsSince(
+  sessionId: string,
+  sinceSeq: number,
+  limit = 500,
+): Promise<EvolveEventsSinceResponse> {
+  return evoJson<EvolveEventsSinceResponse>(
+    `/api/evolve/sessions/${sessionId}/events/since?since_seq=${sinceSeq}&limit=${limit}`,
+    { method: "GET" },
+  );
 }
 
 export async function getEvolveSessions(limit = 50): Promise<{ sessions: EvolveSession[]; total: number }> {

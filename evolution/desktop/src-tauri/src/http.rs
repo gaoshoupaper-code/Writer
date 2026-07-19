@@ -158,6 +158,10 @@ pub async fn http_request(
 /// 4. `invoke("stream_request", { path, method, body, stream_id })`（不 await 结果，靠 event 收）
 ///
 /// Rust 端：reqwest bytes_stream → 每个 chunk 转 String → emit "sse_chunk" → 流结束 emit "sse_end"
+///
+/// trace 稳定性重构（设计 20260720_203000）：已从 lib.rs invoke_handler 注销，
+/// 不再对外暴露（SSE 物理删除）。代码保留避免大面积 Rust 改动编译风险。
+#[allow(dead_code)]
 #[tauri::command]
 pub async fn stream_request(
     app: AppHandle,

@@ -20,8 +20,7 @@ import uuid
 from typing import Any
 
 import app.core.db as db
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from app.eval_agent import repo as eval_repo
@@ -198,6 +197,78 @@ def get_session(eval_id: str) -> dict[str, Any]:
     return session
 
 
+# ── trace 稳定性重构：Pull 模式事件流（替代 SSE，设计 20260720_203000）──
+
+
+class EvalEventsSinceResponse(BaseModel):
+    """评估 session 事件游标拉取响应（替代 SSE /stream）。"""
+    frames: list[dict[str, Any]]   # 从 run_meta 派生的 step/log 帧（按 sequence 升序）
+    max_seq: int                    # 本次返回的最大 sequence（前端下次 since_seq）；无事件时 = since_seq
+    has_more: bool                  # 是否还有更多事件未拉
+    eval_status: str                # 评估 session 当前状态（running/done/failed），前端据此判断是否继续轮询
+
+
+@router.get("/sessions/{eval_id}/events/since", response_model=EvalEventsSinceResponse)
+def get_session_events_since(
+    eval_id: str,
+    since_seq: int = Query(0, ge=0, description="返回 sequence > since_seq 的事件"),
+    limit: int = Query(500, ge=1, le=1000, description="单次返回上限"),
+) -> EvalEventsSinceResponse:
+    """按 sequence 游标拉取评估 session 的事件帧（trace 稳定性重构，Pull 主导）。
+
+    替代 GET /sessions/{id}/stream SSE：前端轮询本接口拿 step/log 帧，
+    断了下个 tick 自动恢复。语义对齐 Phase 2 的 /traces/{id}/events/since。
+
+    实现：从 evaluation_sessions.self_trace_id 反查 trace_id → 查 event_payloads
+    表的 run_meta 事件 → 用 _trace_event_to_sse 派生成 step/log 帧。
+    """
+    session = eval_repo.get_session(eval_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"评估 session {eval_id} 不存在")
+
+    self_trace_id = session.get("self_trace_id")
+    frames: list[dict[str, Any]] = []
+    max_seq = since_seq
+
+    if self_trace_id:
+        # 拉增量事件（limit+1 探测 has_more）。
+        rows = db.query_all(
+            """SELECT sequence, payload_json FROM event_payloads
+               WHERE trace_id=? AND sequence>?
+               ORDER BY sequence LIMIT ?""",
+            (self_trace_id, since_seq, limit + 1),
+        )
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+
+        for r in rows:
+            seq = r["sequence"]
+            if seq > max_seq:
+                max_seq = seq
+            try:
+                from app.core.models import TraceLogEvent
+                evt = TraceLogEvent.model_validate(json.loads(r["payload_json"]))
+                frame = _trace_event_to_sse(evt)
+                if frame:
+                    # 附带 sequence 让前端能去重（轮询重试时不会重复渲染）。
+                    frame["_seq"] = seq
+                    frames.append(frame)
+            except Exception:
+                # 单条解析失败不阻断其它事件。
+                continue
+    else:
+        # self_trace_id 为 None：评估是 Phase 0 之前的旧 session，无录像。
+        # 不算错——直接返回空帧，eval_status 让前端知道是否继续轮询。
+        has_more = False
+
+    return EvalEventsSinceResponse(
+        frames=frames,
+        max_seq=max_seq,
+        has_more=has_more,
+        eval_status=session.get("status", "running"),
+    )
+
+
 @router.get("/evaluated-traces")
 def list_evaluated_traces(limit: int = 100) -> dict[str, Any]:
     """列已评估（有 done 记录）的 trace（进化入口「选已评估 trace」用）。"""
@@ -253,68 +324,6 @@ def stop_session(eval_id: str) -> dict[str, Any]:
 
 
 # ── SSE 实时流 ──────────────────────────────────────────────
-
-
-@router.get("/sessions/{eval_id}/stream")
-async def stream_session(eval_id: str) -> StreamingResponse:
-    """SSE 实时推送评估 Agent 的执行步骤（D3/D4：从 recorder trace 事件流派生）。
-
-    recorder 的 trace 事件（business_step + llm/tool 框架事件）派生为前端可消费的
-    step/log 帧。trace 终态时推送 end/error 帧并关闭流。
-    """
-    recorder = get_recorder()
-    if recorder is None:
-        raise HTTPException(status_code=503, detail="trace recorder 未启动")
-
-    # 按 eval_id（session_id）查自观测 trace_id。
-    trace_id_self = recorder.get_trace_id_by_session(eval_id)
-    if trace_id_self is None:
-        raise HTTPException(status_code=404, detail=f"评估 session {eval_id} 事件流不存在")
-
-    queue = recorder.get_active_queue(trace_id_self)
-
-    async def event_generator():
-        try:
-            yield f"data: {json.dumps({'type': 'start', 'eval_id': eval_id}, ensure_ascii=False)}\n\n"
-
-            while True:
-                if queue is None:
-                    # trace 已终态，队列已清。推 end 帧结束。
-                    yield f"data: {json.dumps({'type': 'end'}, ensure_ascii=False)}\n\n"
-                    break
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    if recorder.is_terminal(trace_id_self):
-                        yield f"data: {json.dumps({'type': 'end'}, ensure_ascii=False)}\n\n"
-                        break
-                    yield f"data: {json.dumps({'type': 'heartbeat'}, ensure_ascii=False)}\n\n"
-                    continue
-
-                # trace 事件 → SSE 帧派生（D3.4）。
-                frame = _trace_event_to_sse(event)
-                if frame:
-                    yield f"data: {json.dumps(frame, ensure_ascii=False)}\n\n"
-
-                # 终态事件 → 推 end 帧并退出。
-                if event.type in ("run_end", "run_error", "run_cancelled"):
-                    end_type = "end" if event.type == "run_end" else "error"
-                    yield f"data: {json.dumps({'type': end_type}, ensure_ascii=False)}\n\n"
-                    break
-        except asyncio.CancelledError:
-            logger.info("评估 session %s SSE 流被取消", eval_id)
-        except Exception:
-            logger.exception("评估 session %s SSE 流异常", eval_id)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
 
 
 def _trace_event_to_sse(event: Any) -> dict[str, Any] | None:

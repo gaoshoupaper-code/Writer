@@ -37,7 +37,6 @@ from app.versioning.snapshot_api import router as snapshot_router
 from app.versioning.elements_api import router as elements_router
 from app.view.active import router as active_api_router
 from app.view.agent_package import router as agent_package_router
-from app.view.sse_stream import router as sse_router
 from app.evolve.api import router as evolve_router
 from app.tests.api import router as tests_router
 from app.eval_agent.api import router as eval_agent_router
@@ -123,10 +122,9 @@ app.include_router(users_router, prefix="/api")
 app.include_router(snapshot_router, prefix="/api")
 # Harness 要素展示（前端「Harness 要素」页）
 app.include_router(elements_router, prefix="/api")
-# 监测前端新增端点（D7 active 富化 / D8 agent-package / D9 SSE stream）
+# 监测前端新增端点（D7 active 富化 / D8 agent-package）
 app.include_router(active_api_router, prefix="/api")
 app.include_router(agent_package_router, prefix="/api")
-app.include_router(sse_router, prefix="/api")
 # 进化端单进化 Agent：手动触发 + 查询 + SSE（替换旧 adapt 4 阶段）
 app.include_router(evolve_router, prefix="/api")
 # 手动单次测试入口（数据集选择 + Agent 版本选择 + 独立测试记录，D-Q9）
