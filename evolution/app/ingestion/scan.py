@@ -93,6 +93,8 @@ def _fetch_and_ingest(trace_id: str, workspace_hint: str | None) -> str | None:
     fetched = _fetch_trace_content(trace_id)
     if fetched is None:
         return None
-    events, hint = fetched
-    # 优先用列表端点返回的 workspace_id
-    return importer.ingest_events(events, workspace_hint or hint)
+    events, hint, run_status_hint = fetched
+    # 优先用列表端点返回的 workspace_id；run_status_hint 用于 importer 纠正运行中误判
+    return importer.ingest_events(
+        events, workspace_hint or hint, run_status_hint=run_status_hint
+    )

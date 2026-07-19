@@ -43,14 +43,18 @@ class NotifyBody(BaseModel):
     error: str | None = None
 
 
-def _fetch_trace_content(trace_id: str, since_seq: int = 0) -> tuple[list, str | None] | None:
+def _fetch_trace_content(
+    trace_id: str, since_seq: int = 0
+) -> tuple[list, str | None, str | None] | None:
     """从执行端 HTTP 拉取 trace 内容（run 摘要 + 事件列表）。
 
     since_seq（D8 增量）：只拉 sequence > since_seq 的事件。首次摄入传 0（全量）。
     执行端 GET /internal/traces/{trace_id}?since_seq=N 支持。
 
     Returns:
-        (events, workspace_id_hint) 或 None（拉取失败/未找到）。
+        (events, workspace_id_hint, run_status_hint) 或 None（拉取失败/未找到）。
+        run_status_hint 来自 executor run summary 的 status 字段（权威源），
+        供 importer 纠正"运行中无终结事件被误判 failed"的场景。
     """
     import httpx
     from contracts.trace import TraceLogEvent
@@ -65,8 +69,10 @@ def _fetch_trace_content(trace_id: str, since_seq: int = 0) -> tuple[list, str |
         resp.raise_for_status()
         data = resp.json()
         events = [TraceLogEvent.model_validate(e) for e in data.get("events", [])]
-        workspace_hint = data.get("run", {}).get("workspace_id")
-        return events, workspace_hint
+        run_summary = data.get("run", {}) or {}
+        workspace_hint = run_summary.get("workspace_id")
+        run_status_hint = run_summary.get("status")
+        return events, workspace_hint, run_status_hint
     except Exception as exc:
         logger.warning("拉取 trace %s 失败：%s", exc)
         return None
@@ -107,14 +113,17 @@ async def _ingest_async(trace_id: str) -> None:
     fetched = await asyncio.to_thread(_fetch_trace_content, trace_id, since_seq)
     if fetched is None:
         return
-    events, workspace_hint = fetched
+    events, workspace_hint, run_status_hint = fetched
     # 增量场景：本次无新事件（since_seq 已是最新）。
     # 仍可能是状态变迁通知（如 awaiting_input→running，resume 不产生事件只改 index），
     # 故不直接 return：用执行端 run 摘要的 status 覆盖本地，保持状态最终一致。
     if since_seq > 0 and not events:
         await asyncio.to_thread(_sync_status_only, trace_id)
         return
-    tid = await asyncio.to_thread(importer.ingest_events, events, workspace_hint, None, prior_events)
+    tid = await asyncio.to_thread(
+        importer.ingest_events,
+        events, workspace_hint, None, prior_events, run_status_hint,
+    )
     if tid is None:
         return
     # 评估已从摄入链路解耦（决策 S6）：不再摄入时自动评估，
@@ -225,6 +234,8 @@ def _sync_manual_test_status(trace_id: str, run_status: str) -> None:
     """trace 摄入完成后，按 trace_id 同步关联的手动测试记录状态（D-Q3）。
 
     completed → done；failed/cancelled → failed。
+    running/awaiting_input 是中间态，不触发终态判定——manual_tests 的 done/failed
+    应只由 trace 终态驱动，运行中摄入（如兜底扫描拉到运行中 trace）不应误标。
     """
     try:
         from app.tests import repo as test_repo
@@ -234,6 +245,8 @@ def _sync_manual_test_status(trace_id: str, run_status: str) -> None:
             return  # 非 manual_test 触发的 trace，跳过
         if row["status"] in ("done", "failed"):
             return  # 已终结，不重复更新
+        if run_status in ("running", "awaiting_input"):
+            return  # 中间态：测试记录保持 running，等终态再判定
         if run_status == "completed":
             test_repo.mark_done(row["test_id"], trace_id)
         elif run_status in ("failed", "cancelled"):

@@ -37,6 +37,7 @@ def ingest_events(
     workspace_id_hint: str | None = None,
     trace_path: Path | None = None,
     prior_events: list[TraceLogEvent] | None = None,
+    run_status_hint: str | None = None,
 ) -> str | None:
     """摄入已解析的事件列表：投影 + 入库（Phase 3 HTTP 拉取入口）。
 
@@ -46,6 +47,10 @@ def ingest_events(
     增量支持（D8）：prior_events 传入本地已入库的旧事件，与本次拉取的增量事件合并后
     全量投影。无 prior_events 时为首次摄入（全量）。nodes 必须全量重投影（projector
     需完整事件流配对），故内部仍 DELETE+INSERT。
+
+    run_status_hint：executor run summary 的权威 status。事件流是历史日志，无法表达
+    "此刻仍在运行"——只有 run_start 没有终结事件时，_derive_run_summary 默认判 failed，
+    hint 用于纠正这种"运行中被误判失败"的场景（详情见 _derive_run_summary）。
 
     Returns:
         摄入的 trace_id；若无有效事件则返回 None。
@@ -61,7 +66,9 @@ def ingest_events(
     if not all_events:
         return None
 
-    run, owner_user_id = _derive_run_summary(all_events, trace_path, workspace_id_hint)
+    run, owner_user_id = _derive_run_summary(
+        all_events, trace_path, workspace_id_hint, run_status_hint
+    )
 
     # 幂等：同 trace_id 重复摄入先删旧记录（trace_flags/nodes/events 随 ON DELETE CASCADE）
     db.execute("DELETE FROM runs WHERE trace_id = ?", (run.trace_id,))
@@ -76,9 +83,19 @@ def ingest_events(
 
 
 def _derive_run_summary(
-    events: list[TraceLogEvent], trace_path: Path | None, workspace_id_hint: str | None
+    events: list[TraceLogEvent],
+    trace_path: Path | None,
+    workspace_id_hint: str | None,
+    run_status_hint: str | None = None,
 ) -> TraceRunSummary:
-    """从 events 自洽推导 TraceRunSummary。"""
+    """从 events 自洽推导 TraceRunSummary。
+
+    status 推导优先级：
+      1. 事件流终结事件（run_end/run_error/run_cancelled/run_awaiting）—— 终态以事件为准
+      2. run_status_hint（executor run summary 权威 status）—— 仅在事件流未识别出
+         明确状态（即落到默认 failed 分支）时覆盖，纠正"运行中无终结事件被误判失败"
+      3. 默认 "failed"（异常终止，未正常收尾）
+    """
     run_start = next((e for e in events if e.type == "run_start"), None)
     run_end = next((e for e in events if e.type == "run_end"), None)
     run_error = next((e for e in events if e.type == "run_error"), None)
@@ -112,6 +129,12 @@ def _derive_run_summary(
     elif run_awaiting:
         # awaiting_input 是中间态（非终态）：无 ended_at/duration_ms
         status = "awaiting_input"
+
+    # executor run summary 是 status 权威源（事件流是历史日志，无法表达"此刻运行中"）。
+    # 只有落到默认 failed 分支（事件流无终结事件）才用 hint 纠正——可能是真异常终止，
+    # 也可能是运行中被扫描拉取；hint 区分两者。终态事件已识别时不覆盖（终态不回退）。
+    if run_status_hint and status == "failed" and run_status_hint != "failed":
+        status = run_status_hint
 
     # workspace_id：优先 run_start.input，其次 hint
     workspace_id = str(start_input.get("workspace_id") or workspace_id_hint or "unknown")
