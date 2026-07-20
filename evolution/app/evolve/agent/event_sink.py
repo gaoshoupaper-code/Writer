@@ -72,6 +72,10 @@ class EvolveEventSink:
         self.session_id = session_id
         # 跟踪进行中的 tool call id → name（on_tool_end 时反查 name）
         self._active_tools: dict[str, str] = {}
+        # 跟踪 LangGraph superstep 最大值（DD5）：从事件 metadata.langgraph_step 取，
+        # session 结束时由 _run_agent_streamed 写 step_stats run_meta（DD8）。
+        # 与 GraphRecursionError 的计数口径对齐，能直接回答"会不会触顶 200"。
+        self.max_superstep = 0
 
     async def on_event(self, event: dict) -> list[str]:
         """处理一个 astream_events 事件，返回要 yield 的 SSE 帧列表。
@@ -104,6 +108,12 @@ class EvolveEventSink:
         kind = event.get("event", "")
         name = event.get("name", "")
         data = event.get("data", {}) or {}
+
+        # 跟踪 LangGraph superstep 最大值（DD5）：每条 astream_events 都带 metadata，
+        # 其中 langgraph_step 是当前 superstep 序号。取 max 用于观测实际步数。
+        step = (event.get("metadata") or {}).get("langgraph_step")
+        if isinstance(step, int) and step > self.max_superstep:
+            self.max_superstep = step
 
         try:
             if kind == "on_chat_model_end":

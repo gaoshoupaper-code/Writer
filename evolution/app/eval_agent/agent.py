@@ -32,8 +32,9 @@ from app.trace import TraceMiddleware, TraceCallbackHandler
 logger = logging.getLogger("evolution.eval_agent.agent")
 
 # 不设总超时护栏（asyncio.wait_for）——评估时长不设上限，让它自然跑完。
-# 不设 recursion_limit 步数限制：步数交给框架默认（≈10007，事实上的不限制），
-# 避免正常评估因步数上限被误杀。GraphRecursionError 分支仅作极端死循环的防御性兜底。
+# 注意：recursion_limit 未显式设置，走 LangChain 框架默认 25（DeepAgents 想设 9999
+# 但未透传到运行时）。评估流程比进化简单，目前 25 够用；若未来触顶可参照
+# evolve/agent.py 的处理（显式 config["recursion_limit"] = N + _handle_recursion_error 兜底）。
 
 
 def build_eval_agent(ctx: EvaluationContext):

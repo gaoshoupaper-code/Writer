@@ -29,7 +29,7 @@ from app.core.settings import settings
 from app.common.middleware.no_fs import NoFilesystemToolsMiddleware
 from app.common.model_factory import build_agent_model
 from app.evolve.agent.middleware.flow_guard import FlowGuardMiddleware
-from app.evolve.agent.prompt import evolve_system_prompt, render_memory_section
+from app.evolve.agent.prompt import evolve_system_prompt
 from app.evolve.agent.tools import make_evolve_tools
 from app.evolve.ctx import EvolveContext, set_tool_context
 from app.trace import TraceMiddleware, TraceCallbackHandler
@@ -95,10 +95,55 @@ async def _run_agent_streamed(
                     **frame,
                 )
 
+    # 循环结束后写 step_stats run_meta（DD5+DD8）：观测实际跑了多少个 superstep，
+    # 为 recursion_limit=200 是否够用提供数据。零新增表，复用 run_meta 事件通道。
+    if ctx.recorder and ctx.trace_id_self and sink.max_superstep > 0:
+        try:
+            ctx.recorder.append_business_event(
+                ctx.trace_id_self,
+                tool="step_stats",
+                status="done",
+                max_superstep=sink.max_superstep,
+            )
+        except Exception:
+            logger.exception(
+                "session %s: 写 step_stats 失败（不影响主流程）",
+                ctx.session_id,
+            )
+
 
 # 不设总超时护栏（asyncio.wait_for）——进化时长不设上限，让它自然跑完。
-# 不设 recursion_limit 步数限制：步数交给框架默认（≈10007，事实上的不限制），
-# 避免正常进化因步数上限被误杀。GraphRecursionError 分支仅作极端死循环的防御性兜底。
+# recursion_limit 显式设 200（避免 LangChain 框架默认 25 误杀正常进化）。
+# GraphRecursionError 分支是兜底：模型陷入死循环（反复调工具不收尾）时强制收敛。
+
+
+async def _handle_recursion_error(ctx: "EvolveContext", round_name: str) -> None:
+    """GraphRecursionError 兜底（DD7）：标 session failed + recorder 收尾 + emit_log。
+
+    各 round 的 ``except GraphRecursionError`` 分支调用本函数完成副作用收敛，
+    然后各自 ``return`` 对应的状态 dict——helper 只管副作用，round 管返回值。
+    语义：recursion error 属于异常（Agent 没收敛），归 failed；
+    cancelled 只属于用户主动 stop，不与此混淆。
+
+    Args:
+        ctx:        进化上下文
+        round_name: 哪个 round 触顶（inspect/converse/finalize/evolve），用于日志定位
+    """
+    from app.evolve import db as ev_db
+
+    logger.warning(
+        "session %s: %s round 步数触顶（recursion_limit=200），未收敛",
+        ctx.session_id, round_name,
+    )
+    ev_db.update_session(ctx.session_id, status="failed")
+    if ctx.recorder and ctx.trace_id_self:
+        ctx.recorder.fail_run(
+            ctx.trace_id_self, f"{round_name} round 步数触顶（未收敛）"
+        )
+    ctx.emit_log(
+        f"{round_name} 阶段消耗过多步数仍未完成"
+        "（可能反复调用工具未收尾）。请重试，或检查模型是否稳定。"
+    )
 
 
 async def build_evolve_agent(ctx: EvolveContext):
@@ -139,7 +184,6 @@ async def build_evolve_agent(ctx: EvolveContext):
         trace_id=ctx.trace_id,
         eval_summary=_format_eval_summary(ctx),
         reflections_summary=_format_reflections(ctx),
-        memory_section=_format_memory_section(ctx),
     )
 
     # middleware：禁框架 fs + 产出约束 + 自观测 trace
@@ -214,6 +258,7 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
 
     config: dict[str, Any] = {
         "configurable": {"thread_id": ctx.thread_id},
+        "recursion_limit": 200,  # 显式放开（避免 LangChain 框架默认 25 误杀）
     }
     if ctx.recorder and ctx.trace_id_self:
         config["callbacks"] = [TraceCallbackHandler(ctx.recorder, ctx.trace_id_self)]
@@ -259,18 +304,8 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
             return {"status": "incomplete", "session_id": ctx.session_id}
 
     except GraphRecursionError:
-        # 步数触顶（仅当框架默认上限被触达时出现）：
-        # 模型陷入死循环没收敛（反复调工具不收尾）。
-        logger.warning(
-            "session %s: 进化 Agent 步数触顶（框架默认上限），未收敛", ctx.session_id
-        )
-        ctx.emit_log(
-            "进化 Agent 消耗了过多步数仍未完成"
-            "（可能反复调用工具未收尾）。请重试，或检查模型是否稳定。"
-        )
-        ev_db.update_session(ctx.session_id, status="failed")
-        if ctx.recorder and ctx.trace_id_self:
-            ctx.recorder.fail_run(ctx.trace_id_self, "进化 Agent 步数触顶（未收敛）")
+        # 步数触顶（recursion_limit=200）：模型陷入死循环没收敛（反复调工具不收尾）。
+        await _handle_recursion_error(ctx, "evolve")
         return {
             "status": "failed", "session_id": ctx.session_id,
             "error": "进化 Agent 步数触顶（未收敛）",
@@ -343,6 +378,7 @@ async def run_inspect_round(ctx: EvolveContext, trace_id: str) -> dict[str, Any]
     agent = await build_evolve_agent(ctx)
     config: dict[str, Any] = {
         "configurable": {"thread_id": ctx.thread_id},
+        "recursion_limit": 200,  # 显式放开（避免 LangChain 框架默认 25 误杀）
     }
     if ctx.recorder and ctx.trace_id_self:
         config["callbacks"] = [TraceCallbackHandler(ctx.recorder, ctx.trace_id_self)]
@@ -375,6 +411,13 @@ async def run_inspect_round(ctx: EvolveContext, trace_id: str) -> dict[str, Any]
         logger.info("session %s: inspect round 完成，转 conversing", ctx.session_id)
         return {"status": "conversing", "session_id": ctx.session_id}
 
+    except GraphRecursionError:
+        # 步数触顶（recursion_limit=200）：探查阶段陷入死循环。
+        await _handle_recursion_error(ctx, "inspect")
+        return {
+            "status": "failed", "session_id": ctx.session_id,
+            "error": "inspect round 步数触顶（未收敛）",
+        }
     except asyncio.CancelledError:
         logger.info("session %s: inspect round 被用户停止", ctx.session_id)
         ev_db.update_session(ctx.session_id, status=STATUS_CANCELLED)
@@ -422,6 +465,7 @@ async def run_converse_round(ctx: EvolveContext, user_message: str) -> dict[str,
     agent = await build_evolve_agent(ctx)
     config: dict[str, Any] = {
         "configurable": {"thread_id": ctx.thread_id},
+        "recursion_limit": 200,  # 显式放开（避免 LangChain 框架默认 25 误杀）
     }
     if ctx.recorder and ctx.trace_id_self:
         config["callbacks"] = [TraceCallbackHandler(ctx.recorder, ctx.trace_id_self)]
@@ -434,6 +478,14 @@ async def run_converse_round(ctx: EvolveContext, user_message: str) -> dict[str,
         logger.info("session %s: converse round 完成", ctx.session_id)
         return {"status": "conversing", "session_id": ctx.session_id}
 
+    except GraphRecursionError:
+        # 步数触顶（recursion_limit=200）：对话轮陷入死循环（异常 failed，
+        # 与用户主动 stop 的 cancelled 语义区分开——recursion 是 Agent 自身没收敛）。
+        await _handle_recursion_error(ctx, "converse")
+        return {
+            "status": "failed", "session_id": ctx.session_id,
+            "error": "converse round 步数触顶（未收敛）",
+        }
     except asyncio.CancelledError:
         # 用户停止输出（决策 L）：会话保留，status 不变
         logger.info("session %s: converse round 被用户停止（会话保留）", ctx.session_id)
@@ -493,6 +545,7 @@ async def run_finalize_round(ctx: EvolveContext) -> dict[str, Any]:
     agent = await build_evolve_agent(ctx)
     config: dict[str, Any] = {
         "configurable": {"thread_id": ctx.thread_id},
+        "recursion_limit": 200,  # 显式放开（避免 LangChain 框架默认 25 误杀）
     }
     if ctx.recorder and ctx.trace_id_self:
         config["callbacks"] = [TraceCallbackHandler(ctx.recorder, ctx.trace_id_self)]
@@ -529,6 +582,13 @@ async def run_finalize_round(ctx: EvolveContext) -> dict[str, Any]:
                 ctx.recorder.fail_run(ctx.trace_id_self, "未产出 change_log")
             return {"status": "failed", "error": "未产出 change_log", "session_id": ctx.session_id}
 
+    except GraphRecursionError:
+        # 步数触顶（recursion_limit=200）：落地阶段陷入死循环。
+        await _handle_recursion_error(ctx, "finalize")
+        return {
+            "status": "failed", "session_id": ctx.session_id,
+            "error": "finalize round 步数触顶（未收敛）",
+        }
     except asyncio.CancelledError:
         logger.info("session %s: finalize round 被用户停止", ctx.session_id)
         ev_db.update_session(ctx.session_id, status=STATUS_CANCELLED)
@@ -622,26 +682,6 @@ def _format_reflections(ctx: EvolveContext) -> str:
         hit = r.get("hit_count", 0)
         lines.append(f"  • [{r['category']}] (命中{hit}次) {r['pattern'][:120]}")
     return "\n".join(lines)
-
-
-def _format_memory_section(ctx: EvolveContext) -> str:
-    """探测当前 harness 工作副本是否有记忆要素，有则渲染记忆子系统认知节。
-
-    认定"哪些是记忆要素"与 elements_api 同源——都读 versioning.constants.MEMORY_FILES。
-    探测逻辑：检查 settings.harness_work_dir_path 下 MEMORY_FILES 的文件是否存在，
-    任意一个存在即认定该包有记忆子系统（注入认知节），全无则返回空串（老版本兼容）。
-
-    注意与桌面的数据源差异：这里探测的是【工作副本】（Agent 在上面做改动），
-    桌面 memory-elements 接口查的是【git 快照】（已发布版本）。两者数据源不同是合理的——
-    Agent 在工作副本上进化，桌面展示历史版本。
-    """
-    from app.versioning.constants import MEMORY_FILES
-
-    work_dir = settings.harness_work_dir_path
-    has_memory = any((work_dir / path).exists() for path in MEMORY_FILES)
-    if not has_memory:
-        return ""
-    return render_memory_section()
 
 
 __all__ = [

@@ -2,7 +2,7 @@
 
 被两处复用，确保前后端认定"什么是记忆要素"同源，避免清单漂移：
   - elements_api：扫描打 tag + memory-elements 接口返回
-  - evolve/agent：_format_memory_section 探测当前工作副本是否有记忆要素 → prompt 注入
+  - evolve/agent/prompt：STATIC_BLUEPRINT ③ 段 memory 类描述（已固化，不再条件注入）
 
 记忆子系统是 NWM（Narrative World Model）重构后的 6 个要素，物理上散落在
 prompts/middleware/tools 三个目录，但语义上构成一条协同链：
