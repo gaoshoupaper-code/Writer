@@ -189,6 +189,9 @@ before implementation rather than after mistakes.
 如果有不清楚的，或有必要的话，去查阅官网文档https://docs.langchain.com/oss/python/deepagents/overview
 使用中文思考回答
 
+## 智能体功能开发
+做智能体功能时，优先参考工业成熟 Agent 工程（Claude Code、Cursor、Codex、Hermes、OpenClaw 等）。
+
 ## 云服务器
 ssh writer
 
