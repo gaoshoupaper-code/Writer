@@ -6,7 +6,6 @@ import {
   getEvolveMessages,
   getEvolvePoints,
   getEvolveSession,
-  getEvolveSessions,
   getEvaluatedTraces,
   getEvolveSessionEventsSince,
   sendEvolveMessage,
@@ -21,28 +20,38 @@ import ConversationPanel from "./ConversationPanel";
 import PointsDrawer from "./PointsDrawer";
 
 /**
- * 进化工作台 Tab（决策 F/N/C）。
+ * 进化工作台 Tab（决策 F/N/C，2026-07-20 重构为两栏）。
  *
- * 三栏布局：
- *   左：历史会话列表（点击切换）
+ * 两栏布局：
  *   中：对话区（ConversationPanel）—— 启动入口 / 对话流 / 输入框
  *   右：进化点浮窗（PointsDrawer）—— 实时状态 + 拍板按钮
+ * （原左侧历史会话已移到独立「进化历史」Tab，本组件不再维护 sessions 列表）
+ *
+ * 跨 tab 选中联动（DD4）：
+ *   - initialSessionId：URL ?session=xxx 解析出的 id（EvolvePage 透传）
+ *   - initialSession：HistoryTab 点选时透传的完整 session 对象（含 status，免重复拉详情）
+ *   - useEffect([initialSessionId])：id 变化时自动选中（有 initialSession 直接用，否则按 id 拉详情）
  *
  * 数据流：
- *   - 启动会话 → start-converse → 订阅 SSE → 拉取 messages + points
- *   - 用户发消息 → POST /messages → SSE 推 Agent 回复（持久化 + 增量拉取）
- *   - 进化点状态变更 → SSE proposal 事件 → 刷新 points
+ *   - 启动会话 → start-converse → 订阅 Pull 事件流 → 拉取 messages + points
+ *   - 用户发消息 → POST /messages → Pull 推 Agent 回复（持久化 + 增量拉取）
+ *   - 进化点状态变更 → proposal 事件 → 刷新 points
  *   - 用户拍板 → POST /finalize → finalizing → 完成后自动跳 review-report（决策 AA）
  *
  * 双向高亮联动（决策 N）：
  *   - 浮窗点击进化点 → highlightedPointId（滚动对话到该点讨论位置）
  *   - 对话区 hover/点击卡片 → 同一 state 反向高亮浮窗
  */
-export default function WorkbenchTab() {
+export default function WorkbenchTab({
+  initialSessionId,
+  initialSession,
+}: {
+  initialSessionId: string | null;
+  initialSession: EvolveSession | null;
+}) {
   const navigate = useNavigate();
 
-  // 会话列表 + 评估trace列表（轮询）
-  const [sessions, setSessions] = useState<EvolveSession[]>([]);
+  // 评估trace列表（轮询，启动入口用）——sessions 列表已迁到 HistoryTab
   const [evaluatedTraces, setEvaluatedTraces] = useState<EvalSession[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [selectedStatus, setSelectedStatus] = useState<string | null>(null);
@@ -59,24 +68,21 @@ export default function WorkbenchTab() {
   const [highlightedPointId, setHighlightedPointId] = useState<string | null>(null);
   const streamCancelRef = useRef<(() => void) | null>(null);
 
-  // ── 轮询：会话列表 + 评估trace 列表 ──────────────────────────
-  const refreshLists = useCallback(async () => {
-    const [sess, evals] = await Promise.all([
-      getEvolveSessions(30).catch(() => null),
-      getEvaluatedTraces(50).catch(() => null),
-    ]);
-    if (sess) setSessions(sess.sessions);
+  // ── 轮询：评估trace 列表（启动入口用）──────────────────────
+  // sessions 列表已迁到 HistoryTab，本组件只保留 evaluatedTraces 轮询。
+  const refreshEvaluatedTraces = useCallback(async () => {
+    const evals = await getEvaluatedTraces(50).catch(() => null);
     if (evals) setEvaluatedTraces(evals.traces);
   }, []);
 
   useEffect(() => {
-    void refreshLists();
-    const timer = setInterval(refreshLists, 10000);
+    void refreshEvaluatedTraces();
+    const timer = setInterval(refreshEvaluatedTraces, 10000);
     return () => {
       clearInterval(timer);
       streamCancelRef.current?.();
     };
-  }, [refreshLists]);
+  }, [refreshEvaluatedTraces]);
 
   // ── 拉取会话详情（messages + points）────────────────────────
   // 拉取进化点（独立于消息——proposal 事件时只刷进化点，避免覆盖流式 token）
@@ -108,18 +114,44 @@ export default function WorkbenchTab() {
     await Promise.all([loadMessages(sessionId), loadPoints(sessionId)]);
   }, [loadMessages, loadPoints]);
 
-  // ── 选会话 ──────────────────────────────────────────────────
-  function selectSession(s: EvolveSession) {
-    streamCancelRef.current?.();
-    setSelectedSessionId(s.session_id);
-    setSelectedStatus(s.status);
-    setHighlightedPointId(null);
-    void loadSessionDetail(s.session_id);
-    // 活跃会话订阅 SSE
-    if (["running", "conversing", "finalizing"].includes(s.status)) {
-      subscribeStream(s.session_id);
+  // ── 选中会话（核心动作，供 initialSessionId 联动 + handleStart 复用）──
+  // 依赖只列 loadSessionDetail——subscribeStream 是 hoisted 函数声明，每次 render
+  // 重建，若列进依赖会让 selectSession 每次 render 都变，破坏 useEffect 幂等性。
+  // subscribeStream 内部用 setState 函数式更新 + ref，闭包稳定性已足够。
+  const selectSession = useCallback(
+    (s: EvolveSession) => {
+      streamCancelRef.current?.();
+      setSelectedSessionId(s.session_id);
+      setSelectedStatus(s.status);
+      setHighlightedPointId(null);
+      void loadSessionDetail(s.session_id);
+      // 活跃会话订阅 Pull 事件流
+      if (["running", "conversing", "finalizing"].includes(s.status)) {
+        subscribeStream(s.session_id);
+      }
+    },
+    [loadSessionDetail],
+  );
+
+  // ── URL ?session=xxx 联动（DD4）─────────────────────────────
+  // HistoryTab 点选 → EvolvePage 写 URL → 本 effect 触发选中。
+  // 有 initialSession 对象直接用（免拉详情）；只有 id（刷新场景）时按 id 拉详情。
+  useEffect(() => {
+    if (!initialSessionId) return;
+    // 已选中相同 session 则跳过（幂等，避免重复订阅）
+    if (initialSessionId === selectedSessionId) return;
+
+    if (initialSession && initialSession.session_id === initialSessionId) {
+      selectSession(initialSession);
+    } else {
+      // 刷新场景：URL 有 id 但无 session 对象 → 拉详情后选中
+      void getEvolveSession(initialSessionId)
+        .then((sess) => selectSession(sess))
+        .catch(() => {
+          // session 不存在或拉取失败：静默，中栏保持启动入口态
+        });
     }
-  }
+  }, [initialSessionId, initialSession, selectSession, selectedSessionId]);
 
   // ── 启动新会话（对话式入口）─────────────────────────────────
   async function handleStart(traceId: string) {
@@ -133,7 +165,7 @@ export default function WorkbenchTab() {
       setSelectedStatus("running");
       toast.success(`进化已启动：${resp.session_id.slice(0, 8)}`);
       subscribeStream(resp.session_id);
-      void refreshLists();
+      void refreshEvaluatedTraces();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "启动进化失败");
     } finally {
@@ -336,7 +368,7 @@ export default function WorkbenchTab() {
       }
       case "end": {
         // 流结束 → 刷新会话详情（拿最终 status）
-        void refreshLists();
+        void refreshEvaluatedTraces();
         void loadSessionDetail(sessionId);
         // 检查是否需要跳 review-report（pending_review 时，决策 AA）
         setTimeout(async () => {
@@ -354,7 +386,7 @@ export default function WorkbenchTab() {
       }
       case "error": {
         toast.error("Agent 执行出错，请查看详情");
-        void refreshLists();
+        void refreshEvaluatedTraces();
         break;
       }
       default:
@@ -428,36 +460,7 @@ export default function WorkbenchTab() {
 
   return (
     <div className="evolve-workbench">
-      {/* 左：会话列表 */}
-      <aside className="workbench-sidebar">
-        <h3 className="sidebar-title">进化历史</h3>
-        <ul className="session-list">
-          {sessions.length === 0 ? (
-            <li className="session-empty">暂无进化记录</li>
-          ) : (
-            sessions.map((s) => {
-              const isActive = s.session_id === selectedSessionId;
-              return (
-                <li
-                  key={s.session_id}
-                  className={`session-item${isActive ? " active" : ""}`}
-                  onClick={() => selectSession(s)}
-                >
-                  <div className="session-item-head">
-                    <span className={`session-status status-${s.status}`}>
-                      {STATUS_DOT[s.status] ?? "?"}
-                    </span>
-                    <code className="session-id">{s.session_id.slice(0, 8)}</code>
-                  </div>
-                  <time className="session-time">{formatTime(s.created_at)}</time>
-                </li>
-              );
-            })
-          )}
-        </ul>
-      </aside>
-
-      {/* 中：对话区 */}
+      {/* 中：对话区（原左侧历史已移到独立「进化历史」Tab）*/}
       <ConversationPanel
         selectedSessionId={selectedSessionId}
         status={selectedStatus}
@@ -485,24 +488,4 @@ export default function WorkbenchTab() {
       />
     </div>
   );
-}
-
-const STATUS_DOT: Record<string, string> = {
-  running: "●",
-  conversing: "●",
-  finalizing: "●",
-  pending_review: "◆",
-  published: "✓",
-  discarded: "✗",
-  failed: "!",
-  cancelled: "○",
-};
-
-function formatTime(iso: string): string {
-  try {
-    const d = new Date(iso);
-    return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-  } catch {
-    return iso;
-  }
 }
