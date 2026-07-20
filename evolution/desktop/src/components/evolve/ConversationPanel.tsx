@@ -176,7 +176,9 @@ export default function ConversationPanel({
             <p className="empty-text">
               {isRunning
                 ? "Agent 正在探查评估报告和 harness 要素，请稍候…"
-                : "等待 Agent 发出开场白…"}
+                : isConversing
+                  ? "等待 Agent 回复…" // conversing 但无消息：用户已发首条消息，等 Agent 回复
+                  : "等待 Agent 发出开场白…"}
             </p>
           </div>
         ) : (

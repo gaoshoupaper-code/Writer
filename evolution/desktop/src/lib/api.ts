@@ -657,15 +657,15 @@ export async function stopEvolve(sessionId: string): Promise<{ status: string; s
 }
 
 /**
- * 按 sequence 游标拉取进化 session 的事件帧（Pull 替代 SSE，设计 20260720_203000）。
- * 返回从 run_meta 派生的 model_stream/model_output/tool_call/phase/log/step/proposal/finalizing 帧。
- * token 级流式（model_stream）通过 has_more 立即续拉保持实时性。
+ * 按 sequence 游标拉取进化 session 的事件帧（trace 重构 20260720_154825）。
+ * 返回从 run_meta 派生的 message_updated/phase/log/step/proposal/finalizing 帧。
+ *
+ * 重构变更：移除 model_stream token 流；新增 message_updated 通知帧（消息已落库，
+ * 前端调 loadMessages 拉权威存储）。
  */
 export interface EvolveFrame {
   type:
-    | "model_stream"
-    | "model_output"
-    | "tool_call"
+    | "message_updated"
     | "phase"
     | "log"
     | "step"

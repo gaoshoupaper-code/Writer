@@ -1,57 +1,37 @@
-"""EvolveEventSink — 进化 Agent 专属 SSE 事件处理器（Phase 2C，决策 T4）。
+"""EvolveEventSink — 进化 Agent 专属事件处理器（trace 重构 20260720_154825）。
 
-实现与 executor.platform.streaming.EventSink 对称的协议，处理 LangGraph
-astream_events 产出的事件，转换为进化端 SSE 帧。
+**重大变更**：移除 token 级流式（on_chat_model_stream），改为只消费轮次级事件。
+trace 通道从此只存框架级 span + 业务 run_meta，token 流不再污染 event_payloads。
 
-Phase 2C：本文件已就绪但未被 round 函数接入（ainvoke → astream 改造留 Phase 3
-与 API/SSE 重构一起做，避免过渡期双轨）。
+职责：
+  消费 LangGraph astream_events 产出的事件，转换为：
+    1. 结构化帧 dict（含 type 字段）—— 供 _run_agent_streamed 派生：
+       - SSE 帧给前端（model_output / tool_call / tool_output）
+       - 持久化消息（assistant / tool / system）到 evolve_messages
+    2. 跟踪 LangGraph superstep 最大值（观测用）
 
-SSE 事件类型（决策 T4）：
-  基础事件（与 writer 端对齐）：
-    - model_output      Agent 一轮回复完整文本（on_chat_model_end）
-    - model_stream      Agent 逐 token 增量（on_chat_model_stream，前端打字机效果）
-    - tool_call         工具调用开始（on_chain_start(tools)）
-    - tool_output       工具调用结果（on_tool_end）
-    - tool_error        工具调用错误（on_tool_error）
+事件类型（重构后）：
+  - model_output   Agent 一轮回复完整文本 + 工具调用意图（on_chat_model_end）
+  - tool_call      工具调用开始（on_chain_start(tools)）—— 仅当本轮有工具调用时
+  - tool_output    工具调用结果（on_tool_end）
+  - tool_error     工具调用错误（on_tool_error）
 
-  进化专属事件（决策 B 双轨制 + 浮窗实时同步）：
-    - proposal          进化点状态变更（监听 propose/update/reject 工具调用）
+移除的事件（D3 决策）：
+  - model_stream   逐 token 增量（on_chat_model_stream）—— 砍掉，token 不入 trace
 
-  阶段/进度事件（决策 W）：
-    - phase             阶段切换（inspect → conversing → finalizing）
-    - finalizing        落地进度（edit/validate/change_log）
-
-设计：进化端比 writer 简单——无 subagent / 章节统计 / 流程图等业务副作用，
-sink 只做"事件 → SSE 帧"转换，无后端副作用。
+设计原则（D1）：trace 通道职责单一，只存 span + run_meta；消息通道独立。
+sink 只产结构化帧，不直接调 EvolveMessagesRepo（持久化由 _run_agent_streamed 协调）。
 """
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
 logger = logging.getLogger("evolution.evolve.agent.event_sink")
 
 
-# ── SSE 帧构造 helper（复制自 executor.platform.streaming，避免跨包依赖）──
-
-
-def sse(event_type: str, payload: object) -> str:
-    """构造标准 SSE 帧：event: <type>\ndata: <json>\n\n。
-
-    payload 用 json.dumps 序列化，ensure_ascii=False 保留中文，
-    default=str 兜底不可序列化对象。
-    """
-    data = json.dumps(payload, ensure_ascii=False, default=str)
-    return f"event: {event_type}\ndata: {data}\n\n"
-
-
-def heartbeat() -> str:
-    """SSE 心跳注释行（浏览器忽略，保持连接活跃）。"""
-    return ": ping\n\n"
-
-
 # ── 进化点工具名集合（用于识别 proposal 事件）──────────────────────
+
 _PROPOSAL_TOOLS = frozenset({
     "propose_evolution_point",
     "update_evolution_point",
@@ -60,49 +40,30 @@ _PROPOSAL_TOOLS = frozenset({
 
 
 class EvolveEventSink:
-    """进化 Agent 的 SSE 事件处理器（决策 T4）。
+    """进化 Agent 的事件处理器（trace 重构后）。
 
-    实现 EventSink 协议的 on_event 方法，处理 LangGraph astream_events 事件。
-    Phase 3 接入时由 run_agent_stream 调用（参考 executor 端 run_agent_stream 骨架）。
-
-    进化端 sink 比 writer 端简单：无业务副作用，只做事件 → SSE 转换。
+    只消费轮次级事件（model_end / tool_end / tool_error），token 流（model_stream）
+    不再处理。产出的结构化帧由 _run_agent_streamed 协调，派生为：
+      - 前端 Pull 帧（通知前端刷新消息）
+      - 持久化消息（落 evolve_messages）
     """
 
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
-        # 跟踪进行中的 tool call id → name（on_tool_end 时反查 name）
-        self._active_tools: dict[str, str] = {}
         # 跟踪 LangGraph superstep 最大值（DD5）：从事件 metadata.langgraph_step 取，
         # session 结束时由 _run_agent_streamed 写 step_stats run_meta（DD8）。
         # 与 GraphRecursionError 的计数口径对齐，能直接回答"会不会触顶 200"。
         self.max_superstep = 0
 
-    async def on_event(self, event: dict) -> list[str]:
-        """处理一个 astream_events 事件，返回要 yield 的 SSE 帧列表。
-
-        与 executor.platform.streaming.EventSink 协议对齐——返回 SSE 帧字符串。
+    async def on_event_dicts(self, event: dict) -> list[dict]:
+        """处理一个 astream_events 事件，返回结构化帧 dict 列表。
 
         Args:
-            event: LangGraph astream_events(version="v2") 产出的 event dict，
-                   含 event/name/data/run_id 等字段。
+            event: LangGraph astream_events(version="v2") 产出的 event dict。
 
         Returns:
-            SSE 帧字符串列表（可空——某些事件不产出帧）。
-        """
-        dicts = await self.on_event_dicts(event)
-        return [sse(d["type"], {k: v for k, v in d.items() if k != "type"}) for d in dicts]
-
-    async def on_event_dicts(self, event: dict) -> list[dict]:
-        """处理一个 astream_events 事件，返回结构化帧 dict 列表（Phase 6）。
-
-        与 on_event 的区别：返回 dict（含 type 字段）而非 SSE 帧字符串。
-        进化端 _run_agent_streamed 用此方法，把 dict 通过 recorder 桥接到 SSE 端，
-        SSE 端的 _trace_event_to_sse 识别 type 字段派生最终 SSE 帧。
-
-        这样保持「按需触发模型」（Agent 在后台 task 跑）+「token 级流式」兼容。
-
-        Returns:
-            [{"type": "model_output"|"model_stream"|"tool_call"|..., ...}, ...]
+            [{"type": "model_output"|"tool_call"|"tool_output"|"tool_error", ...}, ...]
+            空列表表示该事件不产出帧（如 token 流 / 不关心的事件）。
         """
         frames: list[dict] = []
         kind = event.get("event", "")
@@ -119,9 +80,6 @@ class EvolveEventSink:
             if kind == "on_chat_model_end":
                 frames.extend(self._handle_model_end(data))
 
-            elif kind == "on_chat_model_stream":
-                frames.extend(self._handle_model_stream(data))
-
             elif kind == "on_chain_start" and name == "tools":
                 frames.extend(self._handle_tools_start(data))
 
@@ -130,6 +88,9 @@ class EvolveEventSink:
 
             elif kind == "on_tool_error":
                 frames.extend(self._handle_tool_error(name, data))
+
+            # on_chat_model_stream（token 流）：D3 决策砍掉，不再处理。
+            # 这样 trace 通道不再被 token 噪音污染，event_count 反映真实轮次数。
 
         except Exception:
             # sink 内部异常不应中断 agent 流——记日志继续
@@ -140,12 +101,15 @@ class EvolveEventSink:
 
         return frames
 
-    # ── 基础事件处理（Phase 6：返回 dict 列表，含 type 字段）─────
+    # ── 轮次级事件处理（返回 dict 列表，含 type 字段）─────────────
 
     def _handle_model_end(self, data: dict) -> list[dict]:
         """on_chat_model_end：Agent 一轮回复完整文本 + 工具调用意图。
 
         产出 model_output 帧（含 text + tool_calls）。
+        _run_agent_streamed 据此派生：
+          - 无 tool_calls → 持久化 assistant 消息（开场白/对话回复）
+          - 有 tool_calls → 不落 assistant 文本（工具单独走 tool 消息）
         """
         output = data.get("output")
         text = _extract_model_text(output)
@@ -156,29 +120,12 @@ class EvolveEventSink:
             evt["tool_calls"] = tool_calls
         return [evt]
 
-    def _handle_model_stream(self, data: dict) -> list[dict]:
-        """on_chat_model_stream：逐 token 增量（前端打字机效果）。
-
-        产出 model_stream 帧（只含 content delta）。
-        """
-        chunk = data.get("chunk")
-        if hasattr(chunk, "content"):
-            content = chunk.content
-        elif isinstance(chunk, dict):
-            content = chunk.get("content", "")
-        else:
-            content = ""
-
-        if not content or not isinstance(content, str):
-            return []
-
-        return [{"type": "model_stream", "content": content}]
-
     def _handle_tools_start(self, data: dict) -> list[dict]:
         """on_chain_start(tools)：工具调用开始。
 
-        产出 tool_call 帧（tool/input/call_id）。
-        进化点工具额外产出 proposal 帧（决策 B 双轨制浮窗同步）。
+        产出 tool_call 帧（tool_name/input/call_id）。
+        注意：实际 tool_output 在 on_tool_end 才完整；这里只给"开始"信号，
+        用于前端立即显示"Agent 在调 xxx 工具"（通过 Pull 拉到帧后刷新消息列表）。
         """
         frames: list[dict] = []
         tool_inputs = data.get("input", [])
@@ -192,60 +139,43 @@ class EvolveEventSink:
             call_id = tc.get("id", "")
             args = tc.get("args", {}) or {}
 
-            # 记录进行中的工具（on_tool_end 时反查 name）
-            if call_id:
-                self._active_tools[call_id] = tool_name
-
             frames.append({
                 "type": "tool_call",
-                "tool": tool_name,
+                "tool_name": tool_name,
                 "input": _summarize_tool_args(tool_name, args),
                 "call_id": call_id,
             })
-
-            # 进化点工具：额外产 proposal 帧（浮窗实时同步）
-            if tool_name in _PROPOSAL_TOOLS:
-                frames.append({
-                    "type": "proposal",
-                    "action": _proposal_action(tool_name),
-                    "tool": tool_name,
-                    "args_summary": _summarize_proposal_args(tool_name, args),
-                    "call_id": call_id,
-                })
 
         return frames
 
     def _handle_tool_end(self, name: str, data: dict) -> list[dict]:
         """on_tool_end：工具调用完成，产出结果摘要。
 
-        产出 tool_output 帧（tool/output_summary/call_id）。
-        结果只取摘要（避免大块输出拥堵 SSE，决策 R2）。
+        产出 tool_output 帧（tool_name/output_summary/call_id）。
+        结果只取摘要（避免大块输出拥堵）。
+
+        _run_agent_streamed 据此对落地/进化点工具派生 tool 消息持久化。
         """
         output = data.get("output")
         output_str = _extract_tool_output_text(output)
         call_id = _extract_tool_call_id(data)
 
-        # 清理进行中跟踪
-        if call_id and call_id in self._active_tools:
-            self._active_tools.pop(call_id, None)
-
+        # 工具调用的"开始"信号已由 _handle_tools_start 产出 tool_call 帧；
+        # 这里产出 tool_output 帧，让前端能区分"开始 / 完成"。
         return [{
             "type": "tool_output",
-            "tool": name,
-            "output_summary": output_str[:500],  # 截断防 SSE 拥堵（决策 R2）
+            "tool_name": name,
+            "output_summary": output_str[:500],  # 截断防 Pull 帧过大
             "call_id": call_id,
         }]
 
     def _handle_tool_error(self, name: str, data: dict) -> list[dict]:
-        """on_tool_error：工具调用错误。
-
-        产出 tool_error 帧（含 error 信息）。
-        """
+        """on_tool_error：工具调用错误。产出 tool_error 帧。"""
         err = data.get("error") or data.get("output") or ""
         call_id = _extract_tool_call_id(data)
         return [{
             "type": "tool_error",
-            "tool": name,
+            "tool_name": name,
             "call_id": call_id,
             "error": str(err)[:500],
         }]
@@ -301,7 +231,6 @@ def _extract_tool_calls(output: Any) -> list[dict[str, Any]]:
 
 def _extract_tool_call_id(data: dict) -> str:
     """从 on_tool_end/on_tool_error 的 data 提取 tool call id。"""
-    # LangGraph astream_events v2 的 on_tool_end data 含 output（ToolMessage）
     output = data.get("output")
     if hasattr(output, "tool_call_id"):
         return str(output.tool_call_id) or ""
@@ -328,7 +257,7 @@ def _extract_tool_output_text(output: Any) -> str:
 
 
 def _summarize_tool_args(tool_name: str, args: dict) -> dict[str, Any]:
-    """工具参数摘要（避免大块 args 拥堵 SSE）。
+    """工具参数摘要（避免大块 args 拥堵 Pull 帧）。
 
     长字段（如 content/code/changes_json）截断到 200 字符 + 标记 truncated。
     """
@@ -344,43 +273,6 @@ def _summarize_tool_args(tool_name: str, args: dict) -> dict[str, Any]:
     return summary
 
 
-def _proposal_action(tool_name: str) -> str:
-    """进化点工具 → 浮窗 action 标签。"""
-    return {
-        "propose_evolution_point": "propose",
-        "update_evolution_point": "update",
-        "reject_evolution_point": "reject",
-    }.get(tool_name, "unknown")
-
-
-def _summarize_proposal_args(tool_name: str, args: dict) -> dict[str, Any]:
-    """进化点工具调用的参数摘要（浮窗联动用）。
-
-    propose/update/reject 的关键字段抽取，供前端浮窗即时显示
-    （完整数据仍以 GET /points 接口为准——这是双轨制的"快预览"）。
-    """
-    if not isinstance(args, dict):
-        return {}
-    if tool_name == "propose_evolution_point":
-        return {
-            "target": args.get("target", ""),
-            "problem_excerpt": (args.get("problem", "") or "")[:100],
-        }
-    if tool_name == "update_evolution_point":
-        return {
-            "point_id": args.get("point_id", ""),
-            "chosen_option": args.get("chosen_option"),
-        }
-    if tool_name == "reject_evolution_point":
-        return {
-            "point_id": args.get("point_id", ""),
-            "reason_excerpt": (args.get("reason", "") or "")[:100],
-        }
-    return {}
-
-
 __all__ = [
     "EvolveEventSink",
-    "sse",
-    "heartbeat",
 ]

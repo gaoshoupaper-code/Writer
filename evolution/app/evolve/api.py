@@ -492,10 +492,10 @@ def stop_session(session_id: str) -> dict[str, Any]:
 
 
 class EvolveEventsSinceResponse(BaseModel):
-    """进化 session 事件游标拉取响应（替代 SSE /stream）。"""
-    frames: list[dict[str, Any]]   # 从 run_meta 派生的 step/log/model_stream/... 帧（按 sequence 升序）
+    """进化 session 事件游标拉取响应（Pull 主导）。"""
+    frames: list[dict[str, Any]]   # 从 run_meta 派生的 step/log/phase/proposal/finalizing/message_updated 帧
     max_seq: int                    # 本次返回的最大 sequence（前端下次 since_seq）；无事件时 = since_seq
-    has_more: bool                  # 是否还有更多事件未拉（前端立即续拉，token 流不丢实时性）
+    has_more: bool                  # 是否还有更多事件未拉（罕见，重构后事件密度低）
     session_status: str             # session 当前状态（running/conversing/...），前端据此判断是否继续轮询
 
 
@@ -505,14 +505,18 @@ def get_session_events_since(
     since_seq: int = Query(0, ge=0, description="返回 sequence > since_seq 的事件"),
     limit: int = Query(500, ge=1, le=1000, description="单次返回上限"),
 ) -> EvolveEventsSinceResponse:
-    """按 sequence 游标拉取进化 session 的事件帧（Pull 主导，替代 SSE /stream）。
+    """按 sequence 游标拉取进化 session 的事件帧（trace 重构 20260720_154825）。
 
     实现：从 evolve_sessions.self_trace_id 反查 trace_id → 查 event_payloads 表的
-    run_meta 事件 → 用 _trace_event_to_sse 派生成 model_stream/model_output/tool_call/
-    phase/log/step/proposal/finalizing 帧。
+    run_meta 事件 → 用 _trace_event_to_sse 派生成 phase/proposal/finalizing/
+    message_updated/step/log 帧。
 
-    token 级流式（model_stream）：前端检测 has_more=true 时立即续拉（不等 1s），
-    延迟只有网络 RTT（几十 ms），打字机效果几乎保留。
+    重构变更（D1/D3）：
+      - 不再有 model_stream token 流帧（每 token 一行的污染源已移除）
+      - 新增 message_updated 帧：Agent 消息已落 evolve_messages，前端据此调
+        GET /messages 拉权威消息（按 after_seq 增量）
+      - 事件密度大幅降低（每轮 LLM/工具只产 1-2 个 run_meta，而非 N 个 token）
+      - 前端轮询间隔可放宽到 2s（无 token 流实时性要求）
     """
     session = ev_db.get_session(session_id)
     if session is None:
@@ -558,43 +562,38 @@ def get_session_events_since(
 
 
 def _trace_event_to_sse(event: Any) -> dict[str, Any] | None:
-    """trace 事件 → 前端 SSE 帧派生（与 eval_agent/api.py 对称）。
+    """trace 事件 → 前端 Pull 帧派生（trace 重构 20260720_154825）。
 
-    Phase 5 事件协议扩展：识别 emit_step 的特殊 tool 名，派生对应 SSE 帧类型：
-      - tool="phase"            → {type:"phase", phase}
-      - tool="proposal"         → {type:"proposal", action, point_id, seq, target, ...}
-      - tool="finalizing"       → {type:"finalizing", event, target, ...}
-      - 含 message 字段（无 tool） → {type:"log", message}
-      - 含 tool 字段（其他）       → {type:"step", **data}（保留原行为）
+    重构后只派生以下帧（移除了 sse_frame 桥接 / model_stream）：
+      - tool="phase"            → {type:"phase", phase}（阶段切换）
+      - tool="proposal"         → {type:"proposal", ...}（浮窗进化点状态变更）
+      - tool="finalizing"       → {type:"finalizing", ...}（落地进度）
+      - tool="message_updated"  → {type:"message_updated"}（前端据此调 loadMessages）
+      - 含 message 字段（无 tool）→ {type:"log", message}（思考日志）
+      - 含 tool 字段（其他）      → {type:"step", **data}（业务步骤，向后兼容）
 
-    Phase 6 流式扩展：识别 tool="sse_frame"（token 级流式桥接）：
-      - _run_agent_streamed 把 EvolveEventSink 产出的帧 dict 包装为 sse_frame 注入 recorder
-      - 此处解包：status 字段是真实帧 type（model_stream/model_output/tool_call/...），
-        其余字段透传到 SSE 帧。
+    设计变更（D1/D3）：
+      - 不再有 sse_frame 桥接：token 流不入 trace，事件数与 span 数对齐
+      - 新增 message_updated 帧：消息已落 evolve_messages，前端拉权威存储
+      - 前端不再维护临时消息 state，全部走 loadMessages 增量拉
     """
     if event.type != "run_meta" or not event.input:
         return None
     data = event.input if isinstance(event.input, dict) else {}
     tool = data.get("tool", "")
 
-    # Phase 6：流式帧桥接（token 级流式，决策 Y）
-    if tool == "sse_frame":
-        frame_type = data.get("status")
-        if not frame_type:
-            return None
-        # 透传除 tool/status 外的所有字段（content/text/tool/call_id 等）
-        frame = {k: v for k, v in data.items() if k not in ("tool", "status")}
-        frame["type"] = frame_type
-        return frame
+    # trace 重构：消息更新通知（前端调 loadMessages 增量拉）
+    if tool == "message_updated":
+        return {"type": "message_updated"}
 
-    # Phase 5：阶段切换事件
+    # 阶段切换事件
     if tool == "phase":
         phase = data.get("phase")
         if phase:
             return {"type": "phase", "phase": phase}
         return None
 
-    # Phase 5：进化点状态变更（决策 B/M 浮窗实时同步）
+    # 进化点状态变更（决策 B/M 浮窗实时同步）
     if tool == "proposal":
         return {
             "type": "proposal",
@@ -605,7 +604,7 @@ def _trace_event_to_sse(event: Any) -> dict[str, Any] | None:
             "chosen_option": data.get("chosen_option"),
         }
 
-    # Phase 5：落地进度事件（决策 W）
+    # 落地进度事件（决策 W）
     if tool == "finalizing":
         return {
             "type": "finalizing",

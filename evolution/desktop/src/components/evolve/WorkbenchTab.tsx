@@ -173,8 +173,10 @@ export default function WorkbenchTab({
     }
   }
 
-  // ── trace 稳定性重构：Pull 轮询（替代 SSE，设计 20260720_203000）──
-  // 评估进行中每 1s 拉增量事件帧；has_more=true 立即续拉（保持 token 流实时性）。
+  // ── trace 重构：Pull 轮询（设计 20260720_154825）──
+  // 重构后事件密度大幅降低（不再有 token 流），轮询间隔放宽到 2s。
+  // 前端不再维护临时消息 state——所有消息（assistant/tool/system）都从
+  // evolve_messages 权威存储拉取，事件帧只是"通知该刷消息了"的信号。
   async function subscribeStream(sessionId: string) {
     streamCancelRef.current?.();
     let cancelled = false;
@@ -189,7 +191,7 @@ export default function WorkbenchTab({
       }
     };
 
-    const POLL_INTERVAL_MS = 1000;
+    const POLL_INTERVAL_MS = 2000;  // 重构后无 token 流，2s 足够
     const ERROR_BACKOFF_MS = 3000;
 
     const poll = async () => {
@@ -198,21 +200,19 @@ export default function WorkbenchTab({
         const resp = await getEvolveSessionEventsSince(sessionId, sinceSeq);
         if (cancelled) return;
 
-        // 派发每帧到 handleSseFrame（复用 SSE 时代的帧处理逻辑，零改动）。
+        // 派发每帧到 handleSseFrame
         for (const frame of resp.frames) {
           handleSseFrame(sessionId, frame);
         }
         sinceSeq = resp.max_seq;
 
-        // has_more=true：事件积压（token 流），立即续拉（不等 1s，保实时性）。
+        // has_more=true：事件积压（罕见，重构后事件密度低），立即续拉。
         if (resp.has_more) {
           timer = setTimeout(poll, 0);
           return;
         }
 
-        // session_status 终态：派发 end 帧（复用 handleSseFrame 的 end 处理逻辑：
-        // 刷新列表 + 跳转 review），然后停止轮询。SSE 时代 end 帧由后端额外 yield，
-        // Pull 模式靠 session_status 判定终态后在前端模拟派发。
+        // session_status 终态：派发 end 帧，然后停止轮询。
         const terminal = ["published", "discarded", "failed", "cancelled"].includes(
           resp.session_status,
         );
@@ -238,132 +238,40 @@ export default function WorkbenchTab({
     switch (frame.type) {
       case "heartbeat":
         break;
-      case "model_stream": {
-        // Phase 6 token 级流式：增量 token 拼接到当前 Agent 消息（打字机效果）
-        const delta = frame.content;
-        if (typeof delta !== "string" || !delta) break;
-        setMessages((prev) => {
-          // 找最后一条临时 assistant 消息（id 以 stream- 开头）
-          const last = prev[prev.length - 1];
-          if (last && last.role === "assistant" && last.id.startsWith("stream-")) {
-            const updated = { ...last, content: last.content + delta };
-            return [...prev.slice(0, -1), updated];
-          }
-          // 没有正在流的 assistant 消息，新建一条
-          return [
-            ...prev,
-            {
-              id: `stream-${Date.now()}`,
-              session_id: sessionId,
-              role: "assistant",
-              content: delta,
-              seq: prev.length + 1,
-              created_at: new Date().toISOString(),
-            },
-          ];
-        });
-        break;
-      }
-      case "model_output": {
-        // 一轮回复完整文本（含工具调用意图）——替换临时流式消息为持久版本
-        const text = frame.text;
-        if (typeof text !== "string") break;
-        setMessages((prev) => {
-          // 移除最后一条 stream- 消息（如果存在），追加完整消息
-          const without = prev[prev.length - 1]?.id.startsWith("stream-")
-            ? prev.slice(0, -1)
-            : prev;
-          if (!text) return without;
-          return [
-            ...without,
-            {
-              id: `asst-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              session_id: sessionId,
-              role: "assistant",
-              content: text,
-              seq: without.length + 1,
-              created_at: new Date().toISOString(),
-            },
-          ];
-        });
-        break;
-      }
-      case "tool_call": {
-        // 工具调用开始——注入为系统消息（不阻塞主流程）
-        // 后端 sse_frame 包装时 tool → tool_name（避免与外层 tool 参数冲突）
-        const tn = frame.tool_name || frame.tool;
-        if (!tn) break;
-        // 进化点工具的 tool_call 已被 sink 同时产 proposal 帧，不重复显示
-        if (["propose_evolution_point", "update_evolution_point", "reject_evolution_point"].includes(tn)) {
-          break;
-        }
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `tool-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            session_id: sessionId,
-            role: "system",
-            content: `[工具] ${tn}`,
-            seq: prev.length + 1,
-            created_at: new Date().toISOString(),
-          },
-        ]);
+      case "message_updated": {
+        // Agent 落了一条新消息（assistant/tool）到 evolve_messages。
+        // 拉权威存储——前端不维护临时消息，刷新即拿到最新内容。
+        void loadMessages(sessionId);
         break;
       }
       case "phase": {
         // 阶段切换（inspect → conversing → finalizing）
         setSelectedStatus(frame.phase);
-        // 切到 conversing 时拉一次消息（Agent 开场白已落库）。
-        // 注意：inspect round 跑完才会 conversing，此时不会与 token 流冲突。
+        // 切到 conversing 时拉消息（Agent 开场白已落库）+ 进化点。
         if (frame.phase === "conversing") {
           void loadMessages(sessionId);
           void loadPoints(sessionId);
         }
         break;
       }
-      case "log":
-      case "step": {
-        // 探查/落地进度事件（决策 W/B）——注入为系统消息（临时，不入库）
-        const text = frame.message || frame.tool || "";
-        if (text) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              session_id: sessionId,
-              role: "system",
-              content: text,
-              seq: prev.length + 1,
-              created_at: new Date().toISOString(),
-            },
-          ]);
-        }
-        break;
-      }
       case "proposal": {
-        // 进化点状态变更 → 只刷浮窗（决策 B/M），不动消息避免覆盖流式 token
+        // 进化点状态变更 → 刷浮窗（决策 B/M）+ 刷消息（tool 消息已落库）
         void loadPoints(sessionId);
+        void loadMessages(sessionId);
         break;
       }
       case "finalizing": {
-        // 落地进度事件（决策 W）——注入为系统消息显示
-        const evt = frame.event || "";
-        const tgt = frame.target || "";
-        const result = frame.result ? ` ${frame.result}` : "";
-        const text = evt ? `[落地] ${evt} ${tgt}${result}`.trim() : "";
-        if (text) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: `fin-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              session_id: sessionId,
-              role: "system",
-              content: text,
-              seq: prev.length + 1,
-              created_at: new Date().toISOString(),
-            },
-          ]);
-        }
+        // 落地进度事件——后端已把 tool 消息落库，刷消息即可
+        void loadMessages(sessionId);
+        break;
+      }
+      case "log": {
+        // 思考日志事件——后端 emit_log 写的 run_meta，未落消息表。
+        // 这里不展示（避免与持久化消息重复），日志可去 trace 详情页看。
+        break;
+      }
+      case "step": {
+        // 业务步骤事件（read_eval_report 等）——同 log，不展示在对话区。
         break;
       }
       case "end": {
@@ -390,8 +298,7 @@ export default function WorkbenchTab({
         break;
       }
       default:
-        // 其他事件类型（model_stream/tool_call 等）——Phase 4 不细处理，
-        // Phase 5 接入 EvolveEventSink 后再细化渲染。
+        // 未知事件类型——重构后只有上面几种，安全忽略。
         break;
     }
   }

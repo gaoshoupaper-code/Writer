@@ -43,20 +43,28 @@ async def _run_agent_streamed(
     config: dict[str, Any],
     ctx: "EvolveContext",
 ) -> None:
-    """Phase 6 token 级流式 helper：astream_events + EvolveEventSink → recorder 桥接。
+    """astream_events + EvolveEventSink → 消息持久化 + 通知帧（trace 重构 20260720_154825）。
 
-    替代 round 函数里的 `await agent.ainvoke(...)`。功能等价（跑完一轮 Agent），
-    但额外把 LangGraph astream_events 的 token 级事件经 sink 转换后 push 到 recorder
-    队列，SSE 端点消费时产出 model_stream / tool_call / tool_output 等帧，前端打字机效果。
+    替代原 Phase 6 的 token 级流式桥接。重大变更：
+      - 不再把 sink 帧当 sse_frame 入库（trace 通道不再背 token 流职责）
+      - sink 帧改为派生两类副作用：
+        1. 持久化消息到 evolve_messages（assistant / tool / system）—— 权威消息源
+        2. 通知帧（type=model_output/tool_output）走 run_meta 通道通知前端：消息更新了，
+           前端 Pull 拉到后调 loadMessages 拉权威消息即可
 
-    设计：保持「按需触发模型」（Agent 在后台 task 跑）+ 「token 级流式」（事件经 recorder
-    桥接到 SSE 端点）。recorder 同时承担持久化（trace DB）+ 实时（SSE 队列）双重通道。
+    设计（D1/D2/D3）：
+      - trace 通道只存 span（TraceMiddleware 拦截 llm/tool）+ run_meta（业务事件）
+      - 消息通道独立，Agent 每轮回复立即落 evolve_messages，前端按 seq 增量拉
+      - 无 token 流：前端轮询频率可降到 2s，DB 压力大幅降低
 
-    桥接协议：sink.on_event_dicts 返回结构化 dict（含 type 字段），
-    本函数把每个 dict 通过 ctx.emit_step 以 tool='sse_frame' 注入 recorder。
-    SSE 端 _trace_event_to_sse 识别 sse_frame 包装，原样产出对应 SSE 帧。
+    消息派生规则（D2）：
+      - model_output 且无 tool_calls → 落 assistant 消息（开场白/对话回复）
+      - model_output 且有 tool_calls → 不落文本（工具单独走 tool 消息）
+      - tool_output 工具属于 {进化点, write_*, edit_source, validate_changes} → 落 tool 消息
+      - 其他工具的 tool_output → 不落（只读工具不污染对话历史）
     """
     from app.evolve.agent.event_sink import EvolveEventSink
+    from app.evolve.evolve_repo import EvolveMessagesRepo
 
     sink = EvolveEventSink(session_id=ctx.session_id)
     agent_events = agent.astream_events(
@@ -66,7 +74,6 @@ async def _run_agent_streamed(
     )
 
     async for event in agent_events:
-        # 把 LangGraph 事件交给 sink 转换为结构化帧 dict
         try:
             frame_dicts = await sink.on_event_dicts(event)
         except Exception:
@@ -76,27 +83,23 @@ async def _run_agent_streamed(
             )
             continue
 
-        # 每个帧 dict 通过 recorder 桥接到 SSE 端
         for frame in frame_dicts:
-            frame_type = frame.pop("type", None)
+            frame_type = frame.get("type")
             if not frame_type:
                 continue
-            # sink 帧的 'tool' 字段会与 append_business_event 的 tool 参数冲突，
-            # 重命名为 tool_name 避免重复关键字。
-            if "tool" in frame:
-                frame["tool_name"] = frame.pop("tool")
-            # tool='sse_frame' 是 Phase 6 协议标记，status=frame_type，
-            # 剩余字段通过 **extra 透传（content/text/tool_name/call_id 等）。
-            if ctx.recorder and ctx.trace_id_self:
-                ctx.recorder.append_business_event(
-                    ctx.trace_id_self,
-                    "sse_frame",
-                    frame_type,
-                    **frame,
+            try:
+                _persist_message_from_frame(ctx, frame, EvolveMessagesRepo)
+                _emit_notification_frame(ctx, frame)
+            except Exception:
+                # 消息持久化失败是严重问题（会让前端看不到 Agent 动作），
+                # 但不能中断 agent 主流程——ERROR 日志 + 继续跑，让 round 函数的
+                # 产出检查兜底（如 design_doc 未产 → failed）。
+                logger.exception(
+                    "session %s: 消息派生失败 frame_type=%s（不中断 agent）",
+                    ctx.session_id, frame_type,
                 )
 
-    # 循环结束后写 step_stats run_meta（DD5+DD8）：观测实际跑了多少个 superstep，
-    # 为 recursion_limit=200 是否够用提供数据。零新增表，复用 run_meta 事件通道。
+    # 循环结束后写 step_stats run_meta（DD5+DD8）：观测实际跑了多少个 superstep。
     if ctx.recorder and ctx.trace_id_self and sink.max_superstep > 0:
         try:
             ctx.recorder.append_business_event(
@@ -110,6 +113,123 @@ async def _run_agent_streamed(
                 "session %s: 写 step_stats 失败（不影响主流程）",
                 ctx.session_id,
             )
+
+
+# ── 消息持久化派生（D2）──────────────────────────────────────────
+
+# 需要落 tool 消息的工具白名单（D2）：
+#   - 进化点工具：propose/update/reject（浮窗权威状态 + 对话可见）
+#   - 落地工具：write_*/edit_source（落地进度，finalizing 阶段可见）
+#   - 校验工具：validate_changes（落地结果）
+# 其他工具（read_eval_report/read_trace/list_elements 等只读探查）不落消息，
+# 避免污染对话历史。
+_MESSAGE_TOOLS = frozenset({
+    # 进化点工具
+    "propose_evolution_point", "update_evolution_point", "reject_evolution_point",
+    # 落地写工具
+    "write_design_doc", "write_meta_system", "write_outline_system",
+    "write_writing_system", "write_interview_system", "write_detail_outline_system",
+    "write_memory_system", "write_change_log",
+    "edit_source",
+    # 校验工具
+    "validate_changes",
+})
+
+
+def _persist_message_from_frame(
+    ctx: "EvolveContext",
+    frame: dict[str, Any],
+    messages_repo: Any,
+) -> None:
+    """根据 sink 帧派生持久化消息到 evolve_messages（D2）。
+
+    规则：
+      - model_output 无 tool_calls → assistant 消息（开场白/对话回复）
+      - tool_output 工具在白名单 → tool 消息（含 related_points 关联进化点）
+      - 其他帧（model_output 有 tool_calls / tool_call / tool_error）→ 不落
+    """
+    frame_type = frame.get("type")
+
+    if frame_type == "model_output":
+        text = frame.get("text", "")
+        tool_calls = frame.get("tool_calls") or []
+        # 有工具调用 → 不落文本消息（工具单独走 tool 消息，避免重复）
+        if tool_calls or not text.strip():
+            return
+        # 纯文本回复 → assistant 消息
+        messages_repo.append(
+            ctx.session_id, role="assistant", content=text,
+        )
+        return
+
+    if frame_type == "tool_output":
+        tool_name = frame.get("tool_name", "")
+        if tool_name not in _MESSAGE_TOOLS:
+            return
+        output_summary = frame.get("output_summary", "")
+        if not output_summary:
+            return
+
+        # 进化点工具的 related_points 关联（前端双向高亮联动用）
+        related_points: list[str] | None = None
+        if tool_name in {"propose_evolution_point", "update_evolution_point", "reject_evolution_point"}:
+            # 从 output_summary 提取 point_id（propose 返回值含 id=xxx）
+            import re
+            m = re.search(r"id=([a-f0-9]+)", output_summary)
+            if m:
+                related_points = [m.group(1)]
+
+        tool_events = [{
+            "tool": tool_name,
+            "result_excerpt": output_summary[:200],
+        }]
+        # 渲染为可读的 tool 消息内容
+        content = f"[工具·{tool_name}] {output_summary[:300]}"
+        messages_repo.append(
+            ctx.session_id, role="tool", content=content,
+            tool_events=tool_events, related_points=related_points,
+        )
+        return
+
+
+def _emit_notification_frame(ctx: "EvolveContext", frame: dict[str, Any]) -> None:
+    """把 sink 帧派生为通知帧走 run_meta 通道（前端 Pull 拉到后刷消息）。
+
+    重构后的通知帧类型（D1/D3）：
+      - model_output → 通知前端"有新 assistant 消息，调 loadMessages 增量拉"
+      - tool_output（白名单工具）→ 通知前端"有新 tool 消息，刷 loadMessages"
+
+    不再传完整帧内容（消息已落库，前端拉权威存储即可），只传最小信号。
+    token 流（model_stream）完全移除。
+    """
+    if not (ctx.recorder and ctx.trace_id_self):
+        return
+
+    frame_type = frame.get("type")
+    if frame_type == "model_output":
+        text = frame.get("text", "")
+        tool_calls = frame.get("tool_calls") or []
+        # 只在有实际内容要持久化时通知（与 _persist_message_from_frame 对齐）
+        if tool_calls or not text.strip():
+            return
+        ctx.recorder.append_business_event(
+            ctx.trace_id_self,
+            tool="message_updated",
+            status="assistant",
+        )
+        return
+
+    if frame_type == "tool_output":
+        tool_name = frame.get("tool_name", "")
+        if tool_name not in _MESSAGE_TOOLS:
+            return
+        ctx.recorder.append_business_event(
+            ctx.trace_id_self,
+            tool="message_updated",
+            status="tool",
+            tool_name=tool_name,
+        )
+        return
 
 
 # 不设总超时护栏（asyncio.wait_for）——进化时长不设上限，让它自然跑完。
