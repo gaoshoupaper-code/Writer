@@ -10,8 +10,10 @@
     不含文件内容（recorder 的 _sanitize 清空了 tool_calls args）。
   - subagent 归属：靠事件的 agent_name 字段（interview-subagent 等），
     比 path pattern 更准（已验证）。
-  - 内容读取：从 workspace 文件系统读（executor_workspace/{workspace_id}{path}）。
-    文件内容不在 trace 里，只能从磁盘读。
+  - 内容读取：从 workspace 文件系统读。executor 物理布局三层隔离
+    executor_workspace/{owner_user_id}/{workspace_id}{path}（owner_user_id 为用户
+    维度的 uuid4().hex，与 executor 端 thread.user_id 同值）。owner_user_id 缺失
+    （老 trace ALTER TABLE DEFAULT 'unknown'）则该 trace 跳过交付物提取。
 
 各 subagent 交付物（按 agent_name 归属，已验证）：
   - interview-subagent      → /demand.md
@@ -72,14 +74,19 @@ def _path_belongs_to_agent(path: str, agent: str) -> bool:
     return any(pat in path for pat in patterns)
 
 
-def _resolve_workspace_path(workspace_id: str, file_path: str) -> Path:
+def _resolve_workspace_path(
+    workspace_id: str, owner_user_id: str, file_path: str
+) -> Path:
     """解析文件在文件系统的绝对路径。
 
-    workspace 根 = settings.executor_workspace_path（已解析为绝对路径，相对项目根）。
-    子目录 = workspace_id。file_path 形如 /demand.md（前导 / 去除）。
+    executor 物理布局三层隔离：
+      executor_workspace/{owner_user_id}/{workspace_id}/{rel_path}
+    owner_user_id = 用户维度的 uuid4().hex（与 executor thread.user_id 同值），
+    存于 runs.owner_user_id。workspace_id = 工作区维度 hex。
+    file_path 形如 /demand.md（前导 / 去除）。
     """
     rel = file_path.lstrip("/")
-    return settings.executor_workspace_path / workspace_id / rel
+    return settings.executor_workspace_path / owner_user_id / workspace_id / rel
 
 
 def extract_deliveries(trace_id: str) -> dict[str, dict[str, str]]:
@@ -95,12 +102,24 @@ def extract_deliveries(trace_id: str) -> dict[str, dict[str, str]]:
         {agent_short_name: {normalized_path: content, ...}, ...}
         只含实际有交付物（路径 + 可读内容）的 subagent。
     """
-    # 取 trace 的 workspace_id（用于定位文件系统）
-    run = db.query_one("SELECT workspace_id FROM runs WHERE trace_id = ?", (trace_id,))
+    # 取 trace 的 workspace_id 和 owner_user_id（用于定位文件系统三层路径）
+    run = db.query_one(
+        "SELECT workspace_id, owner_user_id FROM runs WHERE trace_id = ?",
+        (trace_id,),
+    )
     if run is None:
         logger.warning("extract_deliveries: trace 不存在 %s", trace_id)
         return {}
     workspace_id = run["workspace_id"]
+    owner_user_id = run["owner_user_id"]
+    # 老 trace ALTER TABLE DEFAULT 'unknown' → 三层路径拼不出来，静默跳过
+    if not owner_user_id or owner_user_id == "unknown":
+        logger.warning(
+            "extract_deliveries: trace %s 的 owner_user_id 缺失（%r），跳过交付物提取",
+            trace_id,
+            owner_user_id,
+        )
+        return {}
 
     # 取所有 write_file 的 tool_end 事件
     rows = db.query_all(
@@ -151,7 +170,7 @@ def extract_deliveries(trace_id: str) -> dict[str, dict[str, str]]:
     for agent, paths in agent_paths.items():
         agent_files: dict[str, str] = {}
         for path in paths:
-            abs_path = _resolve_workspace_path(workspace_id, path)
+            abs_path = _resolve_workspace_path(workspace_id, owner_user_id, path)
             try:
                 text = abs_path.read_text(encoding="utf-8")
                 if text.strip():

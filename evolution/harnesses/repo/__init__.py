@@ -191,6 +191,11 @@ def assemble(ctx: RuntimeContext):
     from .middleware.artifact_prerequisite import ArtifactPrerequisiteMiddleware, ArtifactPrerequisite
     from .middleware.meta_readonly import MetaReadOnlyMiddleware
     from .middleware.goal import GoalMiddleware
+    # A2 加固中间件（原孤儿代码，重新装配 + 修复设计缺陷）
+    from .middleware.read_cache import ReadCacheMiddleware
+    from .middleware.encoding_guard import EncodingGuardMiddleware
+    from .middleware.file_state_tracker import FileStateTrackerMiddleware
+    from .middleware.write_result_inspector import WriteResultInspectorMiddleware
     from .subagents.interview import build_interview_deep_subagent
     from .subagents.types import apply_style_suffix
     # runtime 是 DeepAgents SDK 隔离层（执行端平台能力，包依赖它如同依赖 deepagents）
@@ -202,11 +207,25 @@ def assemble(ctx: RuntimeContext):
     styles = ctx.styles or {}
 
     # ── meta middleware（硬编码，从包内类实例化）──
+    # A2 重构后装配顺序（外层→内层）：
+    #   ErrorRecovery（捕异常/重试，最外层）
+    #   → MetaReadOnly（meta 只读）
+    #   → ReadCache（命中短路，最外层拦截 read_file）
+    #   → FilesystemPathGuard（路径白名单 + 规范化）
+    #   → EncodingGuard（写入后编码+完整性校验；在 PathGuard 之后拿规范化路径）
+    #   → FileStateTracker（edit_file 前 old_string 预检）
+    #   → FileWriteSerialize（按 file_path 串行化写）
+    #   → WriteResultInspector（在串行化内、ErrorRecovery 内，转抛 WriteFailedError）
+    #   → GoalMiddleware（最内层）
     meta_middleware = [
         ErrorRecoveryMiddleware(),
         MetaReadOnlyMiddleware(),
+        ReadCacheMiddleware(),
         FilesystemPathGuardMiddleware(workspace_path),
+        EncodingGuardMiddleware(),
+        FileStateTrackerMiddleware(),
         FileWriteSerializeMiddleware(),
+        WriteResultInspectorMiddleware(),
         GoalMiddleware(),
     ]
     meta_prompt = apply_style_suffix(_read_prompt("meta_system"), styles.get("meta"))
@@ -234,11 +253,23 @@ def assemble(ctx: RuntimeContext):
     effective_backend, skill_sources = compose_skills_backend(ctx.backend, meta_skills)
 
     # ── subagent middleware 工厂 ──
+    # A2 重构后装配顺序（与 meta 一致，去掉 MetaReadOnly 和 Goal）：
+    #   ErrorRecovery（最外层）
+    #   → ReadCache（命中短路）
+    #   → FilesystemPathGuard（路径白名单）
+    #   → EncodingGuard（写入校验）
+    #   → FileStateTracker（edit_file 预检）
+    #   → FileWriteSerialize（写串行化）
+    #   → WriteResultInspector（最内层，转抛 WriteFailedError）
     def middleware_factory(agent_name: str) -> list:
         mw = [
             ErrorRecoveryMiddleware(),
+            ReadCacheMiddleware(),
             FilesystemPathGuardMiddleware(workspace_path),
+            EncodingGuardMiddleware(),
+            FileStateTrackerMiddleware(),
             FileWriteSerializeMiddleware(),
+            WriteResultInspectorMiddleware(),
         ]
         if ctx.trace_recorder is not None and ctx.trace_id and ctx.trace_middleware_cls:
             mw.insert(1, ctx.trace_middleware_cls(
