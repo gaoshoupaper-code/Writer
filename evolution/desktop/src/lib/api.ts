@@ -11,6 +11,9 @@ import type {
   FailurePattern,
   TraceLogEvent,
   TraceContextSegment,
+  WorkspaceNovelContent,
+  WorkspaceStorylineContent,
+  WorkspaceStorylineGraphContent,
 } from "@/lib/types";
 
 // 统一类型从 lib/types.ts 引用（trace 移植后对齐）
@@ -414,6 +417,25 @@ export async function getTraceContext(
     `/api/traces/${traceId}/context?anchor_id=${encodeURIComponent(anchorId)}`,
     { method: "GET" },
   );
+}
+
+// ── Workspace 产物（trace 详情页「产物」tab 直调 executor）──
+// 走 apiJson（不加 /evolution-api 前缀），session cookie 由 Tauri 共享 cookie jar 自动带。
+// 调用方需确保当前登录用户是该 workspace 的 owner，否则 executor 返 403。
+
+/** 读取 workspace 的全部正文（chapter/*.md）。 */
+export async function getWorkspaceNovel(workspaceId: string): Promise<WorkspaceNovelContent> {
+  return apiJson<WorkspaceNovelContent>(`/api/workspaces/${workspaceId}/novel`, { method: "GET" });
+}
+
+/** 读取故事线索引 + 各线详情（storyline.md + storyline/*.md）。 */
+export async function getWorkspaceStoryline(workspaceId: string): Promise<WorkspaceStorylineContent> {
+  return apiJson<WorkspaceStorylineContent>(`/api/workspaces/${workspaceId}/storyline`, { method: "GET" });
+}
+
+/** 读取故事线流程图（storyline_graph.md，读取时按需重生成）。 */
+export async function getWorkspaceStorylineGraph(workspaceId: string): Promise<WorkspaceStorylineGraphContent> {
+  return apiJson<WorkspaceStorylineGraphContent>(`/api/workspaces/${workspaceId}/storyline-graph`, { method: "GET" });
 }
 
 // ── trace 稳定性重构（Pull 模式新接口，设计 20260720_203000）──

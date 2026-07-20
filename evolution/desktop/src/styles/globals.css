@@ -10488,6 +10488,124 @@ html[data-theme="dark"] .point-chosen { color: var(--teal); }
   line-height: 1.4;
 }
 
+/* ── trace 详情页「产物」tab（正文 + 故事线预览）── */
+/* markdown 内部样式复用 .prose-doc，这里只负责容器布局 / 分区 / 状态态。 */
+.artifacts-panel {
+  height: 100%;
+  overflow-y: auto;
+  padding: 4px 0 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.artifacts-section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 18px;
+}
+
+.artifacts-section-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent);
+  margin: 0 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.artifacts-subsections {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.artifacts-subsection-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 0 0 6px;
+}
+
+.artifacts-entry-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 10px 0 4px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-soft);
+}
+.artifacts-entry-title:first-child {
+  border-top: none;
+  padding-top: 0;
+  margin-top: 0;
+}
+
+/* markdown 容器（同时挂 prose-doc）—— 只补边距，其余继承 prose-doc */
+.artifacts-md {
+  margin: 4px 0;
+}
+.storyline-entry-md {
+  padding-left: 10px;
+  border-left: 2px solid var(--border-soft);
+}
+
+.artifacts-chapters {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.artifacts-chapter {
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 10px 14px;
+  background: var(--bg);
+}
+
+.artifacts-chapter-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.artifacts-chapter-no {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.artifacts-chapter-title {
+  font-size: 13.5px;
+  font-weight: 650;
+  color: var(--text);
+  margin: 0;
+}
+
+.artifacts-loading,
+.artifacts-empty {
+  padding: 18px 12px;
+  color: var(--muted);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+.artifacts-error {
+  padding: 10px 12px;
+  color: var(--danger);
+  font-size: 12.5px;
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 25%, transparent);
+  border-radius: 6px;
+}
+
 /* ── 响应式 ── */
 @media (max-width: 1200px) {
   .evolve-workbench { grid-template-columns: 200px minmax(0, 1fr) 280px; }

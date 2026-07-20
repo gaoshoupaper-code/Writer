@@ -4,6 +4,7 @@ import { useTracePolling } from "@/hooks/useTraceStream";
 import { TraceChainTimeline } from "@/components/trace/TraceChainTimeline";
 import { TraceChainDrawer } from "@/components/trace/TraceChainDrawer";
 import { TokenChartPanel } from "@/components/trace/TokenChartPanel";
+import { ArtifactsPanel } from "@/components/trace/ArtifactsPanel";
 import { Badge } from "@/components/ui/badge";
 import {
   getTraceEvents,
@@ -33,7 +34,7 @@ export default function TraceDetailPage() {
   const { detail, isLive, activeSession, loading, error } = useTracePolling(traceId ?? null);
 
   // ── 页面壳状态 ──
-  const [activeTab, setActiveTab] = useState<"trace" | "chart">("trace");
+  const [activeTab, setActiveTab] = useState<"trace" | "chart" | "artifacts">("trace");
   const [drawerNodeId, setDrawerNodeId] = useState<string | null>(null);
   const [highlightedNodeId, setHighlightedNodeId] = useState<string | null>(null);
   const [highlightedLoopIndex, setHighlightedLoopIndex] = useState<number | null>(null);
@@ -345,11 +346,18 @@ export default function TraceDetailPage() {
         >
           Token 图表
         </button>
+        <button
+          className={`inspection-tab ${activeTab === "artifacts" ? "active" : ""}`}
+          type="button"
+          onClick={() => setActiveTab("artifacts")}
+        >
+          产物
+        </button>
       </nav>
 
       {/* tab 内容 */}
       <div className="trace-detail-body">
-        {activeTab === "trace" ? (
+        {activeTab === "trace" && (
           <div className="trace-layout trace-chain-layout">
             <TraceChainTimeline
               nodes={nodes}
@@ -369,7 +377,8 @@ export default function TraceDetailPage() {
               onClose={closeDrawer}
             />
           </div>
-        ) : (
+        )}
+        {activeTab === "chart" && (
           <TokenChartPanel
             detail={detail}
             hasActiveThread={true}
@@ -378,6 +387,9 @@ export default function TraceDetailPage() {
             highlightedLoopIndex={highlightedLoopIndex}
             onClearHighlight={clearHighlight}
           />
+        )}
+        {activeTab === "artifacts" && (
+          <ArtifactsPanel workspaceId={activeRun.workspace_id} />
         )}
       </div>
     </div>

@@ -262,3 +262,65 @@ export type FailurePattern = {
   count: number;
   sample_trace_ids: string[];
 };
+
+// ── Workspace 产物（executor /api/workspaces/* 响应，trace 详情页「产物」tab 用）──
+
+/** 单章正文（executor workspace 下 chapter/*.md）。 */
+export type NovelChapter = {
+  filename: string;
+  title: string;
+  markdown: string;
+};
+
+/** GET /api/workspaces/{id}/novel 响应。 */
+export type WorkspaceNovelContent = {
+  workspace_id: string;
+  source: string;
+  chapters: NovelChapter[];
+};
+
+/** 单条故事线（storyline/*.md）。 */
+export type StorylineEntry = {
+  filename: string;
+  title: string;
+  markdown: string;
+};
+
+/** GET /api/workspaces/{id}/storyline 响应。 */
+export type WorkspaceStorylineContent = {
+  workspace_id: string;
+  index_markdown: string;
+  entries: StorylineEntry[];
+  file_count: number;
+};
+
+export type StorylineGraphStoryline = {
+  id: string;
+  name: string;
+  type: string;
+  status: string;
+  direction: string;
+  key_events: string[];
+};
+
+export type StorylineGraphEvent = {
+  id: string;
+  name: string;
+  type: string;
+  storylines: string[];
+  group: string;
+  doc_order: number;
+};
+
+/** GET /api/workspaces/{id}/storyline-graph 响应（本 tab 暂只用 markdown 字段，结构化字段为后续画图预留）。 */
+export type WorkspaceStorylineGraphContent = {
+  workspace_id: string;
+  markdown: string;
+  storylines: StorylineGraphStoryline[];
+  events: Record<string, StorylineGraphEvent>;
+  t_map: Record<string, number>;
+  storyline_count: number;
+  event_count: number;
+  generated_at: string;
+  stale: boolean;
+};
