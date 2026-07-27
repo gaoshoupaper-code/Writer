@@ -42,6 +42,11 @@ forensics-*/
 *.pdf
 _paper_extract.txt
 
+# 论文研究笔记（个人参考资料，不入仓库；前导 / 限定根目录，不误伤同名子文件）
+/NWM.txt
+/NWM_讲解.md
+/From-Personas-to-Plot_讲解.md
+
 # Node
 node_modules/
 .next/
