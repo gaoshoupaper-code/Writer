@@ -31,6 +31,9 @@ from .types import apply_style_suffix
 from ..middleware.storyline_single_line_limit import (
     StorylineSingleLineLimitMiddleware,
 )
+from ..middleware.storybuilding_iteration_limit import (
+    StorybuildingIterationLimitMiddleware,
+)
 from app.platform.agent.middleware import ContextAssemblerMiddleware
 
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "storybuilding_system.md"
@@ -76,8 +79,8 @@ def build_storybuilding_subagent(
         description=(
             "适用：需要构建或扩展小说故事世界时调用——包括人物、世界观、"
             "故事核心、故事线（含事件组）。"
-            "增量迭代：按人物/故事线的比值分流——人物充足(>3)新增一条故事线，"
-            "人物不足(≤3)新增一个人物并融入现有故事(不新增故事线)；"
+            "增量迭代：按人物/故事线的比值分流——人物充足(≥3)新增一条故事线，"
+            "人物不足(<3)新增一个人物并融入现有故事(不新增故事线)；"
             "每次调用只执行一种模式，可循环多次调用。"
         ),
         system_prompt=system_prompt,
@@ -115,6 +118,10 @@ def build_storybuilding_deep_subagent(
     """
     # ---- 主代理 middleware ----
     storybuilding_middleware = list(middleware_factory("storybuilding-subagent"))
+    # 全局迭代上限：storybuilding 子代理最多被 meta-agent 委托 max_iterations 次
+    # （跨多次 task 调用累计，不重置）。超过后注入终止指令迫使 meta 推进到 detail-outline。
+    # 注意：ReadCache 已由 middleware_factory 全 agent 装配（A2-D2），此处不重复装配。
+    storybuilding_middleware.append(StorybuildingIterationLimitMiddleware(max_iterations=5))
     # 单次单线硬约束：每次 storybuilding 运行最多新增 1 条 storyline（见需求 B1/B4）
     storybuilding_middleware.append(StorylineSingleLineLimitMiddleware(workspace_root, max_new_lines=1))
     if context_file_paths:
@@ -161,7 +168,7 @@ def build_storybuilding_deep_subagent(
             "每条故事线详情（含事件组）拆到 storyline/S{XX}-{名}.md，一条一个文件。"
             "事件以事件组为单位插入，按三幕式比例编排。"
             "增量迭代：按人物/故事线比值分流两种互斥模式——"
-            "人物充足(>3)新增一条故事线，人物不足(≤3)新增一个人物并融入现有故事、不新增故事线；"
+            "人物充足(≥3)新增一条故事线，人物不足(<3)新增一个人物并融入现有故事、不新增故事线；"
             "每次调用只执行一种模式，可循环多次调用。"
             "内置统一审查：产出后调用 review 审查跨维度一致性，单次审查修订（仅 1 次）。"
             "委托时必须说明：使用初构还是增量 Skill、本轮焦点、用户扩展方向。"
@@ -172,6 +179,6 @@ def build_storybuilding_deep_subagent(
         subagent_middleware=primary_spec.get("middleware"),
         backend=backend,
         artifact_paths=[workspace_root / "storyline.md", workspace_root / "storyline", workspace_root / "storyline" / "timeline.md"],
-        max_revisions=1,
+        max_revisions=2,
         skills=skills,
     )

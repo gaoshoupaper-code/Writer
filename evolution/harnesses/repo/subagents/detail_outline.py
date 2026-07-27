@@ -135,6 +135,6 @@ def build_detail_outline_deep_subagent(
         review_spec=review,
         subagent_middleware=primary_spec.get("middleware"),
         backend=backend,
-        max_revisions=1,
+        max_revisions=2,
         skills=[skills_path],
     )

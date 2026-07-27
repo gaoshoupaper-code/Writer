@@ -120,6 +120,9 @@ def extract_facts(trace_id: str) -> dict[str, Any]:
     # 6. review 调用链（新写）
     review_chain = _build_review_chain(events)
 
+    # 6.5 review finding 解析（第二期：从 review 文件内容提取结构化 finding + 初查/复查判定）
+    review_chain = _enrich_review_chain_with_findings(review_chain, review_artifacts)
+
     # 7. revise 修改（新写，时序推断）
     revise_events = _infer_revise_events(events)
 
@@ -380,6 +383,90 @@ def _build_review_chain(events: list) -> list[dict[str, Any]]:
 
     chain.sort(key=lambda x: x["sequence"])
     return chain
+
+
+# ── review finding 结构化解析（第二期） ────────────────────────
+
+# finding 编号前缀正则：W1/W2/S1/D1 等
+_FINDING_ID_RE = re.compile(r"\b([WSD])(\d+)\b")
+
+# 复查状态关键词
+_RECHECK_STATUS_RE = re.compile(r"\b(resolved|unresolved|regressed)\b", re.IGNORECASE)
+
+
+def _enrich_review_chain_with_findings(
+    review_chain: list[dict[str, Any]],
+    review_artifacts: dict[str, str],
+) -> list[dict[str, Any]]:
+    """从 review 文件内容提取结构化 finding + 判断初查/复查模式。
+
+    第二期 reviewer prompt 要求每个问题带稳定编号（W1/S1/D1），复查模式逐条确认状态。
+    这里从 review 文件内容解析这些信息，附加到 review_chain 的每个条目上。
+
+    对同一 review 文件被写多次的情况（初查写一次、复查覆盖一次），按 review_chain
+    条目的时间序判断：同 reviewer 同 review_file 的第一次=初查，第二次=复查。
+
+    Returns:
+        在原 review_chain 每条上追加：
+        - is_recheck: bool（第二次写同文件 = 复查）
+        - findings: [{id, severity, status, note}]（从文件内容解析）
+        历史数据（无结构化编号）findings 为空，不报错。
+    """
+    # 按 reviewer + review_file 统计出现次数，判断初查/复查
+    seen_count: dict[tuple[str, str | None], int] = {}
+
+    for entry in review_chain:
+        key = (entry["reviewer"], entry.get("review_file"))
+        count = seen_count.get(key, 0)
+        seen_count[key] = count + 1
+        entry["is_recheck"] = count > 0  # 同文件第二次写入 = 复查
+
+        # 从 review_artifacts 拿文件内容解析 finding
+        review_file = entry.get("review_file")
+        content = review_artifacts.get(review_file, "") if review_file else ""
+        entry["findings"] = _parse_findings_from_review(content, entry["is_recheck"])
+
+    return review_chain
+
+
+def _parse_findings_from_review(content: str, is_recheck: bool) -> list[dict[str, Any]]:
+    """从 review 文件内容解析 finding 编号和状态。
+
+    初查模式：提取 W1/W2... 或 S1/S2... 或 D1/D2... 编号。
+    复查模式：额外提取每个编号的 resolved/unresolved/regressed 状态。
+
+    历史数据（无编号）返回空列表，不报错。
+    """
+    if not content:
+        return []
+
+    findings: list[dict[str, Any]] = []
+    lines = content.split("\n")
+
+    for line in lines:
+        # 找含 finding 编号的行
+        match = _FINDING_ID_RE.search(line)
+        if not match:
+            continue
+
+        finding_id = f"{match.group(1)}{match.group(2)}"
+        status = "open"  # 初查默认 open
+
+        # 复查模式：找状态关键词
+        if is_recheck:
+            status_match = _RECHECK_STATUS_RE.search(line)
+            if status_match:
+                status = status_match.group(1).lower()
+
+        # 避免重复（同编号在同一文件里可能出现多次）
+        if not any(f["id"] == finding_id for f in findings):
+            findings.append({
+                "id": finding_id,
+                "status": status,
+                "note": line.strip()[:150],  # 保留行内容片段供回钻
+            })
+
+    return findings
 
 
 # ── revise 修改时序推断 ───────────────────────────────────────

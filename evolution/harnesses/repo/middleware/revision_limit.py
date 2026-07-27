@@ -67,9 +67,9 @@ class RevisionLimitMiddleware(AgentMiddleware):
         tool_call_id = _mapping_value(tool_call, "id")
         return ToolMessage(
             content=(
-                f"已达到本轮审查上限（{self.max_revisions} 次 / 本轮创作）。"
-                "请接受当前版本，不要再调用 review 审查。"
-                "请在返回给父代理的摘要中明确注明：「本轮因达到审查上限，已跳过 review 审查」，"
+                f"已达到本轮审查上限（{self.max_revisions} 次 / 本轮创作，含初查 + 复查）。"
+                "审查（初查+复查）已完成，请接受当前版本，不要再调用 review。"
+                "请在返回给父代理的摘要中明确注明：「本轮审查已用完（初查+复查），已跳过额外 review」，"
                 "再基于当前内容收尾返回。"
             ),
             name="task",
