@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "production": 2,
+  "production": 6,
   "versions": [
     {
       "version": 1,
@@ -54,6 +54,17 @@
       "source_session": null,
       "backfilled": true,
       "backfill_note": "NWM 重构改动此前仅落主仓库(25de1a6)未进 harness repo，本次 commit 2822cc0 补进 + 补登记 v5。"
+    },
+    {
+      "version": 6,
+      "parent_version": 5,
+      "change_summary": "fix(infra): A2 加固中间件链复活（EncodingGuard/ReadCache/FileStateTracker/WriteResultInspector）+ 合并服务器 v3 发版的 storybuilding 迭代护栏（StorybuildingIterationLimitMiddleware）",
+      "eval_score": null,
+      "eval_status": "pending",
+      "created_at": "2026-07-20T11:30:00+00:00",
+      "source_session": null,
+      "merged_from": "server-aa7cfe8",
+      "merge_note": "合并本地 A2 修复（56130cc）与服务器 v3 发版（aa7cfe8）的有价值改动。排除服务器 large_tool_results/ 污染；ReadCache 以本地为准（全 agent 装配），去掉服务器在 storybuilding.py 里重复的装配。"
     }
   ],
   "rollback_log": []

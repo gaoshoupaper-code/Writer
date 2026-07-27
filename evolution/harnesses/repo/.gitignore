@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# deepagents 框架存"过大 tool 输出"的临时目录（写作过程中生成，不该入库）
+large_tool_results/
+
