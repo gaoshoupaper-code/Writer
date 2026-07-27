@@ -4786,6 +4786,30 @@ html[data-theme="dark"] .panel-heading {
   border-color: var(--blue, #5f7cff);
 }
 
+.auth-input[aria-invalid="true"] {
+  border-color: #dc2626;
+}
+
+.auth-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  border: 1px solid rgba(220, 38, 38, 0.2);
+  border-radius: 8px;
+  padding: 9px 10px;
+  background: rgba(220, 38, 38, 0.06);
+  color: #b91c1c;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.auth-error svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
 .auth-button {
   margin-top: 6px;
   padding: 11px 16px;
@@ -4867,6 +4891,12 @@ html[data-theme="dark"] .auth-input {
   background: #1c2540;
   border-color: rgba(255, 255, 255, 0.12);
   color: #e2e8f0;
+}
+
+html[data-theme="dark"] .auth-error {
+  border-color: rgba(248, 113, 113, 0.28);
+  background: rgba(248, 113, 113, 0.1);
+  color: #fca5a5;
 }
 
 /* ── TopBar 用户菜单 ─────────────────────────────────────── */

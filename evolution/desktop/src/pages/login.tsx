@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { toast } from "sonner";
+import { CircleAlert } from "lucide-react";
 import { login, fetchMeOrNull } from "@/lib/api";
 
 export default function LoginPage() {
@@ -9,6 +9,7 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [checking, setChecking] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   // 已登录则跳首页。加 checking 锁防止 Shell↔Login 反弹闪烁：
   // 探测完成前不渲染任何内容，避免与 Shell 守卫的探测互相反弹。
@@ -33,12 +34,13 @@ export default function LoginPage() {
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (submitting) return;
+    setError(null);
     setSubmitting(true);
     try {
       await login(username.trim(), password);
       navigate("/", { replace: true });
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "登录失败。");
+      setError(err instanceof Error ? err.message : "登录失败，请稍后重试。");
     } finally {
       setSubmitting(false);
     }
@@ -59,11 +61,16 @@ export default function LoginPage() {
             <input
               className="auth-input"
               value={username}
-              onChange={(e) => setUsername(e.target.value)}
+              onChange={(e) => {
+                setUsername(e.target.value);
+                setError(null);
+              }}
               placeholder="用户名"
               autoFocus
               autoComplete="username"
               disabled={submitting}
+              aria-invalid={Boolean(error)}
+              aria-describedby={error ? "login-error" : undefined}
             />
           </label>
           <label className="auth-field">
@@ -72,12 +79,23 @@ export default function LoginPage() {
               className="auth-input"
               type="password"
               value={password}
-              onChange={(e) => setPassword(e.target.value)}
+              onChange={(e) => {
+                setPassword(e.target.value);
+                setError(null);
+              }}
               placeholder="密码"
               autoComplete="current-password"
               disabled={submitting}
+              aria-invalid={Boolean(error)}
+              aria-describedby={error ? "login-error" : undefined}
             />
           </label>
+          {error && (
+            <div className="auth-error" id="login-error" role="alert">
+              <CircleAlert aria-hidden="true" size={16} strokeWidth={2} />
+              <span>{error}</span>
+            </div>
+          )}
           <button
             className="auth-button"
             type="submit"

@@ -176,8 +176,23 @@ async function _fetch(input: string, init: RequestInit): Promise<RelayResponse> 
 async function apiJson<T>(input: string, init: RequestInit, fetcher = apiFetch): Promise<T> {
   const resp = await fetcher(input, init);
   if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(text || `HTTP ${resp.status}`);
+    const text = (await resp.text()).trim();
+    let message = text;
+
+    if (text) {
+      try {
+        const payload = JSON.parse(text) as { detail?: unknown; message?: unknown };
+        if (typeof payload.detail === "string") {
+          message = payload.detail;
+        } else if (typeof payload.message === "string") {
+          message = payload.message;
+        }
+      } catch {
+        // 非 JSON 响应（例如网关错误）保留原文，便于定位服务异常。
+      }
+    }
+
+    throw new Error(message || `请求失败（HTTP ${resp.status}）`);
   }
   return resp.json();
 }
