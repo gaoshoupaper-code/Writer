@@ -53,10 +53,12 @@ class EvaluationContext:
         self.recorder: "EvolutionTraceRecorder | None" = None
         # 自观测 trace id（本次评估的录像）。由 api 启动时 create_run 设置。
         self.trace_id_self: str = ""
-        # 证据包（轨迹证据包，2026-07）：评估 Agent 优先读证据包而非直读 trace。
-        # 无证据包时为 None，评估 Agent 降级为直读 trace。
-        self.evidence_pack: dict[str, Any] | None = None
-        self.pack_id: str | None = None
+        # 阶段 C（2026-07-27）：证据卷宗是评估 Agent 的唯一业务证据输入。
+        # 评估 Agent 不再直读原始 trace / 工作区——所有事实从卷宗读。
+        # dossier_id + dossier_version 启动时绑定，不可变（需求 §21）。
+        self.dossier: dict[str, Any] | None = None
+        self.dossier_id: str | None = None
+        self.dossier_version: int | None = None
 
     # ── 事件推送便捷方法（D3：代理到 recorder.append_business_event）──
 

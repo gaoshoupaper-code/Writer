@@ -168,13 +168,14 @@ def list_sessions(
 
 
 def get_done_by_trace(trace_id: str) -> dict[str, Any] | None:
-    """查某 trace 最近一条 done 评估（进化强前置校验用，T2/S8）。
+    """查某 trace 最近一条成功评估（进化强前置校验用，T2/S8）。
 
-    一条 trace 可能被多次评估（不同时间），取最新的 done 记录。
+    阶段 C：兼容 done（旧链路）和 completed（新链路卷宗封存）。
+    一条 trace 可能被多次评估（不同时间），取最新成功记录。
     """
     row = db.query_one(
         """SELECT * FROM evaluation_sessions
-           WHERE trace_id = ? AND status = 'done'
+           WHERE trace_id = ? AND status IN ('done', 'completed')
            ORDER BY updated_at DESC LIMIT 1""",
         (trace_id,),
     )
@@ -182,13 +183,15 @@ def get_done_by_trace(trace_id: str) -> dict[str, Any] | None:
 
 
 def list_evaluated_traces(limit: int = 100) -> list[dict[str, Any]]:
-    """列已评估（有 done 记录）的 trace（进化入口「选已评估 trace」用）。
+    """列已评估的 trace（进化入口「选已评估 trace」用）。
 
-    返回每个 trace 最新 done 评估的摘要（eval_id/trace_id/scores 摘要/created_at）。
+    阶段 C：评估成功状态从 done 变为 completed（评估卷宗封存）。兼容两者：
+    done = 旧链路（直读 trace 评估）；completed = 新链路（卷宗评估 + 封存）。
+    阶段 D 进化入口将改为按评估卷宗启动，此函数届时重写。
     """
     rows = db.query_all(
         """SELECT * FROM evaluation_sessions
-           WHERE status = 'done'
+           WHERE status IN ('done', 'completed')
            ORDER BY updated_at DESC LIMIT ?""",
         (limit,),
     )

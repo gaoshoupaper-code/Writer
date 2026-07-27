@@ -49,14 +49,15 @@ def get_recorder() -> EvolutionTraceRecorder | None:
 
 
 class EvalStartRequest(BaseModel):
-    """评估启动请求。"""
+    """评估启动请求（阶段 C：按证据卷宗启动）。"""
 
-    trace_id: str  # 必填：要评估的 trace
+    dossier_id: str  # 必填：要评估的证据卷宗 id（须为完整态 ready）
 
 
 class EvalStartResponse(BaseModel):
     eval_id: str
     trace_id: str
+    dossier_id: str
     status: str  # started
 
 
@@ -67,75 +68,94 @@ class EvalStartResponse(BaseModel):
 async def eval_start(
     req: EvalStartRequest,
 ) -> EvalStartResponse:
-    """启动一次评估（异步）。立即返回 eval_id，后台跑评估 Agent。"""
-    # 校验 trace 存在
-    from app.view.traces import get_trace
-    try:
-        get_trace(req.trace_id)
-    except Exception:
+    """启动一次评估（异步）。按证据卷宗启动，立即返回 eval_id，后台跑评估 Agent。
+
+    阶段 C（2026-07-27）：评估只接受完整证据卷宗（status=ready）。
+    partial / failed / 编译中一律拒绝（需求 §29），不降级为直读 trace。
+    评估尝试启动时绑定卷宗版本（bound_dossier_id + version），不可变。
+    """
+    from app.dossier import repo as dossier_repo
+
+    # 1. 查卷宗 + 校验完整态（需求 §29：只接受 ready）
+    dossier = dossier_repo.get_dossier(req.dossier_id)
+    if dossier is None:
         raise HTTPException(
             status_code=404,
-            detail=f"trace {req.trace_id} 不存在",
+            detail=f"证据卷宗 {req.dossier_id} 不存在",
         )
+    if dossier["status"] != "ready":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"证据卷宗 {req.dossier_id} 状态为 {dossier['status']}，"
+                f"只有 ready（完整）卷宗可评估。partial/failed/编译中均不可评估。"
+            ),
+        )
+    trace_id = dossier["trace_id"]
+    dossier_version = dossier["version"]
 
-    # 防自观测：评估 Agent 只评估创作 Agent 的 trace，不能评估进化端自观测 trace
-    # （evolution_eval = 评估 Agent 自身录像，evolution_evolve = 进化 Agent 录像）。
-    # 否则会形成"评估自己"的死循环或跨 Agent 误评。
+    # 2. 防自观测：卷宗来源 trace 不能是进化端自观测 trace（需求 §44）。
     run_row = db.query_one(
-        "SELECT run_purpose FROM runs WHERE trace_id = ?", (req.trace_id,)
+        "SELECT run_purpose FROM runs WHERE trace_id = ?", (trace_id,)
     )
     run_purpose = (run_row or {}).get("run_purpose") or "user_generation"
     if run_purpose in ("evolution_eval", "evolution_evolve"):
         raise HTTPException(
             status_code=400,
             detail=(
-                f"trace {req.trace_id} 是进化端自观测 trace"
+                f"证据卷宗 {req.dossier_id} 来源 trace 是进化端自观测"
                 f"（run_purpose={run_purpose}），不能评估。"
-                "只能评估创作 Agent 的 trace。"
             ),
+        )
+
+    # 3. 单卷宗单活动任务（需求 §40）：已有活动评估则复用，不创建并行任务。
+    active = eval_repo.get_active_attempt_by_dossier(req.dossier_id)
+    if active is not None:
+        logger.info(
+            "评估启动复用现有活动任务: eval=%s dossier=%s",
+            active["eval_id"], req.dossier_id,
+        )
+        return EvalStartResponse(
+            eval_id=active["eval_id"], trace_id=trace_id,
+            dossier_id=req.dossier_id, status="started",
         )
 
     eval_id = uuid.uuid4().hex[:12]
 
-    # 从 manual_tests 反查该 trace 对应的 Agent 版本（T7）
-    version_type, version_id = _lookup_agent_version(req.trace_id)
+    # 4. 从 manual_tests 反查该 trace 对应的 Agent 版本（T7）
+    version_type, version_id = _lookup_agent_version(trace_id)
 
-    # 落库评估 session
+    # 5. 落库评估尝试（绑定卷宗版本，不可变）
     eval_repo.create_session(
-        eval_id, req.trace_id,
+        eval_id, trace_id,
         agent_version_type=version_type,
         agent_version_id=version_id,
+        bound_dossier_id=req.dossier_id,
     )
 
-    # 构建评估上下文 + 注入 recorder（D6）
+    # 6. 构建评估上下文：dossier 是唯一业务证据输入（不再降级直读 trace）
     ctx = EvaluationContext(
-        eval_id, req.trace_id,
+        eval_id, trace_id,
         agent_version_type=version_type,
         agent_version_id=version_id,
     )
     ctx.recorder = get_recorder()
+    ctx.dossier = dossier
+    ctx.dossier_id = req.dossier_id
+    ctx.dossier_version = dossier_version
 
-    # 注入证据卷宗（2026-07）：评估 Agent 优先读证据卷宗而非直读 trace。
-    # 无证据卷宗时 evidence_pack 保持 None，评估 Agent 降级为直读 trace。
-    # 阶段 C 将改为：评估只接受完整证据卷宗，无卷宗则拒绝启动。
-    from app.dossier import repo as dossier_repo
-    dossier = dossier_repo.get_consumable_dossier(req.trace_id)
-    if dossier:
-        ctx.evidence_pack = dossier  # ctx 字段名阶段 C 统一为 dossier
-        ctx.pack_id = dossier["dossier_id"]
-        logger.info("评估 session 绑定证据卷宗: dossier=%s status=%s", ctx.pack_id, dossier["status"])
-    else:
-        logger.info("评估 session 无证据卷宗可用，降级为直读 trace: trace=%s", req.trace_id)
-
-    # 后台跑评估 Agent（create_task 拿到 task 引用，存注册表供 stop 端点取消）
+    # 7. 后台跑评估 Agent
     task = asyncio.create_task(_run_eval_bg(ctx))
     _running_tasks[eval_id] = task
 
     logger.info(
-        "评估 session 启动: eval=%s trace=%s version=%s/%s",
-        eval_id, req.trace_id, version_type, version_id,
+        "评估 session 启动: eval=%s dossier=%s(v%s) trace=%s version=%s/%s",
+        eval_id, req.dossier_id, dossier_version, trace_id, version_type, version_id,
     )
-    return EvalStartResponse(eval_id=eval_id, trace_id=req.trace_id, status="started")
+    return EvalStartResponse(
+        eval_id=eval_id, trace_id=trace_id,
+        dossier_id=req.dossier_id, status="started",
+    )
 
 
 def _lookup_agent_version(trace_id: str) -> tuple[str | None, int | None]:
@@ -163,13 +183,13 @@ async def _run_eval_bg(ctx: EvaluationContext) -> None:
     try:
         result = await run_eval_session(ctx)
         if result["status"] == "done":
-            # Agent 正常结束。但「正常结束」≠「产出了报告」：
-            # write_eval_report 工具若被调用，DB 状态已是 done 且写了报告。
-            # 若 Agent 没调报告工具就结束，DB 仍是 running —— 此时报告缺失，
-            # 应视为失败，避免 session 永远停在 running。
+            # Agent 正常结束。但「正常结束」≠「评估卷宗已封存」：
+            # write_eval_report 工具若成功，sealer 已把尝试标 completed 并回填 sealed_dossier_id。
+            # 若 Agent 没调报告工具就结束，或封存失败，DB 仍是 running/failed —— 视为失败。
             session = eval_repo.get_session(ctx.eval_id)
-            if session is None or session.get("status") != "done":
-                eval_repo.update_session(ctx.eval_id, status="failed")
+            if session is None or session.get("status") != "completed":
+                eval_repo.update_session(ctx.eval_id, status="failed",
+                                         failure_reason="评估未封存卷宗（Agent 未产报告或封存失败）")
         elif result["status"] == "cancelled":
             # 用户主动停止的合法终态，不算失败。
             pass

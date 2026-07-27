@@ -252,4 +252,52 @@ def _detect_badcase(group_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-__all__ = ["evaluate_trace"]
+def evaluate_from_facts(facts: dict[str, Any], trace_id: str) -> dict[str, Any]:
+    """从证据卷宗 facts 评估内容质量（阶段 C：不读工作区文件系统）。
+
+    与 evaluate_trace 的区别：
+      - 输入是卷宗 facts（B1 冻结的 deliveries），不再调 extract_deliveries 读文件
+      - 不写 evaluation_runs / evaluation_scores 表（那些是旧 trace 维度表）
+      - 返回结构相同（groups/badcase/calibration/rubric_version），供评估卷宗封存
+
+    deliveries 结构转换：卷宗 facts.deliveries 是 {agent: {path: {content_frozen,...}}}，
+    scoring 期望 {agent: {path: content_str}}，这里取 content_frozen 还原。
+    """
+    if not llm.judge_enabled():
+        logger.warning("evaluate_from_facts 跳过：LLM 未配置")
+        return {"skipped": True, "reason": "LLM 未配置"}
+
+    # 从卷宗 facts 还原 scoring 期望的 deliveries 格式
+    frozen = facts.get("deliveries") or {}
+    deliveries: dict[str, dict[str, str]] = {}
+    for agent, files in frozen.items():
+        agent_files: dict[str, str] = {}
+        for path, meta in files.items():
+            content = meta.get("content_frozen") if isinstance(meta, dict) else meta
+            if content:
+                agent_files[path] = content
+        if agent_files:
+            deliveries[agent] = agent_files
+
+    if not deliveries:
+        return {"skipped": True, "reason": "卷宗无冻结交付物"}
+
+    try:
+        groups = rubric.applicable_groups(deliveries)
+        group_results: dict[str, dict[str, Any]] = {}
+        for group_name, dimensions in groups.items():
+            group_results[group_name] = _evaluate_group(trace_id, group_name, dimensions, deliveries)
+
+        badcase = _detect_badcase(group_results)
+        return {
+            "groups": group_results,
+            "badcase": badcase,
+            "calibration": rubric.CALIBRATION_STATUS,
+            "rubric_version": rubric.RUBRIC_VERSION,
+        }
+    except Exception as exc:
+        logger.exception("evaluate_from_facts 失败 trace=%s", trace_id)
+        return {"error": str(exc)}
+
+
+__all__ = ["evaluate_trace", "evaluate_from_facts"]
