@@ -10,13 +10,13 @@ import {
   stopEval,
   getTraces,
   getEvalSessionEventsSince,
-  startEvidenceCompile,
-  getEvidenceSession,
-  getCurrentEvidencePack,
+  startCompileDossier,
+  getDossierSession,
+  getCurrentDossier,
   type EvalSession,
   type TraceListItem,
   type EvalFrame,
-  type EvidencePack,
+  type Dossier,
 } from "@/lib/api";
 
 /**
@@ -296,41 +296,41 @@ function EvalReport({ evalSession, onTraceClick }: { evalSession: EvalSession; o
   const scores = evalSession.scores || {};
   const findings = evalSession.findings || [];
 
-  // 证据编译状态（轨迹证据包）
-  const [evidenceStatus, setEvidenceStatus] = useState<string>("idle"); // idle|compiling|ready|partial|failed|error
-  const [evidencePack, setEvidencePack] = useState<EvidencePack | null>(null);
+  // 证据卷宗编译状态
+  const [dossierStatus, setDossierStatus] = useState<string>("idle"); // idle|compiling|ready|partial|failed|error
+  const [dossier, setDossier] = useState<Dossier | null>(null);
 
   async function handleCompileEvidence() {
-    setEvidenceStatus("compiling");
+    setDossierStatus("compiling");
     try {
-      const resp = await startEvidenceCompile(evalSession.trace_id);
+      const resp = await startCompileDossier(evalSession.trace_id);
       // 轮询编译状态
       const poll = async () => {
-        const pack = await getEvidenceSession(resp.pack_id);
-        if (pack.status === "compiling" || pack.status === "pending") {
-          setEvidencePack(pack);
+        const d = await getDossierSession(resp.dossier_id);
+        if (d.status === "compiling" || d.status === "pending") {
+          setDossier(d);
           setTimeout(poll, 2000);
         } else {
-          setEvidencePack(pack);
-          setEvidenceStatus(pack.status);
+          setDossier(d);
+          setDossierStatus(d.status);
         }
       };
       poll();
     } catch (e) {
-      setEvidenceStatus("error");
+      setDossierStatus("error");
     }
   }
 
-  // 页面加载时检查是否已有证据包
+  // 页面加载时检查是否已有证据卷宗
   useEffect(() => {
-    getCurrentEvidencePack(evalSession.trace_id)
-      .then((pack) => {
-        setEvidencePack(pack);
-        setEvidenceStatus(pack.status);
+    getCurrentDossier(evalSession.trace_id)
+      .then((d) => {
+        setDossier(d);
+        setDossierStatus(d.status);
       })
       .catch(() => {
-        // 无证据包是正常状态，不算错误
-        setEvidenceStatus("idle");
+        // 无证据卷宗是正常状态，不算错误
+        setDossierStatus("idle");
       });
   }, [evalSession.trace_id]);
 
@@ -388,47 +388,47 @@ function EvalReport({ evalSession, onTraceClick }: { evalSession: EvalSession; o
         </div>
       )}
 
-      {/* 轨迹证据包编译入口（2026-07） */}
+      {/* 证据卷宗编译入口（2026-07） */}
       <div className="evidence-compile-section">
-        <h4>轨迹证据包</h4>
-        {evidenceStatus === "idle" && (
+        <h4>证据卷宗</h4>
+        {dossierStatus === "idle" && (
           <button className="config-button primary" onClick={handleCompileEvidence}>
-            编译轨迹证据包
+            编译证据卷宗
           </button>
         )}
-        {evidenceStatus === "compiling" && (
+        {dossierStatus === "compiling" && (
           <div className="evidence-status compiling">
-            <span className="spinner" /> 编译中… pack_id={evidencePack?.pack_id?.slice(0, 8)}…
+            <span className="spinner" /> 编译中… dossier={dossier?.dossier_id?.slice(0, 8)}…
           </div>
         )}
-        {(evidenceStatus === "ready" || evidenceStatus === "partial") && evidencePack && (
+        {(dossierStatus === "ready" || dossierStatus === "partial") && dossier && (
           <div className="evidence-status done">
-            <span className={`pack-status ${evidencePack.status}`}>
-              {evidencePack.status === "ready" ? "✓ 完整" : "△ 降级"}（v{evidencePack.version}）
+            <span className={`pack-status ${dossier.status}`}>
+              {dossier.status === "ready" ? "✓ 完整" : "△ 降级"}（v{dossier.version}）
             </span>
-            {evidencePack.manifest && (
+            {dossier.manifest && (
               <div className="evidence-summary">
-                <span>完整度: {evidencePack.manifest.completeness}</span>
-                <span>适用维度: {evidencePack.manifest.applicable_dimensions?.join(", ")}</span>
-                <span>review: {evidencePack.manifest.coverage?.review_calls ?? 0} 次</span>
-                <span>错误: {evidencePack.manifest.coverage?.error_events ?? 0} 个</span>
-                {evidencePack.manifest.coverage?.gaps?.length > 0 && (
-                  <span className="evidence-gaps">⚠ 缺口: {evidencePack.manifest.coverage.gaps.join("; ")}</span>
+                <span>完整度: {dossier.manifest.completeness}</span>
+                <span>适用维度: {dossier.manifest.applicable_dimensions?.join(", ")}</span>
+                <span>review: {dossier.manifest.coverage?.review_calls ?? 0} 次</span>
+                <span>错误: {dossier.manifest.coverage?.error_events ?? 0} 个</span>
+                {dossier.manifest.coverage?.gaps?.length > 0 && (
+                  <span className="evidence-gaps">⚠ 缺口: {dossier.manifest.coverage.gaps.join("; ")}</span>
                 )}
               </div>
             )}
-            {evidencePack.failure_reason && (
-              <div className="evidence-reason">{evidencePack.failure_reason}</div>
+            {dossier.failure_reason && (
+              <div className="evidence-reason">{dossier.failure_reason}</div>
             )}
           </div>
         )}
-        {evidenceStatus === "failed" && (
+        {dossierStatus === "failed" && (
           <div className="evidence-status failed">
-            ✗ 编译失败：{evidencePack?.failure_reason || "未知原因"}
+            ✗ 编译失败：{dossier?.failure_reason || "未知原因"}
             <button className="link-button" onClick={handleCompileEvidence}>重试</button>
           </div>
         )}
-        {evidenceStatus === "error" && (
+        {dossierStatus === "error" && (
           <div className="evidence-status failed">
             ✗ 请求失败
             <button className="link-button" onClick={handleCompileEvidence}>重试</button>

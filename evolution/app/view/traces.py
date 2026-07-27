@@ -254,9 +254,10 @@ def get_trace_context(
 @router.delete("/traces/{trace_id}")
 def delete_trace(trace_id: str) -> dict[str, str]:
     """删除 trace 的 evolution 记录（runs/nodes/events/flags/证据包 随级联删除）。"""
-    # 证据包是逻辑外键（无物理 FK），需显式级联删除——证据包冻结了用户需求和正文，
+    # 证据卷宗是逻辑外键（无物理 FK），需显式级联删除——证据卷宗冻结了用户需求和正文，
     # 删除原 trace 时必须一并清理，避免冻结内容脱离原 trace 留存（需求 D-删除语义）。
-    db.execute("DELETE FROM evidence_packs WHERE trace_id = ?", (trace_id,))
+    # 阶段 F 会强化：同步删评估卷宗、纠错裁决、未发布进化记录。
+    db.execute("DELETE FROM evidence_dossiers WHERE trace_id = ?", (trace_id,))
     cur = db.execute("DELETE FROM runs WHERE trace_id = ?", (trace_id,))
     if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="Trace not found")

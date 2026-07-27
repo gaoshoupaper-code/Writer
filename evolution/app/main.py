@@ -40,7 +40,7 @@ from app.view.agent_package import router as agent_package_router
 from app.evolve.api import router as evolve_router
 from app.tests.api import router as tests_router
 from app.eval_agent.api import router as eval_agent_router
-from app.evidence.api import router as evidence_router
+from app.dossier.api import router as dossier_router
 from app.view.versions_api import router as versions_router
 from app.dataset.api import router as dataset_router
 from app.ingestion.scan import start_scan_scheduler
@@ -132,7 +132,7 @@ app.include_router(evolve_router, prefix="/api")
 app.include_router(tests_router, prefix="/api")
 # 评估 Agent（三功能解耦：评估从进化流水线抽离为独立顶层 Agent，S1/S7）
 app.include_router(eval_agent_router, prefix="/api")
-app.include_router(evidence_router, prefix="/api")
+app.include_router(dossier_router, prefix="/api")
 # 配置版本谱系视图（前端版本谱系页 D8）
 app.include_router(versions_router, prefix="/api")
 # 数据集管理（数据闭环设计：分层数据集 golden/growing + revision 锁定）

@@ -115,16 +115,17 @@ async def eval_start(
     )
     ctx.recorder = get_recorder()
 
-    # 注入证据包（轨迹证据包，2026-07）：评估 Agent 优先读证据包而非直读 trace。
-    # 无证据包时 evidence_pack 保持 None，评估 Agent 降级为直读 trace。
-    from app.evidence import repo as evidence_repo
-    evidence_pack = evidence_repo.get_consumable_pack(req.trace_id)
-    if evidence_pack:
-        ctx.evidence_pack = evidence_pack
-        ctx.pack_id = evidence_pack["pack_id"]
-        logger.info("评估 session 绑定证据包: pack=%s status=%s", ctx.pack_id, evidence_pack["status"])
+    # 注入证据卷宗（2026-07）：评估 Agent 优先读证据卷宗而非直读 trace。
+    # 无证据卷宗时 evidence_pack 保持 None，评估 Agent 降级为直读 trace。
+    # 阶段 C 将改为：评估只接受完整证据卷宗，无卷宗则拒绝启动。
+    from app.dossier import repo as dossier_repo
+    dossier = dossier_repo.get_consumable_dossier(req.trace_id)
+    if dossier:
+        ctx.evidence_pack = dossier  # ctx 字段名阶段 C 统一为 dossier
+        ctx.pack_id = dossier["dossier_id"]
+        logger.info("评估 session 绑定证据卷宗: dossier=%s status=%s", ctx.pack_id, dossier["status"])
     else:
-        logger.info("评估 session 无证据包可用，降级为直读 trace: trace=%s", req.trace_id)
+        logger.info("评估 session 无证据卷宗可用，降级为直读 trace: trace=%s", req.trace_id)
 
     # 后台跑评估 Agent（create_task 拿到 task 引用，存注册表供 stop 端点取消）
     task = asyncio.create_task(_run_eval_bg(ctx))

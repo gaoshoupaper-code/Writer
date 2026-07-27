@@ -53,6 +53,9 @@ def get_conn() -> sqlite3.Connection:
 def init_db() -> None:
     """建表（幂等）。应用启动时调用一次。"""
     conn = get_conn()
+    # 重命名迁移必须在 executescript 之前：否则 executescript 的
+    # CREATE TABLE IF NOT EXISTS evidence_dossiers 会先建空表，使 RENAME 冲突。
+    _migrate_rename_evidence_packs_to_dossiers(conn)
     with _lock:
         conn.executescript(
             """
@@ -411,15 +414,16 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_ep_session ON evolve_points(session_id, seq);
             CREATE INDEX IF NOT EXISTS idx_ep_status ON evolve_points(session_id, status);
 
-            -- evidence_packs：轨迹证据包（Trace Evidence Pack，2026-07）。
+            -- evidence_dossiers：证据卷宗（Evidence Dossier，2026-07，原名 evidence_packs）。
             -- 一条 trace × 一个编译规则版本 = 一行；同 trace 可有多版本（追加，不覆盖）。
-            -- 证据包是评估 Agent 与进化 Agent 的共享事实底座，替代各自直读 trace。
+            -- 证据卷宗是评估 Agent 与进化 Agent 的共享事实底座，替代各自直读 trace。
             -- 四层结构：manifest（清单）/facts（事实）/semantic（语义归纳）/index（回钻索引）。
             -- 另存 eval_view/evolve_view 两个角色工作页投影（从同一事实底座投影，不携带独立事实）。
             -- provenance：trace_time=运行时产物修订（保真最高）/compile_time_snapshot=编译时快照（历史 trace 降级）。
             -- status 状态机：pending|compiling|ready|partial|failed|superseded。
-            CREATE TABLE IF NOT EXISTS evidence_packs (
-                pack_id             TEXT PRIMARY KEY,           -- uuid
+            -- 2026-07-27 重命名 evidence_packs → evidence_dossiers（统一"证据卷宗"术语）。
+            CREATE TABLE IF NOT EXISTS evidence_dossiers (
+                pack_id             TEXT PRIMARY KEY,           -- uuid（DB 列名沿用 pack_id，代码层 alias 为 dossier_id）
                 trace_id            TEXT NOT NULL,              -- FK runs（逻辑外键）
                 owner_user_id       TEXT NOT NULL,              -- 继承自 runs，权限边界
                 version             INTEGER NOT NULL,           -- 同 trace 的版本号（1,2,3...）
@@ -439,9 +443,34 @@ def init_db() -> None:
                 finished_at         TEXT,                       -- 编译完成/失败时间
                 UNIQUE(trace_id, version)
             );
-            CREATE INDEX IF NOT EXISTS idx_epk_trace ON evidence_packs(trace_id);
-            CREATE INDEX IF NOT EXISTS idx_epk_current ON evidence_packs(trace_id, is_current);
-            CREATE INDEX IF NOT EXISTS idx_epk_status ON evidence_packs(status);
+            CREATE INDEX IF NOT EXISTS idx_edo_trace ON evidence_dossiers(trace_id);
+            CREATE INDEX IF NOT EXISTS idx_edo_current ON evidence_dossiers(trace_id, is_current);
+            CREATE INDEX IF NOT EXISTS idx_edo_status ON evidence_dossiers(status);
+
+            -- evaluation_dossiers：评估卷宗（2026-07-27，需求：进化证据分级可见性重构）。
+            -- 一次评估的不可变交付物，包含评估结论及本次实际引用的冻结证据片段。
+            -- 是进化 Agent 唯一可见的 trace 派生输入（评估完成时原子封存）。
+            -- 一个评估尝试（evaluation_sessions.eval_id）最多产出一份评估卷宗（UNIQUE 约束）。
+            -- 永久绑定启动时的证据卷宗版本（source_dossier_id + source_dossier_version 不可变）。
+            CREATE TABLE IF NOT EXISTS evaluation_dossiers (
+                dossier_id          TEXT PRIMARY KEY,           -- 评估卷宗 id（uuid）
+                eval_attempt_id     TEXT NOT NULL,              -- 关联评估尝试（evaluation_sessions.eval_id，逻辑外键）
+                source_dossier_id   TEXT NOT NULL,              -- 绑定的证据卷宗 id（不可变）
+                source_dossier_version INTEGER NOT NULL,        -- 绑定的证据卷宗版本（不可变）
+                trace_id            TEXT NOT NULL,              -- 冗余便于查询（逻辑 FK runs）
+                owner_user_id       TEXT NOT NULL,              -- 继承自 runs
+                conclusions_json    TEXT,                       -- 各维度结论 + 引用的冻结证据片段
+                findings_json       TEXT,                       -- 问题 finding（每条带 evidence_ref）
+                positive_patterns_json TEXT,                    -- 正向可复用模式（每条带 evidence_ref）
+                scores_json         TEXT,                       -- 评分（沿用 evaluation_sessions.scores_json 结构）
+                report_md           TEXT,                       -- 可读报告
+                completeness_status TEXT NOT NULL,              -- complete / incomplete（契约覆盖判定）
+                seal_status         TEXT NOT NULL DEFAULT 'sealed',  -- sealed（唯一终态；封存失败则不入此表）
+                created_at          TEXT NOT NULL,
+                UNIQUE(eval_attempt_id)                         -- 一个尝试最多一份卷宗
+            );
+            CREATE INDEX IF NOT EXISTS idx_evdo_source ON evaluation_dossiers(source_dossier_id);
+            CREATE INDEX IF NOT EXISTS idx_evdo_trace ON evaluation_dossiers(trace_id);
             """
         )
         conn.commit()
@@ -476,6 +505,11 @@ def init_db() -> None:
         # scope 分家：llm_configs 加 scope 列 + 现有数据复制成双份（evolution + executor）
         _migrate_llm_configs_scope(conn)
         # user_cache 表由 executescript CREATE IF NOT EXISTS 直接建（新表无需 ALTER 迁移）
+
+        # 评估尝试演化：evaluation_sessions 加列（bound_dossier / 资源消耗 / 失败原因 / 封存回填）
+        _migrate_evaluation_sessions_attempt_fields(conn)
+        # 进化输入绑定：evolve_sessions 加 bound_eval_dossier_id 列（永久绑定评估卷宗）
+        _migrate_evolve_sessions_bound_eval_dossier(conn)
 
 
 def _migrate_evolve_sessions_driver_fields(conn: sqlite3.Connection) -> None:
@@ -515,6 +549,90 @@ def _migrate_evolve_sessions_eval_ref(conn: sqlite3.Connection) -> None:
     with _lock:
         conn.execute("ALTER TABLE evolve_sessions ADD COLUMN eval_ref TEXT")
         conn.commit()
+
+
+def _migrate_rename_evidence_packs_to_dossiers(conn: sqlite3.Connection) -> None:
+    """幂等迁移：evidence_packs → evidence_dossiers（统一"证据卷宗"术语，2026-07-27）。
+
+    存量库里有 evidence_packs 旧表 → RENAME 成 evidence_dossiers（SQLite 原生支持，
+    保留全部数据 + 索引自动跟随）。新库由 executescript 直接建 evidence_dossiers，
+    此函数检测新表已存在则跳过。
+
+    必须在 init_db() 的 executescript 之前调用：否则 executescript 的
+    CREATE TABLE IF NOT EXISTS evidence_dossiers 会先建空表，使 RENAME 落空。
+    """
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    has_old = "evidence_packs" in tables
+    has_new = "evidence_dossiers" in tables
+    if has_old and not has_new:
+        with _lock:
+            conn.execute("ALTER TABLE evidence_packs RENAME TO evidence_dossiers")
+            # RENAME 后旧索引名仍指向新表（SQLite 自动跟随），重建为 idx_edo_* 命名更清晰。
+            for old_idx, new_idx, ddl in (
+                ("idx_epk_trace", "idx_edo_trace",
+                 "CREATE INDEX IF NOT EXISTS idx_edo_trace ON evidence_dossiers(trace_id)"),
+                ("idx_epk_current", "idx_edo_current",
+                 "CREATE INDEX IF NOT EXISTS idx_edo_current ON evidence_dossiers(trace_id, is_current)"),
+                ("idx_epk_status", "idx_edo_status",
+                 "CREATE INDEX IF NOT EXISTS idx_edo_status ON evidence_dossiers(status)"),
+            ):
+                conn.execute(f"DROP INDEX IF EXISTS {old_idx}")
+                conn.execute(ddl)
+            conn.commit()
+        logger.info("迁移：evidence_packs → evidence_dossiers（重命名完成）")
+
+
+def _migrate_evaluation_sessions_attempt_fields(conn: sqlite3.Connection) -> None:
+    """幂等迁移：evaluation_sessions 演变为「评估尝试」，补列（2026-07-27）。
+
+    语义变更：evaluation_sessions 从「评估结果行」变为「评估尝试」（承载任务生命周期
+    + 资源消耗）。评估产物（结论 + 引用证据）拆到独立的不可变 evaluation_dossiers 表。
+
+    新列：
+    - bound_dossier_id：启动时绑定的证据卷宗 id（不可变，阶段 C 评估按卷宗启动后回填）。
+    - sealed_dossier_id：成功封存的评估卷宗 id（评估成功后回填，NULL=未成功封存）。
+    - model_calls_used / tokens_used / runtime_ms：资源消耗（阶段 F 资源上限用）。
+    - model_calls_limit / tokens_limit / runtime_limit：对应硬上限（可配置）。
+    - failure_reason / stop_reason：失败/停止原因（需求 §41 尝试留痕）。
+
+    status 值域沿用同一列：running/done/failed/cancelled → 后续阶段 C 扩展为
+    queued/running/completed/failed/stopped/interrupted 六态（值域迁移随 C 阶段落地）。
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(evaluation_sessions)").fetchall()}
+    new_cols = {
+        "bound_dossier_id": "TEXT",
+        "sealed_dossier_id": "TEXT",
+        "model_calls_used": "INTEGER NOT NULL DEFAULT 0",
+        "tokens_used": "INTEGER NOT NULL DEFAULT 0",
+        "runtime_ms": "INTEGER NOT NULL DEFAULT 0",
+        "model_calls_limit": "INTEGER",
+        "tokens_limit": "INTEGER",
+        "runtime_limit": "INTEGER",
+        "failure_reason": "TEXT",
+        "stop_reason": "TEXT",
+    }
+    missing = {c: t for c, t in new_cols.items() if c not in existing}
+    if not missing:
+        return
+    with _lock:
+        for col, coltype in missing.items():
+            conn.execute(f"ALTER TABLE evaluation_sessions ADD COLUMN {col} {coltype}")
+        conn.commit()
+
+
+def _migrate_evolve_sessions_bound_eval_dossier(conn: sqlite3.Connection) -> None:
+    """幂等迁移：evolve_sessions 补 bound_eval_dossier_id 列（2026-07-27）。
+
+    进化会话永久绑定启动时选定的评估卷宗 id（需求 §42：禁止会话创建后切换输入，
+    绝不按"最新评估"动态解析）。新进化只消费 evaluation_dossiers，不再按 trace_id 拼接。
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(evolve_sessions)").fetchall()}
+    if "bound_eval_dossier_id" in existing:
+        return
+    with _lock:
+        conn.execute("ALTER TABLE evolve_sessions ADD COLUMN bound_eval_dossier_id TEXT")
+        conn.commit()
+
 
 
 def _migrate_runs_owner_user_id(conn: sqlite3.Connection) -> None:

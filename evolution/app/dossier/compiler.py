@@ -1,4 +1,4 @@
-"""证据编译器：编排提取 → LLM 语义归纳 → 生成索引和角色视图 → 落包。
+"""证据卷宗编译器：编排提取 → LLM 语义归纳 → 生成索引和角色视图 → 落卷宗。
 
 编译流程：
   1. 前置检查 LLM 配置（未配置则降级为纯规则提取，semantic 层留空）
@@ -7,9 +7,9 @@
   4. LLM 分段语义归纳（阶段摘要 + 全局重点候选，每条必引证据 ID）
   5. 生成索引层（受控回钻 ID）
   6. 生成角色工作页（投影，不生成新事实）
-  7. 落包 + 标记当前版本
+  7. 落卷宗 + 标记当前版本
 
-成本控制：每包 LLM 调用上限，超额降级为 partial。
+成本控制：每卷宗 LLM 调用上限，超额降级为 partial。
 状态机：pending → compiling → ready/partial/failed。
 """
 from __future__ import annotations
@@ -21,21 +21,21 @@ from typing import Any
 
 import app.core.db as db
 import app.core.llm as llm
-from app.evidence import repo
-from app.evidence.extractor import extract_facts, COMPILE_RULE_VERSION
-from app.evidence.prompt import build_stage_summary_prompt, build_global_priorities_prompt
+from app.dossier import repo
+from app.dossier.extractor import extract_facts, COMPILE_RULE_VERSION
+from app.dossier.prompt import build_stage_summary_prompt, build_global_priorities_prompt
 
-logger = logging.getLogger("evolution.evidence.compiler")
+logger = logging.getLogger("evolution.dossier.compiler")
 
-# 每包 LLM 调用上限（4 阶段归纳 + 1 全局分级 + 余量）。超额降级为 partial。
+# 每卷宗 LLM 调用上限（4 阶段归纳 + 1 全局分级 + 余量）。超额降级为 partial。
 MAX_LLM_CALLS = 20
 
 # 四个阶段名（对应 primary subagent 产物）
 _STAGES = ["interview", "storybuilding", "detail-outline", "writing"]
 
 
-def compile_evidence(trace_id: str, pack_id: str) -> dict[str, Any]:
-    """编译一条 trace 的证据包（同步函数，由 API 层 asyncio.to_thread 调用）。
+def compile_dossier(trace_id: str, dossier_id: str) -> dict[str, Any]:
+    """编译一条 trace 的证据卷宗（同步函数，由 API 层 asyncio.to_thread 调用）。
 
     Returns:
         {"status": "ready"|"partial"|"failed", "reason": str|None, "llm_calls": int}
@@ -44,7 +44,7 @@ def compile_evidence(trace_id: str, pack_id: str) -> dict[str, Any]:
 
     try:
         # 标记 compiling
-        repo.update_pack(pack_id, status="compiling")
+        repo.update_dossier(dossier_id, status="compiling")
 
         # 1. 提取事实层
         facts = extract_facts(trace_id)
@@ -53,8 +53,8 @@ def compile_evidence(trace_id: str, pack_id: str) -> dict[str, Any]:
         critical_gap = _check_critical_evidence(facts)
         if critical_gap:
             reason = f"关键证据缺失：{critical_gap}"
-            repo.update_pack(
-                pack_id, status="failed", failure_reason=reason,
+            repo.update_dossier(
+                dossier_id, status="failed", failure_reason=reason,
                 facts=facts, finished=True,
             )
             return {"status": "failed", "reason": reason, "llm_calls": 0}
@@ -65,20 +65,20 @@ def compile_evidence(trace_id: str, pack_id: str) -> dict[str, Any]:
         # 4. LLM 语义归纳（或降级）
         llm_ok = llm.judge_enabled()
         if not llm_ok:
-            logger.warning("compile_evidence %s: LLM 未配置，语义层降级为空", trace_id)
+            logger.warning("compile_dossier %s: LLM 未配置，语义层降级为空", trace_id)
             semantic = {"stages": [], "priorities": [], "skipped": True,
                         "reason": "LLM 未配置，语义归纳跳过"}
         else:
             try:
                 semantic, llm_calls = _compile_semantic_layer(facts)
             except _LLMLimitExceeded as e:
-                logger.warning("compile_evidence %s: LLM 调用达上限，降级为 partial", trace_id)
+                logger.warning("compile_dossier %s: LLM 调用达上限，降级为 partial", trace_id)
                 semantic = e.partial_result
-                repo.update_pack(pack_id, status="partial",
-                                 failure_reason=f"LLM 调用达上限（{MAX_LLM_CALLS}次）",
-                                 llm_calls_used=llm_calls)
+                repo.update_dossier(dossier_id, status="partial",
+                                    failure_reason=f"LLM 调用达上限（{MAX_LLM_CALLS}次）",
+                                    llm_calls_used=llm_calls)
             except Exception as exc:
-                logger.exception("compile_evidence %s: 语义归纳失败，降级为 partial", trace_id)
+                logger.exception("compile_dossier %s: 语义归纳失败，降级为 partial", trace_id)
                 semantic = {"stages": [], "priorities": [], "error": str(exc)}
 
         # 5. 生成索引层
@@ -104,9 +104,9 @@ def compile_evidence(trace_id: str, pack_id: str) -> dict[str, Any]:
             final_status = "ready"
             fail_reason = None
 
-        # 8. 落包
-        repo.update_pack(
-            pack_id,
+        # 8. 落卷宗
+        repo.update_dossier(
+            dossier_id,
             status=final_status,
             manifest=manifest,
             facts=facts,
@@ -119,20 +119,20 @@ def compile_evidence(trace_id: str, pack_id: str) -> dict[str, Any]:
             finished=True,
         )
 
-        # 9. 标记当前版本（旧包 superseded）
+        # 9. 标记当前版本（旧卷宗 superseded）
         if final_status in ("ready", "partial"):
-            repo.mark_current(pack_id)
+            repo.mark_current(dossier_id)
 
         logger.info(
-            "compile_evidence %s: 完成 status=%s llm_calls=%d",
+            "compile_dossier %s: 完成 status=%s llm_calls=%d",
             trace_id, final_status, llm_calls,
         )
         return {"status": final_status, "reason": fail_reason, "llm_calls": llm_calls}
 
     except Exception as exc:
-        logger.exception("compile_evidence %s: 编译异常", trace_id)
-        repo.update_pack(
-            pack_id, status="failed",
+        logger.exception("compile_dossier %s: 编译异常", trace_id)
+        repo.update_dossier(
+            dossier_id, status="failed",
             failure_reason=f"编译异常：{exc}",
             finished=True,
         )
@@ -494,4 +494,4 @@ def _enforce_evidence_refs(parsed: dict[str, Any]) -> dict[str, Any]:
     return parsed
 
 
-__all__ = ["compile_evidence"]
+__all__ = ["compile_dossier"]

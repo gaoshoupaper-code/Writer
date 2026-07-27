@@ -28,7 +28,7 @@ from app.common.flow_metrics import compute_flow_metrics
 from app.eval_agent import eval_extractor
 from app.view.traces import load_trace_detail
 
-logger = logging.getLogger("evolution.evidence.extractor")
+logger = logging.getLogger("evolution.dossier.extractor")
 
 # review subagent 命名约定（与包内 subagents/reviewers/ 的 middleware_factory 名对齐）
 _REVIEW_AGENT_NAMES = {
