@@ -86,9 +86,9 @@ def make_content_tools() -> list:
 
     @tool
     async def get_content_score() -> str:
-        """获取内容质量层评估分数（内容8维 + subagent4维）。
+        """获取 28 维五级锚点评估分数（通用五维 + 按契约适用的领域模块）。
 
-        内容评估在后台异步跑（5 次 LLM-judge，较慢），本工具 await 它拿结果。
+        评估在后台异步跑（按适用组数多次 LLM-judge，较慢），本工具 await 它拿结果。
         如果还没跑完会等待。建议在流程诊断做完、写报告前调用。
         """
         ctx = get_eval_context()

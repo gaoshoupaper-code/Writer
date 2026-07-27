@@ -71,9 +71,13 @@ def make_report_tools() -> list:
                 return f"产出报告失败：trace {trace_id} 不存在"
             flow_metrics = compute_flow_metrics(detail)
 
-            # 组装 scores（内容层 + 流程硬指标）
+            # 组装 scores（第三期 28 维五级锚点结构）
+            from app.eval_agent.rubrics import xianxia as rubric
             scores = {
-                "content": content_scores,
+                "rubric_version": content_scores.get("rubric_version", rubric.RUBRIC_VERSION),
+                "calibration": content_scores.get("calibration", rubric.CALIBRATION_STATUS),
+                "groups": content_scores.get("groups", {}),
+                "badcase": content_scores.get("badcase", {}),
                 "flow_metrics": flow_metrics,
             }
 

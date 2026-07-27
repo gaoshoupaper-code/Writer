@@ -295,7 +295,6 @@ export default function EvaluationPage() {
 function EvalReport({ evalSession, onTraceClick }: { evalSession: EvalSession; onTraceClick: (id: string) => void }) {
   const scores = evalSession.scores || {};
   const findings = evalSession.findings || [];
-  const contentOverall = scores.content_overall as number | undefined;
 
   // 证据编译状态（轨迹证据包）
   const [evidenceStatus, setEvidenceStatus] = useState<string>("idle"); // idle|compiling|ready|partial|failed|error
@@ -340,23 +339,40 @@ function EvalReport({ evalSession, onTraceClick }: { evalSession: EvalSession; o
       <h3>评估报告 {evalSession.eval_id.slice(0, 8)}</h3>
       <div className="detail-grid">
         <div><label>状态</label><span className={`session-status ${evalSession.status}`}>{evalStatusLabel(evalSession.status)}</span></div>
-        <div><label>内容总分</label><span className="score-big">{contentOverall != null ? contentOverall.toFixed(2) : "—"}</span></div>
+        <div><label>校准状态</label><span className={`calibration-status ${scores.calibration || "unknown"}`}>{scores.calibration === "uncalibrated" ? "⚠ 未校准" : scores.calibration || "—"}</span></div>
       </div>
 
-      {Object.keys(scores).length > 0 && scores.content_scores && (
+      {/* 28 维五级锚点按组展示（第三期） */}
+      {scores.groups && Object.keys(scores.groups).length > 0 && (
         <div className="score-breakdown">
-          <h4>内容维度分数</h4>
-          <div className="score-bars">
-            {Object.entries(scores.content_scores as Record<string, number>).map(([k, v]) => (
-              <div key={k} className="score-bar">
-                <span className="score-label">{k}</span>
-                <div className="score-track">
-                  <div className="score-fill" style={{ width: `${(v as number) * 100}%` }} />
+          {Object.entries(scores.groups as Record<string, any>).map(([groupName, groupData]: [string, any]) => {
+            if (groupData.skipped) return null;
+            const groupScores = groupData.scores || {};
+            const validScores = Object.entries(groupScores).filter(([, v]: [string, any]) => v > 0) as [string, number][];
+            const groupAvg = validScores.length > 0
+              ? (validScores.reduce((sum: number, [, v]: [string, number]) => sum + v, 0) / validScores.length).toFixed(1)
+              : "—";
+            const groupLabels: Record<string, string> = {
+              general: "通用五维", storybuilding: "玄幻故事构建",
+              outline: "玄幻详细大纲", body: "玄幻正文",
+            };
+            return (
+              <div key={groupName} className="score-group">
+                <h4>{groupLabels[groupName] || groupName} <span className="group-avg">均分 {groupAvg}</span> <span className="dim-count">({validScores.length}/{groupData.total_dim_count || validScores.length}维)</span></h4>
+                <div className="score-bars">
+                  {Object.entries(groupScores).map(([k, v]: [string, any]) => (
+                    <div key={k} className={`score-bar ${v === 0 ? "no-data" : ""} ${v > 0 && v < 3 ? "low-score" : ""}`}>
+                      <span className="score-label">{k}</span>
+                      <div className="score-track">
+                        <div className="score-fill" style={{ width: `${v > 0 ? (v / 5) * 100 : 0}%` }} />
+                      </div>
+                      <span className="score-num">{v > 0 ? `${v}/5` : "N/A"}</span>
+                    </div>
+                  ))}
                 </div>
-                <span className="score-num">{(v as number).toFixed(2)}</span>
               </div>
-            ))}
-          </div>
+            );
+          })}
         </div>
       )}
 

@@ -7178,6 +7178,58 @@ html[data-theme="dark"] {
   min-width: 80px;
 }
 
+/* ── 28 维五级锚点评分展示（第三期） ── */
+
+.score-group {
+  margin-bottom: 16px;
+}
+
+.score-group h4 {
+  margin: 0 0 6px 0;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.group-avg {
+  font-size: 11px;
+  color: var(--teal, #3a9e7e);
+  font-weight: 500;
+}
+
+.dim-count {
+  font-size: 10px;
+  color: var(--text-dim, #8892a8);
+}
+
+.score-bar.low-score .score-fill {
+  background: var(--coral, #c9794e);
+}
+
+.score-bar.low-score .score-num {
+  color: var(--coral, #c9794e);
+}
+
+.score-bar.no-data .score-fill {
+  background: var(--text-dim, #8892a8);
+  opacity: 0.3;
+}
+
+.score-bar.no-data .score-num {
+  color: var(--text-dim, #8892a8);
+}
+
+.calibration-status.uncalibrated {
+  color: #eab308;
+  font-weight: 500;
+}
+
+.calibration-status.calibrated {
+  color: #3a9e7e;
+  font-weight: 500;
+}
+
 .severity-high .finding-dim { color: #ef4444; }
 .severity-medium .finding-dim { color: var(--coral, #c9794e); }
 .severity-low .finding-dim { color: #eab308; }

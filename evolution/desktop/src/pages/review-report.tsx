@@ -327,18 +327,39 @@ function ChangeCard({
 // ── 辅助组件 ──────────────────────────────────────────────────
 
 function ScoreBadges({ scores }: { scores: Record<string, any> }) {
-  // 从 scores 里提取关键分数（flow_metrics 或 content 总分）
+  // 从 scores 里提取关键分数（第三期 28 维五级锚点结构）
   const items: { label: string; value: string }[] = [];
-  const content = scores.content;
-  if (content && typeof content === "object") {
-    const overall = content.overall ?? content.total;
-    if (overall != null) items.push({ label: "内容总分", value: Number(overall).toFixed(1) });
+
+  // 校准状态
+  if (scores.calibration === "uncalibrated") {
+    items.push({ label: "校准", value: "未校准" });
   }
+
+  // 各组分（groups 结构）
+  const groups = scores.groups;
+  if (groups && typeof groups === "object") {
+    const groupLabels: Record<string, string> = {
+      general: "通用", storybuilding: "故事构建", outline: "大纲", body: "正文",
+    };
+    for (const [groupName, groupData] of Object.entries(groups)) {
+      const gd = groupData as any;
+      if (gd.skipped || !gd.scores) continue;
+      const validScores = Object.values(gd.scores).filter((v: any) => v > 0) as number[];
+      if (validScores.length > 0) {
+        const avg = (validScores.reduce((s: number, v: number) => s + v, 0) / validScores.length).toFixed(1);
+        items.push({ label: groupLabels[groupName] || groupName, value: `${avg}/5` });
+      }
+    }
+  }
+
+  // 流程指标
   const flow = scores.flow_metrics;
   if (flow && typeof flow === "object") {
-    const errRate = flow.error_rate;
+    const reliability = flow.reliability || flow;
+    const errRate = reliability.error_rate ?? reliability.tool_error_rate;
     if (errRate != null) items.push({ label: "错误率", value: `${(Number(errRate) * 100).toFixed(1)}%` });
   }
+
   if (items.length === 0) return <span className="text-dim">—</span>;
   return (
     <span className="score-badges">

@@ -1,15 +1,15 @@
-"""双层评估打分（决策 D2/D3/D4，从原 evaluation_engine 并入 eval_agent）。
+"""28 维五级锚点评估打分（第三期，2026-07）。
 
-编排（5 次 judge 调用，异源模型）：
-  - 内容维度 1 次：取 writing 正文 → 8 内容指标打分
-  - subagent 维度 4 次：各取该 subagent 文件交付物 → 各能力维度打分
+编排（按任务契约自适应启用评分组，每组 1 次 LLM 调用）：
+  - 通用五维（所有任务适用）
+  - 玄幻故事构建六维（有 storybuilding 交付物时）
+  - 玄幻详细大纲六维（有 detail-outline 交付物时）
+  - 玄幻正文十一维（有 writing 交付物时）
 
-每次调用：rubric prompt + 交付物文本 → 异源 LLM → 解析 JSON 分数。
+每次调用：rubric prompt + 交付物文本 → LLM → 解析 JSON 五级锚定分（1-5）。
 幂等：evaluation_runs 有 done 记录则跳过（同 trace 不重评）。
 
-（多模型/多次打分均值机制暂不实现——决策 S7。）
-
-设计依据：设计文档 D2(5次编排)/D3(异源)/D4(取文件交付物)/D11(粗标三档)。
+设计依据：.claude/md/20260726_214821_trace证据管线.md § 评估维度矩阵
 """
 
 from __future__ import annotations
@@ -29,9 +29,9 @@ logger = logging.getLogger("evolution.eval_agent.scoring")
 
 
 def evaluate_trace(trace_id: str) -> dict[str, Any] | None:
-    """对一个 trace 跑完整双层评估。
+    """对一个 trace 跑完整 28 维评估。
 
-    Returns: 评估结果摘要 dict（含各层分数/badcase 标记），失败/跳过返回 None。
+    Returns: 评估结果 dict（含各组分数/badcase 标记/校准状态），失败/跳过返回 None。
     幂等：evaluation_runs 有 done 记录则跳过。
     """
     if not llm.judge_enabled():
@@ -52,28 +52,28 @@ def evaluate_trace(trace_id: str) -> dict[str, Any] | None:
     )
 
     try:
-        # 1. 提取各 subagent 交付物
+        # 1. 提取交付物 + 判断启用哪些评分组
         deliveries = eval_extractor.extract_deliveries(trace_id)
+        groups = rubric.applicable_groups(deliveries)
 
-        # 2. 内容维度评估（writing 正文）
-        content_result = _evaluate_content_layer(trace_id, deliveries)
+        # 2. 按组评估（每组 1 次 LLM 调用）
+        group_results: dict[str, dict[str, Any]] = {}
+        for group_name, dimensions in groups.items():
+            result = _evaluate_group(trace_id, group_name, dimensions, deliveries)
+            group_results[group_name] = result
 
-        # 3. subagent 维度评估（4 个 subagent 各一次）
-        subagent_results = _evaluate_subagent_layer(trace_id, deliveries)
+        # 3. 落盘
+        _save_scores(trace_id, group_results)
 
-        # 4. 落盘
-        _save_scores(trace_id, content_result, subagent_results)
-
-        # 5. badcase 判定（任一维度低即 badcase，D 决策）
-        badcase = _detect_badcase(content_result, subagent_results)
+        # 4. badcase 判定
+        badcase = _detect_badcase(group_results)
 
         db.execute(
             "UPDATE evaluation_runs SET status='done', finished_at=? WHERE trace_id=?",
             (datetime.now(UTC).isoformat(), trace_id),
         )
 
-        # 6. 反思归纳（数据闭环 D2/D19）：badcase 时自动归纳失败模式入 reflection_library。
-        #    异常不阻断评估返回（反思是副产品）。
+        # 5. 反思归纳（badcase 时自动归纳，异常不阻断）
         if badcase.get("is_badcase"):
             try:
                 from app.reflection.extractor import extract_from_eval
@@ -82,9 +82,10 @@ def evaluate_trace(trace_id: str) -> dict[str, Any] | None:
                 logger.warning("反思归纳异常（不阻断评估）trace=%s", trace_id, exc_info=True)
 
         return {
-            "content": content_result,
-            "subagent": subagent_results,
+            "groups": group_results,
             "badcase": badcase,
+            "calibration": rubric.CALIBRATION_STATUS,
+            "rubric_version": rubric.RUBRIC_VERSION,
         }
     except Exception as exc:
         logger.exception("evaluate_trace 失败 %s", trace_id)
@@ -95,63 +96,87 @@ def evaluate_trace(trace_id: str) -> dict[str, Any] | None:
         return None
 
 
-def _evaluate_content_layer(
-    trace_id: str, deliveries: dict[str, dict[str, str]]
+def _evaluate_group(
+    trace_id: str,
+    group_name: str,
+    dimensions: list[dict],
+    deliveries: dict[str, dict[str, str]],
 ) -> dict[str, Any]:
-    """内容维度：取 writing 正文 → 8 内容指标打分。"""
-    content_text = eval_extractor.get_content_layer_text(trace_id)
-    if not content_text:
-        logger.warning("内容维度评估跳过 %s：无 writing 交付物", trace_id)
-        return {"skipped": True, "reason": "无 writing 正文交付物"}
+    """评估单个评分组（1 次 LLM 调用）。
 
-    rubric_prompt = rubric.build_content_rubric_prompt()
-    output_format = rubric.build_output_format(rubric.content_dim_keys())
+    通用五维基于全部交付物拼接文本；其他组基于对应 agent 的交付物。
+    """
+    artifact_text = _get_group_artifact_text(group_name, deliveries)
+    if not artifact_text:
+        label = rubric.GROUP_LABELS.get(group_name, group_name)
+        return {"skipped": True, "reason": f"无 {label} 交付物"}
+
+    dim_keys = [d["key"] for d in dimensions]
+    rubric_prompt = rubric.build_group_rubric_prompt(group_name, dimensions)
+    output_format = rubric.build_output_format(dim_keys)
+
     messages = [
         {"role": "system", "content": rubric_prompt + output_format},
-        {"role": "user", "content": f"## 待评估作品正文\n\n{content_text}"},
+        {"role": "user", "content": f"## 待评估产物\n\n{artifact_text}"},
     ]
     raw = llm.chat(messages)
     result = _parse_response(raw)
+
+    scores = result.get("scores", {})
+    # 过滤 score=0（无法判断）的维度，不计入组分
+    valid_scores = {k: v for k, v in scores.items() if isinstance(v, (int, float)) and v > 0}
+    group_score = (
+        round(sum(valid_scores.values()) / len(valid_scores), 2)
+        if valid_scores else 0
+    )
+
     return {
         "skipped": False,
-        "scores": result.get("scores", {}),
-        "overall": result.get("overall", 0),
-        "verdict": result.get("verdict", "review"),
+        "scores": scores,
+        "group_score": group_score,
+        "valid_dim_count": len(valid_scores),
+        "total_dim_count": len(dim_keys),
         "evidence": result.get("evidence", ""),
+        "verdict": result.get("verdict", "review"),
     }
 
 
-def _evaluate_subagent_layer(
-    trace_id: str, deliveries: dict[str, dict[str, str]]
-) -> dict[str, dict[str, Any]]:
-    """subagent 维度：4 个 subagent 各评一次。"""
-    results: dict[str, dict[str, Any]] = {}
-    for dim in rubric.SUBAGENT_DIMENSIONS:
-        agent = dim["agent"]
-        agent_text = eval_extractor.get_agent_delivery_text(trace_id, agent)
-        if not agent_text:
-            results[agent] = {"skipped": True, "reason": f"无 {agent} 交付物"}
-            continue
+def _get_group_artifact_text(
+    group_name: str,
+    deliveries: dict[str, dict[str, str]],
+) -> str:
+    """获取某组的评估产物文本。
 
-        rubric_prompt = rubric.build_subagent_rubric_prompt(agent)
-        output_format = rubric.build_output_format([dim["key"]])
-        messages = [
-            {"role": "system", "content": rubric_prompt + output_format},
-            {"role": "user", "content": f"## {agent} 环节交付物\n\n{agent_text}"},
-        ]
-        raw = llm.chat(messages)
-        result = _parse_response(raw)
-        scores = result.get("scores", {})
-        # subagent 单维度，取该维度分
-        score = scores.get(dim["key"], result.get("overall", 0))
-        results[agent] = {
-            "skipped": False,
-            "key": dim["key"],
-            "score": score,
-            "verdict": result.get("verdict", "review"),
-            "evidence": result.get("evidence", ""),
-        }
-    return results
+    通用五维：拼接所有可用交付物（demand + 设定 + 大纲 + 正文摘要）。
+    其他组：取对应 agent 的交付物。
+    """
+    if group_name == "general":
+        # 通用五维基于全部交付物，但截断控制总长度
+        parts: list[str] = []
+        for agent in ("interview", "storybuilding", "detail-outline", "writing"):
+            agent_text = eval_extractor.get_agent_delivery_text(deliveries, agent) if hasattr(eval_extractor, 'get_agent_delivery_text') else ""
+            if not agent_text:
+                # get_agent_delivery_text 需要 trace_id，这里直接从 deliveries 拼
+                files = deliveries.get(agent, {})
+                if files:
+                    agent_text = "\n\n---\n\n".join(
+        f"## 文件: {p}\n\n{c[:2000]}" for p, c in sorted(files.items())
+                    )
+            if agent_text:
+                parts.append(f"### {agent} 交付物\n{agent_text[:3000]}")
+        return "\n\n".join(parts)
+
+    # 其他组：取对应 agent 交付物
+    agent_map = {"storybuilding": "storybuilding", "outline": "detail-outline", "body": "writing"}
+    agent = agent_map.get(group_name)
+    if not agent:
+        return ""
+    files = deliveries.get(agent, {})
+    if not files:
+        return ""
+    return "\n\n---\n\n".join(
+        f"## 文件: {p}\n\n{c[:6000]}" for p, c in sorted(files.items())
+    )
 
 
 def _parse_response(raw: str) -> dict[str, Any]:
@@ -170,31 +195,21 @@ def _parse_response(raw: str) -> dict[str, Any]:
     raise ValueError(f"无法解析 LLM 返回为 JSON: {raw[:200]}")
 
 
-def _save_scores(
-    trace_id: str,
-    content_result: dict[str, Any],
-    subagent_results: dict[str, dict[str, Any]],
-) -> None:
-    """写 evaluation_scores 表。"""
+def _save_scores(trace_id: str, group_results: dict[str, dict[str, Any]]) -> None:
+    """写 evaluation_scores 表（layer=组名，target=组名，metric=维度名）。"""
     now = datetime.now(UTC).isoformat()
     rows: list[tuple[Any, ...]] = []
 
-    # 内容维度
-    if not content_result.get("skipped"):
-        for metric, score in content_result.get("scores", {}).items():
-            rows.append((
-                trace_id, "content", "novel", metric,
-                float(score), content_result.get("evidence", ""), now,
-            ))
-
-    # subagent 维度
-    for agent, res in subagent_results.items():
-        if res.get("skipped"):
+    for group_name, result in group_results.items():
+        if result.get("skipped"):
             continue
-        rows.append((
-            trace_id, "subagent", agent, res.get("key", agent),
-            float(res.get("score", 0)), res.get("evidence", ""), now,
-        ))
+        evidence = result.get("evidence", "")
+        for metric, score in result.get("scores", {}).items():
+            rows.append((
+                trace_id, group_name, group_name, metric,
+                float(score) if isinstance(score, (int, float)) else 0.0,
+                evidence, now,
+            ))
 
     if rows:
         db.executemany(
@@ -205,39 +220,36 @@ def _save_scores(
         )
 
 
-def _detect_badcase(
-    content_result: dict[str, Any],
-    subagent_results: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    """badcase 判定：任一维度低于阈值即 badcase（需求决策）。"""
+def _detect_badcase(group_results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """badcase 判定：任一维度 < 3（五级制阈值）即 badcase。
+
+    score=0（无法判断）不计入 badcase 判定（证据不足不等于质量差）。
+    """
+    threshold = rubric.BADCASE_THRESHOLD
     flagged: list[dict[str, Any]] = []
 
-    # 内容维度（evidence 共享整体依据，judge 对内容层输出的是综合 evidence）
-    if not content_result.get("skipped"):
-        threshold = rubric.CONTENT_BADCASE_THRESHOLD
-        content_evidence = content_result.get("evidence", "")
-        for metric, score in content_result.get("scores", {}).items():
-            if float(score) < threshold:
-                flagged.append({
-                    "layer": "content", "target": "novel",
-                    "metric": metric, "score": float(score), "threshold": threshold,
-                    "evidence": content_evidence,
-                })
-
-    # subagent 维度（每个 subagent 有自己的 evidence）
-    threshold = rubric.SUBAGENT_BADCASE_THRESHOLD
-    for agent, res in subagent_results.items():
-        if res.get("skipped"):
+    for group_name, result in group_results.items():
+        if result.get("skipped"):
             continue
-        if float(res.get("score", 0)) < threshold:
-            flagged.append({
-                "layer": "subagent", "target": agent,
-                "metric": res.get("key", agent),
-                "score": float(res.get("score", 0)), "threshold": threshold,
-                "evidence": res.get("evidence", ""),
-            })
+        evidence = result.get("evidence", "")
+        for metric, score in result.get("scores", {}).items():
+            if not isinstance(score, (int, float)):
+                continue
+            if score == 0:
+                continue  # 无法判断不计入
+            if score < threshold:
+                flagged.append({
+                    "group": group_name,
+                    "metric": metric,
+                    "score": float(score),
+                    "threshold": threshold,
+                    "evidence": evidence,
+                })
 
     return {
         "is_badcase": len(flagged) > 0,
         "flagged_dimensions": flagged,
     }
+
+
+__all__ = ["evaluate_trace"]
