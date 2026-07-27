@@ -303,9 +303,75 @@ def get_session_events_since(
 
 @router.get("/evaluated-traces")
 def list_evaluated_traces(limit: int = 100) -> dict[str, Any]:
-    """列已评估（有 done 记录）的 trace（进化入口「选已评估 trace」用）。"""
+    """列已评估的 trace（旧链路兼容）。
+
+    阶段 E：进化入口改用 /dossiers（已封存评估卷宗）。本端点保留向后兼容。
+    """
     traces = eval_repo.list_evaluated_traces(limit=limit)
     return {"traces": traces, "total": len(traces)}
+
+
+@router.get("/dossiers")
+def list_eval_dossiers(limit: int = 100) -> dict[str, Any]:
+    """列已封存的评估卷宗（阶段 E：进化入口「选评估卷宗启动」用）。
+
+    返回每份评估卷宗的摘要。进化 Agent 按选定的 dossier_id 启动（永久绑定）。
+    """
+    import json as _json
+    rows = db.query_all(
+        """SELECT dossier_id, eval_attempt_id, source_dossier_id, source_dossier_version,
+                  trace_id, owner_user_id, completeness_status, seal_status, created_at,
+                  findings_json, scores_json
+           FROM evaluation_dossiers
+           WHERE seal_status = 'sealed'
+           ORDER BY created_at DESC LIMIT ?""",
+        (limit,),
+    )
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        item = dict(r)
+        try:
+            findings = _json.loads(item.get("findings_json") or "[]")
+            item["findings_count"] = len(findings) if isinstance(findings, list) else 0
+        except (_json.JSONDecodeError, TypeError):
+            item["findings_count"] = 0
+        try:
+            scores = _json.loads(item.get("scores_json") or "{}")
+            item["scores_summary"] = {
+                "calibration": (scores or {}).get("calibration"),
+                "is_badcase": bool((scores or {}).get("badcase", {}).get("is_badcase")),
+            }
+        except (_json.JSONDecodeError, TypeError):
+            item["scores_summary"] = None
+        item.pop("findings_json", None)
+        item.pop("scores_json", None)
+        items.append(item)
+    return {"dossiers": items, "total": len(items)}
+
+
+@router.get("/dossiers/{dossier_id}")
+def get_eval_dossier(dossier_id: str) -> dict[str, Any]:
+    """查单个评估卷宗详情（含 findings / frozen_evidence / scores / report_md）。"""
+    import json as _json
+    row = db.query_one(
+        "SELECT * FROM evaluation_dossiers WHERE dossier_id = ?",
+        (dossier_id,),
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"评估卷宗 {dossier_id} 不存在")
+    item = dict(row)
+    for col, key in (("conclusions_json", "conclusions"), ("findings_json", "findings"),
+                     ("positive_patterns_json", "positive_patterns"),
+                     ("scores_json", "scores"), ("frozen_evidence_json", "frozen_evidence")):
+        raw = item.get(col)
+        if raw:
+            try:
+                item[key] = _json.loads(raw)
+            except (_json.JSONDecodeError, TypeError):
+                item[key] = None
+        else:
+            item[key] = None
+    return item
 
 
 # ── 停止 ────────────────────────────────────────────────────

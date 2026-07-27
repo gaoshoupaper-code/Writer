@@ -14,6 +14,7 @@ import UpdateBanner from "@/components/UpdateBanner";
 const BASE_NAV_ITEMS = [
   { to: "/", label: "监测", end: true, icon: "📊" },
   { to: "/history", label: "历史", end: false, icon: "📜" },
+  { to: "/dossiers", label: "证据卷宗", end: false, icon: "📦" },
   { to: "/evaluation", label: "评估", end: false, icon: "📝" },
   { to: "/evolve", label: "进化", end: false, icon: "🧬" },
   { to: "/harness", label: "Harness 要素", end: false, icon: "🔧" },

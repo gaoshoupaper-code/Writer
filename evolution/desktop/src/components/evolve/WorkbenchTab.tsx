@@ -6,12 +6,12 @@ import {
   getEvolveMessages,
   getEvolvePoints,
   getEvolveSession,
-  getEvaluatedTraces,
+  getEvalDossiers,
   getEvolveSessionEventsSince,
   sendEvolveMessage,
   startEvolveConverse,
   stopEvolve,
-  type EvalSession,
+  type EvalDossierSummary,
   type EvolveMessage,
   type EvolvePoint,
   type EvolveSession,
@@ -51,8 +51,8 @@ export default function WorkbenchTab({
 }) {
   const navigate = useNavigate();
 
-  // 评估trace列表（轮询，启动入口用）——sessions 列表已迁到 HistoryTab
-  const [evaluatedTraces, setEvaluatedTraces] = useState<EvalSession[]>([]);
+  // 已封存评估卷宗列表（轮询，进化启动入口用，阶段 E）
+  const [evalDossiers, setEvalDossiers] = useState<EvalDossierSummary[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [selectedStatus, setSelectedStatus] = useState<string | null>(null);
 
@@ -69,20 +69,20 @@ export default function WorkbenchTab({
   const streamCancelRef = useRef<(() => void) | null>(null);
 
   // ── 轮询：评估trace 列表（启动入口用）──────────────────────
-  // sessions 列表已迁到 HistoryTab，本组件只保留 evaluatedTraces 轮询。
-  const refreshEvaluatedTraces = useCallback(async () => {
-    const evals = await getEvaluatedTraces(50).catch(() => null);
-    if (evals) setEvaluatedTraces(evals.traces);
+  // 阶段 E：轮询已封存评估卷宗列表（进化启动入口）
+  const refreshEvalDossiers = useCallback(async () => {
+    const resp = await getEvalDossiers(50).catch(() => null);
+    if (resp) setEvalDossiers(resp.dossiers);
   }, []);
 
   useEffect(() => {
-    void refreshEvaluatedTraces();
-    const timer = setInterval(refreshEvaluatedTraces, 10000);
+    void refreshEvalDossiers();
+    const timer = setInterval(refreshEvalDossiers, 10000);
     return () => {
       clearInterval(timer);
       streamCancelRef.current?.();
     };
-  }, [refreshEvaluatedTraces]);
+  }, [refreshEvalDossiers]);
 
   // ── 拉取会话详情（messages + points）────────────────────────
   // 拉取进化点（独立于消息——proposal 事件时只刷进化点，避免覆盖流式 token）
@@ -154,18 +154,19 @@ export default function WorkbenchTab({
   }, [initialSessionId, initialSession, selectSession, selectedSessionId]);
 
   // ── 启动新会话（对话式入口）─────────────────────────────────
-  async function handleStart(traceId: string) {
+  // 阶段 D/E：按评估卷宗启动进化（永久绑定 eval_dossier_id）
+  async function handleStart(evalDossierId: string) {
     setStarting(true);
     setMessages([]);
     setPoints([]);
     setAcceptedCount(0);
     try {
-      const resp = await startEvolveConverse(traceId);
+      const resp = await startEvolveConverse(evalDossierId);
       setSelectedSessionId(resp.session_id);
       setSelectedStatus("running");
       toast.success(`进化已启动：${resp.session_id.slice(0, 8)}`);
       subscribeStream(resp.session_id);
-      void refreshEvaluatedTraces();
+      void refreshEvalDossiers();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "启动进化失败");
     } finally {
@@ -276,7 +277,7 @@ export default function WorkbenchTab({
       }
       case "end": {
         // 流结束 → 刷新会话详情（拿最终 status）
-        void refreshEvaluatedTraces();
+        void refreshEvalDossiers();
         void loadSessionDetail(sessionId);
         // 检查是否需要跳 review-report（pending_review 时，决策 AA）
         setTimeout(async () => {
@@ -294,7 +295,7 @@ export default function WorkbenchTab({
       }
       case "error": {
         toast.error("Agent 执行出错，请查看详情");
-        void refreshEvaluatedTraces();
+        void refreshEvalDossiers();
         break;
       }
       default:
@@ -373,7 +374,7 @@ export default function WorkbenchTab({
         status={selectedStatus}
         messages={messages}
         points={points}
-        evaluatedTraces={evaluatedTraces}
+        evalDossiers={evalDossiers}
         starting={starting}
         stopping={stopping}
         highlightedPointId={highlightedPointId}

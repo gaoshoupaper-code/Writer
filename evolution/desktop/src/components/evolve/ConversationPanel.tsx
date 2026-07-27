@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { EvalSession, EvolveMessage, EvolvePoint } from "@/lib/api";
+import type { EvalDossierSummary, EvolveMessage, EvolvePoint } from "@/lib/api";
 import EvolveMessageBubble from "./EvolveMessageBubble";
 
 /**
@@ -24,11 +24,11 @@ interface Props {
   status: string | null;
   messages: EvolveMessage[];
   points: EvolvePoint[];
-  evaluatedTraces: EvalSession[];
+  evalDossiers: EvalDossierSummary[];
   starting: boolean;
   stopping: boolean;
   highlightedPointId: string | null; // 来自浮窗点击
-  onStart: (traceId: string) => void;
+  onStart: (evalDossierId: string) => void;
   onSend: (content: string) => void;
   onStop: () => void;
   onPointHover: (pointId: string | null) => void;
@@ -39,7 +39,7 @@ export default function ConversationPanel({
   status,
   messages,
   points,
-  evaluatedTraces,
+  evalDossiers,
   starting,
   stopping,
   highlightedPointId,
@@ -48,7 +48,7 @@ export default function ConversationPanel({
   onStop,
   onPointHover,
 }: Props) {
-  const [selectedTraceId, setSelectedTraceId] = useState("");
+  const [selectedEvalDossierId, setSelectedEvalDossierId] = useState("");
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -83,32 +83,33 @@ export default function ConversationPanel({
           <div className="start-icon">🧬</div>
           <h2 className="start-title">启动一次进化共创</h2>
           <p className="start-subtitle">
-            选一条已评估的 trace，进化 Agent 会先读评估报告 + 探查要素，
+            选一份已封存的评估卷宗，进化 Agent 会先读评估结论 + 引用证据 + 探查要素，
             然后和你一起讨论怎么改。
           </p>
           <div className="start-form">
             <select
               className="trace-select"
-              value={selectedTraceId}
-              onChange={(e) => setSelectedTraceId(e.target.value)}
-              disabled={starting || evaluatedTraces.length === 0}
+              value={selectedEvalDossierId}
+              onChange={(e) => setSelectedEvalDossierId(e.target.value)}
+              disabled={starting || evalDossiers.length === 0}
             >
               <option value="">
-                {evaluatedTraces.length === 0
-                  ? "暂无已评估的 trace"
-                  : "选择一条已评估的 trace…"}
+                {evalDossiers.length === 0
+                  ? "暂无已封存的评估卷宗"
+                  : "选择一份评估卷宗…"}
               </option>
-              {evaluatedTraces.map((t) => (
-                <option key={t.eval_id} value={t.trace_id}>
-                  {t.trace_id?.slice(0, 12)} · {t.status || "done"}
+              {evalDossiers.map((d) => (
+                <option key={d.dossier_id} value={d.dossier_id}>
+                  trace {d.trace_id?.slice(0, 10)}… · {d.findings_count} 条诊断
+                  {d.scores_summary?.is_badcase ? " · badcase" : ""}
                 </option>
               ))}
             </select>
             <button
               type="button"
               className="start-btn"
-              disabled={!selectedTraceId || starting}
-              onClick={() => selectedTraceId && onStart(selectedTraceId)}
+              disabled={!selectedEvalDossierId || starting}
+              onClick={() => selectedEvalDossierId && onStart(selectedEvalDossierId)}
             >
               {starting ? "启动中…" : "启动进化"}
             </button>

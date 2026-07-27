@@ -143,6 +143,40 @@ def list_trace_packs(trace_id: str) -> dict[str, Any]:
     return {"packs": dossiers, "total": len(dossiers)}  # key 沿用 packs，前端兼容
 
 
+@router.get("/consumable")
+def list_consumable() -> dict[str, Any]:
+    """列所有可评估的证据卷宗（status=ready，跨 trace，阶段 E 评估入口用）。
+
+    返回每份可消费卷宗的摘要：dossier_id / trace_id / version / status /
+    manifest 完整度 / created_at。评估页据此选卷宗启动评估。
+    """
+    rows = db.query_all(
+        """SELECT pack_id, trace_id, owner_user_id, version, is_current, status,
+                  provenance, compile_rule_version, manifest_json, failure_reason,
+                  llm_calls_used, created_at, finished_at
+           FROM evidence_dossiers
+           WHERE status = 'ready'
+           ORDER BY created_at DESC LIMIT 200""",
+    )
+    import json as _json
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        item = dict(r)
+        item["dossier_id"] = item["pack_id"]  # 对外统一 dossier_id
+        # manifest 摘要（完整度 + 契约覆盖）
+        try:
+            manifest = _json.loads(item.get("manifest_json") or "{}")
+            item["completeness"] = manifest.get("completeness")
+            matrix = manifest.get("contract_coverage_matrix") or {}
+            item["contract_complete"] = matrix.get("complete")
+        except (_json.JSONDecodeError, TypeError):
+            item["completeness"] = None
+            item["contract_complete"] = None
+        item.pop("manifest_json", None)
+        items.append(item)
+    return {"dossiers": items, "total": len(items)}
+
+
 @router.get("/traces/{trace_id}/current")
 def get_current_pack(trace_id: str) -> dict[str, Any]:
     """查某 trace 的当前推荐版本（is_current=1）。无则 404。"""
