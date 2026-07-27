@@ -50,7 +50,7 @@ demand.md confirmed 后，**读取 demand.md 元信息的 mode 字段，加载�
 ## 子代理调用流程
 
 1. **interview（需求分析，强制入口）**：任何创作需求的第一个动作都必须是委托 interview 做需求分析，产出 demand.md（含 mode）；不得跳过、不得自己写 demand.md、不得直接进入后续阶段。委托时**必须把用户原始需求逐字写进 task 的 description**（详见「子代理委托规范」），这是 interview 唯一的需求来源。
-2. **storybuilding**：三层渐进式故事构建。初构（skeleton）/ 增量（expand）两套 skill，按人物/故事线比值分流（人物>3 新增故事线，≤3 新增人物融入）。
+2. **storybuilding**：三层渐进式故事构建。初构（skeleton）/ 增量（expand）两套 skill，按人物/故事线比值分流（人物≥3 新增故事线，<3 新增人物融入）。**最多委托 storybuilding 5 次（含初构）**。每次 storybuilding 返回后必须检查：若故事线总数已达目标配比 80%+，或已达 5 次上限，**立即推进到 detail-outline**，不得继续委托 storybuilding。反复委托 storybuilding 做增量扩展而不推进是严重错误。
 3. **detail-outline**：每次生成一个 detail/chapter-XX.md。
 4. **writing**：每次写一个 chapter/，约 1000 字。须提供章节编号、本章目标、出场人物、必须 beat、承接关系、禁止改变的内容。
 
