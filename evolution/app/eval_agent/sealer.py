@@ -84,15 +84,20 @@ def seal_evaluation_dossier(
     positive_patterns: list[dict[str, Any]] | None = None,
     scores: dict[str, Any] | None = None,
     report_md: str = "",
+    frozen_evidence: dict[str, Any] | None = None,
 ) -> str:
     """封存一份不可变评估卷宗。返回评估卷宗 id。
 
     单事务：写 evaluation_dossiers + 回填 evaluation_sessions.sealed_dossier_id + completed。
     任一步失败 → 整事务回滚，抛 SealError（评估失败，无分裂态）。
+
+    frozen_evidence：本次评估实际引用的证据片段（{evidence_id: 片段内容}）。
+    阶段 D：进化 Agent 只读评估卷宗即可归因（需求 §22），无需回钻证据卷宗。
     """
     findings = findings or []
     positive_patterns = positive_patterns or []
     conclusions = conclusions or []
+    frozen_evidence = frozen_evidence or {}
 
     # 1. 完整性校验
     _validate_completeness(findings, positive_patterns)
@@ -111,8 +116,8 @@ def seal_evaluation_dossier(
                    (dossier_id, eval_attempt_id, source_dossier_id, source_dossier_version,
                     trace_id, owner_user_id, conclusions_json, findings_json,
                     positive_patterns_json, scores_json, report_md,
-                    completeness_status, seal_status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sealed', ?)""",
+                    frozen_evidence_json, completeness_status, seal_status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sealed', ?)""",
                 (
                     dossier_id, eval_attempt_id, source_dossier_id, source_dossier_version,
                     trace_id, owner_user_id,
@@ -121,6 +126,7 @@ def seal_evaluation_dossier(
                     json.dumps(positive_patterns, ensure_ascii=False),
                     json.dumps(scores, ensure_ascii=False) if scores else None,
                     report_md,
+                    json.dumps(frozen_evidence, ensure_ascii=False) if frozen_evidence else None,
                     completeness, now,
                 ),
             )
@@ -154,4 +160,81 @@ def seal_evaluation_dossier(
     return dossier_id
 
 
-__all__ = ["seal_evaluation_dossier", "SealError"]
+def collect_frozen_evidence(
+    findings: list[dict[str, Any]],
+    positive_patterns: list[dict[str, Any]],
+    trace_id: str,
+    allowed_evidence_ids: set[str],
+) -> dict[str, Any]:
+    """收集 finding/positive_pattern 引用的证据片段，冻结进评估卷宗（阶段 D）。
+
+    进化 Agent 只读评估卷宗即可归因（需求 §22）。本函数从 event_payloads 取片段，
+    但只限 allowed_evidence_ids（证据卷宗 index 登记的 ID，受控）。
+
+    Args:
+        findings / positive_patterns: 评估产出（含 evidence_ref/evidence_id）
+        trace_id: 证据卷宗来源 trace
+        allowed_evidence_ids: 证据卷宗 index 登记的合法 evidence_id 集合（受控回钻边界）
+    Returns:
+        {evidence_id: 片段摘要}，只含被实际引用且在 index 内的 ID。
+    """
+    # 收集所有被引用的 evidence_id
+    referenced: set[str] = set()
+    for item in (*findings, *positive_patterns):
+        if not isinstance(item, dict):
+            continue
+        refs = item.get("evidence_ref") or item.get("evidence_id")
+        if isinstance(refs, str):
+            refs = [refs]
+        if isinstance(refs, list):
+            referenced.update(str(r) for r in refs)
+    # 只冻结在证据卷宗 index 内的 ID（受控，防注入）
+    to_freeze = referenced & allowed_evidence_ids
+    if not to_freeze:
+        return {}
+
+    frozen: dict[str, Any] = {}
+    # event_id 在 payload_json 里（event_payloads 表无 event_id 列），按 trace_id
+    # 拉全部事件在 Python 里按 event_id 筛。evolution 量级下可接受。
+    rows = db.query_all(
+        "SELECT payload_json FROM event_payloads WHERE trace_id = ?",
+        (trace_id,),
+    )
+    # 建 event_id → payload 索引
+    by_eid: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        eid = payload.get("event_id")
+        if eid:
+            by_eid[str(eid)] = payload
+
+    for eid in to_freeze:
+        event_id = eid[4:] if eid.startswith("evt-") else eid
+        payload = by_eid.get(event_id)
+        if payload is None:
+            continue
+        # 片段摘要：type/agent/sequence/error + tool_output/output（截断）
+        snapshot: dict[str, Any] = {
+            "type": payload.get("type"),
+            "agent_name": payload.get("agent_name"),
+            "sequence": payload.get("sequence"),
+        }
+        if payload.get("error"):
+            snapshot["error"] = payload["error"][:300]
+        tool_output = payload.get("tool_output")
+        if isinstance(tool_output, dict):
+            content = tool_output.get("content", "")
+            if content:
+                snapshot["tool_output"] = str(content)[:1000]
+        output = payload.get("output")
+        if output:
+            snapshot["output"] = str(output)[:1000]
+        frozen[eid] = snapshot
+    return frozen
+
+
+
+__all__ = ["seal_evaluation_dossier", "collect_frozen_evidence", "SealError"]

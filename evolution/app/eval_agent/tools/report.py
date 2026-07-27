@@ -104,11 +104,19 @@ def make_report_tools() -> list:
             # 封存为不可变评估卷宗（阶段 C）。
             # sealer 做完整性校验 + 原子写入 evaluation_dossiers + 回填尝试 completed。
             # 封存失败 = 评估失败（R9），抛 SealError 由调用方标 failed。
-            from app.eval_agent.sealer import seal_evaluation_dossier, SealError
+            from app.eval_agent.sealer import seal_evaluation_dossier, collect_frozen_evidence, SealError
 
             # 从卷宗拿 owner_user_id（评估卷宗继承证据卷宗血缘）
             dossier = ctx.dossier or {}
             owner_user_id = dossier.get("owner_user_id") or "unknown"
+
+            # 阶段 D：冻结 finding 引用的证据片段进评估卷宗（供进化归因，需求 §22）。
+            # 只冻结证据卷宗 index 登记的 ID（受控回钻边界）。
+            index = dossier.get("index") or {}
+            allowed_evidence_ids = set(index.get("evidence_ids", []))
+            frozen_evidence = collect_frozen_evidence(
+                findings, [], trace_id, allowed_evidence_ids,
+            )
 
             try:
                 evd_id = seal_evaluation_dossier(
@@ -122,6 +130,7 @@ def make_report_tools() -> list:
                     positive_patterns=[],
                     scores=scores,
                     report_md=report_md,
+                    frozen_evidence=frozen_evidence,
                 )
             except SealError as e:
                 ctx.emit_step("write_eval_report", "failed", error=str(e))

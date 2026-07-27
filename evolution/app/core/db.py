@@ -464,6 +464,7 @@ def init_db() -> None:
                 positive_patterns_json TEXT,                    -- 正向可复用模式（每条带 evidence_ref）
                 scores_json         TEXT,                       -- 评分（沿用 evaluation_sessions.scores_json 结构）
                 report_md           TEXT,                       -- 可读报告
+                frozen_evidence_json TEXT,                      -- 本次评估实际引用的冻结证据片段（{evidence_id: 片段}，供进化归因，需求 §22）
                 completeness_status TEXT NOT NULL,              -- complete / incomplete（契约覆盖判定）
                 seal_status         TEXT NOT NULL DEFAULT 'sealed',  -- sealed（唯一终态；封存失败则不入此表）
                 created_at          TEXT NOT NULL,
@@ -510,6 +511,8 @@ def init_db() -> None:
         _migrate_evaluation_sessions_attempt_fields(conn)
         # 进化输入绑定：evolve_sessions 加 bound_eval_dossier_id 列（永久绑定评估卷宗）
         _migrate_evolve_sessions_bound_eval_dossier(conn)
+        # 评估卷宗冻结证据片段（阶段 D：供进化归因，需求 §22）
+        _migrate_evaluation_dossiers_frozen_evidence(conn)
 
 
 def _migrate_evolve_sessions_driver_fields(conn: sqlite3.Connection) -> None:
@@ -631,6 +634,20 @@ def _migrate_evolve_sessions_bound_eval_dossier(conn: sqlite3.Connection) -> Non
         return
     with _lock:
         conn.execute("ALTER TABLE evolve_sessions ADD COLUMN bound_eval_dossier_id TEXT")
+        conn.commit()
+
+
+def _migrate_evaluation_dossiers_frozen_evidence(conn: sqlite3.Connection) -> None:
+    """幂等迁移：evaluation_dossiers 补 frozen_evidence_json 列（阶段 D，2026-07-27）。
+
+    评估卷宗封存时把本次评估实际引用的证据片段冻结进来（{evidence_id: 片段}），
+    让进化 Agent 只读评估卷宗即可归因（需求 §22），无需回钻证据卷宗。
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(evaluation_dossiers)").fetchall()}
+    if "frozen_evidence_json" in existing:
+        return
+    with _lock:
+        conn.execute("ALTER TABLE evaluation_dossiers ADD COLUMN frozen_evidence_json TEXT")
         conn.commit()
 
 

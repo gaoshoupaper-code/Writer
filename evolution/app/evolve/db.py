@@ -30,11 +30,13 @@ def update_session(
     design_doc_path: str | None = None,
     change_log_path: str | None = None,
     eval_ref: str | None = None,
+    bound_eval_dossier_id: str | None = None,
 ) -> None:
     """更新 session 字段（只更新非 None 的字段）。
 
     三功能解耦后精简：删除 baseline/candidate/score 等废弃字段参数（T9）。
     新增 eval_ref（关联评估报告 eval_id，S6/T2）。
+    bound_eval_dossier_id（阶段 D，需求 §42：永久绑定评估卷宗，会话创建后不可变）。
     """
     sets: list[str] = []
     params: list[Any] = []
@@ -53,6 +55,9 @@ def update_session(
     if eval_ref is not None:
         sets.append("eval_ref = ?")
         params.append(eval_ref)
+    if bound_eval_dossier_id is not None:
+        sets.append("bound_eval_dossier_id = ?")
+        params.append(bound_eval_dossier_id)
 
     if not sets:
         return

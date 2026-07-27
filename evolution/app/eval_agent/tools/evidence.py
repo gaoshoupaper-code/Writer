@@ -140,18 +140,26 @@ def make_evidence_tools() -> list:
                 return (f"证据 ID {evidence_id} 不在卷宗索引内（受控回钻："
                         "只能沿卷宗内 ID 展开）")
 
-            # 从 event_payloads 加载原始事件（受控：ID 已被卷宗索引登记）
+            # 从 event_payloads 加载原始事件（受控：ID 已被卷宗索引登记）。
+            # event_id 在 payload_json 里（表无 event_id 列），按 trace 拉全部再筛。
             import json
             import app.core.db as db
             event_id = evidence_id[4:] if evidence_id.startswith("evt-") else evidence_id
-            row = db.query_one(
-                "SELECT payload_json FROM event_payloads WHERE trace_id = ? AND event_id = ?",
-                (ctx.input_trace_id, event_id),
+            rows = db.query_all(
+                "SELECT payload_json FROM event_payloads WHERE trace_id = ?",
+                (ctx.input_trace_id,),
             )
-            if row is None:
+            payload = None
+            for r in rows:
+                try:
+                    p = json.loads(r["payload_json"])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if str(p.get("event_id", "")) == event_id:
+                    payload = p
+                    break
+            if payload is None:
                 return f"证据片段 {event_id} 不存在"
-
-            payload = json.loads(row["payload_json"])
             lines = [f"# 证据片段 {evidence_id}", ""]
             lines.append(f"- type: {payload.get('type', '?')}")
             lines.append(f"- agent: {payload.get('agent_name', '?')}")

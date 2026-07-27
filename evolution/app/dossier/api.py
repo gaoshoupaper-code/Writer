@@ -209,20 +209,29 @@ def drill_evidence(dossier_id: str, evidence_id: str, request: Request) -> dict[
             detail=f"证据 ID {evidence_id} 不在证据卷宗索引中（受控回钻：只能沿卷宗内 ID 展开）",
         )
 
-    # 从 evt-{event_id} 提取 event_id，加载原始事件
+    # 从 evt-{event_id} 提取 event_id，加载原始事件。
+    # event_id 在 payload_json 里（表无 event_id 列），按 trace 拉全部再筛。
     event_id = evidence_id
     if evidence_id.startswith("evt-"):
         event_id = evidence_id[4:]
 
-    row = db.query_one(
-        "SELECT payload_json FROM event_payloads WHERE trace_id = ? AND event_id = ?",
-        (dossier["trace_id"], event_id),
+    import json
+    rows = db.query_all(
+        "SELECT payload_json FROM event_payloads WHERE trace_id = ?",
+        (dossier["trace_id"],),
     )
-    if row is None:
+    payload = None
+    for r in rows:
+        try:
+            p = json.loads(r["payload_json"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if str(p.get("event_id", "")) == event_id:
+            payload = p
+            break
+    if payload is None:
         raise HTTPException(status_code=404, detail=f"原始事件 {event_id} 不存在")
 
-    import json
-    payload = json.loads(row["payload_json"])
     return {
         "evidence_id": evidence_id,
         "trace_id": dossier["trace_id"],
