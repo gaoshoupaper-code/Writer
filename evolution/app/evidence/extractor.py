@@ -108,6 +108,9 @@ def extract_facts(trace_id: str) -> dict[str, Any]:
     # 3. 流程指标（复用 flow_metrics）
     flow_metrics = compute_flow_metrics(detail)
 
+    # 3.5 产物修订快照（第二期：从 run_meta 的 artifact_snapshot 键提取）
+    artifact_revisions = _extract_artifact_revisions(events)
+
     # 4. 产物交付物（复用 extract_deliveries）
     deliveries = eval_extractor.extract_deliveries(trace_id)
 
@@ -123,21 +126,25 @@ def extract_facts(trace_id: str) -> dict[str, Any]:
     # 8. 失败恢复链（新写）
     recovery_chain = _build_recovery_chain(events, nodes)
 
-    # 9. 覆盖统计
+    # 9. provenance 判定：有运行时产物快照 → trace_time；否则 → compile_time_snapshot
+    provenance = "trace_time" if artifact_revisions else "compile_time_snapshot"
+
+    # 10. 覆盖统计
     coverage = _compute_coverage(
         contract, flow_metrics, deliveries, review_chain, revise_events,
-        recovery_chain, nodes,
+        recovery_chain, nodes, artifact_revisions,
     )
 
     return {
         "compile_rule_version": COMPILE_RULE_VERSION,
-        "provenance": "compile_time_snapshot",
+        "provenance": provenance,
         "run_summary": run_summary,
         "contract": contract,
         "topology": flow_metrics.get("topology", {}),
         "reliability": flow_metrics.get("reliability", {}),
         "resources": flow_metrics.get("resources", {}),
         "deliveries": deliveries,
+        "artifact_revisions": artifact_revisions,
         "review_artifacts": review_artifacts,
         "review_chain": review_chain,
         "revise_events": revise_events,
@@ -288,6 +295,42 @@ def _extract_review_artifacts(trace_id: str) -> dict[str, str]:
             logger.debug("读取 review 文件失败 %s", abs_path)
 
     return result
+
+
+# ── 产物修订快照提取（第二期） ────────────────────────────────
+
+
+def _extract_artifact_revisions(events: list) -> list[dict[str, Any]]:
+    """从 run_meta 事件的 artifact_snapshot 键提取产物修订时间线。
+
+    第二期执行端在每次 write_file/edit_file 成功后 emit 一条 run_meta 事件，
+    含 file_path/tool/fingerprint/content。这里提取为结构化修订记录。
+
+    Returns:
+        [{file_path, tool, fingerprint, agent_name, sequence, evidence_id, content_length}, ...]
+        按时间排序。无快照事件时返回空列表（provenance 降级为 compile_time_snapshot）。
+    """
+    revisions: list[dict[str, Any]] = []
+    for evt in events:
+        if evt.type != "run_meta":
+            continue
+        if not isinstance(evt.input, dict):
+            continue
+        snapshot = evt.input.get("artifact_snapshot")
+        if not isinstance(snapshot, dict):
+            continue
+        revisions.append({
+            "file_path": snapshot.get("file_path"),
+            "tool": snapshot.get("tool"),
+            "fingerprint": snapshot.get("fingerprint"),
+            "agent_name": snapshot.get("agent_name") or evt.agent_name,
+            "sequence": evt.sequence,
+            "evidence_id": f"evt-{evt.event_id}",
+            "content_length": snapshot.get("content_length"),
+        })
+
+    revisions.sort(key=lambda x: x["sequence"])
+    return revisions
 
 
 # ── review 调用链重建 ─────────────────────────────────────────
@@ -468,6 +511,7 @@ def _compute_coverage(
     revise_events: list[dict[str, Any]],
     recovery_chain: list[dict[str, Any]],
     nodes: list,
+    artifact_revisions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """计算覆盖统计 + 缺口列表。
 
@@ -490,12 +534,17 @@ def _compute_coverage(
     # revise 不可证不一定是缺口（可能确实不需要修订），单列说明
     revise_note = "无 revise 推断（可能未修订，或 review 后无同路径再写）" if not revise_events else None
 
+    # provenance：有运行时产物快照 → trace_time；否则 → compile_time_snapshot
+    artifact_count = len(artifact_revisions) if artifact_revisions else 0
+    provenance = "trace_time" if artifact_count > 0 else "compile_time_snapshot"
+
     return {
         "stage_kinds": sorted(stage_kinds),
         "agent_count": len(agent_names),
         "agent_names": sorted(agent_names),
         "delivery_agents": list(deliveries.keys()),
         "delivery_file_count": sum(len(v) for v in deliveries.values()),
+        "artifact_revisions": artifact_count,
         "review_calls": len(review_chain),
         "revise_inferred": len(revise_events),
         "error_events": reliability.get("error_events_total", 0),
@@ -503,7 +552,7 @@ def _compute_coverage(
         "subagent_calls_total": topology.get("subagent_calls_total", 0),
         "gaps": gaps,
         "revise_note": revise_note,
-        "provenance": "compile_time_snapshot",
+        "provenance": provenance,
     }
 
 

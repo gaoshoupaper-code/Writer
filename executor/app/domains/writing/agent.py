@@ -53,6 +53,110 @@ def _get_memory_recall_cls():
         return None
 
 
+def _make_artifact_snapshot_cb(recorder, trace_id: str | None):
+    """构造产物修订快照回调（第二期证据采集，2026-07）。
+
+    ArtifactSnapshotMiddleware 写盘成功后调用，传入快照 dict。
+    回调 emit 一条 run_meta 事件（input.artifact_snapshot），供证据编译器重建产物修订时间线。
+    recorder 或 trace_id 为 None 时返回 None（不采集）。
+    """
+    if recorder is None or not trace_id:
+        return None
+
+    def _callback(snapshot_data: dict) -> None:
+        try:
+            recorder.append_event(trace_id, {
+                "type": "run_meta",
+                "source": "middleware",
+                "agent_name": snapshot_data.get("agent_name", "unknown"),
+                "input": {"artifact_snapshot": {
+                    "file_path": snapshot_data["file_path"],
+                    "tool": snapshot_data.get("tool"),
+                    "fingerprint": snapshot_data["fingerprint"],
+                    "content": snapshot_data.get("content", ""),
+                    "content_length": len(snapshot_data.get("content", "")),
+                }},
+            })
+        except Exception:
+            pass  # 快照失败不影响写作流程
+
+    return _callback
+
+
+def _emit_contract_snapshot(recorder, trace_id: str, payload, thread, run_purpose: str):
+    """新 trace 启动时冻结任务契约快照（第二期证据采集，2026-07）。
+
+    从 payload + thread 提取八类契约字段，emit 一条 run_meta 事件。
+    拿不到的字段标 missing，不阻塞写作流程。
+    """
+    try:
+        # 尝试读 demand.md（契约核心，可能尚未生成——interview 阶段才产出）
+        workspace_path = Path(thread.workspace_path)
+        demand_path = workspace_path / "demand.md"
+        demand_md = None
+        try:
+            if demand_path.exists():
+                text = demand_path.read_text(encoding="utf-8")
+                demand_md = text[:4000] if text.strip() else None
+        except (OSError, UnicodeDecodeError):
+            pass
+
+        # 从 payload 提取原始用户目标
+        primary_text = ""
+        for attr in ("prompt", "content", "text", "premise"):
+            val = getattr(payload, attr, None)
+            if val:
+                primary_text = str(val)
+                break
+
+        contract = {
+            "user_goal": primary_text or None,
+            "task_type": "screenplay.generate.stream",
+            "run_purpose": run_purpose,
+            "endpoint": "screenplay.generate.stream",
+            "thread_id": thread.thread_id,
+            "workspace_id": thread.workspace_id,
+            "session_name": getattr(thread, "session_name", None),
+            "demand_md": demand_md,
+            "demand_available": demand_md is not None,
+            "missing": [],
+        }
+        # 标注缺失字段
+        if not demand_md:
+            contract["missing"].append("demand.md 尚未生成（interview 阶段才产出，契约快照在任务开始时冻结）")
+        for field in ("promised_artifacts", "hard_constraints", "style_preferences",
+                      "scope", "ambiguities", "input_references"):
+            contract["missing"].append(f"{field}：需语义层从 demand.md 提取")
+
+        recorder.append_event(trace_id, {
+            "type": "run_meta",
+            "source": "system",
+            "input": {"contract_snapshot": contract},
+        })
+    except Exception:
+        pass  # 契约快照失败不影响写作流程
+    """构造任务契约快照回调（第二期证据采集，2026-07）。
+
+    任务启动时调用一次，传入契约八类字段。
+    回调 emit 一条 run_meta 事件（input.contract_snapshot），供证据编译器重建任务契约。
+    recorder 或 trace_id 为 None 时返回 None（不采集）。
+    """
+    if recorder is None or not trace_id:
+        return None
+
+    def _callback(contract_data: dict) -> None:
+        try:
+            recorder.append_event(trace_id, {
+                "type": "run_meta",
+                "source": "system",
+                "input": {"contract_snapshot": contract_data},
+            })
+        except Exception:
+            pass  # 契约快照失败不影响写作流程
+
+    return _callback
+
+
 class MetaAgentService(BaseAgentService):
     def __init__(self, settings: Settings, workspace_root: Path, trace_recorder: TraceRecorder, style_store: CreateTypeStore, checkpointer: BaseCheckpointSaver) -> None:
         # 复用 BaseAgentService 的通用初始化（settings/workspace_root/trace_recorder/checkpointer）
@@ -189,6 +293,10 @@ class MetaAgentService(BaseAgentService):
             # pool 未初始化或配置缺失时返回 None → writing 走 ContextAssembler 全量注入。
             memory_backend=get_memory_backend(f"{owner_id}_{workspace_path.name}"),
             memory_recall_middleware_cls=_get_memory_recall_cls(),  # 从 harness 包加载
+            # 第二期证据采集（2026-07）：产物快照 callback。
+            # 包内 _make_artifact_snapshot_callback 优先用执行端传入的 callback。
+            # 任务契约快照在 generate_stream 里直接 emit（不走 callback，因为它是任务级一次性事件）。
+            artifact_snapshot_callback=_make_artifact_snapshot_cb(self.trace_recorder, trace_id),
         )
 
         pkg = load_current_package()
@@ -269,6 +377,9 @@ class MetaAgentService(BaseAgentService):
             is_new = True
         if is_new:
             yield _sse("status", {"status": "started", "trace_id": trace.trace_id})
+            # 第二期证据采集（2026-07）：新 trace 启动时冻结任务契约快照。
+            # resume 分支不 emit（契约在初始 run 已冻结）。
+            _emit_contract_snapshot(self.trace_recorder, trace.trace_id, payload, thread, run_purpose)
         trace_queue = self.trace_recorder.get_active_queue(trace.trace_id)
         if trace_queue is None:
             raise RuntimeError(f"Trace queue was not created: {trace.trace_id}")

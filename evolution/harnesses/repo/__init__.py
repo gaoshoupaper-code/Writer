@@ -170,6 +170,48 @@ def _make_quality_callback(ctx: RuntimeContext):
     return _callback
 
 
+def _make_artifact_snapshot_callback(ctx: RuntimeContext):
+    """构造产物修订快照回调（第二期证据采集，2026-07）。
+
+    ArtifactSnapshotMiddleware 每次写盘成功后调用此回调，传入快照 dict。
+    回调用 trace_recorder.append_event 写一条 run_meta 事件到 trace，
+    供证据编译器重建产物修订时间线。
+
+    trace_recorder 或 trace_id 为 None 时返回 None（不采集）。
+    ctx.artifact_snapshot_callback 非 None 时优先用执行端传入的 callback
+    （执行端可自定义 emit 逻辑）；否则包内构造默认 callback。
+    """
+    # 执行端传入了自定义 callback（推荐路径：执行端知道怎么 emit run_meta）
+    if ctx.artifact_snapshot_callback is not None:
+        return ctx.artifact_snapshot_callback
+
+    # 降级：包内构造默认 callback（直接用 trace_recorder emit）
+    recorder = ctx.trace_recorder
+    trace_id = ctx.trace_id
+    if recorder is None or not trace_id:
+        return None
+
+    def _callback(snapshot_data: dict) -> None:
+        try:
+            recorder.append_event(trace_id, {
+                "type": "run_meta",
+                "source": "middleware",
+                "agent_name": snapshot_data.get("agent_name", "unknown"),
+                "input": {"artifact_snapshot": {
+                    "file_path": snapshot_data["file_path"],
+                    "tool": snapshot_data.get("tool"),
+                    "fingerprint": snapshot_data["fingerprint"],
+                    # content 可能很大，按需保留（首期保留，供证据包冻结）
+                    "content_preview": snapshot_data.get("content", "")[:2000],
+                    "content_length": len(snapshot_data.get("content", "")),
+                }},
+            })
+        except Exception:
+            pass  # 快照失败不影响写作流程（静默吞掉）
+
+    return _callback
+
+
 def assemble(ctx: RuntimeContext):
     """装配完整创作 Agent（meta + 4 个 subagent）。
 
@@ -196,6 +238,7 @@ def assemble(ctx: RuntimeContext):
     from .middleware.encoding_guard import EncodingGuardMiddleware
     from .middleware.file_state_tracker import FileStateTrackerMiddleware
     from .middleware.write_result_inspector import WriteResultInspectorMiddleware
+    from .middleware.artifact_snapshot import ArtifactSnapshotMiddleware
     from .subagents.interview import build_interview_deep_subagent
     from .subagents.types import apply_style_suffix
     # runtime 是 DeepAgents SDK 隔离层（执行端平台能力，包依赖它如同依赖 deepagents）
@@ -286,6 +329,11 @@ def assemble(ctx: RuntimeContext):
                 ctx.credits_service, ctx.trace_id, ctx.owner_id,
                 ctx.workspace_path, agent_name,
             ))
+        # ArtifactSnapshotMiddleware 挂载到所有子代理（第二期证据采集，2026-07）。
+        # 装在 WriteResultInspector 之后（最内层），只有写盘成功的才快照。
+        artifact_cb = _make_artifact_snapshot_callback(ctx)
+        if artifact_cb is not None:
+            mw.append(ArtifactSnapshotMiddleware(artifact_cb, workspace_path, agent_name))
         return mw
 
     # ── subagent 装配 ──

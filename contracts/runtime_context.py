@@ -93,6 +93,8 @@ class RuntimeContext:
     # 记忆系统（复用 T2 注入模式：实例 + 类双注入，None 时不挂载）
     memory_backend: object | None = None  # MemoryBackend 实例（进程单例），None 走全量注入
     memory_recall_middleware_cls: object | None = None  # MemoryRecallMiddleware 类
+    # 证据采集（第二期，2026-07）：callback 模式，None 时不采集
+    artifact_snapshot_callback: object | None = None  # Callable[[dict], None]，写盘成功后冻结产物快照
 
 
 __all__ = ["RuntimeContext"]
