@@ -106,6 +106,95 @@ def make_flow_tools() -> list:
         )
 
     @tool
+    def read_evidence_pack() -> str:
+        """读取轨迹证据包的进化工作页（过程归因目录）。
+
+        证据包是编译器从 trace 提取的结构化事实底座。进化工作页包含：
+          - 失败恢复链（error → retry/fallback → 主链是否继续）
+          - review 调用链 + revise 推断
+          - 协作拓扑 / 可靠性 / 资源指标
+          - 重点候选（P0/P1/P2）
+
+        结合评估 finding 和这里的过程诊断，定位哪个阶段/Agent/机制值得改进。
+        首期进化工作页只做证据归因目录，不映射候选 harness 要素。
+        """
+        ctx = get_tool_context()
+        if ctx is None:
+            return "错误：session 未初始化"
+        if not ctx.evidence_pack:
+            return "错误：证据包未加载（evidence_pack 为空）"
+        pack = ctx.evidence_pack
+        evolve_view = pack.get("evolve_view") or {}
+
+        # 格式化进化工作页
+        lines = ["# 证据包 · 进化工作页", ""]
+
+        # 失败恢复链
+        recovery = evolve_view.get("recovery_chain", [])
+        if recovery:
+            lines.append(f"## 失败恢复链（{len(recovery)} 条）")
+            for rc in recovery:
+                followed = rc.get("followed_by")
+                followed_desc = f"→ 主链继续（{followed['type']}）" if followed else "→ 主链未继续"
+                lines.append(f"- [{rc.get('evidence_id')}] {rc.get('error_type')} @ {rc.get('agent_name', '?')}: {rc.get('error_message', '')[:100]} {followed_desc}")
+            lines.append("")
+
+        # review 链
+        rcs = evolve_view.get("review_chain", [])
+        if rcs:
+            lines.append(f"## review 调用链（{len(rcs)} 次）")
+            for rc in rcs:
+                lines.append(f"- [{rc.get('evidence_id')}] {rc.get('reviewer', '?')} → {rc.get('review_file', '?')}")
+            lines.append("")
+
+        # revise 推断
+        rvs = evolve_view.get("revise_events", [])
+        if rvs:
+            lines.append(f"## revise 推断（{len(rvs)} 次，时序推断）")
+            for rv in rvs:
+                lines.append(f"- [{rv.get('evidence_id')}] {rv.get('subagent', '?')} 修订 {rv.get('revised_path', '?')}（review 后）")
+            lines.append("")
+
+        # 可靠性指标
+        reliability = evolve_view.get("reliability", {})
+        if reliability:
+            lines.append("## 可靠性指标")
+            lines.append(f"- 错误事件总数: {reliability.get('error_events_total', 0)}")
+            lines.append(f"- 工具错误率: {reliability.get('tool_error_rate', 0)}")
+            lines.append(f"- middleware 介入: {reliability.get('middleware_events', 0)}")
+            err_by_agent = reliability.get("error_by_agent", {})
+            if err_by_agent:
+                lines.append(f"- 按 agent 分布: {json.dumps(err_by_agent, ensure_ascii=False)}")
+            lines.append("")
+
+        # 资源指标
+        resources = evolve_view.get("resources", {})
+        if resources:
+            lines.append("## 资源指标")
+            lines.append(f"- 总 token: {resources.get('total_tokens', 0)}")
+            lines.append(f"- 重复读文件: {resources.get('repeated_read_files', 0)}（浪费 {resources.get('repeated_read_waste', 0)} 次）")
+            lines.append("")
+
+        # 重点候选
+        priorities = evolve_view.get("priorities", [])
+        if priorities:
+            lines.append(f"## 重点候选（{len(priorities)} 条）")
+            for p in priorities:
+                lines.append(f"- **{p.get('level', '?')}** [{p.get('category', '?')}] {p.get('desc', '')} → {p.get('evidence_id', '')}")
+            lines.append("")
+
+        # 可回钻 ID
+        drillable = evolve_view.get("drillable_ids", [])
+        lines.append(f"## 可回钻证据 ID（共 {len(drillable)} 个）")
+
+        # 指令
+        lines.append("")
+        lines.append(f"## 指导")
+        lines.append(evolve_view.get("instructions", "结合评估 finding 和过程诊断定位改进点。"))
+
+        return "\n".join(lines)
+
+    @tool
     def read_trace(trace_id: str) -> str:
         """读取一个 trace 的节点结构化摘要。
 
@@ -321,7 +410,7 @@ def make_flow_tools() -> list:
             ctx.emit_step("write_change_log", "failed", error=str(e))
             return f"产出记录失败：{e}"
 
-    return [read_eval_report, read_trace, write_design_doc, validate_changes, write_change_log]
+    return [read_eval_report, read_evidence_pack, read_trace, write_design_doc, validate_changes, write_change_log]
 
 
 # ── import 检查辅助 ─────────────────────────────────────────────

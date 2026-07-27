@@ -81,6 +81,7 @@ async def evolve_start(
     """
     # 强前置校验 + working 区锁
     eval_session = _resolve_evaluated_trace(req.trace_id)
+    _resolve_evidence_pack(req.trace_id)  # 证据包闸门（轨迹证据包，2026-07）
     active = _find_active_session()
     if active:
         raise HTTPException(
@@ -120,6 +121,7 @@ async def evolve_start_converse(req: EvolveStartRequest) -> EvolveStartResponse:
     新前端「进化工作台」Tab 应调本端点而非 /start。
     """
     eval_session = _resolve_evaluated_trace(req.trace_id)
+    _resolve_evidence_pack(req.trace_id)  # 证据包闸门（轨迹证据包，2026-07）
     active = _find_active_session()
     if active:
         raise HTTPException(
@@ -232,8 +234,30 @@ def _resolve_evaluated_trace(trace_id: str) -> dict[str, Any]:
     return eval_session
 
 
+def _resolve_evidence_pack(trace_id: str) -> dict[str, Any]:
+    """校验 trace 已有可消费的证据包（轨迹证据包，2026-07）。
+
+    证据包是进化 Agent 的过程归因依据。无证据包或编译未完成则拒绝启动进化。
+    Returns:
+        证据包 dict（含四层 + 进化工作页）。
+    Raises:
+        HTTPException: 无可消费证据包。
+    """
+    from app.evidence import repo as evidence_repo
+    pack = evidence_repo.get_consumable_pack(trace_id)
+    if pack is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"trace {trace_id} 尚未编译证据包或编译未完成，"
+                f"请先在评估页编译轨迹证据包后再启动进化"
+            ),
+        )
+    return pack
+
+
 def _build_evolve_ctx(session_id: str, trace_id: str, eval_session: dict[str, Any]) -> EvolveContext:
-    """构建进化上下文：加载评估快照 + 注入 recorder + 关联 eval_ref。
+    """构建进化上下文：加载评估快照 + 证据包 + 注入 recorder + 关联 eval_ref。
 
     单体 /start 和对话式 /start-converse 共用。
     """
@@ -248,6 +272,11 @@ def _build_evolve_ctx(session_id: str, trace_id: str, eval_session: dict[str, An
         "findings": eval_session.get("findings"),
         "report_md": eval_session.get("report_md"),
     }
+    # 注入证据包（轨迹证据包，2026-07）
+    from app.evidence import repo as evidence_repo
+    evidence_pack = evidence_repo.get_consumable_pack(trace_id)
+    if evidence_pack:
+        ctx.evidence_pack = evidence_pack
     ev_db.update_session(session_id, eval_ref=eval_session["eval_id"])
     return ctx
 
@@ -913,6 +942,14 @@ def _rebuild_ctx_from_db(session_id: str) -> EvolveContext | None:
             }
             if not ctx.trace_id:
                 ctx.trace_id = ev.get("trace_id") or ""
+
+    # 反查证据包（轨迹证据包，2026-07）：对话中重建 ctx 也必须加载证据包，
+    # 否则进化 Agent 在 conversing/finalize 阶段会丢失证据归因目录。
+    if ctx.trace_id:
+        from app.evidence import repo as evidence_repo
+        evidence_pack = evidence_repo.get_consumable_pack(ctx.trace_id)
+        if evidence_pack:
+            ctx.evidence_pack = evidence_pack
 
     return ctx
 

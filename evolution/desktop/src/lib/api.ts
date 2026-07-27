@@ -565,6 +565,75 @@ export async function getEvaluatedTraces(limit = 100): Promise<{ traces: EvalSes
 }
 
 // ════════════════════════════════════════════════════════════
+//  证据编译（evidence）— 轨迹证据包 Trace Evidence Pack
+// ════════════════════════════════════════════════════════════
+
+/** 证据包（四层结构 + 两个角色视图，JSON 列按需解析） */
+export interface EvidencePack {
+  pack_id: string;
+  trace_id: string;
+  owner_user_id: string;
+  version: number;
+  is_current: boolean;
+  status: string; // pending|compiling|ready|partial|failed|superseded
+  provenance: string; // trace_time|compile_time_snapshot
+  compile_rule_version: string;
+  manifest: Record<string, any> | null;
+  facts: Record<string, any> | null;
+  semantic: Record<string, any> | null;
+  index: Record<string, any> | null;
+  eval_view: Record<string, any> | null;
+  evolve_view: Record<string, any> | null;
+  failure_reason: string | null;
+  llm_calls_used: number;
+  created_at: string;
+  finished_at: string | null;
+}
+
+/** 启动证据编译（幂等：同规则版本已有 ready/partial 则直接返回） */
+export async function startEvidenceCompile(
+  traceId: string,
+): Promise<{ pack_id: string; trace_id: string; status: string }> {
+  return evoJson(`/api/evidence/start`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ trace_id: traceId }),
+  });
+}
+
+/** 查证据包详情（含四层 + 两个视图） */
+export async function getEvidenceSession(packId: string): Promise<EvidencePack> {
+  return evoJson<EvidencePack>(`/api/evidence/sessions/${packId}`, { method: "GET" });
+}
+
+/** 列出 trace 的所有证据包版本 */
+export async function getTraceEvidencePacks(
+  traceId: string,
+): Promise<{ packs: EvidencePack[]; total: number }> {
+  return evoJson(`/api/evidence/traces/${traceId}/packs`, { method: "GET" });
+}
+
+/** 查 trace 的当前推荐版本 */
+export async function getCurrentEvidencePack(traceId: string): Promise<EvidencePack> {
+  return evoJson<EvidencePack>(`/api/evidence/traces/${traceId}/current`, { method: "GET" });
+}
+
+/** 取消编译 */
+export async function stopEvidenceCompile(
+  packId: string,
+): Promise<{ status: string; pack_id: string }> {
+  return evoJson(`/api/evidence/sessions/${packId}/stop`, { method: "POST" });
+}
+
+/** 按证据 ID 回钻原始片段 */
+export async function drillEvidence(
+  packId: string,
+  evidenceId: string,
+): Promise<{ evidence_id: string; trace_id: string; event: Record<string, any> }> {
+  return evoJson(`/api/evidence/packs/${packId}/drill/${evidenceId}`, { method: "GET" });
+}
+
+// ════════════════════════════════════════════════════════════
 //  进化（evolve）
 // ════════════════════════════════════════════════════════════
 

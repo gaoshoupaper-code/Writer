@@ -23,10 +23,12 @@ EVAL_SYSTEM_PROMPT = """\
 
 ## 工作流程
 
-1. **看流程硬指标**：你已收到 flow_metrics（协作拓扑/错误保障/资源消耗三类指标，
-   纯客观值）。先看这些数值，定位异常方向。
-2. **读 trace 摘要**：调用 read_trace 纵观全局，看节点树结构、各子代理调用、错误分布。
-3. **深挖关键节点**：对异常/可疑节点，用 read_trace_node 展开，必要时用 read_trace_range
+1. **读证据包评估工作页**（首选）：调用 read_evidence_pack，按 P0→P1→P2 重点候选
+   顺序审查。证据包是编译器从 trace 提取的结构化事实底座 + 重点候选，覆盖全局。
+   需要细节时用 drill_evidence(evidence_id) 回钻原始片段。
+   如果无证据包可用（返回提示），降级为直读 trace（步骤 2-3）。
+2. **（降级路径）读 trace 摘要**：调用 read_trace 纵观全局，看节点树结构、各子代理调用、错误分布。
+3. **（降级路径）深挖关键节点**：对异常/可疑节点，用 read_trace_node 展开，必要时用 read_trace_range
    读完整区间。
 4. **取内容分数**：调用 get_content_score 拿内容质量评分（内容8维 + subagent4维）。
 5. **产出诊断**：调用 write_eval_report，提交 findings（诊断条目）+ summary（总述）。

@@ -7182,6 +7182,63 @@ html[data-theme="dark"] {
 .severity-medium .finding-dim { color: var(--coral, #c9794e); }
 .severity-low .finding-dim { color: #eab308; }
 
+/* ── 证据编译区域（轨迹证据包，2026-07） ── */
+
+.evidence-compile-section {
+  margin-top: 16px;
+  padding: 12px 16px;
+  background: var(--surface-hover, #242b3d);
+  border-radius: 8px;
+}
+
+.evidence-compile-section h4 {
+  margin: 0 0 8px 0;
+  font-size: 13px;
+}
+
+.evidence-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.evidence-status.compiling { color: var(--gold, #c4a747); }
+.evidence-status.done { color: #3a9e7e; }
+.evidence-status.failed { color: #ef4444; }
+
+.evidence-status .spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.evidence-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-dim, #8892a8);
+}
+
+.evidence-gaps { color: #eab308; }
+
+.evidence-reason {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--coral, #c9794e);
+}
+
+.pack-status.ready { color: #3a9e7e; font-weight: 500; }
+.pack-status.partial { color: #eab308; font-weight: 500; }
+
 /* ── harness 页（重构：Tab + 升级总览 + 泳道图） ── */
 
 /* diff 语义色（低饱和自然色，适配暖纸背景） */

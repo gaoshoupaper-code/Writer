@@ -410,6 +410,38 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_ep_session ON evolve_points(session_id, seq);
             CREATE INDEX IF NOT EXISTS idx_ep_status ON evolve_points(session_id, status);
+
+            -- evidence_packs：轨迹证据包（Trace Evidence Pack，2026-07）。
+            -- 一条 trace × 一个编译规则版本 = 一行；同 trace 可有多版本（追加，不覆盖）。
+            -- 证据包是评估 Agent 与进化 Agent 的共享事实底座，替代各自直读 trace。
+            -- 四层结构：manifest（清单）/facts（事实）/semantic（语义归纳）/index（回钻索引）。
+            -- 另存 eval_view/evolve_view 两个角色工作页投影（从同一事实底座投影，不携带独立事实）。
+            -- provenance：trace_time=运行时产物修订（保真最高）/compile_time_snapshot=编译时快照（历史 trace 降级）。
+            -- status 状态机：pending|compiling|ready|partial|failed|superseded。
+            CREATE TABLE IF NOT EXISTS evidence_packs (
+                pack_id             TEXT PRIMARY KEY,           -- uuid
+                trace_id            TEXT NOT NULL,              -- FK runs（逻辑外键）
+                owner_user_id       TEXT NOT NULL,              -- 继承自 runs，权限边界
+                version             INTEGER NOT NULL,           -- 同 trace 的版本号（1,2,3...）
+                is_current          INTEGER NOT NULL DEFAULT 0, -- 1=当前推荐版本
+                status              TEXT NOT NULL DEFAULT 'pending',  -- pending|compiling|ready|partial|failed|superseded
+                provenance          TEXT NOT NULL,              -- trace_time|compile_time_snapshot
+                compile_rule_version TEXT NOT NULL,             -- 编译规则版本（用于判断是否需重编译）
+                manifest_json       TEXT,                       -- 清单层：契约/版本/完整度/适用维度
+                facts_json          TEXT,                       -- 事实层：阶段/委派/产物/错误/review链/指标（客观）
+                semantic_json       TEXT,                       -- 语义层：阶段摘要/对齐/重点候选（LLM产出，必引证据）
+                index_json          TEXT,                       -- 索引层：可回钻 node/segment/artifact ID
+                eval_view_json      TEXT,                       -- 评估工作页投影
+                evolve_view_json    TEXT,                       -- 进化工作页投影
+                failure_reason      TEXT,                       -- failed/partial 时的原因
+                llm_calls_used      INTEGER NOT NULL DEFAULT 0, -- 编译消耗的 LLM 调用数（成本控制）
+                created_at          TEXT NOT NULL,
+                finished_at         TEXT,                       -- 编译完成/失败时间
+                UNIQUE(trace_id, version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_epk_trace ON evidence_packs(trace_id);
+            CREATE INDEX IF NOT EXISTS idx_epk_current ON evidence_packs(trace_id, is_current);
+            CREATE INDEX IF NOT EXISTS idx_epk_status ON evidence_packs(status);
             """
         )
         conn.commit()

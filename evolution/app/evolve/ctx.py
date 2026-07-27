@@ -90,6 +90,9 @@ class EvolveContext:
         self.trace_id: str = ""
         # 评估报告快照（从 evaluation_sessions 表加载，dict：scores/findings/report_md）
         self.eval_snapshot: dict[str, Any] = {}
+        # 证据包快照（轨迹证据包，2026-07）：进化 Agent 消费证据包的进化工作页，
+        # 结合评估 finding 做过程归因。无证据包时为空 dict。
+        self.evidence_pack: dict[str, Any] = {}
 
         # 数据闭环 F1：trace 所属的数据集层（golden|growing）。
         # golden → 验证模式（不能退化）；growing → 探索模式（找新方向）。

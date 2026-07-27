@@ -53,6 +53,10 @@ class EvaluationContext:
         self.recorder: "EvolutionTraceRecorder | None" = None
         # 自观测 trace id（本次评估的录像）。由 api 启动时 create_run 设置。
         self.trace_id_self: str = ""
+        # 证据包（轨迹证据包，2026-07）：评估 Agent 优先读证据包而非直读 trace。
+        # 无证据包时为 None，评估 Agent 降级为直读 trace。
+        self.evidence_pack: dict[str, Any] | None = None
+        self.pack_id: str | None = None
 
     # ── 事件推送便捷方法（D3：代理到 recorder.append_business_event）──
 
