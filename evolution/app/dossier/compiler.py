@@ -23,7 +23,11 @@ import app.core.db as db
 import app.core.llm as llm
 from app.dossier import repo
 from app.dossier.extractor import extract_facts, COMPILE_RULE_VERSION
-from app.dossier.prompt import build_stage_summary_prompt, build_global_priorities_prompt
+from app.dossier.prompt import (
+    build_stage_summary_prompt,
+    build_global_priorities_prompt,
+    build_contract_parse_prompt,
+)
 
 logger = logging.getLogger("evolution.dossier.compiler")
 
@@ -59,10 +63,17 @@ def compile_dossier(trace_id: str, dossier_id: str) -> dict[str, Any]:
             )
             return {"status": "failed", "reason": reason, "llm_calls": 0}
 
-        # 3. 生成清单层
-        manifest = _build_manifest(trace_id, facts)
+        # 3. 任务契约语义提取（B3）：LLM 从 demand.md 提取八类字段。
+        # 提取结果 contract_parsed 进 semantic 层，供确定性覆盖矩阵判定（需求 §32/§33）。
+        contract = facts.get("contract", {})
+        contract_parsed, contract_llm_calls = _extract_contract_semantic(contract)
+        llm_calls += contract_llm_calls
 
-        # 4. LLM 语义归纳（或降级）
+        # 4. 任务契约驱动的覆盖矩阵（B3，确定性闸门）。
+        # 即使 Agent 声称完成，矩阵 missing_count>0 仍判不完整（§33）。
+        contract_matrix = _compute_contract_coverage_matrix(contract_parsed, facts)
+
+        # 5. LLM 语义归纳（或降级）
         llm_ok = llm.judge_enabled()
         if not llm_ok:
             logger.warning("compile_dossier %s: LLM 未配置，语义层降级为空", trace_id)
@@ -74,28 +85,39 @@ def compile_dossier(trace_id: str, dossier_id: str) -> dict[str, Any]:
             except _LLMLimitExceeded as e:
                 logger.warning("compile_dossier %s: LLM 调用达上限，降级为 partial", trace_id)
                 semantic = e.partial_result
-                repo.update_dossier(dossier_id, status="partial",
-                                    failure_reason=f"LLM 调用达上限（{MAX_LLM_CALLS}次）",
-                                    llm_calls_used=llm_calls)
+                # 不在此处落终态（B4 不可变性：避免后面再次 update 终态卷宗）。
+                # 只更新 llm_calls_used，最终状态由 step 9 统一判定并落库。
+                repo.update_dossier(dossier_id, llm_calls_used=llm_calls)
             except Exception as exc:
                 logger.exception("compile_dossier %s: 语义归纳失败，降级为 partial", trace_id)
                 semantic = {"stages": [], "priorities": [], "error": str(exc)}
 
-        # 5. 生成索引层
+        # 把契约语义提取结果挂进 semantic 层（覆盖矩阵在 manifest，因其属确定性判定）
+        if contract_parsed is not None:
+            semantic["contract_parsed"] = contract_parsed
+
+        # 6. 生成清单层（含覆盖矩阵，完整性判定依据）
+        manifest = _build_manifest(trace_id, facts, contract_matrix)
+
+        # 7. 生成索引层
         index = _build_index_layer(facts, semantic)
 
-        # 6. 生成角色工作页（投影）
+        # 8. 生成角色工作页（投影）
         eval_view = _project_eval_view(facts, semantic, index, manifest)
         evolve_view = _project_evolve_view(facts, semantic, index, manifest)
 
-        # 7. 确定最终状态
+        # 9. 确定最终状态：契约覆盖矩阵 + 证据缺口 + 语义层降级 任一不满足即 partial
         has_gaps = bool(facts["coverage"].get("gaps"))
         semantic_skipped = semantic.get("skipped") or semantic.get("error")
-        if has_gaps or semantic_skipped:
+        contract_incomplete = not contract_matrix.get("complete", False)
+        if has_gaps or semantic_skipped or contract_incomplete:
             final_status = "partial"
-            gaps_desc = "; ".join(facts["coverage"].get("gaps", []))
             fail_reason_parts = []
+            if contract_incomplete:
+                missing_items = [i["key"] for i in contract_matrix.get("items", []) if i["status"] == "missing"]
+                fail_reason_parts.append(f"契约覆盖缺口：{', '.join(missing_items) or '提取失败'}")
             if has_gaps:
+                gaps_desc = "; ".join(facts["coverage"].get("gaps", []))
                 fail_reason_parts.append(f"证据缺口：{gaps_desc}")
             if semantic_skipped:
                 fail_reason_parts.append(f"语义层降级：{semantic.get('reason') or semantic.get('error')}")
@@ -160,20 +182,207 @@ def _check_critical_evidence(facts: dict[str, Any]) -> str | None:
     return None
 
 
+# ── 任务契约语义提取 + 覆盖矩阵（B3，2026-07-27）──────────────
+
+
+def _extract_contract_semantic(contract: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
+    """LLM 从 demand.md 提取任务契约八类字段（B3）。
+
+    返回 (contract_parsed_dict, llm_call_count)。
+    demand.md 缺失或 LLM 不可用时返回 (None, 0)——契约覆盖矩阵退化为
+    基于原始 contract 的弱判定（适用项标 missing）。
+
+    提取结果写进 semantic 层 contract_parsed，确定性覆盖矩阵据此判定（需求 §33）。
+    """
+    demand_md = contract.get("demand_md")
+    if not demand_md:
+        return None, 0
+    if not llm.judge_enabled():
+        logger.warning("契约语义提取跳过：LLM 未配置")
+        return None, 0
+
+    messages = build_contract_parse_prompt(demand_md)
+    try:
+        raw = llm.chat(messages, temperature=0.0)
+        parsed = _parse_json_response(raw)
+        # 契约字段无 evidence_id 要求（依据是 demand.md 整体），但补一个溯源标记
+        parsed["_source"] = "demand_md_semantic"
+        parsed["_demand_sha256"] = __import__("hashlib").sha256(
+            demand_md.encode("utf-8")
+        ).hexdigest()
+        return parsed, 1
+    except Exception as exc:
+        logger.warning("契约语义提取失败: %s", exc)
+        return None, 0
+
+
+# 契约字段 → 产物 kind 的映射（判断"承诺产物是否已交付"）
+_CONTRACT_KIND_TO_DELIVERY_AGENT = {
+    "demand": "interview",
+    "character": "storybuilding",
+    "worldview": "storybuilding",
+    "storyline": "storybuilding",
+    "detail": "detail-outline",
+    "chapter": "writing",
+}
+
+
+def _compute_contract_coverage_matrix(
+    contract_parsed: dict[str, Any] | None,
+    facts: dict[str, Any],
+) -> dict[str, Any]:
+    """任务契约驱动的覆盖矩阵（B3，确定性）。
+
+    需求 §32：每个适用项必须有冻结证据，不适用项显式 N/A，任何适用项缺失即不完整。
+    本函数是确定性闸门——不依赖 Agent 自述（§33），即使 Agent 声称完成，检查未通过
+    仍不能成为完整卷宗。
+
+    矩阵维度（按契约字段 × facts 产物交叉判定）：
+      - promised_artifacts：每个承诺产物是否在 deliveries 里有对应交付
+      - applicable_stages：每个适用阶段是否有产物/review 记录
+      - hard_constraints / style_preferences / scope：demand.md 提取成功即视为"契约可得"
+
+    Returns:
+        {
+          "items": [{dim, key, status: "covered"|"missing"|"na", evidence, reason}],
+          "missing_count": int,
+          "covered_count": int,
+          "na_count": int,
+          "complete": bool,  # 适用项全部 covered 才 complete
+        }
+    """
+    items: list[dict[str, Any]] = []
+    deliveries = facts.get("deliveries", {})
+    delivery_agents = set(deliveries.keys())
+    review_chain = facts.get("review_chain", [])
+
+    if contract_parsed is None:
+        # 契约语义提取失败（无 demand.md 或 LLM 不可用）：覆盖矩阵无法判定
+        items.append({
+            "dim": "contract_semantic",
+            "key": "demand_md_parse",
+            "status": "missing",
+            "evidence": None,
+            "reason": "demand.md 缺失或 LLM 未配置，契约八类字段无法提取",
+        })
+        return _summarize_matrix(items)
+
+    # 1. 承诺产物逐项校验
+    promised = contract_parsed.get("promised_artifacts") or []
+    for art in promised:
+        if not isinstance(art, dict):
+            continue
+        kind = art.get("kind")
+        required = art.get("required", True)
+        desc = art.get("desc", kind or "")
+        agent = _CONTRACT_KIND_TO_DELIVERY_AGENT.get(kind)
+        if not agent:
+            items.append({
+                "dim": "promised_artifact", "key": f"{kind}:{desc}",
+                "status": "na", "evidence": None,
+                "reason": f"产物类型 {kind} 无 agent 映射，不纳入覆盖判定",
+            })
+            continue
+        if not required:
+            items.append({
+                "dim": "promised_artifact", "key": f"{kind}:{desc}",
+                "status": "na", "evidence": None,
+                "reason": "非必需产物（required=false）",
+            })
+            continue
+        if agent in delivery_agents:
+            files = deliveries[agent]
+            items.append({
+                "dim": "promised_artifact", "key": f"{kind}:{desc}",
+                "status": "covered",
+                "evidence": {"agent": agent, "files": list(files.keys())},
+                "reason": f"{agent} 已交付 {len(files)} 个文件",
+            })
+        else:
+            items.append({
+                "dim": "promised_artifact", "key": f"{kind}:{desc}",
+                "status": "missing", "evidence": None,
+                "reason": f"承诺产物 {kind}（{agent}）无交付记录",
+            })
+
+    # 2. 适用执行阶段逐项校验
+    applicable_stages = contract_parsed.get("applicable_stages") or []
+    for stage in applicable_stages:
+        agent = stage  # stage 名即 agent 短名
+        has_delivery = agent in delivery_agents
+        has_review = any(_stage_matches_reviewer(agent, rc.get("reviewer", "")) for rc in review_chain)
+        if has_delivery or has_review:
+            items.append({
+                "dim": "applicable_stage", "key": stage,
+                "status": "covered",
+                "evidence": {"delivery": has_delivery, "review": has_review},
+                "reason": f"阶段 {stage} 有产物或 review 记录",
+            })
+        else:
+            items.append({
+                "dim": "applicable_stage", "key": stage,
+                "status": "missing", "evidence": None,
+                "reason": f"适用阶段 {stage} 无产物也无 review 记录",
+            })
+
+    # 3. 契约字段可得性（提取成功即 covered，这是"demand.md 契约可得"的证据）
+    for field in ("user_goal", "hard_constraints", "style_preferences", "scope"):
+        val = contract_parsed.get(field)
+        if val:
+            items.append({
+                "dim": "contract_field", "key": field,
+                "status": "covered",
+                "evidence": {"_source": "demand_md_semantic"},
+                "reason": f"{field} 已从 demand.md 提取",
+            })
+        else:
+            items.append({
+                "dim": "contract_field", "key": field,
+                "status": "missing", "evidence": None,
+                "reason": f"{field} 无法从 demand.md 提取",
+            })
+
+    return _summarize_matrix(items)
+
+
+def _summarize_matrix(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """汇总覆盖矩阵统计。"""
+    missing_count = sum(1 for i in items if i["status"] == "missing")
+    covered_count = sum(1 for i in items if i["status"] == "covered")
+    na_count = sum(1 for i in items if i["status"] == "na")
+    return {
+        "items": items,
+        "missing_count": missing_count,
+        "covered_count": covered_count,
+        "na_count": na_count,
+        "complete": missing_count == 0,
+    }
+
+
 # ── 清单层 ────────────────────────────────────────────────────
 
 
-def _build_manifest(trace_id: str, facts: dict[str, Any]) -> dict[str, Any]:
-    """生成清单层：契约摘要 + 版本 + 完整度 + 适用维度。"""
+def _build_manifest(
+    trace_id: str,
+    facts: dict[str, Any],
+    contract_matrix: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """生成清单层：契约摘要 + 版本 + 完整度 + 适用维度 + 契约覆盖矩阵（B3）。"""
     coverage = facts.get("coverage", {})
     contract = facts.get("contract", {})
     run_summary = facts.get("run_summary", {})
+    contract_matrix = contract_matrix or {}
 
     # 确定适用维度（首期简化：有正文产物 → 评估正文；否则只评通用五维）
     has_novel = any(k == "writing" for k in facts.get("deliveries", {}))
     applicable_dims = ["通用五维"]
     if has_novel:
         applicable_dims.append("玄幻正文十一维")
+
+    # 完整性综合判定：契约覆盖矩阵 complete + 无证据缺口（B3 强化）
+    matrix_complete = contract_matrix.get("complete", False)
+    no_gaps = not coverage.get("gaps")
+    completeness = "full" if (matrix_complete and no_gaps) else "partial"
 
     return {
         "trace_id": trace_id,
@@ -184,8 +393,9 @@ def _build_manifest(trace_id: str, facts: dict[str, Any]) -> dict[str, Any]:
         "contract_available": contract.get("available", False),
         "contract_demand_md": contract.get("demand_md") is not None,
         "contract_missing": contract.get("missing", []),
-        "completeness": "full" if not coverage.get("gaps") else "partial",
+        "completeness": completeness,
         "applicable_dimensions": applicable_dims,
+        "contract_coverage_matrix": contract_matrix,  # B3：任务契约驱动覆盖矩阵
         "coverage": {
             "stage_kinds": coverage.get("stage_kinds", []),
             "agent_count": coverage.get("agent_count", 0),
@@ -279,12 +489,17 @@ def _compile_semantic_layer(facts: dict[str, Any]) -> tuple[dict[str, Any], int]
     }, llm_calls
 
 
-def _get_stage_artifact_text(stage: str, deliveries: dict[str, dict[str, str]]) -> str:
-    """取某阶段的产物拼接文本。"""
+def _get_stage_artifact_text(stage: str, deliveries: dict[str, dict[str, Any]]) -> str:
+    """取某阶段的产物拼接文本（读冻结正文 content_frozen）。"""
     files = deliveries.get(stage, {})
     if not files:
         return ""
-    parts = [f"## 文件: {path}\n\n{content}" for path, content in sorted(files.items())]
+    parts = []
+    for path, meta in sorted(files.items()):
+        # B1 后 deliveries 结构：{path: {content_frozen, content_sha256, ...}}
+        content = meta.get("content_frozen") if isinstance(meta, dict) else meta
+        if content:
+            parts.append(f"## 文件: {path}\n\n{content}")
     return "\n\n---\n\n".join(parts)
 
 

@@ -37,6 +37,14 @@ _TERMINAL_STATUSES = {"ready", "partial", "failed", "superseded"}
 _CONSUMABLE_STATUSES = {"ready", "partial"}
 
 
+class DossierImmutableError(Exception):
+    """终态证据卷宗不可原地修改（需求 §35 不可变性，B4）。
+
+    重新编纂或纠错必须走 create_dossier 产生新版本。
+    """
+
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -98,7 +106,24 @@ def update_dossier(
 
     dict 参数序列化为 JSON 存库（ensure_ascii=False 保中文）。
     finished=True 时写 finished_at（编译结束）。
+
+    不可变性保护（B4，需求 §35）：终态卷宗（ready/partial/failed/superseded）
+    一经落库不可原地修改。重新编纂或纠错必须走 create_dossier 产生新版本。
+    编译流程内的 pending→compiling→终态 是单次流程，不会重复 update 已终态卷宗。
     """
+    # 不可变性 guard：查当前状态，已是终态则拒绝
+    existing = db.query_one(
+        "SELECT status FROM evidence_dossiers WHERE pack_id = ?",
+        (dossier_id,),
+    )
+    if existing is None:
+        raise DossierImmutableError(f"证据卷宗 {dossier_id} 不存在")
+    if existing["status"] in _TERMINAL_STATUSES:
+        raise DossierImmutableError(
+            f"证据卷宗 {dossier_id} 已是终态（{existing['status']}），不可原地修改。"
+            f"重新编纂或纠错须创建新版本。"
+        )
+
     sets: list[str] = []
     params: list[Any] = []
     if status is not None:
@@ -279,6 +304,7 @@ def delete_by_trace(trace_id: str) -> int:
 
 
 __all__ = [
+    "DossierImmutableError",
     "create_dossier",
     "update_dossier",
     "mark_current",
