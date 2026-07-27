@@ -122,34 +122,29 @@ def _extract_last_ai_text(result: Any) -> str:
 
 
 def _fallback_report(ctx: EvaluationContext, result: Any) -> None:
-    """降级兜底：Agent 正常结束但没调 write_eval_report（DB 状态仍 running）。
+    """降级兜底：Agent 正常结束但没调 write_eval_report（未封存评估卷宗）。
 
-    从 Agent 最后一条 AI 消息提取内容，构造降级报告写入 DB（status=done）。
-    避免 trace=completed / eval=failed 的状态不一致——Agent 确实跑完了诊断，
-    只是在最后一步漏调了报告工具，不该因此判为失败。
-
-    报告标注「降级」并附 Agent 实际产出，让用户能判断诊断质量。
+    阶段 C 语义：评估成功的唯一标志是封存了评估卷宗（completed + sealed_dossier_id）。
+    Agent 漏调报告工具 = 未封存卷宗 = 评估失败（无法解锁进化）。
+    这里把 Agent 最后的输出存为 failure_reason 供诊断，但状态标 failed。
     """
     ai_text = _extract_last_ai_text(result)
-    fallback_md = (
-        f"# 评估报告（trace={ctx.input_trace_id}）\n\n"
-        f"> ⚠️ **降级报告**：评估 Agent 未正常调用 `write_eval_report` 工具，"
-        f"以下为 Agent 最后的输出内容（未经结构化整理）。\n\n"
-        f"---\n\n"
-        f"{ai_text or '（Agent 未产出可提取的文本内容）'}"
+    fallback_reason = (
+        "评估 Agent 未调用 write_eval_report，未封存评估卷宗。"
+        f"Agent 最后输出：{(ai_text or '（无可提取内容）')[:500]}"
     )
     try:
         eval_repo.update_session(
             ctx.eval_id,
-            status="done",
-            report_md=fallback_md,
+            status="failed",
+            failure_reason=fallback_reason,
         )
-        ctx.emit_log("评估 Agent 未调用报告工具，已降级产出报告。")
+        ctx.emit_log("评估 Agent 未调用报告工具，本次评估未封存卷宗（failed）。")
         logger.warning(
-            "eval %s: Agent 未调 write_eval_report，已降级写报告", ctx.eval_id,
+            "eval %s: Agent 未调 write_eval_report，标 failed（未封存卷宗）", ctx.eval_id,
         )
     except Exception:
-        logger.exception("eval %s: 降级报告写入失败", ctx.eval_id)
+        logger.exception("eval %s: 降级处理失败", ctx.eval_id)
 
 
 async def run_eval_session(ctx: EvaluationContext) -> dict[str, Any]:

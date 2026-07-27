@@ -516,7 +516,9 @@ export async function stopActiveSession(session: {
 export interface EvalSession {
   eval_id: string;
   trace_id: string;
-  status: string; // running | done | failed
+  status: string; // running | completed | failed | cancelled（阶段 C：done→completed）
+  bound_dossier_id: string | null;
+  sealed_dossier_id: string | null;
   scores_json: string | null;
   findings_json: string | null;
   report_md: string | null;
@@ -526,12 +528,77 @@ export interface EvalSession {
   findings: any[] | null;
 }
 
-export async function startEval(traceId: string): Promise<{ eval_id: string; trace_id: string; status: string }> {
+// ── 评估卷宗（阶段 C 封存的不可变产物）──────────────────────────
+export interface EvalDossierSummary {
+  dossier_id: string;
+  eval_attempt_id: string;
+  source_dossier_id: string;
+  source_dossier_version: number;
+  trace_id: string;
+  owner_user_id: string;
+  completeness_status: string;
+  seal_status: string;
+  findings_count: number;
+  scores_summary: { calibration: string | null; is_badcase: boolean } | null;
+  created_at: string;
+}
+
+export interface EvalDossierDetail extends EvalDossierSummary {
+  conclusions: any[] | null;
+  findings: any[] | null;
+  positive_patterns: any[] | null;
+  scores: Record<string, any> | null;
+  report_md: string | null;
+  frozen_evidence: Record<string, any> | null;
+}
+
+// ── 可消费证据卷宗摘要（阶段 E 评估入口选卷宗用）────────────────
+export interface ConsumableDossierSummary {
+  dossier_id: string;
+  pack_id: string;
+  trace_id: string;
+  owner_user_id: string;
+  version: number;
+  is_current: boolean;
+  status: string;
+  provenance: string;
+  compile_rule_version: string;
+  completeness: string | null;
+  contract_complete: boolean | null;
+  failure_reason: string | null;
+  llm_calls_used: number;
+  created_at: string;
+  finished_at: string | null;
+}
+
+/** 启动评估（阶段 C：按证据卷宗启动，须 ready 完整卷宗） */
+export async function startEval(
+  dossierId: string,
+): Promise<{ eval_id: string; trace_id: string; dossier_id: string; status: string }> {
   return evoJson(`/api/eval-agent/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ trace_id: traceId }),
+    body: JSON.stringify({ dossier_id: dossierId }),
   });
+}
+
+/** 列已封存的评估卷宗（阶段 E：进化入口选评估卷宗启动用） */
+export async function getEvalDossiers(
+  limit = 100,
+): Promise<{ dossiers: EvalDossierSummary[]; total: number }> {
+  return evoJson(`/api/eval-agent/dossiers?limit=${limit}`, { method: "GET" });
+}
+
+/** 查单个评估卷宗详情（含 findings / frozen_evidence / scores） */
+export async function getEvalDossier(dossierId: string): Promise<EvalDossierDetail> {
+  return evoJson<EvalDossierDetail>(`/api/eval-agent/dossiers/${dossierId}`, { method: "GET" });
+}
+
+/** 列可消费的证据卷宗（status=ready，阶段 E 评估入口选卷宗用） */
+export async function getConsumableDossiers(
+  limit = 200,
+): Promise<{ dossiers: ConsumableDossierSummary[]; total: number }> {
+  return evoJson(`/api/dossier/consumable?limit=${limit}`, { method: "GET" });
 }
 
 export async function stopEval(evalId: string): Promise<{ status: string; eval_id: string }> {
@@ -580,12 +647,13 @@ export async function getEvaluatedTraces(limit = 100): Promise<{ traces: EvalSes
 }
 
 // ════════════════════════════════════════════════════════════
-//  证据编译（evidence）— 轨迹证据包 Trace Evidence Pack
+//  证据卷宗（dossier）— Evidence Dossier
 // ════════════════════════════════════════════════════════════
 
-/** 证据包（四层结构 + 两个角色视图，JSON 列按需解析） */
-export interface EvidencePack {
-  pack_id: string;
+/** 证据卷宗（四层结构 + 两个角色视图，JSON 列按需解析） */
+export interface Dossier {
+  dossier_id: string;
+  pack_id: string; // DB 原始列名（与 dossier_id 同值），保留便于诊断
   trace_id: string;
   owner_user_id: string;
   version: number;
@@ -605,47 +673,47 @@ export interface EvidencePack {
   finished_at: string | null;
 }
 
-/** 启动证据编译（幂等：同规则版本已有 ready/partial 则直接返回） */
-export async function startEvidenceCompile(
+/** 启动证据卷宗编译（幂等：同规则版本已有 ready/partial 则直接返回） */
+export async function startCompileDossier(
   traceId: string,
-): Promise<{ pack_id: string; trace_id: string; status: string }> {
-  return evoJson(`/api/evidence/start`, {
+): Promise<{ dossier_id: string; trace_id: string; status: string }> {
+  return evoJson(`/api/dossier/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ trace_id: traceId }),
   });
 }
 
-/** 查证据包详情（含四层 + 两个视图） */
-export async function getEvidenceSession(packId: string): Promise<EvidencePack> {
-  return evoJson<EvidencePack>(`/api/evidence/sessions/${packId}`, { method: "GET" });
+/** 查证据卷宗详情（含四层 + 两个视图） */
+export async function getDossierSession(dossierId: string): Promise<Dossier> {
+  return evoJson<Dossier>(`/api/dossier/sessions/${dossierId}`, { method: "GET" });
 }
 
-/** 列出 trace 的所有证据包版本 */
-export async function getTraceEvidencePacks(
+/** 列出 trace 的所有证据卷宗版本 */
+export async function getTraceDossiers(
   traceId: string,
-): Promise<{ packs: EvidencePack[]; total: number }> {
-  return evoJson(`/api/evidence/traces/${traceId}/packs`, { method: "GET" });
+): Promise<{ packs: Dossier[]; total: number }> {
+  return evoJson(`/api/dossier/traces/${traceId}/packs`, { method: "GET" });
 }
 
 /** 查 trace 的当前推荐版本 */
-export async function getCurrentEvidencePack(traceId: string): Promise<EvidencePack> {
-  return evoJson<EvidencePack>(`/api/evidence/traces/${traceId}/current`, { method: "GET" });
+export async function getCurrentDossier(traceId: string): Promise<Dossier> {
+  return evoJson<Dossier>(`/api/dossier/traces/${traceId}/current`, { method: "GET" });
 }
 
 /** 取消编译 */
-export async function stopEvidenceCompile(
-  packId: string,
-): Promise<{ status: string; pack_id: string }> {
-  return evoJson(`/api/evidence/sessions/${packId}/stop`, { method: "POST" });
+export async function stopCompileDossier(
+  dossierId: string,
+): Promise<{ status: string; dossier_id: string }> {
+  return evoJson(`/api/dossier/sessions/${dossierId}/stop`, { method: "POST" });
 }
 
-/** 按证据 ID 回钻原始片段 */
+/** 按证据 ID 回钻原始片段（受控回钻，权限校验） */
 export async function drillEvidence(
-  packId: string,
+  dossierId: string,
   evidenceId: string,
 ): Promise<{ evidence_id: string; trace_id: string; event: Record<string, any> }> {
-  return evoJson(`/api/evidence/packs/${packId}/drill/${evidenceId}`, { method: "GET" });
+  return evoJson(`/api/dossier/packs/${dossierId}/drill/${evidenceId}`, { method: "GET" });
 }
 
 // ════════════════════════════════════════════════════════════
@@ -728,11 +796,14 @@ export interface EvalSnapshot {
   scores: Record<string, any> | null;
 }
 
-export async function startEvolve(traceId: string): Promise<{ session_id: string; trace_id: string; eval_id: string; status: string }> {
+/** 启动单体进化（阶段 D：按评估卷宗启动，永久绑定） */
+export async function startEvolve(
+  evalDossierId: string,
+): Promise<{ session_id: string; trace_id: string; eval_dossier_id: string; status: string }> {
   return evoJson(`/api/evolve/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ trace_id: traceId }),
+    body: JSON.stringify({ eval_dossier_id: evalDossierId }),
   });
 }
 
@@ -847,13 +918,14 @@ export async function getEvolveSystemPrompt(): Promise<EvolveSystemPrompt> {
 }
 
 /** 对话式启动进化（决策 T2，inspect round + 转 conversing） */
+/** 启动对话式进化（阶段 D：按评估卷宗启动，永久绑定） */
 export async function startEvolveConverse(
-  traceId: string,
-): Promise<{ session_id: string; trace_id: string; eval_id: string; status: string }> {
+  evalDossierId: string,
+): Promise<{ session_id: string; trace_id: string; eval_dossier_id: string; status: string }> {
   return evoJson(`/api/evolve/start-converse`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ trace_id: traceId }),
+    body: JSON.stringify({ eval_dossier_id: evalDossierId }),
   });
 }
 

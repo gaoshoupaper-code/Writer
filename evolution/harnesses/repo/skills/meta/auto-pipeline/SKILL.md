@@ -9,7 +9,12 @@ description: 当 demand.md 的 mode 为 auto（用户选择全自动生成）时
 
 ## 流程
 
-1. **故事构建**（2-10 轮）：委托 storybuilding 初构（skeleton skill）→ 多轮增量（expand skill）。每轮传入本轮焦点与前轮审查问题。
+1. **故事构建**（2-5 轮，**最多 5 轮**）：委托 storybuilding 初构（skeleton skill）→ 多轮增量（expand skill）。每轮传入本轮焦点与前轮审查问题。
+   - **阶段退出条件（满足任一即推进到细纲）**：
+     a. 故事线总数（含主线段）已达到 demand.md 目标配比的 80%+；
+     b. 已委托 storybuilding **5 次**（硬上限，含初构）；
+     c. storybuilding 子代理返回"建议推进到 detail-outline"。
+   - **防循环纪律**：每次 storybuilding 返回后，**必须检查上述退出条件**。满足时立即推进到 detail-outline，**不得继续委托 storybuilding 做增量扩展**。反复委托而不推进是严重错误。
 2. **细纲**：委托 detail-outline 先生成 detail/overview.md 获取总章数，再按顺序逐章生成 detail/chapter-XX.md。
 3. **正文**：委托 writing 逐章写作；每章返回后再写下一章。
 

@@ -1,7 +1,11 @@
 """报告产出类工具（决策 T4/S14：评估只诊断不提方案）。
 
-评估 Agent 最终一步：组装评分 + 诊断条目 + 证据，写入 evaluation_sessions 表。
+评估 Agent 最终一步：组装评分 + 诊断条目 + 证据，封存为不可变评估卷宗
+（evaluation_dossiers 表，阶段 C）。
 铁律：产出里不含任何改进建议/suggestion 字段（那是进化 Agent 方案阶段的活）。
+
+阶段 C 切断：flow_metrics 从证据卷宗 facts 读（B 阶段已冻结），
+不再 load_trace_detail 直读 trace。
 """
 from __future__ import annotations
 
@@ -11,11 +15,9 @@ from typing import Any
 
 from langchain_core.tools import tool
 
-from app.common.flow_metrics import compute_flow_metrics
 from app.eval_agent import repo as eval_repo
 from app.eval_agent.ctx import get_eval_context
 from app.eval_agent.tools.content import get_content_task_result
-from app.view.traces import load_trace_detail
 
 logger = logging.getLogger("evolution.eval_agent.tools.report")
 
@@ -59,17 +61,19 @@ def make_report_tools() -> list:
 
             # 取内容分数（后台任务可能已完成）—— 只读访问 content 状态
             content_scores: dict[str, Any] = {}
-            cr = get_content_task_result(trace_id)
+            cr = get_content_task_result(ctx.eval_id)
             if cr and not cr.get("error") and not cr.get("skipped"):
                 content_scores = cr
 
-            # 算流程硬指标（D8：自动算，写进报告）。
-            # 用 load_trace_detail（完整 TraceDetail，含 events）——compute_flow_metrics
-            # 要遍历 events 算指标；get_trace 路由版是 Lite 无 events 会 AttributeError。
-            detail = load_trace_detail(trace_id)
-            if detail is None:
-                return f"产出报告失败：trace {trace_id} 不存在"
-            flow_metrics = compute_flow_metrics(detail)
+            # 流程硬指标从证据卷宗 facts 读（阶段 C 切断 load_trace_detail 旁路）。
+            # B 阶段已把 topology/reliability/resources 冻结进卷宗 facts。
+            dossier = ctx.dossier or {}
+            facts = dossier.get("facts") or {}
+            flow_metrics = {
+                "topology": facts.get("topology", {}),
+                "reliability": facts.get("reliability", {}),
+                "resources": facts.get("resources", {}),
+            }
 
             # 组装 scores（第三期 28 维五级锚点结构）
             from app.eval_agent.rubrics import xianxia as rubric
@@ -97,18 +101,47 @@ def make_report_tools() -> list:
                     lines.append("")
             report_md = "\n".join(lines)
 
-            # 写入 evaluation_sessions 表（S2 DB 交接）
-            eval_repo.update_session(
-                ctx.eval_id,
-                status="done",
-                scores=scores,
-                findings=findings,
-                report_md=report_md,
+            # 封存为不可变评估卷宗（阶段 C）。
+            # sealer 做完整性校验 + 原子写入 evaluation_dossiers + 回填尝试 completed。
+            # 封存失败 = 评估失败（R9），抛 SealError 由调用方标 failed。
+            from app.eval_agent.sealer import seal_evaluation_dossier, collect_frozen_evidence, SealError
+
+            # 从卷宗拿 owner_user_id（评估卷宗继承证据卷宗血缘）
+            dossier = ctx.dossier or {}
+            owner_user_id = dossier.get("owner_user_id") or "unknown"
+
+            # 阶段 D：冻结 finding 引用的证据片段进评估卷宗（供进化归因，需求 §22）。
+            # 只冻结证据卷宗 index 登记的 ID（受控回钻边界）。
+            index = dossier.get("index") or {}
+            allowed_evidence_ids = set(index.get("evidence_ids", []))
+            frozen_evidence = collect_frozen_evidence(
+                findings, [], trace_id, allowed_evidence_ids,
             )
+
+            try:
+                evd_id = seal_evaluation_dossier(
+                    eval_attempt_id=ctx.eval_id,
+                    source_dossier_id=ctx.dossier_id,
+                    source_dossier_version=ctx.dossier_version or 0,
+                    trace_id=trace_id,
+                    owner_user_id=owner_user_id,
+                    conclusions=[],  # 首期结论内联在 report_md，findings 是结构化核心
+                    findings=findings,
+                    positive_patterns=[],
+                    scores=scores,
+                    report_md=report_md,
+                    frozen_evidence=frozen_evidence,
+                )
+            except SealError as e:
+                ctx.emit_step("write_eval_report", "failed", error=str(e))
+                # 封存失败：尝试标 failed（R9，不产生分裂态）
+                eval_repo.update_session(ctx.eval_id, status="failed", failure_reason=str(e)[:500])
+                return f"评估卷宗封存失败，本次评估未成功：{e}"
+
             ctx.emit_step(
-                "write_eval_report", "done", findings=len(findings),
+                "write_eval_report", "done", findings=len(findings), evd=evd_id,
             )
-            return f"评估报告已产出并入库（{len(findings)} 条诊断）"
+            return f"评估卷宗已封存（{len(findings)} 条诊断，evd={evd_id[:8]}）"
         except json.JSONDecodeError as e:
             ctx.emit_step("write_eval_report", "failed", error=str(e))
             return f"findings_json 解析失败：{e}"

@@ -145,4 +145,63 @@ __all__ = [
     "GLOBAL_PRIORITIES_SYSTEM",
     "build_stage_summary_prompt",
     "build_global_priorities_prompt",
+    "CONTRACT_PARSE_SYSTEM",
+    "build_contract_parse_prompt",
 ]
+
+
+# ── 任务契约语义提取 prompt（B3，2026-07-27）──────────────────
+
+CONTRACT_PARSE_SYSTEM = """你是轨迹证据编译器的任务契约提取模块。你的职责是从 demand.md（用户需求文档）提取结构化任务契约，供评估/进化 Agent 判断"该 trace 是否完成了用户要求"。
+
+铁律：
+1. 你只做客观提取和归纳，不评价需求好坏，不推测用户没说的内容。
+2. 每个字段必须有 demand.md 原文依据；无法从 demand.md 判定的字段填 null 并在 missing 里说明原因。
+3. applicable_stages 必须基于 demand.md 明确提到的环节，不要脑补。
+
+输出 JSON 格式（严格，不要 markdown 代码块）：
+{
+  "user_goal": "用户想完成什么（一句话）",
+  "task_type": "任务类型（如：玄幻长篇连载/短篇/大纲等）",
+  "promised_artifacts": [
+    {"kind": "产物类型（demand/character/worldview/storyline/detail/chapter）", "desc": "具体描述", "required": true}
+  ],
+  "hard_constraints": [
+    {"constraint": "硬约束内容", "category": "篇幅/视角/题材/禁忌/其他"}
+  ],
+  "style_preferences": [
+    {"pref": "风格偏好", "category": "文风/节奏/语气/其他"}
+  ],
+  "scope": "范围边界（写什么、不写什么）",
+  "ambiguities": [
+    {"point": "含糊点", "impact": "对产出的影响"}
+  ],
+  "input_references": [
+    {"ref": "参考素材/输入", "type": "文件/链接/对话"}
+  ],
+  "applicable_stages": ["interview", "storybuilding", "detail-outline", "writing"],
+  "missing": ["无法判定的字段及原因"]
+}"""
+
+
+def build_contract_parse_prompt(demand_md: str) -> list[dict[str, str]]:
+    """构造任务契约语义提取的 messages。
+
+    demand_md 是从文件系统读取的需求原文（已截断）。LLM 提取八类契约字段 +
+    适用执行阶段，供确定性覆盖矩阵判定（需求 §32）。
+    """
+    user_content = f"""## demand.md 原文
+
+{demand_md}
+
+---
+
+请基于上文提取结构化任务契约。严格遵循系统提示的 JSON 格式。
+- 每个字段都要有原文依据；demand.md 没说的填 null 并在 missing 说明。
+- promised_artifacts 的 required：明确要的填 true，可选的填 false。
+- applicable_stages：只列 demand.md 有明确要求或必然涉及的阶段。
+"""
+    return [
+        {"role": "system", "content": CONTRACT_PARSE_SYSTEM},
+        {"role": "user", "content": user_content},
+    ]

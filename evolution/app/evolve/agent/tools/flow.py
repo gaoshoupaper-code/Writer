@@ -1,14 +1,16 @@
-"""流程工具（5 个）——进化 Agent 的评估消费 + 产出 + 校验（决策 S2/S9）。
+"""流程工具——进化 Agent 的评估消费 + 产出 + 校验（决策 S2/S9）。
 
-从原 plan/execute 子代理工具归并而来，单体化后统一挂载到单体 Agent。
-所有 emit_step 调用去掉了 phase 参数（单体 Agent 无阶段概念）。
+阶段 D（2026-07-27）切断进化旁路：进化 Agent 只读评估卷宗，不读原始 trace /
+完整证据卷宗。
 
 工具：
-  - read_eval_report()              读评估报告（从 ctx.eval_snapshot）
-  - read_trace(trace_id)            读 trace 摘要
+  - read_eval_report()              读评估卷宗（findings + 冻结证据 + scores）
+  - read_evidence_pack()            读评估卷宗的过程归因（frozen_evidence 片段）
   - write_design_doc(changes, rationale)  产 design_doc.md
-  - validate_changes()              纯源码校验（py_compile + import，废弃 config 校验）
+  - validate_changes()              纯源码校验（py_compile + import）
   - write_change_log(applied, summary)    产 change_log.md
+
+阶段 D 切断：read_trace / _read_memory_quality_summary 已移除（旁路）。
 """
 from __future__ import annotations
 
@@ -23,55 +25,8 @@ from langchain_core.tools import tool
 from app.core.settings import settings
 from app.evolve import docs
 from app.evolve.ctx import get_tool_context
-from app.view.traces import get_trace
 
 logger = logging.getLogger("evolution.evolve.agent.tools.flow")
-
-
-def _read_memory_quality_summary(trace_id: str) -> str:
-    """读 trace 的 memory_quality 埋点，返回可读摘要供 evolve agent 诊断。
-
-    P4 进化闭环：memory_recall middleware 每次检索写一条 run_meta 事件，
-    本函数汇总这些事件的 memory_quality 字段，让 evolution agent 看到记忆系统表现。
-
-    Returns:
-        格式化的 memory_quality 摘要字符串（无数据返回空串）。
-    """
-    import json
-
-    import app.core.db as db
-
-    rows = db.query_all(
-        "SELECT payload_json FROM event_payloads "
-        "WHERE trace_id=? AND type='run_meta' ORDER BY sequence",
-        (trace_id,),
-    )
-    if not rows:
-        return ""
-
-    entries: list[str] = []
-    for row in rows:
-        try:
-            payload = json.loads(row["payload_json"]) if isinstance(row["payload_json"], str) else row["payload_json"]
-        except (json.JSONDecodeError, TypeError):
-            continue
-        mq = (payload.get("input") or {}).get("memory_quality")
-        if not mq or not isinstance(mq, dict):
-            continue
-        ch = mq.get("chapter_num", "?")
-        ok = mq.get("retrieval_ok", True)
-        nodes = mq.get("evidence_nodes_count", 0)
-        edges = mq.get("evidence_edges_count", 0)
-        tokens = mq.get("evidence_packet_tokens", 0)
-        status = "✓" if ok else "✗"
-        entries.append(f"  第{ch}章 {status} 节点={nodes} 边={edges} token={tokens}")
-        if not ok and mq.get("error"):
-            entries.append(f"    错误: {mq['error'][:100]}")
-
-    if not entries:
-        return ""
-
-    return "\n记忆系统检索质量：\n" + "\n".join(entries)
 
 
 def make_flow_tools() -> list:
@@ -107,144 +62,55 @@ def make_flow_tools() -> list:
 
     @tool
     def read_evidence_pack() -> str:
-        """读取轨迹证据包的进化工作页（过程归因目录）。
+        """读取评估卷宗引用的冻结证据片段（过程归因，阶段 D）。
 
-        证据包是编译器从 trace 提取的结构化事实底座。进化工作页包含：
-          - 失败恢复链（error → retry/fallback → 主链是否继续）
-          - review 调用链 + revise 推断
-          - 协作拓扑 / 可靠性 / 资源指标
-          - 重点候选（P0/P1/P2）
-
-        结合评估 finding 和这里的过程诊断，定位哪个阶段/Agent/机制值得改进。
-        首期进化工作页只做证据归因目录，不映射候选 harness 要素。
+        阶段 D 切断：进化 Agent 只读评估卷宗。本工具展示评估 finding 实际引用的
+        冻结证据片段（封存时从证据卷宗冻结进评估卷宗，需求 §22），用于归因定位。
+        不读原始 trace / 完整证据卷宗。
         """
         ctx = get_tool_context()
         if ctx is None:
             return "错误：session 未初始化"
-        if not ctx.evidence_pack:
-            return "错误：证据包未加载（evidence_pack 为空）"
-        pack = ctx.evidence_pack
-        evolve_view = pack.get("evolve_view") or {}
+        if not ctx.eval_dossier:
+            return "错误：评估卷宗未加载"
+        dossier = ctx.eval_dossier
+        frozen = dossier.get("frozen_evidence") or {}
+        findings = dossier.get("findings") or []
 
-        # 格式化进化工作页
-        lines = ["# 证据包 · 进化工作页", ""]
+        lines = ["# 评估卷宗 · 引用证据片段", ""]
 
-        # 失败恢复链
-        recovery = evolve_view.get("recovery_chain", [])
-        if recovery:
-            lines.append(f"## 失败恢复链（{len(recovery)} 条）")
-            for rc in recovery:
-                followed = rc.get("followed_by")
-                followed_desc = f"→ 主链继续（{followed['type']}）" if followed else "→ 主链未继续"
-                lines.append(f"- [{rc.get('evidence_id')}] {rc.get('error_type')} @ {rc.get('agent_name', '?')}: {rc.get('error_message', '')[:100]} {followed_desc}")
+        if not frozen:
+            lines.append("本次评估未冻结证据片段（评估卷宗封存时无引用或证据卷宗无对应片段）。")
+            lines.append("结合 read_eval_report 的 findings 理解问题。")
+            return "\n".join(lines)
+
+        # 按 finding 归组展示其引用的片段
+        lines.append(f"## 冻结证据片段（共 {len(frozen)} 个）")
+        for fid, snapshot in frozen.items():
+            lines.append(f"### {fid}")
+            lines.append(f"- type: {snapshot.get('type', '?')}")
+            lines.append(f"- agent: {snapshot.get('agent_name', '?')}")
+            lines.append(f"- sequence: {snapshot.get('sequence', '?')}")
+            if snapshot.get("error"):
+                lines.append(f"- error: {snapshot['error'][:200]}")
+            if snapshot.get("tool_output"):
+                lines.append(f"- tool_output: {snapshot['tool_output'][:400]}")
+            if snapshot.get("output"):
+                lines.append(f"- output: {snapshot['output'][:400]}")
             lines.append("")
 
-        # review 链
-        rcs = evolve_view.get("review_chain", [])
-        if rcs:
-            lines.append(f"## review 调用链（{len(rcs)} 次）")
-            for rc in rcs:
-                lines.append(f"- [{rc.get('evidence_id')}] {rc.get('reviewer', '?')} → {rc.get('review_file', '?')}")
-            lines.append("")
-
-        # revise 推断
-        rvs = evolve_view.get("revise_events", [])
-        if rvs:
-            lines.append(f"## revise 推断（{len(rvs)} 次，时序推断）")
-            for rv in rvs:
-                lines.append(f"- [{rv.get('evidence_id')}] {rv.get('subagent', '?')} 修订 {rv.get('revised_path', '?')}（review 后）")
-            lines.append("")
-
-        # 可靠性指标
-        reliability = evolve_view.get("reliability", {})
-        if reliability:
-            lines.append("## 可靠性指标")
-            lines.append(f"- 错误事件总数: {reliability.get('error_events_total', 0)}")
-            lines.append(f"- 工具错误率: {reliability.get('tool_error_rate', 0)}")
-            lines.append(f"- middleware 介入: {reliability.get('middleware_events', 0)}")
-            err_by_agent = reliability.get("error_by_agent", {})
-            if err_by_agent:
-                lines.append(f"- 按 agent 分布: {json.dumps(err_by_agent, ensure_ascii=False)}")
-            lines.append("")
-
-        # 资源指标
-        resources = evolve_view.get("resources", {})
-        if resources:
-            lines.append("## 资源指标")
-            lines.append(f"- 总 token: {resources.get('total_tokens', 0)}")
-            lines.append(f"- 重复读文件: {resources.get('repeated_read_files', 0)}（浪费 {resources.get('repeated_read_waste', 0)} 次）")
-            lines.append("")
-
-        # 重点候选
-        priorities = evolve_view.get("priorities", [])
-        if priorities:
-            lines.append(f"## 重点候选（{len(priorities)} 条）")
-            for p in priorities:
-                lines.append(f"- **{p.get('level', '?')}** [{p.get('category', '?')}] {p.get('desc', '')} → {p.get('evidence_id', '')}")
-            lines.append("")
-
-        # 可回钻 ID
-        drillable = evolve_view.get("drillable_ids", [])
-        lines.append(f"## 可回钻证据 ID（共 {len(drillable)} 个）")
-
-        # 指令
+        # 哪些 finding 引用了哪些片段
+        lines.append("## finding → 证据引用")
+        for f in findings:
+            refs = f.get("evidence_ref") or f.get("evidence_id")
+            if isinstance(refs, str):
+                refs = [refs]
+            if isinstance(refs, list) and refs:
+                lines.append(f"- {f.get('id', '?')}: {', '.join(str(r) for r in refs)}")
         lines.append("")
-        lines.append(f"## 指导")
-        lines.append(evolve_view.get("instructions", "结合评估 finding 和过程诊断定位改进点。"))
+        lines.append("结合 read_eval_report 的 findings 诊断 + 这里的证据片段定位改进点。")
 
         return "\n".join(lines)
-
-    @tool
-    def read_trace(trace_id: str) -> str:
-        """读取一个 trace 的节点结构化摘要。
-
-        用于看实际执行流程，对照评估诊断理解问题。
-
-        Args:
-            trace_id: 要读的 trace id
-        """
-        ctx = get_tool_context()
-        if ctx is None:
-            return "错误：session 未初始化"
-        ctx.emit_step("read_trace", "running", trace_id=trace_id)
-        try:
-            detail = get_trace(trace_id)
-            run = detail.run
-            lines = [
-                f"trace_id: {run.trace_id}",
-                f"状态: {run.status}  耗时: {run.duration_ms or '?'}ms  事件数: {run.event_count}",
-            ]
-            if run.error:
-                lines.append(f"错误: {run.error[:300]}")
-            lines.append(f"节点数: {len(detail.nodes)}")
-            for node in detail.nodes:
-                if node.kind == "run":
-                    continue
-                parts = [f"  [{node.kind}]"]
-                if node.node_id:
-                    parts.append(f"id={node.node_id}")
-                if node.agent_name:
-                    parts.append(node.agent_name)
-                if node.tool_name:
-                    parts.append(f"tool={node.tool_name}")
-                if node.status and node.status != "ok":
-                    parts.append(f"status={node.status}")
-                if node.error:
-                    parts.append(f"err={node.error[:120]}")
-                if node.chain_summary:
-                    parts.append(f"| {node.chain_summary[:160]}")
-                lines.append(" ".join(parts))
-
-            # P4：追加记忆系统检索质量摘要（从 run_meta 事件读 memory_quality）
-            mq_summary = _read_memory_quality_summary(trace_id)
-            if mq_summary:
-                lines.append(mq_summary)
-
-            ctx.emit_step("read_trace", "done", trace_id=trace_id)
-            return "\n".join(lines)
-        except Exception as e:
-            ctx.emit_step("read_trace", "failed", error=str(e))
-            return f"读 trace 失败：{e}"
 
     @tool
     def write_design_doc(changes_json: str, rationale: str) -> str:
@@ -410,7 +276,7 @@ def make_flow_tools() -> list:
             ctx.emit_step("write_change_log", "failed", error=str(e))
             return f"产出记录失败：{e}"
 
-    return [read_eval_report, read_evidence_pack, read_trace, write_design_doc, validate_changes, write_change_log]
+    return [read_eval_report, read_evidence_pack, write_design_doc, validate_changes, write_change_log]
 
 
 # ── import 检查辅助 ─────────────────────────────────────────────

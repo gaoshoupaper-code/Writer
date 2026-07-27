@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -28,7 +29,12 @@ from app.common.flow_metrics import compute_flow_metrics
 from app.eval_agent import eval_extractor
 from app.view.traces import load_trace_detail
 
-logger = logging.getLogger("evolution.evidence.extractor")
+logger = logging.getLogger("evolution.dossier.extractor")
+
+# 冻结交付物正文的单文件字符上限（B1，2026-07-27）。
+# 评估 get_content_score 需正文打分；过长章节截断后仍具代表性。
+# R22 体积权衡：N 章小说 × 8000 字符在 SQLite TEXT 列内可控。
+DELIVERY_FREEZE_CHAR_LIMIT = 8000
 
 # review subagent 命名约定（与包内 subagents/reviewers/ 的 middleware_factory 名对齐）
 _REVIEW_AGENT_NAMES = {
@@ -111,8 +117,10 @@ def extract_facts(trace_id: str) -> dict[str, Any]:
     # 3.5 产物修订快照（第二期：从 run_meta 的 artifact_snapshot 键提取）
     artifact_revisions = _extract_artifact_revisions(events)
 
-    # 4. 产物交付物（复用 extract_deliveries）
-    deliveries = eval_extractor.extract_deliveries(trace_id)
+    # 4. 产物交付物（冻结正文全文 + 指纹，B1）。
+    # 复用 eval_extractor 的路径定位逻辑，但升级为冻结正文（截断 + sha256），
+    # 让评估可仅凭卷宗打分（阶段 C 切断工作区旁路的前提）。
+    deliveries = _freeze_deliveries(trace_id)
 
     # 5. review 文件内容（扩展：覆盖 review subagent 写的 review/*.md）
     review_artifacts = _extract_review_artifacts(trace_id)
@@ -128,6 +136,9 @@ def extract_facts(trace_id: str) -> dict[str, Any]:
 
     # 8. 失败恢复链（新写）
     recovery_chain = _build_recovery_chain(events, nodes)
+
+    # 8.5 memory_quality 埋点（B2）：冻结进 facts，进化侧不再直读 run_meta
+    memory_quality = _extract_memory_quality(events)
 
     # 9. provenance 判定：有运行时产物快照 → trace_time；否则 → compile_time_snapshot
     provenance = "trace_time" if artifact_revisions else "compile_time_snapshot"
@@ -152,7 +163,136 @@ def extract_facts(trace_id: str) -> dict[str, Any]:
         "review_chain": review_chain,
         "revise_events": revise_events,
         "recovery_chain": recovery_chain,
+        "memory_quality": memory_quality,
         "coverage": coverage,
+    }
+
+
+# ── 交付物冻结（B1，2026-07-27）──────────────────────────────
+
+
+def _freeze_deliveries(trace_id: str) -> dict[str, dict[str, dict[str, Any]]]:
+    """冻结各 primary subagent 的交付物正文（全文截断 + sha256 指纹）。
+
+    复用 eval_extractor.extract_deliveries 的路径定位与 agent 归属逻辑，
+    但升级返回结构：每个文件携带冻结正文、字符数、是否截断、内容指纹。
+    评估 Agent（阶段 C）可仅凭此冻结正文打分，无需再读工作区文件系统。
+
+    Returns:
+        {agent_short_name: {normalized_path: {
+            "content_frozen": str,       # 截断后的正文（≤ DELIVERY_FREEZE_CHAR_LIMIT）
+            "content_sha256": str,       # 全文（截断前）的 sha256 指纹
+            "char_count": int,           # 全文字符数（截断前）
+            "truncated": bool,           # 是否因超上限截断
+        }, ...}, ...}
+        只含实际有可读交付物的 subagent。
+    """
+    # 复用 eval_extractor 拿到 {agent: {path: content}}（它已读全文，截断 6000）
+    # 但我们需要全文 + 自己的截断阈值，故重新读文件系统。
+    raw = eval_extractor.extract_deliveries(trace_id)
+    if not raw:
+        return {}
+
+    frozen: dict[str, dict[str, dict[str, Any]]] = {}
+    for agent, files in raw.items():
+        agent_frozen: dict[str, dict[str, Any]] = {}
+        for path, _truncated_content in files.items():
+            # 重新读全文（eval_extractor 返回的是 6000 截断版，这里要全文算指纹）
+            full_text = _read_delivery_fulltext(trace_id, path)
+            if full_text is None:
+                # eval_extractor 读到但这里读不到（并发删除等），保留其截断版作降级
+                full_text = _truncated_content
+            char_count = len(full_text)
+            truncated = char_count > DELIVERY_FREEZE_CHAR_LIMIT
+            content_frozen = full_text[:DELIVERY_FREEZE_CHAR_LIMIT] if truncated else full_text
+            agent_frozen[path] = {
+                "content_frozen": content_frozen,
+                "content_sha256": hashlib.sha256(full_text.encode("utf-8")).hexdigest(),
+                "char_count": char_count,
+                "truncated": truncated,
+            }
+        if agent_frozen:
+            frozen[agent] = agent_frozen
+    return frozen
+
+
+def _read_delivery_fulltext(trace_id: str, file_path: str) -> str | None:
+    """读取交付物的完整正文（不截断）。失败返回 None。
+
+    复用 eval_extractor 的三层路径解析。与 extract_deliveries 的读取一致，
+    但返回全文供 _freeze_deliveries 计算指纹和按本模块阈值截断。
+    """
+    run = db.query_one(
+        "SELECT workspace_id, owner_user_id FROM runs WHERE trace_id = ?",
+        (trace_id,),
+    )
+    if run is None:
+        return None
+    workspace_id = run["workspace_id"]
+    owner_user_id = run["owner_user_id"]
+    if not owner_user_id or owner_user_id == "unknown":
+        return None
+    rel = file_path.lstrip("/")
+    abs_path = settings.executor_workspace_path / owner_user_id / workspace_id / rel
+    try:
+        text = abs_path.read_text(encoding="utf-8")
+        return text if text.strip() else None
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+# ── memory_quality 提取（B2，2026-07-27）─────────────────────
+
+
+def _extract_memory_quality(events: list) -> dict[str, Any]:
+    """从 run_meta 事件提取 memory_quality 埋点（B2）。
+
+    执行端 memory_recall middleware 每次检索写一条 run_meta 事件，含
+    input.memory_quality。进化侧原先直 SQL 读（flow._read_memory_quality_summary），
+    现冻结进卷宗 facts，让进化侧切断后仍可读。
+
+    Returns:
+        {"entries": [...], "summary": {...}, "available": bool}
+        entries 每条含 chapter_num/retrieval_ok/nodes/edges/tokens/error/sequence/evidence_id。
+    """
+    entries: list[dict[str, Any]] = []
+    for evt in events:
+        if evt.type != "run_meta":
+            continue
+        if not isinstance(evt.input, dict):
+            continue
+        mq = evt.input.get("memory_quality")
+        if not mq or not isinstance(mq, dict):
+            continue
+        entries.append({
+            "chapter_num": mq.get("chapter_num"),
+            "retrieval_ok": mq.get("retrieval_ok", True),
+            "evidence_nodes_count": mq.get("evidence_nodes_count", 0),
+            "evidence_edges_count": mq.get("evidence_edges_count", 0),
+            "evidence_packet_tokens": mq.get("evidence_packet_tokens", 0),
+            "error": mq.get("error"),
+            "sequence": evt.sequence,
+            "evidence_id": f"evt-{evt.event_id}",
+        })
+
+    entries.sort(key=lambda x: x["sequence"])
+
+    if not entries:
+        return {"entries": [], "summary": {"available": False}, "available": False}
+
+    ok_count = sum(1 for e in entries if e["retrieval_ok"])
+    return {
+        "entries": entries,
+        "summary": {
+            "available": True,
+            "total_retrievals": len(entries),
+            "ok_count": ok_count,
+            "fail_count": len(entries) - ok_count,
+            "total_nodes": sum(e["evidence_nodes_count"] for e in entries),
+            "total_edges": sum(e["evidence_edges_count"] for e in entries),
+            "total_tokens": sum(e["evidence_packet_tokens"] for e in entries),
+        },
+        "available": True,
     }
 
 

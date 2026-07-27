@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -8,15 +8,11 @@ import {
   getEvalSession,
   startEval,
   stopEval,
-  getTraces,
   getEvalSessionEventsSince,
-  startEvidenceCompile,
-  getEvidenceSession,
-  getCurrentEvidencePack,
+  getConsumableDossiers,
   type EvalSession,
-  type TraceListItem,
   type EvalFrame,
-  type EvidencePack,
+  type ConsumableDossierSummary,
 } from "@/lib/api";
 
 /**
@@ -30,9 +26,9 @@ import {
 export default function EvaluationPage() {
   const navigate = useNavigate();
   const [evals, setEvals] = useState<EvalSession[]>([]);
-  const [traces, setTraces] = useState<TraceListItem[]>([]);
+  const [consumableDossiers, setConsumableDossiers] = useState<ConsumableDossierSummary[]>([]);
   const [selectedEval, setSelectedEval] = useState<EvalSession | null>(null);
-  const [selectedTraceId, setSelectedTraceId] = useState("");
+  const [selectedDossierId, setSelectedDossierId] = useState("");
   const [starting, setStarting] = useState(false);
   const [liveLogs, setLiveLogs] = useState<any[]>([]);
   const [streaming, setStreaming] = useState(false);
@@ -41,38 +37,32 @@ export default function EvaluationPage() {
   const streamCancelRef = useRef<(() => void) | null>(null);
   // 失败态：区分"暂无评估记录"与"加载失败"
   const [loadError, setLoadError] = useState<string | null>(null);
+  // 从证据卷宗页跳转预选（?dossier=xxx）
+  const [searchParams] = useSearchParams();
 
   const refresh = useCallback(async () => {
     let esFailed = false;
-    let trFailed = false;
-    const [es, tr] = await Promise.all([
+    let dosFailed = false;
+    const [es, dos] = await Promise.all([
       getEvalSessions(30).catch(() => { esFailed = true; return null; }),
-      getTraces({ limit: 50 }).catch(() => { trFailed = true; return null; }),
+      getConsumableDossiers(200).catch(() => { dosFailed = true; return null; }),
     ]);
     if (es !== null) setEvals(es.sessions);
-    if (tr !== null) {
-      // 排除进化端自观测 trace——评估 Agent 只评估创作 Agent 的 trace，
-      // 不能评估自己（evolution_eval）或进化 Agent（evolution_evolve）的录像。
-      setTraces(
-        tr.items.filter(
-          (t) => t.run_purpose !== "evolution_eval" && t.run_purpose !== "evolution_evolve",
-        ),
-      );
-    }
+    if (dos !== null) setConsumableDossiers(dos.dossiers);
 
-    if (esFailed && trFailed) {
-      if (evals.length === 0 && traces.length === 0) {
+    if (esFailed && dosFailed) {
+      if (evals.length === 0 && consumableDossiers.length === 0) {
         setLoadError("评估数据加载失败（evolution 服务不可达或鉴权失败）");
       } else {
         toast.error("评估数据刷新失败，显示的为上次成功拉取的数据");
       }
     } else {
       setLoadError(null);
-      if (esFailed || trFailed) {
+      if (esFailed || dosFailed) {
         toast.error("部分评估数据加载失败，已显示可用数据");
       }
     }
-  }, [evals.length, traces.length]);
+  }, [evals.length, consumableDossiers.length]);
 
   useEffect(() => {
     refresh();
@@ -83,15 +73,23 @@ export default function EvaluationPage() {
     };
   }, [refresh]);
 
+  // 从证据卷宗页跳转预选 dossier（?dossier=xxx）
+  useEffect(() => {
+    const preselected = searchParams.get("dossier");
+    if (preselected && !selectedDossierId) {
+      setSelectedDossierId(preselected);
+    }
+  }, [searchParams, selectedDossierId]);
+
   async function handleStart() {
-    if (!selectedTraceId) {
-      toast.error("请先选择一条 trace");
+    if (!selectedDossierId) {
+      toast.error("请先选择一个证据卷宗（须在证据卷宗模块编译为完整态）");
       return;
     }
     setStarting(true);
     setLiveLogs([]);
     try {
-      const resp = await startEval(selectedTraceId);
+      const resp = await startEval(selectedDossierId);
       toast.success(`评估已启动：${resp.eval_id.slice(0, 8)}`);
       setStreaming(true);
       setStreamingEvalId(resp.eval_id);
@@ -230,28 +228,36 @@ export default function EvaluationPage() {
         <main className="evolve-main">
           <section className="evolve-start">
             <h3>启动新评估</h3>
+            <div className="evolve-start-hint">
+              评估只接受完整证据卷宗（ready）。请先在
+              <a onClick={() => navigate("/dossiers")}>证据卷宗模块</a>
+              编译。
+            </div>
             <div className="evolve-start-form">
               <select
                 className="evolve-select"
-                value={selectedTraceId}
-                onChange={(e) => setSelectedTraceId(e.target.value)}
+                value={selectedDossierId}
+                onChange={(e) => setSelectedDossierId(e.target.value)}
                 disabled={starting}
               >
-                <option value="">选择 trace…</option>
-                {traces.map((t) => (
-                  <option key={t.trace_id} value={t.trace_id}>
-                    {t.trace_id.slice(0, 12)}…（{t.status}）
+                <option value="">选择证据卷宗…</option>
+                {consumableDossiers.map((d) => (
+                  <option key={d.dossier_id} value={d.dossier_id}>
+                    trace {d.trace_id.slice(0, 10)}… · v{d.version} · {d.completeness || "?"}
                   </option>
                 ))}
               </select>
               <button
                 className="config-button primary"
                 onClick={handleStart}
-                disabled={starting || !selectedTraceId}
+                disabled={starting || !selectedDossierId}
               >
                 {starting ? "启动中…" : "启动评估"}
               </button>
             </div>
+            {consumableDossiers.length === 0 && (
+              <div className="muted">暂无完整证据卷宗。先去证据卷宗模块编译。</div>
+            )}
           </section>
 
           {(liveLogs.length > 0 || selectedEval || streaming) && (
@@ -281,7 +287,11 @@ export default function EvaluationPage() {
                 </div>
               )}
               {selectedEval && !streaming && (
-                <EvalReport evalSession={selectedEval} onTraceClick={(id) => navigate(`/traces/${id}`)} />
+                <EvalReport
+                  evalSession={selectedEval}
+                  onTraceClick={(id) => navigate(`/traces/${id}`)}
+                  onNavigateDossiers={() => navigate("/dossiers")}
+                />
               )}
             </section>
           )}
@@ -292,47 +302,9 @@ export default function EvaluationPage() {
 }
 
 /** 评估报告展示组件。 */
-function EvalReport({ evalSession, onTraceClick }: { evalSession: EvalSession; onTraceClick: (id: string) => void }) {
+function EvalReport({ evalSession, onTraceClick, onNavigateDossiers }: { evalSession: EvalSession; onTraceClick: (id: string) => void; onNavigateDossiers: () => void }) {
   const scores = evalSession.scores || {};
   const findings = evalSession.findings || [];
-
-  // 证据编译状态（轨迹证据包）
-  const [evidenceStatus, setEvidenceStatus] = useState<string>("idle"); // idle|compiling|ready|partial|failed|error
-  const [evidencePack, setEvidencePack] = useState<EvidencePack | null>(null);
-
-  async function handleCompileEvidence() {
-    setEvidenceStatus("compiling");
-    try {
-      const resp = await startEvidenceCompile(evalSession.trace_id);
-      // 轮询编译状态
-      const poll = async () => {
-        const pack = await getEvidenceSession(resp.pack_id);
-        if (pack.status === "compiling" || pack.status === "pending") {
-          setEvidencePack(pack);
-          setTimeout(poll, 2000);
-        } else {
-          setEvidencePack(pack);
-          setEvidenceStatus(pack.status);
-        }
-      };
-      poll();
-    } catch (e) {
-      setEvidenceStatus("error");
-    }
-  }
-
-  // 页面加载时检查是否已有证据包
-  useEffect(() => {
-    getCurrentEvidencePack(evalSession.trace_id)
-      .then((pack) => {
-        setEvidencePack(pack);
-        setEvidenceStatus(pack.status);
-      })
-      .catch(() => {
-        // 无证据包是正常状态，不算错误
-        setEvidenceStatus("idle");
-      });
-  }, [evalSession.trace_id]);
 
   return (
     <div className="session-detail">
@@ -388,51 +360,21 @@ function EvalReport({ evalSession, onTraceClick }: { evalSession: EvalSession; o
         </div>
       )}
 
-      {/* 轨迹证据包编译入口（2026-07） */}
+      {/* 阶段 E：评估基于证据卷宗，展示绑定的卷宗信息 */}
       <div className="evidence-compile-section">
-        <h4>轨迹证据包</h4>
-        {evidenceStatus === "idle" && (
-          <button className="config-button primary" onClick={handleCompileEvidence}>
-            编译轨迹证据包
-          </button>
-        )}
-        {evidenceStatus === "compiling" && (
-          <div className="evidence-status compiling">
-            <span className="spinner" /> 编译中… pack_id={evidencePack?.pack_id?.slice(0, 8)}…
-          </div>
-        )}
-        {(evidenceStatus === "ready" || evidenceStatus === "partial") && evidencePack && (
+        <h4>证据卷宗</h4>
+        {evalSession.bound_dossier_id ? (
           <div className="evidence-status done">
-            <span className={`pack-status ${evidencePack.status}`}>
-              {evidencePack.status === "ready" ? "✓ 完整" : "△ 降级"}（v{evidencePack.version}）
-            </span>
-            {evidencePack.manifest && (
-              <div className="evidence-summary">
-                <span>完整度: {evidencePack.manifest.completeness}</span>
-                <span>适用维度: {evidencePack.manifest.applicable_dimensions?.join(", ")}</span>
-                <span>review: {evidencePack.manifest.coverage?.review_calls ?? 0} 次</span>
-                <span>错误: {evidencePack.manifest.coverage?.error_events ?? 0} 个</span>
-                {evidencePack.manifest.coverage?.gaps?.length > 0 && (
-                  <span className="evidence-gaps">⚠ 缺口: {evidencePack.manifest.coverage.gaps.join("; ")}</span>
-                )}
-              </div>
+            <span>绑定卷宗：{evalSession.bound_dossier_id.slice(0, 12)}…</span>
+            {evalSession.sealed_dossier_id && (
+              <span className="pack-status ready">✓ 已封存评估卷宗 {evalSession.sealed_dossier_id.slice(0, 12)}…</span>
             )}
-            {evidencePack.failure_reason && (
-              <div className="evidence-reason">{evidencePack.failure_reason}</div>
-            )}
+            <button className="link-button" onClick={onNavigateDossiers}>
+              卷宗管理 →
+            </button>
           </div>
-        )}
-        {evidenceStatus === "failed" && (
-          <div className="evidence-status failed">
-            ✗ 编译失败：{evidencePack?.failure_reason || "未知原因"}
-            <button className="link-button" onClick={handleCompileEvidence}>重试</button>
-          </div>
-        )}
-        {evidenceStatus === "error" && (
-          <div className="evidence-status failed">
-            ✗ 请求失败
-            <button className="link-button" onClick={handleCompileEvidence}>重试</button>
-          </div>
+        ) : (
+          <div className="muted">旧链路评估（未绑定证据卷宗）</div>
         )}
       </div>
 

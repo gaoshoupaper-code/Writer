@@ -1,11 +1,11 @@
-"""证据包读取类工具（轨迹证据包，2026-07）。
+"""证据卷宗读取类工具（阶段 C：可见性隔离后）。
 
-评估 Agent 优先通过本工具读证据包的评估工作页，而非直读 trace。
-证据包缺失时降级为直读 trace（read_trace* 工具仍保留）。
+评估 Agent 的唯一事实来源是证据卷宗。本模块提供：
+  - read_evidence_pack()    读卷宗评估工作页（清单+重点候选+阶段摘要+review链）
+  - drill_evidence(eid)     按证据 ID 受控回钻（只能沿卷宗索引内 ID）
 
-工具：
-  - read_evidence_pack()    读评估工作页（清单+重点候选+阶段摘要+review链）
-  - drill_evidence(eid)     按证据 ID 回钻原始片段
+阶段 C 切断：评估 Agent 不再直读原始 trace / 工作区。
+卷宗是评估的硬前置——无完整卷宗的评估在启动时即被拒（api 层校验）。
 """
 from __future__ import annotations
 
@@ -19,31 +19,29 @@ logger = logging.getLogger("evolution.eval_agent.tools.evidence")
 
 
 def make_evidence_tools() -> list:
-    """构建证据包读取类工具。"""
+    """构建证据卷宗读取类工具。"""
 
     @tool
     def read_evidence_pack() -> str:
-        """读取轨迹证据包的评估工作页。
+        """读取证据卷宗的评估工作页。
 
-        证据包是编译器从 trace 提取的结构化事实底座 + 重点候选。
-        先用本工具按 P0→P1→P2 顺序审查重点候选，再用 drill_evidence 回钻原始片段。
-
-        如果没有证据包（返回提示），请改用 read_trace 直接读 trace。
+        证据卷宗是编译器从 trace 提取的结构化事实底座 + 重点候选。
+        先用本工具按 P0→P1→P2 顺序审查重点候选，再用 drill_evidence 回钻证据片段。
         """
         ctx = get_eval_context()
         if ctx is None:
             return "错误：评估 session 未初始化"
-        pack = ctx.evidence_pack
-        if not pack:
-            return ("无证据包可用。请用 read_trace / read_trace_node / read_trace_range "
-                    "直接读 trace。")
+        dossier = ctx.dossier
+        if not dossier:
+            # 阶段 C：无卷宗不应到达此处（启动时已校验）。防御性提示。
+            return "错误：证据卷宗未加载（启动时应校验完整卷宗）。"
         ctx.emit_step("read_evidence_pack", "running")
         try:
-            eval_view = pack.get("eval_view") or {}
-            manifest = pack.get("manifest") or {}
+            eval_view = dossier.get("eval_view") or {}
+            manifest = dossier.get("manifest") or {}
 
             # 格式化评估工作页为可读文本
-            lines = ["# 证据包 · 评估工作页", ""]
+            lines = ["# 证据卷宗 · 评估工作页", ""]
 
             # 清单摘要
             ms = eval_view.get("manifest_summary", {})
@@ -55,6 +53,16 @@ def make_evidence_tools() -> list:
             if gaps:
                 lines.append(f"- ⚠ 证据缺口: {'; '.join(gaps)}")
             lines.append("")
+
+            # 任务契约覆盖矩阵（B3）
+            matrix = manifest.get("contract_coverage_matrix") or {}
+            if matrix:
+                lines.append(f"## 任务契约覆盖（complete={matrix.get('complete')}）")
+                for item in matrix.get("items", [])[:8]:
+                    lines.append(
+                        f"- [{item.get('status')}] {item.get('dim')}/{item.get('key')}: {item.get('reason', '')[:80]}"
+                    )
+                lines.append("")
 
             # 重点候选
             priorities = eval_view.get("priorities", {})
@@ -92,7 +100,7 @@ def make_evidence_tools() -> list:
             # 可回钻 ID
             drillable = eval_view.get("drillable_ids", [])
             lines.append(f"## 可回钻证据 ID（共 {len(drillable)} 个）")
-            lines.append("用 drill_evidence(evidence_id) 回钻原始片段。")
+            lines.append("用 drill_evidence(evidence_id) 回钻证据片段。")
             if drillable:
                 lines.append(f"示例: {', '.join(drillable[:5])}{'...' if len(drillable) > 5 else ''}")
             lines.append("")
@@ -105,14 +113,14 @@ def make_evidence_tools() -> list:
             return "\n".join(lines)
         except Exception as e:
             ctx.emit_step("read_evidence_pack", "failed", error=str(e))
-            return f"读证据包失败：{e}"
+            return f"读证据卷宗失败：{e}"
 
     @tool
     def drill_evidence(evidence_id: str) -> str:
-        """按证据 ID 回钻原始片段（受控回钻）。
+        """按证据 ID 回钻证据片段（受控回钻，限于卷宗索引内 ID）。
 
         evidence_id 从 read_evidence_pack 的重点候选或可回钻列表获取。
-        只能回钻证据包索引内的 ID。
+        只能回钻证据卷宗索引层已登记的 ID（受控，不可任意搜索 trace）。
 
         Args:
             evidence_id: 证据 ID（格式 evt-{event_id}）
@@ -120,44 +128,49 @@ def make_evidence_tools() -> list:
         ctx = get_eval_context()
         if ctx is None:
             return "错误：评估 session 未初始化"
-        pack = ctx.evidence_pack
-        if not pack:
-            return "无证据包可用，无法回钻"
+        dossier = ctx.dossier
+        if not dossier:
+            return "错误：证据卷宗未加载"
         ctx.emit_step("drill_evidence", "running", evidence_id=evidence_id)
         try:
-            # 校验 evidence_id 在索引内
-            index = pack.get("index") or {}
+            # 校验 evidence_id 在卷宗索引层内（受控回钻）
+            index = dossier.get("index") or {}
             allowed = set(index.get("evidence_ids", []))
             if evidence_id not in allowed:
-                return (f"证据 ID {evidence_id} 不在索引内（受控回钻："
-                        "只能沿包内 ID 展开）")
+                return (f"证据 ID {evidence_id} 不在卷宗索引内（受控回钻："
+                        "只能沿卷宗内 ID 展开）")
 
-            # 从 trace 加载原始事件
+            # 从 event_payloads 加载原始事件（受控：ID 已被卷宗索引登记）。
+            # event_id 在 payload_json 里（表无 event_id 列），按 trace 拉全部再筛。
             import json
             import app.core.db as db
             event_id = evidence_id[4:] if evidence_id.startswith("evt-") else evidence_id
-            row = db.query_one(
-                "SELECT payload_json FROM event_payloads WHERE trace_id = ? AND event_id = ?",
-                (ctx.input_trace_id, event_id),
+            rows = db.query_all(
+                "SELECT payload_json FROM event_payloads WHERE trace_id = ?",
+                (ctx.input_trace_id,),
             )
-            if row is None:
-                return f"原始事件 {event_id} 不存在"
-
-            payload = json.loads(row["payload_json"])
-            # 格式化关键字段
-            lines = [f"# 原始事件 {evidence_id}", ""]
+            payload = None
+            for r in rows:
+                try:
+                    p = json.loads(r["payload_json"])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if str(p.get("event_id", "")) == event_id:
+                    payload = p
+                    break
+            if payload is None:
+                return f"证据片段 {event_id} 不存在"
+            lines = [f"# 证据片段 {evidence_id}", ""]
             lines.append(f"- type: {payload.get('type', '?')}")
             lines.append(f"- agent: {payload.get('agent_name', '?')}")
             lines.append(f"- sequence: {payload.get('sequence', '?')}")
             if payload.get("error"):
                 lines.append(f"- error: {payload['error'][:300]}")
-            # tool_output（如果是 write_file）
             tool_output = payload.get("tool_output")
             if isinstance(tool_output, dict):
                 content = tool_output.get("content", "")
                 if content:
                     lines.append(f"- tool_output: {str(content)[:800]}")
-            # input/output（LLM 事件）
             output = payload.get("output")
             if output:
                 lines.append(f"- output: {str(output)[:800]}")
