@@ -77,7 +77,11 @@ class TraceMiddleware(AgentMiddleware):
         except BaseException as exc:
             # GraphInterrupt 是 HITL（ask_user）的正常控制流，不是错误——
             # 直接放行，不记录 llm_error，避免监测面板误报。
-            if not isinstance(exc, GraphInterrupt):
+            if isinstance(exc, GraphInterrupt):
+                self.recorder.record_hitl(
+                    self.trace_id, self.agent_name, phase="model", state="requested"
+                )
+            else:
                 self._record_model_error(request, started, exc)
             raise
         self._record_model_end(request, response, started)
@@ -94,7 +98,11 @@ class TraceMiddleware(AgentMiddleware):
         try:
             response = await handler(request)
         except BaseException as exc:
-            if not isinstance(exc, GraphInterrupt):
+            if isinstance(exc, GraphInterrupt):
+                self.recorder.record_hitl(
+                    self.trace_id, self.agent_name, phase="model", state="requested"
+                )
+            else:
                 self._record_model_error(request, started, exc)
             raise
         self._record_model_end(request, response, started)
@@ -113,7 +121,16 @@ class TraceMiddleware(AgentMiddleware):
         except BaseException as exc:
             # GraphInterrupt 是 HITL（ask_user）的正常控制流，不是工具错误——
             # 直接放行，不记录 tool_error，避免监测面板误报。
-            if not isinstance(exc, GraphInterrupt):
+            if isinstance(exc, GraphInterrupt):
+                tool_call = getattr(request, "tool_call", {})
+                self.recorder.record_hitl(
+                    self.trace_id,
+                    self.agent_name,
+                    phase="tool",
+                    state="requested",
+                    tool_call_id=_mapping_value(tool_call, "id"),
+                )
+            else:
                 self._record_tool_error(request, started, exc)
             raise
         self._record_tool_end(request, response, started)
@@ -126,7 +143,16 @@ class TraceMiddleware(AgentMiddleware):
         try:
             response = await handler(request)
         except BaseException as exc:
-            if not isinstance(exc, GraphInterrupt):
+            if isinstance(exc, GraphInterrupt):
+                tool_call = getattr(request, "tool_call", {})
+                self.recorder.record_hitl(
+                    self.trace_id,
+                    self.agent_name,
+                    phase="tool",
+                    state="requested",
+                    tool_call_id=_mapping_value(tool_call, "id"),
+                )
+            else:
                 self._record_tool_error(request, started, exc)
             raise
         self._record_tool_end(request, response, started)
@@ -156,10 +182,7 @@ class TraceMiddleware(AgentMiddleware):
                 "run_id": run_id,
                 "parent_run_id": parent_run_id,
                 "model_name": _model_name(request.model),
-                # 截断超长字符串：llm_start 会把完整 system prompt + 注入的全部上下文
-                # 文件 + 对话历史记进去，单条就几十 KB，是 trace jsonl 膨胀的主因
-                # （实测单文件 39MB / 820 事件）。截断后保留头尾可读，体积降两个数量级。
-                "input": _truncate_payload({"messages": messages_payload}),
+                "input": {"messages": messages_payload},
             },
         )
 
@@ -177,7 +200,7 @@ class TraceMiddleware(AgentMiddleware):
                 "parent_run_id": parent_run_id,
                 "model_name": _model_name(request.model),
                 "duration_ms": _duration_ms(started),
-                "output": _truncate_payload(_model_output(response)),       # 模型输出（消息列表等）
+                "output": _model_output(response),       # 模型输出（消息列表等）
                 "usage": _usage_payload(response),       # token 使用量统计
                 "tool_calls": _tool_calls_payload(response),  # 模型请求的工具调用
             },
@@ -220,6 +243,7 @@ class TraceMiddleware(AgentMiddleware):
                 "parent_run_id": parent_run_id,
                 "tool_call_id": _mapping_value(tool_call, "id"),
                 "tool_name": _mapping_value(tool_call, "name"),
+                "tool_args": _mapping_value(tool_call, "args"),
             },
         )
 
@@ -227,7 +251,7 @@ class TraceMiddleware(AgentMiddleware):
         """记录工具调用完成事件，包含工具输出。"""
         tool_call = getattr(request, "tool_call", {})
         run_id, parent_run_id = self._current_run_ids()
-        self.recorder.append_event(
+        event = self.recorder.append_event(
             self.trace_id,
             {
                 "type": "tool_end",
@@ -238,16 +262,26 @@ class TraceMiddleware(AgentMiddleware):
                 "parent_run_id": parent_run_id,
                 "tool_call_id": _mapping_value(tool_call, "id"),
                 "tool_name": _mapping_value(tool_call, "name"),
+                "tool_args": _mapping_value(tool_call, "args"),
                 "duration_ms": _duration_ms(started),
                 "tool_output": _jsonable(response),
             },
         )
+        if _mapping_value(tool_call, "name") in {"read_file", "read"}:
+            self.recorder.record_skill_activation_from_tool(
+                self.trace_id,
+                self.agent_name,
+                _mapping_value(tool_call, "args"),
+                success=True,
+                trigger_event_id=event.event_id,
+                trigger_span_id=event.span_id,
+            )
 
     def _record_tool_error(self, request: Any, started: float, error: BaseException) -> None:
         """记录工具调用错误事件。"""
         tool_call = getattr(request, "tool_call", {})
         run_id, parent_run_id = self._current_run_ids()
-        self.recorder.append_event(
+        event = self.recorder.append_event(
             self.trace_id,
             {
                 "type": "tool_error",
@@ -258,10 +292,21 @@ class TraceMiddleware(AgentMiddleware):
                 "parent_run_id": parent_run_id,
                 "tool_call_id": _mapping_value(tool_call, "id"),
                 "tool_name": _mapping_value(tool_call, "name"),
+                "tool_args": _mapping_value(tool_call, "args"),
                 "duration_ms": _duration_ms(started),
                 "error": f"{error.__class__.__name__}: {error}",
             },
         )
+        if _mapping_value(tool_call, "name") in {"read_file", "read"}:
+            self.recorder.record_skill_activation_from_tool(
+                self.trace_id,
+                self.agent_name,
+                _mapping_value(tool_call, "args"),
+                success=False,
+                trigger_event_id=event.event_id,
+                trigger_span_id=event.span_id,
+                error=f"{error.__class__.__name__}: {error}",
+            )
 
     # ------------------------------------------------------------------
     # 内部：从 LangGraph 运行时上下文获取 run_id 和父级 run_id
@@ -291,35 +336,6 @@ class TraceMiddleware(AgentMiddleware):
 def _duration_ms(started: float) -> int:
     """计算从 started 时间点到现在的毫秒数。"""
     return int((time.perf_counter() - started) * 1000)
-
-
-# 单条 trace 事件内任意字符串的最大保留长度（超出截断为头尾各半 + 省略标记）。
-# 选 10000：保留足够上下文定位问题（system prompt + 注入上下文是排查 Agent 行为
-# 的关键材料，压太狠会切掉诊断信息），同时把单条事件 payload 从几十 KB 压到 ~10KB，
-# 相比原始膨胀仍有大幅压缩，配合方向1 的写盘解耦彻底消除事件循环阻塞。
-_MAX_TRACE_STRING = 10000
-
-
-def _truncate_payload(value: Any) -> Any:
-    """递归截断 payload 中超长的字符串，控制单条 trace 事件体积。
-
-    - str 超长 → 保留头尾各一半 + 省略标记（保留可读性，能看到开头与结尾）
-    - dict/list → 递归处理每个值（结构不变）
-    - 标量/其它 → 原样返回
-
-    幂等、无副作用：返回的是新结构，不修改入参。
-    """
-    if isinstance(value, str):
-        if len(value) <= _MAX_TRACE_STRING:
-            return value
-        keep = _MAX_TRACE_STRING // 2
-        omitted = len(value) - _MAX_TRACE_STRING
-        return f"{value[:keep]}…[truncated {omitted} chars]…{value[-keep:]}"
-    if isinstance(value, Mapping):
-        return {str(k): _truncate_payload(v) for k, v in value.items()}
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-        return [_truncate_payload(item) for item in value]
-    return value
 
 
 def _model_name(model: object) -> str:

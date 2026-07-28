@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     # 形如 http://localhost:7789。留空则 loader 降级为读本地 .md 文件（兼容）。
     evolution_url: str = ""
 
+    # Trace 结束后的复制/重生成等 Outcome 先落本地 SQLite，再可靠投递 evolution。
+    outcome_buffer_path: str = "data/trace_outcomes.db"
+
     # prompt loader 本地缓存目录（Phase 5 T10）：从 evolution 拉的 prompt 缓存到此，
     # evolution 不可用时降级读缓存。默认 executor/.prompt_cache。
     prompt_cache_dir: str = ".prompt_cache"

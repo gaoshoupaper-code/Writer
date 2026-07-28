@@ -9,11 +9,17 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+import hashlib
+import json
+from typing import Any, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 TraceStatus = Literal["running", "awaiting_input", "completed", "failed", "cancelled", "interrupted"]
+TraceWorkload = Literal["creation", "evidence_compile", "evaluation", "evolution"]
+TraceIntegrityStatus = Literal["verified", "incomplete", "conflict", "legacy"]
+TraceCoverageStatus = Literal["known", "partial", "unknown", "not_applicable"]
+TracePayloadKind = Literal["semantic_full", "reference_only", "structural"]
 TraceEventType = Literal[
     "run_start",
     "run_end",
@@ -31,8 +37,17 @@ TraceEventType = Literal[
     # copy = 用户复制了内容（正信号）；regenerate = 用户点了重试（负信号）。
     "user_copy",
     "user_regenerate",
+    "span_link",
+    "skill_catalog",
+    "skill_activation",
+    "middleware_assembly",
+    "middleware_intervention",
+    "hitl",
+    "artifact_revision",
+    "capture_degraded",
+    "run_manifest",
 ]
-TraceNodeKind = Literal["run", "agent", "llm", "tool", "todo", "error", "skill"]
+TraceNodeKind = Literal["run", "agent", "llm", "tool", "todo", "error", "skill", "middleware", "artifact", "hitl"]
 TraceAgentRole = Literal["main", "subagent"]
 TraceContextKind = Literal["system", "human", "ai", "tool", "todo", "error", "skill"]
 TraceTodoStatus = Literal["pending", "in_progress", "completed"]
@@ -42,6 +57,59 @@ class TraceUsage(BaseModel):
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+
+
+class TracePayloadRef(BaseModel):
+    """受治理正文的不可变引用；事件不得内联持久化语义正文。"""
+
+    payload_id: str
+    content_hash: str
+    kind: TracePayloadKind
+    size_bytes: int
+    sensitivity: Literal["internal", "restricted"] = "restricted"
+    expires_at: str | None = None
+
+
+class TraceSpanLink(BaseModel):
+    """异步因果关系，不伪造为跨 Trace 父子 Span。"""
+
+    target_trace_id: str
+    target_span_id: str | None = None
+    relation: Literal["triggered_by", "retry_of", "resumed_from", "derived_from", "consumes", "produces"]
+    artifact_revision_id: str | None = None
+    artifact: dict[str, Any] | None = None
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class TraceManifest(BaseModel):
+    """executor 终态落盘清单，供 evolution 校验连续摄入。"""
+
+    schema_version: int = 2
+    trace_id: str
+    final_sequence: int
+    terminal_event_id: str
+    events_hash: str
+    payload_ids: list[str] = Field(default_factory=list)
+    capture_degraded: bool = False
+    created_at: str
+
+
+class SkillCatalogEntry(BaseModel):
+    skill_id: str
+    name: str
+    version: str | None = None
+    content_hash: str
+    source: str
+    scope: str
+    runtime_path: str
+
+
+class MiddlewareDescriptor(BaseModel):
+    name: str
+    position: int
+    config_hash: str
+    version: str | None = None
+    mount_location: str = "agent.custom_middleware"
 
 
 class TraceMemoryQuality(BaseModel):
@@ -85,6 +153,21 @@ class TraceRunSummary(BaseModel):
     # 可选字段：executor 端构造时不传即 None，向后兼容。
     last_heartbeat_at: str | None = None
     interrupted_reason: str | None = None
+    # V2：新 trace 显式写 2；旧索引和历史 JSONL 仍按默认 1 读取。
+    schema_version: int = 1
+    service: str | None = None
+    workload: TraceWorkload | None = None
+    purpose: str | None = None
+    integrity_status: TraceIntegrityStatus = "legacy"
+    coverage: dict[str, TraceCoverageStatus] = Field(default_factory=dict)
+    run_snapshot: dict[str, Any] = Field(default_factory=dict)
+    links: list[TraceSpanLink] = Field(default_factory=list)
+    external_refs: dict[str, str] = Field(default_factory=dict)
+    manifest: TraceManifest | None = None
+
+    @property
+    def trace_incomplete(self) -> bool:
+        return self.integrity_status != "verified"
 
 
 class TraceLogEvent(BaseModel):
@@ -96,7 +179,7 @@ class TraceLogEvent(BaseModel):
     type: TraceEventType
     status: TraceStatus
     timestamp: str
-    source: Literal["system", "middleware"]
+    source: Literal["system", "middleware", "runtime"]
     duration_ms: int | None = None
     run_id: str | None = None
     parent_run_id: str | None = None
@@ -120,6 +203,32 @@ class TraceLogEvent(BaseModel):
     output_anchor_id: str | None = None
     error: str | None = None
     skill_name: str | None = None
+    schema_version: int = 1
+    span_id: str | None = None
+    payload_refs: dict[str, TracePayloadRef] = Field(default_factory=dict)
+    links: list[TraceSpanLink] = Field(default_factory=list)
+    skill_catalog: list[SkillCatalogEntry] = Field(default_factory=list)
+    skill_activation: dict[str, Any] | None = None
+    middleware_stack: list[MiddlewareDescriptor] = Field(default_factory=list)
+    intervention: dict[str, Any] | None = None
+    hitl: dict[str, Any] | None = None
+    artifact_revision_id: str | None = None
+    artifact: dict[str, Any] | None = None
+
+
+def compute_trace_events_hash(events: Iterable[TraceLogEvent]) -> str:
+    """Return the canonical digest shared by manifests and receipts."""
+    digest = hashlib.sha256()
+    for event in sorted(events, key=lambda item: item.sequence):
+        canonical_event = json.dumps(
+            event.model_dump(mode="json", exclude_none=True),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest.update(canonical_event.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
 
 
 class TraceNode(BaseModel):

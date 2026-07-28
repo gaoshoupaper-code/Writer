@@ -1,264 +1,280 @@
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { AlertTriangle, RefreshCw } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import {
-  getStatsOverview,
-  getStatsSkills,
-  getStatsFailures,
   getActiveRuns,
-  type StatsOverview,
-  type SkillStat,
-  type FailurePattern,
+  getTraces,
   type ActiveRun,
+  type TraceListItem,
 } from "@/lib/api";
+import type { TraceIntegrityStatus, TraceWorkload } from "@/lib/types";
 
-/**
- * 监测大盘（设计文档信息架构：默认首屏）。
- *
- * 双 Tab（D7）：
- * - 创作监测：run_purpose = user_generation（用户在创作端的创作过程）
- * - 进化监测：run_purpose = evolution_eval + evolution_evolve（进化端自身的评估/进化过程）
- *
- * Tab 只影响活跃 run 列表（前端过滤，S6）；统计概览/skill/失败模式保持全局（D8）。
- */
+const PAGE_SIZE = 50;
+const WORKLOADS: Array<{ value: TraceWorkload | "all"; label: string }> = [
+  { value: "all", label: "全部工作负载" },
+  { value: "creation", label: "创作" },
+  { value: "evidence_compile", label: "证据编译" },
+  { value: "evaluation", label: "评估" },
+  { value: "evolution", label: "进化" },
+];
+const INTEGRITIES: Array<{ value: TraceIntegrityStatus | "all"; label: string }> = [
+  { value: "all", label: "全部完整性" },
+  { value: "verified", label: "已验证" },
+  { value: "incomplete", label: "不完整" },
+  { value: "conflict", label: "冲突" },
+  { value: "legacy", label: "旧版" },
+];
+type TimeRange = "24h" | "7d" | "30d" | "all";
+
 export default function MonitorPage() {
   const navigate = useNavigate();
-  const [overview, setOverview] = useState<StatsOverview | null>(null);
-  const [skills, setSkills] = useState<SkillStat[]>([]);
-  const [failures, setFailures] = useState<FailurePattern[]>([]);
+  const [workload, setWorkload] = useState<TraceWorkload | "all">("all");
+  const [integrity, setIntegrity] = useState<TraceIntegrityStatus | "all">("all");
+  const [timeRange, setTimeRange] = useState<TimeRange>("7d");
+  const [page, setPage] = useState(0);
   const [activeRuns, setActiveRuns] = useState<ActiveRun[]>([]);
+  const [recentRuns, setRecentRuns] = useState<TraceListItem[]>([]);
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
-  // 全部请求都失败时才显示整页错误态（部分失败走 toast，不阻断展示已拿到的数据）
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<"creation" | "evolution">("creation");
 
-  const refresh = useCallback(async () => {
-    // 每个请求独立 catch：记录成败而非吞掉，便于区分"真空"与"加载失败"
-    let overviewFailed = false;
-    const [ov, sk, fl, ar] = await Promise.all([
-      getStatsOverview().catch(() => { overviewFailed = true; return null; }),
-      getStatsSkills(15).catch(() => null as SkillStat[] | null),
-      getStatsFailures(8).catch(() => null as FailurePattern[] | null),
-      getActiveRuns().catch(() => null as ActiveRun[] | null),
-    ]);
-    setOverview(ov);
-    if (sk !== null) setSkills(sk);
-    if (fl !== null) setFailures(fl);
-    if (ar !== null) setActiveRuns(ar);
+  const since = useMemo(() => {
+    if (timeRange === "all") return undefined;
+    const hours = timeRange === "24h" ? 24 : timeRange === "7d" ? 24 * 7 : 24 * 30;
+    return new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+  }, [timeRange]);
 
-    // 首次加载（loading=true）全部失败 → 整页错误态；
-    // 后续轮询全部失败 → toast 提示但保留旧数据（不刷空）
-    const allFailed = ov === null && sk === null && fl === null && ar === null;
-    if (allFailed) {
-      if (loading) {
-        setError("监测数据加载失败（evolution 服务不可达或鉴权失败）");
-      } else {
-        toast.error("监测数据刷新失败，显示的为上次成功拉取的数据");
-      }
-    } else {
+  const refresh = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
+    try {
+      const [active, recent] = await Promise.all([
+        getActiveRuns(),
+        getTraces({
+          workload: workload === "all" ? undefined : workload,
+          integrity_status: integrity === "all" ? undefined : integrity,
+          since,
+          limit: PAGE_SIZE,
+          offset: page * PAGE_SIZE,
+        }),
+      ]);
+      setActiveRuns(active);
+      setRecentRuns(recent.items);
+      setTotal(recent.total);
       setError(null);
-      // 部分失败：提示用户某块没更新，但不阻断展示
-      if (overviewFailed || sk === null || fl === null || ar === null) {
-        toast.error("部分监测数据加载失败，已显示可用数据");
-      }
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "运行观测数据加载失败";
+      if (silent) toast.error(message);
+      else setError(message);
+    } finally {
+      if (!silent) setLoading(false);
     }
-    setLoading(false);
-  }, [loading]);
+  }, [integrity, page, since, workload]);
 
   useEffect(() => {
     refresh();
-    // 活跃 run 每 5s 刷新一次
-    const timer = setInterval(refresh, 5000);
-    return () => clearInterval(timer);
   }, [refresh]);
 
-  // 按 tab 过滤活跃 run（S6：全量拉取 + 前端过滤）
-  const filteredRuns = useMemo(() => {
-    if (tab === "creation") {
-      return activeRuns.filter((r) => !r.run_purpose || r.run_purpose === "user_generation");
-    }
-    // 进化监测：eval + evolve
-    return activeRuns.filter(
-      (r) => r.run_purpose === "evolution_eval" || r.run_purpose === "evolution_evolve",
-    );
-  }, [activeRuns, tab]);
+  useEffect(() => {
+    const timer = window.setInterval(() => refresh(true), 5000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
 
-  if (loading) {
-    return <div className="page-loading">加载监测数据…</div>;
+  const filteredActive = useMemo(
+    () => activeRuns.filter((run) =>
+      (workload === "all" || run.workload === workload)
+      && (integrity === "all" || run.integrity_status === integrity)),
+    [activeRuns, integrity, workload],
+  );
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+  function resetFilters(next: () => void) {
+    next();
+    setPage(0);
   }
 
+  if (loading) return <div className="page-loading">加载运行观测…</div>;
   if (error) {
     return (
       <div className="page-error">
-        <div className="page-error-title">监测数据加载失败</div>
+        <div className="page-error-title">运行观测加载失败</div>
         <div className="page-error-detail">{error}</div>
-        <button className="page-error-retry" onClick={() => { setLoading(true); refresh(); }}>
-          重试
-        </button>
+        <button className="page-error-retry" onClick={() => refresh()}>重试</button>
       </div>
     );
   }
 
-  const successRate = overview && overview.total > 0
-    ? ((overview.success / overview.total) * 100).toFixed(1)
-    : "—";
-
   return (
-    <div className="monitor-page">
-      <header className="page-header">
-        <h1>监测大盘</h1>
-        <p className="page-desc">总览运行健康度、活跃任务与失败模式（每 5 秒自动刷新）</p>
+    <div className="trace-workbench">
+      <header className="workbench-header">
+        <div>
+          <h1>运行观测</h1>
+          <p>Trace V2 结构、完整性与运行时机制</p>
+        </div>
+        <button className="icon-button" type="button" title="刷新" onClick={() => refresh()}>
+          <RefreshCw size={16} />
+        </button>
       </header>
 
-      {/* 统计概览卡片（全局，不受 tab 影响） */}
-      <section className="stats-grid">
-        <div className="stat-card">
-          <span className="stat-value">{overview?.total ?? 0}</span>
-          <span className="stat-label">总运行数</span>
-          <span className="stat-sub">成功 {overview?.success ?? 0} / 失败 {overview?.failed ?? 0}</span>
-        </div>
-        <div className="stat-card">
-          <span className="stat-value">{successRate}%</span>
-          <span className="stat-label">成功率</span>
-          <span className="stat-sub">错误率 {((overview?.error_rate ?? 0) * 100).toFixed(1)}%</span>
-        </div>
-        <div className="stat-card">
-          <span className="stat-value">{formatTokens(overview?.total_tokens ?? 0)}</span>
-          <span className="stat-label">总 Token</span>
-          <span className="stat-sub">入 {formatTokens(overview?.total_input_tokens ?? 0)} / 出 {formatTokens(overview?.total_output_tokens ?? 0)}</span>
-        </div>
-        <div className="stat-card">
-          <span className="stat-value">{formatMs(overview?.duration_p50)}</span>
-          <span className="stat-label">P50 延迟</span>
-          <span className="stat-sub">P90 {formatMs(overview?.duration_p90)} / P99 {formatMs(overview?.duration_p99)}</span>
-        </div>
-      </section>
-
-      {/* 双 Tab */}
-      <nav className="inspection-tabs monitor-tabs">
-        <button
-          className={`inspection-tab ${tab === "creation" ? "active" : ""}`}
-          type="button"
-          onClick={() => setTab("creation")}
+      <div className="workbench-toolbar" aria-label="运行筛选">
+        <select
+          value={workload}
+          onChange={(event) => resetFilters(() => setWorkload(event.target.value as TraceWorkload | "all"))}
+          aria-label="工作负载"
         >
-          创作监测
-        </button>
-        <button
-          className={`inspection-tab ${tab === "evolution" ? "active" : ""}`}
-          type="button"
-          onClick={() => setTab("evolution")}
+          {WORKLOADS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+        </select>
+        <select
+          value={integrity}
+          onChange={(event) => resetFilters(() => setIntegrity(event.target.value as TraceIntegrityStatus | "all"))}
+          aria-label="完整性"
         >
-          进化监测
-        </button>
-      </nav>
+          {INTEGRITIES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+        </select>
+        <div className="segmented-control" aria-label="时间范围">
+          {(["24h", "7d", "30d", "all"] as TimeRange[]).map((range) => (
+            <button
+              key={range}
+              type="button"
+              className={timeRange === range ? "active" : ""}
+              onClick={() => resetFilters(() => setTimeRange(range))}
+            >
+              {range === "24h" ? "24 小时" : range === "7d" ? "7 天" : range === "30d" ? "30 天" : "全部"}
+            </button>
+          ))}
+        </div>
+        <span className="toolbar-count">{total} 条运行</span>
+      </div>
 
-      {/* 活跃 run（按 tab 过滤） */}
-      <section className="monitor-section">
-        <h2 className="section-title">
-          {tab === "creation" ? "创作活跃运行" : "进化活跃运行"}（{filteredRuns.length}）
-        </h2>
-        {filteredRuns.length === 0 ? (
-          <div className="monitor-empty">
-            {tab === "creation" ? "当前无创作活跃运行" : "当前无进化活跃运行"}
-          </div>
+      <RunSection title="活跃运行" count={filteredActive.length}>
+        {filteredActive.length === 0 ? (
+          <EmptyState label="当前无匹配的活跃运行" />
         ) : (
-          <div className="run-list">
-            {filteredRuns.map((run) => (
-              <div
-                key={run.trace_id}
-                className="run-item"
-                onClick={() => navigate(`/traces/${run.trace_id}`)}
-              >
-                <div className="run-item-main">
-                  <span className={`run-status ${run.status}`}>● {run.status}</span>
-                  <span className="run-session">{run.session_name || run.endpoint || run.trace_id.slice(0, 12)}</span>
-                  {tab === "evolution" && <PurposeBadge purpose={run.run_purpose} />}
-                </div>
-                <div className="run-item-meta">
-                  <span>{run.event_count} 事件</span>
-                  <span>{formatMs(run.duration_ms)}</span>
-                  <span className={run.ingested ? "ingested" : "not-ingested"}>
-                    {run.ingested ? "已入库" : "采集中"}
-                  </span>
-                </div>
-              </div>
-            ))}
+          <div className="run-table-wrap">
+            <table className="workbench-table">
+              <RunTableHead active />
+              <tbody>
+                {filteredActive.map((run) => (
+                  <RunRow key={run.trace_id} run={run} onOpen={() => navigate(`/traces/${run.trace_id}`)} />
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
-      </section>
+      </RunSection>
 
-      {/* skill 统计（全局，不受 tab 影响） */}
-      <section className="monitor-section">
-        <h2 className="section-title">Agent 调用统计</h2>
-        {skills.length === 0 ? (
-          <div className="monitor-empty">暂无 skill 统计数据</div>
+      <RunSection title="近期运行" count={recentRuns.length}>
+        {recentRuns.length === 0 ? (
+          <EmptyState label="当前筛选条件下无运行" />
         ) : (
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Agent</th>
-                <th>调用次数</th>
-                <th>失败率</th>
-                <th>平均耗时</th>
-              </tr>
-            </thead>
-            <tbody>
-              {skills.map((s) => (
-                <tr key={s.agent_name}>
-                  <td>{s.agent_name}</td>
-                  <td>{s.call_count}</td>
-                  <td className={s.fail_rate > 0.1 ? "cell-warn" : ""}>
-                    {(s.fail_rate * 100).toFixed(1)}%
-                  </td>
-                  <td>{formatMs(s.avg_duration_ms)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </section>
-
-      {/* 失败模式（全局） */}
-      {failures.length > 0 && (
-        <section className="monitor-section">
-          <h2 className="section-title">常见失败模式</h2>
-          <div className="failure-list">
-            {failures.map((f, i) => (
-              <div key={i} className="failure-item">
-                <span className="failure-count">{f.count}×</span>
-                <code className="failure-pattern" title={f.error_pattern}>{f.error_pattern}</code>
-                {f.sample_trace_ids[0] && (
-                  <button
-                    className="failure-link"
-                    onClick={() => navigate(`/traces/${f.sample_trace_ids[0]}`)}
-                  >
-                    查看 →
-                  </button>
-                )}
-              </div>
-            ))}
+          <div className="run-table-wrap">
+            <table className="workbench-table">
+              <RunTableHead />
+              <tbody>
+                {recentRuns.map((run) => (
+                  <RunRow key={run.trace_id} run={run} onOpen={() => navigate(`/traces/${run.trace_id}`)} />
+                ))}
+              </tbody>
+            </table>
           </div>
-        </section>
+        )}
+      </RunSection>
+
+      {total > PAGE_SIZE && (
+        <div className="workbench-pager">
+          <button disabled={page === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}>上一页</button>
+          <span>第 {page + 1} / {totalPages} 页</span>
+          <button disabled={page >= totalPages - 1} onClick={() => setPage((value) => Math.min(totalPages - 1, value + 1))}>下一页</button>
+        </div>
       )}
     </div>
   );
 }
 
-/** 来源标签（进化端内部区分评估/进化） */
-function PurposeBadge({ purpose }: { purpose: string | null }) {
-  if (!purpose) return null;
-  const label =
-    purpose === "evolution_eval" ? "评估"
-      : purpose === "evolution_evolve" ? "进化"
-      : purpose === "user_generation" ? "执行"
-      : purpose;
-  const color =
-    purpose === "evolution_eval" ? "var(--running, #0f766e)"
-      : purpose === "evolution_evolve" ? "#a78bfa"
-      : "var(--muted)";
+function RunSection({ title, count, children }: { title: string; count: number; children: React.ReactNode }) {
   return (
-    <span className="purpose-badge" style={{ color }}>{label}</span>
+    <section className="workbench-section">
+      <div className="section-heading"><h2>{title}</h2><span>{count}</span></div>
+      {children}
+    </section>
   );
+}
+
+function RunTableHead({ active = false }: { active?: boolean }) {
+  return (
+    <thead><tr>
+      <th>运行</th><th>工作负载</th><th>状态</th><th>完整性</th><th>Coverage</th>
+      <th>机制</th><th>{active ? "已运行" : "开始 / 耗时"}</th>
+    </tr></thead>
+  );
+}
+
+type ObservableRun = ActiveRun | TraceListItem;
+
+function RunRow({ run, onOpen }: { run: ObservableRun; onOpen: () => void }) {
+  return (
+    <tr className="clickable-row" onClick={onOpen} tabIndex={0} onKeyDown={(event) => {
+      if (event.key === "Enter" || event.key === " ") onOpen();
+    }}>
+      <td>
+        <span className="run-primary" title={run.trace_id}>{run.session_name || run.trace_id.slice(0, 14)}</span>
+        <span className="run-secondary">
+          {"service" in run ? run.service || "unknown" : "live"} · v{"schema_version" in run ? run.schema_version : 2}
+        </span>
+      </td>
+      <td><WorkloadBadge workload={run.workload} /></td>
+      <td><StatusBadge status={run.status} /></td>
+      <td><IntegrityBadge status={run.integrity_status} /></td>
+      <td><CoverageSummary coverage={run.coverage} /></td>
+      <td><MechanismSummary run={run} /></td>
+      <td className="run-time-cell">
+        {run.started_at ? formatDateTime(run.started_at) : "—"}
+        <span>{formatMs(run.duration_ms)}</span>
+      </td>
+    </tr>
+  );
+}
+
+function WorkloadBadge({ workload }: { workload: TraceWorkload | null }) {
+  const labels: Record<TraceWorkload, string> = {
+    creation: "创作", evidence_compile: "证据编译", evaluation: "评估", evolution: "进化",
+  };
+  return <span className={`workload-badge workload-${workload || "unknown"}`}>{workload ? labels[workload] : "未标注"}</span>;
+}
+
+function IntegrityBadge({ status }: { status: TraceIntegrityStatus }) {
+  const labels: Record<TraceIntegrityStatus, string> = {
+    verified: "已验证", incomplete: "不完整", conflict: "冲突", legacy: "旧版",
+  };
+  return (
+    <span className={`integrity-badge integrity-${status}`}>
+      {status !== "verified" && <AlertTriangle size={12} />}{labels[status]}
+    </span>
+  );
+}
+
+function StatusBadge({ status }: { status: string }) {
+  return <span className={`run-status ${status}`}><span className="status-dot" />{status}</span>;
+}
+
+function CoverageSummary({ coverage }: { coverage: Record<string, string> }) {
+  const values = Object.values(coverage);
+  if (values.length === 0) return <span className="coverage-summary unknown">未知</span>;
+  const known = values.filter((value) => value === "known" || value === "not_applicable").length;
+  const complete = known === values.length;
+  return <span className={`coverage-summary ${complete ? "complete" : "partial"}`}>{known}/{values.length}</span>;
+}
+
+function MechanismSummary({ run }: { run: ObservableRun }) {
+  return (
+    <span className="mechanism-summary" title="Skill 激活 / Middleware 干预 / HITL">
+      S {run.skill_activation_count} · M {run.middleware_intervention_count} · H {run.hitl_count}
+    </span>
+  );
+}
+
+function EmptyState({ label }: { label: string }) {
+  return <div className="workbench-empty">{label}</div>;
 }
 
 function formatMs(ms: number | null | undefined): string {
@@ -267,8 +283,8 @@ function formatMs(ms: number | null | undefined): string {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
-function formatTokens(n: number): string {
-  if (n < 1000) return String(n);
-  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}K`;
-  return `${(n / 1_000_000).toFixed(1)}M`;
+function formatDateTime(iso: string): string {
+  return new Date(iso).toLocaleString("zh-CN", {
+    month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
 }

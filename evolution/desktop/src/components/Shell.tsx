@@ -1,5 +1,22 @@
 import { useEffect, useState } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
+import {
+  Activity,
+  BrainCircuit,
+  ChartNoAxesCombined,
+  ClipboardCheck,
+  Database,
+  Dna,
+  FileArchive,
+  FlaskConical,
+  GitFork,
+  LogOut,
+  Package,
+  PenTool,
+  ShieldCheck,
+  Wrench,
+  type LucideIcon,
+} from "lucide-react";
 import { fetchMeOrNull, logout, type AuthMe } from "@/lib/api";
 import UpdateBanner from "@/components/UpdateBanner";
 
@@ -11,25 +28,28 @@ import UpdateBanner from "@/components/UpdateBanner";
  *   - 基础 8 项（所有用户可见）
  *   - 超管专属 3 项：进化端模型 / 执行端模型 / 管理后台（仅 super_admin）
  */
-const BASE_NAV_ITEMS = [
-  { to: "/", label: "监测", end: true, icon: "📊" },
-  { to: "/history", label: "历史", end: false, icon: "📜" },
-  { to: "/dossiers", label: "证据卷宗", end: false, icon: "📦" },
-  { to: "/evaluation", label: "评估", end: false, icon: "📝" },
-  { to: "/evolve", label: "进化", end: false, icon: "🧬" },
-  { to: "/harness", label: "Harness 要素", end: false, icon: "🔧" },
-  { to: "/versions", label: "版本谱系", end: false, icon: "🌳" },
-  { to: "/dataset", label: "数据集", end: false, icon: "🗂️" },
-  { to: "/tests", label: "单次测试", end: false, icon: "🧪" },
+type NavItem = { to: string; label: string; end: boolean; icon: LucideIcon };
+
+const BASE_NAV_ITEMS: NavItem[] = [
+  { to: "/", label: "运行观测", end: true, icon: Activity },
+  { to: "/lineage", label: "血缘", end: false, icon: GitFork },
+  { to: "/analysis", label: "分析", end: false, icon: ChartNoAxesCombined },
+  { to: "/dossiers", label: "证据卷宗", end: false, icon: Package },
+  { to: "/evaluation", label: "评估", end: false, icon: ClipboardCheck },
+  { to: "/evolve", label: "进化", end: false, icon: Dna },
+  { to: "/harness", label: "Harness 要素", end: false, icon: Wrench },
+  { to: "/versions", label: "版本谱系", end: false, icon: FileArchive },
+  { to: "/dataset", label: "数据集", end: false, icon: Database },
+  { to: "/tests", label: "单次测试", end: false, icon: FlaskConical },
 ];
 
 // 超管专属导航（仅 super_admin 可见，D20 + D8：两个配置项和管理后台都仅超管）。
 // 原"配置"项（/config，所有用户可见）拆为两个超管项：进化端模型 / 执行端模型。
 // 原 admin 4 项（用户/邀请码/积分流水/积分设置）收敛为"管理后台"父入口，进入后 tab 切换。
-const SUPER_ADMIN_NAV_ITEMS = [
-  { to: "/config/evolution", label: "进化端模型", end: false, icon: "🧠" },
-  { to: "/config/executor", label: "执行端模型", end: false, icon: "✍️" },
-  { to: "/admin", label: "管理后台", end: false, icon: "🛡️" },
+const SUPER_ADMIN_NAV_ITEMS: NavItem[] = [
+  { to: "/config/evolution", label: "进化端模型", end: false, icon: BrainCircuit },
+  { to: "/config/executor", label: "执行端模型", end: false, icon: PenTool },
+  { to: "/admin", label: "管理后台", end: false, icon: ShieldCheck },
 ];
 
 export default function Shell() {
@@ -82,12 +102,13 @@ export default function Shell() {
     <div className="shell">
       <aside className="shell-sidebar">
         <div className="shell-brand">
-          <span className="shell-brand-icon">🧬</span>
+          <Dna className="shell-brand-icon" size={19} />
           <span className="shell-brand-text">思衍进化</span>
         </div>
         <nav className="shell-nav">
-          {navItems.map((item) =>
-            item.to ? (
+          {navItems.map((item) => {
+            const Icon = item.icon;
+            return (
               <NavLink
                 key={item.to}
                 to={item.to}
@@ -96,31 +117,25 @@ export default function Shell() {
                   `shell-nav-item ${isActive ? "active" : ""}`
                 }
               >
-                <span className="shell-nav-icon">{item.icon}</span>
+                <Icon className="shell-nav-icon" size={16} />
                 <span>{item.label}</span>
               </NavLink>
-            ) : (
-              <div key={item.label} className="shell-nav-item soon" title="即将上线">
-                <span className="shell-nav-icon">{item.icon}</span>
-                <span>{item.label}</span>
-                <span className="shell-nav-badge">soon</span>
-              </div>
-            )
-          )}
+            );
+          })}
         </nav>
         <div className="shell-user">
           <div className="shell-user-info">
             <span className="shell-user-name">{me.username}</span>
             <span className="shell-user-id">{me.user_id.slice(0, 8)}</span>
           </div>
-          <button className="shell-logout" onClick={handleLogout} title="退出登录">
-            退出
+          <button className="shell-logout" onClick={handleLogout} title="退出登录" aria-label="退出登录">
+            <LogOut size={14} />
           </button>
         </div>
       </aside>
       <main className="shell-main">
         <UpdateBanner />
-        <Outlet />
+        <Outlet context={{ isSuperAdmin: me.is_super_admin }} />
       </main>
     </div>
   );

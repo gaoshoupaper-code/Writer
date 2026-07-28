@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { HashRouter, Routes, Route, Navigate, useNavigate, useLocation } from "react-router-dom";
 import { Toaster } from "@/components/ui/sonner";
 import { setUnauthorizedHandler } from "@/lib/api";
@@ -15,13 +15,15 @@ import Versions from "@/pages/versions";
 import Dataset from "@/pages/dataset";
 import Tests from "@/pages/tests";
 import TraceDetail from "@/pages/trace-detail";
-import History from "@/pages/history";
 import AdminUsers from "@/pages/admin/users";
 import AdminInviteCodes from "@/pages/admin/invite-codes";
 import AdminCredits from "@/pages/admin/credits";
 import AdminCreditsSettings from "@/pages/admin/credits/settings";
 import Shell from "@/components/Shell";
 import AdminLayout from "@/components/AdminLayout";
+
+const Lineage = lazy(() => import("@/pages/lineage"));
+const Analysis = lazy(() => import("@/pages/analysis"));
 
 function UnauthorizedHandler() {
   const navigate = useNavigate();
@@ -48,6 +50,8 @@ function App() {
         <Route element={<Shell />}>
           {/* 基础 8 项（D24：不动） */}
           <Route path="/" element={<Monitor />} />
+          <Route path="/lineage" element={<Suspense fallback={<div className="page-loading">加载血缘…</div>}><Lineage /></Suspense>} />
+          <Route path="/analysis" element={<Suspense fallback={<div className="page-loading">加载分析…</div>}><Analysis /></Suspense>} />
           <Route path="/evolve" element={<Evolve />} />
           <Route path="/evolve/:sessionId/review" element={<ReviewReport />} />
           <Route path="/dossiers" element={<Dossiers />} />
@@ -56,7 +60,7 @@ function App() {
           <Route path="/versions" element={<Versions />} />
           <Route path="/dataset" element={<Dataset />} />
           <Route path="/tests" element={<Tests />} />
-          <Route path="/history" element={<History />} />
+          <Route path="/history" element={<Navigate to="/" replace />} />
 
           {/* 配置拆两个（D17），老 /config 重定向到 /config/evolution 保兼容 */}
           <Route path="/config/evolution" element={<EvolutionConfigPage />} />

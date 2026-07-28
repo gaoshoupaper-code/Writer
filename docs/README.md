@@ -13,6 +13,8 @@
 **Writer 是一个"AI 帮人写小说/剧本"的系统。** 用户在桌面端 App 里提需求，
 后端跑一条 AI 流水线，把需求一步步加工成完整的作品。
 
+> **Trace V2**：创作、证据卷宗编译、评估、进化共用一套 canonical Trace 合同，但各自保持独立运行边界；异步因果通过不可变制品版本与 Link 还原。进化端面向开发者和质量人员提供“运行观测、血缘、分析”三个工作台，完整机制见[系统心智模型](系统心智模型.md)。
+
 > **桌面端改造说明**：用户入口已从浏览器 Web（原 `frontend/` Next.js）迁移为
 > Windows 桌面端 App（`desktop/` Tauri 2 + React）。原 `frontend/` 已废弃，
 > UI 代码迁入 `desktop/src/`。新增 `website/`（Astro 官网 + 下载页，由 executor 服务器托管）。

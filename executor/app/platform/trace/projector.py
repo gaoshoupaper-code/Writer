@@ -121,6 +121,15 @@ class TraceProjector:
                 state.add_tool_error_node(start, event)
             elif event.type == "run_error":
                 state.add_run_error(event)
+            elif event.type in {
+                "skill_activation",
+                "middleware_assembly",
+                "middleware_intervention",
+                "artifact_revision",
+                "hitl",
+            }:
+                state.ensure_agent_node(event)
+                state.add_mechanism_node(event)
 
             # ── 实例时间戳追踪 ──
             if event.agent_name and _agent_role(event.agent_name) == "subagent":
@@ -327,8 +336,9 @@ class _ProjectionState:
         input_range = start.input_range if start else None
         tool_error = _tool_error(end.tool_output)
         pg_id = start.parallel_group_id if start else None
-        # 检测 SKILL.md 调用
-        skill_name = _detect_skill(end)
+        # V1 traces did not have explicit activation events, so legacy inference
+        # remains read-only compatibility instead of becoming a V2 fact.
+        skill_name = _detect_skill(end) if end.schema_version < 2 else None
         if skill_name:
             kind = "skill"
             label = skill_name
@@ -365,6 +375,24 @@ class _ProjectionState:
         )
         if end.tool_name in TODO_TOOL_NAMES:
             self._append_todo(end, start.event if start else None, anchor_id)
+
+    def add_mechanism_node(self, event: TraceLogEvent) -> None:
+        kind, label, summary = _mechanism_node_metadata(event)
+        self.projection.nodes.append(
+            TraceNode(
+                node_id=f"{event.type}:{event.event_id}",
+                parent_node_id=self._agent_node_id(event),
+                kind=kind,
+                label=label,
+                status=event.status,
+                **self._node_agent_attrs(event),
+                started_at=event.timestamp,
+                ended_at=event.timestamp,
+                skill_name=event.skill_name if kind == "skill" else None,
+                raw_event_ids=[event.event_id],
+                chain_summary=summary,
+            )
+        )
 
     def add_tool_error_node(self, start: _PendingEvent | None, error: TraceLogEvent) -> None:
         node_id = start.node_id if start else _tool_node_id(error)
@@ -858,6 +886,33 @@ def _detect_skill(event: TraceLogEvent) -> str | None:
         if match:
             return match.group(1).strip()
     return "unknown-skill"
+
+
+def _mechanism_node_metadata(event: TraceLogEvent) -> tuple[str, str, str]:
+    if event.type == "skill_activation":
+        name = event.skill_name or "unknown-skill"
+        outcome = "activated" if event.status == "completed" else "activation failed"
+        return "skill", name, f"Skill {name}: {outcome}"
+    if event.type == "middleware_assembly":
+        names = [item.name for item in event.middleware_stack]
+        label = "Middleware stack"
+        summary = " -> ".join(names) if names else "Empty middleware stack"
+        return "middleware", label, summary
+    if event.type == "middleware_intervention":
+        intervention = event.intervention or {}
+        action = str(intervention.get("action") or "unknown")
+        hook = intervention.get("hook")
+        summary = f"{action} at {hook}" if hook else action
+        return "middleware", action, summary
+    if event.type == "artifact_revision":
+        artifact = event.artifact or {}
+        label = str(artifact.get("logical_key") or artifact.get("artifact_id") or event.artifact_revision_id or "Artifact revision")
+        return "artifact", label, f"Immutable artifact revision {event.artifact_revision_id or 'unknown'}"
+    hitl = event.hitl or {}
+    state = str(hitl.get("state") or event.status)
+    phase = hitl.get("phase")
+    summary = f"{state} at {phase}" if phase else state
+    return "hitl", "Human input", summary
 
 
 def _todo_items(tool_output: Any) -> list[TraceTodoItem]:

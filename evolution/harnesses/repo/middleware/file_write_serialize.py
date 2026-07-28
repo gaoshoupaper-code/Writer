@@ -51,7 +51,12 @@ class FileWriteSerializeMiddleware(AgentMiddleware):
     跳过文件已存在检查，直接调用内层 handler。
     """
 
-    def __init__(self, *, allow_overwrite: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        allow_overwrite: bool = False,
+        intervention_callback: Callable[..., None] | None = None,
+    ) -> None:
         """
         Args:
             allow_overwrite: 是否允许 write_file 覆盖已存在的文件，默认 False
@@ -59,6 +64,7 @@ class FileWriteSerializeMiddleware(AgentMiddleware):
         self.allow_overwrite = allow_overwrite
         # file_path → 锁；lazy 创建，见 _lock_for。
         self._locks: dict[str, asyncio.Lock] = {}
+        self.intervention_callback = intervention_callback
 
     def _write_file_key(self, request: Any) -> str | None:
         """若为写工具调用，返回其目标 file_path；否则返回 None（不串行化）。"""
@@ -89,7 +95,18 @@ class FileWriteSerializeMiddleware(AgentMiddleware):
             return await handler(request)
         if self.allow_overwrite:
             logger.warning("write_file overwrite allowed for %s", key)
-        async with self._lock_for(key):
+        lock = self._lock_for(key)
+        if lock.locked() and self.intervention_callback is not None:
+            try:
+                self.intervention_callback(
+                    action="write_serialization",
+                    hook="awrap_tool_call",
+                    affected_fields=["control_flow", "file_path"],
+                    reason="concurrent_write_same_path",
+                )
+            except Exception:
+                pass
+        async with lock:
             return await handler(request)
 
     def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:

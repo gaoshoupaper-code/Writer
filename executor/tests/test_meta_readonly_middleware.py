@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 from langchain_core.messages import ToolMessage
 
-# MetaReadOnlyMiddleware 已迁进 harness 包（Phase 7），通过包加载后 import
-from app.platform.agent.loader import load_current_package
-load_current_package()
+# Load the source harness directly; production checkout tests belong to git_sync.
+from app.platform.agent.loader import load_package
+
+_HARNESS_DIR = Path(__file__).resolve().parents[2] / "evolution" / "harnesses" / "repo"
+load_package(_HARNESS_DIR)
 from harness_current.middleware.meta_readonly import (
     MetaReadOnlyMiddleware,
     _resolve_subagent,
 )
+from harness_current.middleware.path_guard import FilesystemPathGuardMiddleware
 
 
 def _request(tool_name: str, file_path: str = "", tool_call_id: str = "call-1") -> Any:
@@ -130,6 +134,52 @@ class MetaReadOnlyMiddlewareTest(unittest.TestCase):
             self.mw.awrap_tool_call(_request("read_file", "/demand.md"), read_handler)
         )
         self.assertEqual(result, "read-ok")
+
+    def test_records_only_effective_block_and_route_interventions(self) -> None:
+        interventions: list[dict[str, Any]] = []
+        middleware = MetaReadOnlyMiddleware(
+            intervention_callback=lambda **item: interventions.append(item)
+        )
+
+        middleware.wrap_tool_call(_request("read_file", "/demand.md"), lambda _: "ok")
+        middleware.wrap_tool_call(_request("write_file", "/demand.md"), lambda _: "unused")
+
+        self.assertEqual([item["action"] for item in interventions], ["block", "route"])
+        self.assertEqual(interventions[1]["reason"], "interview")
+
+
+class _OverridableRequest:
+    def __init__(self, tool_call: dict[str, Any]) -> None:
+        self.tool_call = tool_call
+
+    def override(self, *, tool_call: dict[str, Any]) -> "_OverridableRequest":
+        return _OverridableRequest(tool_call)
+
+
+class PathGuardInterventionTest(unittest.TestCase):
+    def test_records_path_modification_and_block(self) -> None:
+        interventions: list[dict[str, Any]] = []
+        middleware = FilesystemPathGuardMiddleware(
+            Path.cwd(),
+            intervention_callback=lambda **item: interventions.append(item),
+        )
+        request = _OverridableRequest(
+            {"name": "write_file", "args": {"file_path": "outline.md"}, "id": "call-1"}
+        )
+
+        result = middleware.wrap_tool_call(request, lambda guarded: guarded)
+        blocked = middleware.wrap_tool_call(
+            _OverridableRequest(
+                {"name": "write_file", "args": {"file_path": "../secret.md"}, "id": "call-2"}
+            ),
+            lambda guarded: guarded,
+        )
+
+        self.assertEqual(result.tool_call["args"]["file_path"], "/outline.md")
+        self.assertIsInstance(blocked, ToolMessage)
+        self.assertEqual([item["action"] for item in interventions], ["modify", "block"])
+        self.assertEqual(interventions[0]["before"], {"file_path": "outline.md"})
+        self.assertEqual(interventions[0]["after"], {"file_path": "/outline.md"})
 
 
 class ResolveSubagentTest(unittest.TestCase):

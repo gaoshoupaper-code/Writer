@@ -20,7 +20,7 @@ import logging
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from app.eval_agent import repo as eval_repo
@@ -35,6 +35,11 @@ from app.evolve.ctx import (
     EvolveContext,
 )
 from app.trace.recorder import EvolutionTraceRecorder
+from app.trace.facts import (
+    ConsumptionRejected,
+    append_release_event,
+    require_sealed_evaluation_dossier,
+)
 
 logger = logging.getLogger("evolution.evolve.api")
 
@@ -146,6 +151,12 @@ def _prepare_evolve_session(
 
     bound_eval_dossier_id 写入 evolve_sessions，会话创建后永久不变（需求 §42）。
     """
+    if get_recorder() is None:
+        raise HTTPException(status_code=503, detail={
+            "message": "Trace recorder unavailable; evolution was not started",
+            "integrity_status": "incomplete",
+            "missing_fields": ["trace_recorder"],
+        })
     session_id = uuid.uuid4().hex[:12]
     ev_db.create_session(session_id, case_id="")
     ctx = _build_evolve_ctx(session_id, eval_dossier)
@@ -210,15 +221,17 @@ def _resolve_eval_dossier(eval_dossier_id: str) -> dict[str, Any]:
     Raises:
         HTTPException: 卷宗不存在 / 未封存 / 不完整。
     """
-    row = db.query_one(
-        "SELECT * FROM evaluation_dossiers WHERE dossier_id = ?",
-        (eval_dossier_id,),
-    )
-    if row is None:
+    try:
+        row = require_sealed_evaluation_dossier(eval_dossier_id)
+    except ConsumptionRejected as exc:
         raise HTTPException(
-            status_code=404,
-            detail=f"评估卷宗 {eval_dossier_id} 不存在",
-        )
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "integrity_status": exc.integrity_status,
+                "missing_fields": list(exc.missing_fields),
+            },
+        ) from exc
 
     import json as _json
     dossier: dict[str, Any] = dict(row)
@@ -233,11 +246,6 @@ def _resolve_eval_dossier(eval_dossier_id: str) -> dict[str, Any]:
         else:
             dossier[col[:-5]] = None
 
-    if dossier.get("seal_status") != "sealed":
-        raise HTTPException(
-            status_code=400,
-            detail=f"评估卷宗 {eval_dossier_id} 未封存（seal_status={dossier.get('seal_status')}），不能启动进化",
-        )
     findings = dossier.get("findings")
     if not findings or not isinstance(findings, list):
         raise HTTPException(
@@ -647,14 +655,14 @@ def _trace_event_to_sse(event: Any) -> dict[str, Any] | None:
 
 
 @router.post("/evolve/sessions/{session_id}/publish")
-def publish_session(session_id: str) -> dict[str, Any]:
+def publish_session(session_id: str, request: Request) -> dict[str, Any]:
     """发版：把进化改动固化为新 Agent 版本（去 DB 重构）。
 
     流程（4步）：
       1. 更新 registry.json（publish_version：append 新版本 + 移 production 指针）
       2. git commit + push（registry 变更 + 源码改动在同一个 commit，单 commit 原子性）
-      3. 通知执行端（/reload）
-      4. 推进 session status → published
+      3. 通知执行端并等待 reload 确认
+      4. 只有 reload 成功才推进 activated / published
     """
     session = ev_db.get_session(session_id)
     if session is None:
@@ -669,6 +677,10 @@ def publish_session(session_id: str) -> dict[str, Any]:
     from app.versioning import registry_repo
     from app.versioning.snapshot_publisher import notify_executor
 
+    release_id = f"release-{session_id}"
+    actor_user_id = getattr(request.state, "user_id", None)
+    release_started = False
+
     try:
         # 1. 更新 registry.json（源码改动已在 repo/ 工作目录，evolve 落盘的）
         entry = registry_repo.publish_version(
@@ -679,9 +691,51 @@ def publish_session(session_id: str) -> dict[str, Any]:
         # 2. git commit + push（registry 变更 + 源码改动 → 同一个 commit，原子）
         commit_msg = f"进化发版 v{entry['version']}: session={session_id}"
         source_commit = git_ops.commit_and_push(commit_msg)
+        candidate_id = f"harness-version-{entry['version']}"
+        append_release_event(
+            release_id=release_id,
+            status="committed",
+            candidate_id=candidate_id,
+            actor_user_id=actor_user_id,
+        )
+        append_release_event(
+            release_id=release_id,
+            status="registry_promoted",
+            candidate_id=candidate_id,
+            actor_user_id=actor_user_id,
+        )
+        release_started = True
 
-        # 3. 通知执行端
+        # 3. reload 成功响应才表示 executor 已刷新。
         notified = notify_executor(entry["version"])
+        if not notified:
+            append_release_event(
+                release_id=release_id,
+                status="activation_failed",
+                candidate_id=candidate_id,
+                actor_user_id=actor_user_id,
+            )
+            ev_db.update_session(session_id, status="failed")
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "版本已提交并提升 registry，但 executor reload 未确认",
+                    "release_id": release_id,
+                    "release_status": "activation_failed",
+                },
+            )
+        append_release_event(
+            release_id=release_id,
+            status="executor_refresh_ack",
+            candidate_id=candidate_id,
+            actor_user_id=actor_user_id,
+        )
+        append_release_event(
+            release_id=release_id,
+            status="activated",
+            candidate_id=candidate_id,
+            actor_user_id=actor_user_id,
+        )
 
         # 4. 推进状态
         ev_db.update_session(session_id, status="published")
@@ -691,12 +745,26 @@ def publish_session(session_id: str) -> dict[str, Any]:
             session_id, entry["version"], source_commit,
         )
         return {
-            "status": "published",
+            "status": "activated",
+            "release_id": release_id,
             "snapshot_version": entry["version"],
             "source_commit": source_commit,
             "notified": notified,
         }
+    except HTTPException:
+        raise
     except Exception as e:
+        if release_started:
+            try:
+                append_release_event(
+                    release_id=release_id,
+                    status="activation_failed",
+                    candidate_id=locals().get("candidate_id"),
+                    actor_user_id=actor_user_id,
+                )
+                ev_db.update_session(session_id, status="failed")
+            except Exception:
+                logger.exception("记录 activation_failed 失败: release=%s", release_id)
         logger.exception("发版失败: session=%s", session_id)
         raise HTTPException(status_code=500, detail=f"发版失败：{e}")
 
@@ -926,6 +994,7 @@ def _rebuild_ctx_from_db(session_id: str) -> EvolveContext | None:
             eval_dossier = _resolve_eval_dossier(bound_eval_dossier_id)
             ctx.eval_dossier = eval_dossier
             ctx.eval_dossier_id = bound_eval_dossier_id
+            ctx.trace_id_self = session.get("self_trace_id") or ""
             ctx.trace_id = eval_dossier.get("trace_id") or ""
             ctx.origin_layer = _resolve_origin_layer(ctx.trace_id) if ctx.trace_id else None
             ctx.eval_snapshot = {

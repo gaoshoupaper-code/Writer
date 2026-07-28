@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -499,6 +500,7 @@ def init_db() -> None:
         _migrate_evolve_sessions_eval_ref(conn)
         # 数据闭环：manual_tests 补 origin_layer 列（golden|growing，进化区分验证/探索，决策 A6）
         _migrate_manual_tests_origin_layer(conn)
+        _init_trace_v2_tables(conn)
         # Phase 1：初始化归因映射（幂等，仅空表时填充）
         _seed_agent_prompt_map(conn)
         # 多配置管理：llm_config（单数，单行）→ llm_configs（复数，多行 + is_active）
@@ -970,6 +972,210 @@ def _drop_orphan_diagnosis_tables(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+def _init_trace_v2_tables(conn: sqlite3.Connection) -> None:
+    """建立 Trace V2 的治理表，并以加法迁移保留历史三表。"""
+    with _lock:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS trace_receipts (
+                trace_id TEXT PRIMARY KEY REFERENCES runs(trace_id) ON DELETE CASCADE,
+                contiguous_seq INTEGER NOT NULL DEFAULT 0,
+                max_seen_seq INTEGER NOT NULL DEFAULT 0,
+                missing_ranges_json TEXT NOT NULL DEFAULT '[]',
+                manifest_json TEXT,
+                manifest_status TEXT NOT NULL DEFAULT 'missing',
+                receipt_revision INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS integrity_conflicts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id TEXT NOT NULL,
+                conflict_key TEXT NOT NULL,
+                existing_hash TEXT NOT NULL,
+                received_hash TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                UNIQUE(trace_id, conflict_key, received_hash)
+            );
+            CREATE TABLE IF NOT EXISTS payload_objects (
+                payload_id TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                sensitivity TEXT NOT NULL,
+                expires_at TEXT,
+                storage_path TEXT NOT NULL,
+                sealed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS trace_payload_links (
+                trace_id TEXT NOT NULL REFERENCES runs(trace_id) ON DELETE CASCADE,
+                event_id TEXT NOT NULL,
+                field_name TEXT NOT NULL,
+                payload_id TEXT NOT NULL REFERENCES payload_objects(payload_id) ON DELETE CASCADE,
+                PRIMARY KEY(trace_id, event_id, field_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_payload_expiry ON payload_objects(expires_at);
+            CREATE TABLE IF NOT EXISTS access_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_user_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                object_type TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS access_audit_no_update
+            BEFORE UPDATE ON access_audit
+            BEGIN
+                SELECT RAISE(ABORT, 'access_audit is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS access_audit_no_delete
+            BEFORE DELETE ON access_audit
+            BEGIN
+                SELECT RAISE(ABORT, 'access_audit is append-only');
+            END;
+            CREATE TABLE IF NOT EXISTS artifacts (
+                artifact_id TEXT PRIMARY KEY,
+                artifact_type TEXT NOT NULL,
+                workspace_id TEXT,
+                logical_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(workspace_id, artifact_type, logical_key)
+            );
+            CREATE TABLE IF NOT EXISTS artifact_revisions (
+                artifact_revision_id TEXT PRIMARY KEY,
+                artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+                parent_revision_id TEXT,
+                payload_id TEXT NOT NULL REFERENCES payload_objects(payload_id),
+                content_hash TEXT NOT NULL,
+                producer_trace_id TEXT,
+                producer_event_id TEXT,
+                harness_version TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS lineage_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_type TEXT NOT NULL,
+                from_id TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                to_type TEXT NOT NULL,
+                to_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(from_type, from_id, relation, to_type, to_id)
+            );
+            CREATE TABLE IF NOT EXISTS consumption_rejections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                consumer_workload TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                integrity_status TEXT NOT NULL,
+                missing_fields_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS outcome_records (
+                outcome_id TEXT PRIMARY KEY,
+                target_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                outcome_type TEXT NOT NULL,
+                payload_id TEXT,
+                actor_user_id TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS score_records (
+                score_id TEXT PRIMARY KEY,
+                target_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                rubric_id TEXT NOT NULL,
+                rubric_version TEXT NOT NULL,
+                score_json TEXT NOT NULL,
+                supersedes_score_id TEXT,
+                actor_user_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS release_events_v2 (
+                release_event_id TEXT PRIMARY KEY,
+                release_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                candidate_id TEXT,
+                actor_user_id TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS experiment_runs_v2 (
+                experiment_id TEXT PRIMARY KEY,
+                source_evaluation_dossier_id TEXT NOT NULL,
+                baseline_revision_id TEXT,
+                candidate_revision_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                formula_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                finished_at TEXT
+            );
+            CREATE TRIGGER IF NOT EXISTS outcome_records_no_update
+            BEFORE UPDATE ON outcome_records BEGIN
+                SELECT RAISE(ABORT, 'outcome_records is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS outcome_records_no_delete
+            BEFORE DELETE ON outcome_records BEGIN
+                SELECT RAISE(ABORT, 'outcome_records is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS score_records_no_update
+            BEFORE UPDATE ON score_records BEGIN
+                SELECT RAISE(ABORT, 'score_records is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS score_records_no_delete
+            BEFORE DELETE ON score_records BEGIN
+                SELECT RAISE(ABORT, 'score_records is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS release_events_v2_no_update
+            BEFORE UPDATE ON release_events_v2 BEGIN
+                SELECT RAISE(ABORT, 'release_events_v2 is append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS release_events_v2_no_delete
+            BEFORE DELETE ON release_events_v2 BEGIN
+                SELECT RAISE(ABORT, 'release_events_v2 is append-only');
+            END;
+            """
+        )
+        event_columns = {row[1] for row in conn.execute("PRAGMA table_info(event_payloads)").fetchall()}
+        if "event_id" not in event_columns:
+            conn.execute("ALTER TABLE event_payloads ADD COLUMN event_id TEXT")
+        if "event_hash" not in event_columns:
+            conn.execute("ALTER TABLE event_payloads ADD COLUMN event_hash TEXT")
+        if "payload_refs_json" not in event_columns:
+            conn.execute("ALTER TABLE event_payloads ADD COLUMN payload_refs_json TEXT NOT NULL DEFAULT '{}'")
+        run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+        for column, ddl in (
+            ("schema_version", "INTEGER NOT NULL DEFAULT 1"),
+            ("service", "TEXT"),
+            ("workload", "TEXT"),
+            ("integrity_status", "TEXT NOT NULL DEFAULT 'legacy'"),
+            ("coverage_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("run_snapshot_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("external_refs_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("links_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ):
+            if column not in run_columns:
+                conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {ddl}")
+        dossier_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(evidence_dossiers)").fetchall()
+        }
+        if "compile_trace_id" not in dossier_columns:
+            conn.execute("ALTER TABLE evidence_dossiers ADD COLUMN compile_trace_id TEXT")
+        payload_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(payload_objects)").fetchall()
+        }
+        if "deleted_at" not in payload_columns:
+            conn.execute("ALTER TABLE payload_objects ADD COLUMN deleted_at TEXT")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_event_trace_id ON event_payloads(trace_id, event_id) WHERE event_id IS NOT NULL")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_event_trace_sequence ON event_payloads(trace_id, sequence)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_workload_started ON runs(workload, started_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_integrity ON runs(integrity_status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_event_trace_type ON event_payloads(trace_id, type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_lineage_from ON lineage_edges(from_type, from_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_lineage_to ON lineage_edges(to_type, to_id)")
+        conn.commit()
+
+
 def execute(sql: str, params: tuple[Any, ...] | list[Any] = ()) -> sqlite3.Cursor:
     """执行单条写/读语句（线程安全）。"""
     conn = get_conn()
@@ -977,6 +1183,20 @@ def execute(sql: str, params: tuple[Any, ...] | list[Any] = ()) -> sqlite3.Curso
         cur = conn.execute(sql, params)
         conn.commit()
         return cur
+
+
+@contextmanager
+def transaction():
+    """给需要 receipt、事件和投影原子一致的写路径使用。"""
+    conn = get_conn()
+    with _lock:
+        try:
+            conn.execute("BEGIN")
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
 
 def executemany(sql: str, params_seq: list[tuple[Any, ...]]) -> sqlite3.Cursor:

@@ -95,6 +95,16 @@ class EvolveStartDossierGateTest(unittest.TestCase):
             ("eval-d", "trace-d", "running", self.did, "2026-01-01", "2026-01-01"),
         )
         from app.eval_agent.sealer import seal_evaluation_dossier
+        db.execute(
+            "INSERT OR IGNORE INTO runs(trace_id, workspace_id, status, ingested_at, "
+            "schema_version, service, workload, integrity_status) VALUES(?,?,?,?,?,?,?,?)",
+            ("trace-eval-d", "evolution", "completed", "2026-01-01",
+             2, "evolution", "evaluation", "verified"),
+        )
+        db.execute(
+            "UPDATE evaluation_sessions SET self_trace_id=? WHERE eval_id=?",
+            ("trace-eval-d", "eval-d"),
+        )
         self.evd = seal_evaluation_dossier(
             "eval-d", self.did, 1, "trace-d", "u1",
             findings=[{"id": "f01", "finding": "问题", "evidence_ref": ["evt-e1"]}],
@@ -107,13 +117,15 @@ class EvolveStartDossierGateTest(unittest.TestCase):
         db.execute("DELETE FROM evolve_sessions WHERE baseline_trace='trace-d' OR session_id LIKE 'test-%'")
         db.execute("DELETE FROM evidence_dossiers WHERE trace_id='trace-d'")
         db.execute("DELETE FROM runs WHERE trace_id='trace-d'")
+        db.execute("DELETE FROM runs WHERE trace_id='trace-eval-d'")
 
     def test_resolve_rejects_nonexistent_dossier(self):
         from fastapi import HTTPException
         from app.evolve.api import _resolve_eval_dossier
         with self.assertRaises(HTTPException) as cm:
             _resolve_eval_dossier("nonexist")
-        self.assertEqual(cm.exception.status_code, 404)
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertIn("dossier", cm.exception.detail["missing_fields"])
 
     def test_resolve_returns_sealed_dossier_with_frozen_evidence(self):
         from app.evolve.api import _resolve_eval_dossier
@@ -125,10 +137,20 @@ class EvolveStartDossierGateTest(unittest.TestCase):
     def test_evolve_start_binds_dossier_permanently(self):
         """进化启动永久绑定 bound_eval_dossier_id（§42）。"""
         import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import patch
         from app.evolve.api import EvolveStartRequest, evolve_start_converse
-        resp = asyncio.run(evolve_start_converse(
-            EvolveStartRequest(eval_dossier_id=self.evd)
-        ))
+
+        def capture_task(coro):
+            coro.close()
+            return SimpleNamespace()
+
+        with patch("app.evolve.api.get_recorder", return_value=object()), patch(
+            "app.evolve.api.asyncio.create_task", side_effect=capture_task
+        ):
+            resp = asyncio.run(evolve_start_converse(
+                EvolveStartRequest(eval_dossier_id=self.evd)
+            ))
         self.assertEqual(resp.eval_dossier_id, self.evd)
         sess = db.query_one(
             "SELECT bound_eval_dossier_id FROM evolve_sessions WHERE session_id=?",
@@ -141,15 +163,10 @@ class EvalDossierFrozenEvidenceTest(unittest.TestCase):
     """需求 §22：评估卷宗冻结 finding 引用的证据片段（供进化归因）。"""
 
     def test_frozen_evidence_column_exists(self):
-        import sqlite3
-        conn = sqlite3.connect(_tmp_db.name)
-        try:
-            cols = [r[1] for r in conn.execute(
-                "PRAGMA table_info(evaluation_dossiers)"
-            ).fetchall()]
-            self.assertIn("frozen_evidence_json", cols)
-        finally:
-            conn.close()
+        cols = [r[1] for r in db.get_conn().execute(
+            "PRAGMA table_info(evaluation_dossiers)"
+        ).fetchall()]
+        self.assertIn("frozen_evidence_json", cols)
 
     def test_collect_frozen_evidence_only_allows_indexed_ids(self):
         """collect_frozen_evidence 只冻结证据卷宗 index 内的 ID（受控）。"""

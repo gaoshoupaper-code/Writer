@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -103,7 +104,17 @@ def active_runs_api() -> list[dict[str, Any]]:
     if trace_ids:
         placeholders = ",".join("?" * len(trace_ids))
         rows = db.query_all(
-            f"SELECT trace_id, session_name, run_purpose FROM runs WHERE trace_id IN ({placeholders})",
+            f"""SELECT r.trace_id, r.session_name, r.run_purpose, r.workload,
+                       r.integrity_status, r.coverage_json,
+                       (SELECT COUNT(*) FROM event_payloads e
+                        WHERE e.trace_id=r.trace_id AND e.type='skill_activation')
+                           AS skill_activation_count,
+                       (SELECT COUNT(*) FROM event_payloads e
+                        WHERE e.trace_id=r.trace_id AND e.type='middleware_intervention')
+                           AS middleware_intervention_count,
+                       (SELECT COUNT(*) FROM event_payloads e
+                        WHERE e.trace_id=r.trace_id AND e.type='hitl') AS hitl_count
+                FROM runs r WHERE r.trace_id IN ({placeholders})""",
             tuple(trace_ids),
         )
     else:
@@ -112,6 +123,12 @@ def active_runs_api() -> list[dict[str, Any]]:
         r["trace_id"]: {
             "session_name": r.get("session_name"),
             "run_purpose": r.get("run_purpose"),
+            "workload": r.get("workload"),
+            "integrity_status": r.get("integrity_status"),
+            "coverage": json.loads(r.get("coverage_json") or "{}"),
+            "skill_activation_count": int(r.get("skill_activation_count") or 0),
+            "middleware_intervention_count": int(r.get("middleware_intervention_count") or 0),
+            "hitl_count": int(r.get("hitl_count") or 0),
         }
         for r in rows
     }
@@ -134,6 +151,12 @@ def active_runs_api() -> list[dict[str, Any]]:
             # D9：run_purpose（executor trace 优先用 r 自带的，join 不到时降级）
             # evolution recorder 的活跃 trace 已自带 run_purpose（recorder.list_active_runs 返回）
             "run_purpose": r.get("run_purpose") or meta.get("run_purpose") or "user_generation",
+            "workload": r.get("workload") or meta.get("workload"),
+            "integrity_status": r.get("integrity_status") or meta.get("integrity_status") or "legacy",
+            "coverage": r.get("coverage") or meta.get("coverage") or {},
+            "skill_activation_count": r.get("skill_activation_count") or meta.get("skill_activation_count") or 0,
+            "middleware_intervention_count": r.get("middleware_intervention_count") or meta.get("middleware_intervention_count") or 0,
+            "hitl_count": r.get("hitl_count") or meta.get("hitl_count") or 0,
         })
     return enriched
 

@@ -27,6 +27,7 @@ from app.eval_agent import repo as eval_repo
 from app.eval_agent.agent import run_eval_session
 from app.eval_agent.ctx import EvaluationContext
 from app.trace.recorder import EvolutionTraceRecorder
+from app.trace.facts import ConsumptionRejected, require_ready_evidence_dossier
 
 logger = logging.getLogger("evolution.eval_agent.api")
 
@@ -76,21 +77,25 @@ async def eval_start(
     """
     from app.dossier import repo as dossier_repo
 
-    # 1. 查卷宗 + 校验完整态（需求 §29：只接受 ready）
+    # 1. 统一消费闸门：业务 ready、来源 creation Trace 和编译 Trace 都须 verified。
+    try:
+        require_ready_evidence_dossier(req.dossier_id)
+    except ConsumptionRejected as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "integrity_status": exc.integrity_status,
+                "missing_fields": list(exc.missing_fields),
+            },
+        ) from exc
     dossier = dossier_repo.get_dossier(req.dossier_id)
-    if dossier is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"证据卷宗 {req.dossier_id} 不存在",
-        )
-    if dossier["status"] != "ready":
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"证据卷宗 {req.dossier_id} 状态为 {dossier['status']}，"
-                f"只有 ready（完整）卷宗可评估。partial/failed/编译中均不可评估。"
-            ),
-        )
+    if dossier is None:  # 闸门已验证存在；仅防并发删除。
+        raise HTTPException(status_code=409, detail={
+            "message": f"证据卷宗 {req.dossier_id} 在启动时被删除",
+            "integrity_status": "unknown",
+            "missing_fields": ["dossier"],
+        })
     trace_id = dossier["trace_id"]
     dossier_version = dossier["version"]
 
@@ -107,6 +112,14 @@ async def eval_start(
                 f"（run_purpose={run_purpose}），不能评估。"
             ),
         )
+
+    recorder = get_recorder()
+    if recorder is None:
+        raise HTTPException(status_code=503, detail={
+            "message": "Trace recorder unavailable; evaluation was not started",
+            "integrity_status": "incomplete",
+            "missing_fields": ["trace_recorder"],
+        })
 
     # 3. 单卷宗单活动任务（需求 §40）：已有活动评估则复用，不创建并行任务。
     active = eval_repo.get_active_attempt_by_dossier(req.dossier_id)
@@ -139,7 +152,7 @@ async def eval_start(
         agent_version_type=version_type,
         agent_version_id=version_id,
     )
-    ctx.recorder = get_recorder()
+    ctx.recorder = recorder
     ctx.dossier = dossier
     ctx.dossier_id = req.dossier_id
     ctx.dossier_version = dossier_version

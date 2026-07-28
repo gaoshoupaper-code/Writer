@@ -125,8 +125,8 @@ model {
           this -> prompt '装配时读'
         }
         trace = component 'trace/' {
-          description '执行轨迹记录. 完成后通知 evolution'
-          this -> writer.evolution '通知 trace 完成'
+          description 'Writer Trace V2: PayloadGate、ArtifactRevision、Manifest、W3C 与 Outcome 本地缓冲；采集失败 fail-open'
+          this -> writer.evolution.ingestion 'HTTP /internal 终态提示；evolution 拉取事件、Payload 和 Manifest'
         }
         state = component 'state/' {
           description '工作区 / 风格 / 产物存储'
@@ -144,7 +144,7 @@ model {
           description '记忆系统固定基础设施(不可进化). MemoryBackend 四原语: retrieve(四阶段检索) + add_episode(章节入图) + ingest_storybuilding(蓝图入图) + health_check. 封装 Graphiti+FalkorDB+LLM(json_schema降级)+embedder(智谱embedding-3). 存储=FalkorDB(writer-falkordb docker服务, Redis协议时序知识图谱). 进程单例懒加载, 连不上自动关闭记忆功能降级全量注入'
         }
       }
-      harness = layer 'evolution/harnesses/current/' {
+      harness = layer 'evolution/harnesses/repo/' {
         description 'Agent 包 (流水线装配 + prompt + skill). 被 platform 加载, 不反向依赖. 记忆可进化要素: middleware/memory_recall_middleware.py(查询构造+证据包组装) + tools/narrative_schema(实体/边类型) + tools/storyline_parser + tools/story_calendar(虚构历法)'
       }
 
@@ -169,7 +169,7 @@ model {
 
     evolution = container-service 'evolution 进化端' {
       technology 'FastAPI / Python'
-      description '三功能 + 双 Agent: ①单次测试 ②评估 Agent ③进化 Agent. 用户主导, 人工串联闭环'
+      description 'Writer canonical Trace 真相源：creation、evidence_compile、evaluation、evolution 各自独立 Trace；receipt、完整性、血缘和三工作台查询'
       this -> writer.executor '③拉取 trace / A/B 生成 / ⑦推送快照发布通知'
       this -> llm '调用 (评估 Agent + 进化 Agent)'
       this -> writer.db '读写'
@@ -180,11 +180,11 @@ model {
       //   ② 评估 Agent: eval_agent/ 独立顶层 Agent, 对一条 trace 做诊断
       //   ③ 进化 Agent: evolve/ 吃评估报告 → 方案→执行 → 产待审改动 → 人工发版
       evolveApi = layer 'app/evolve/api.py (进化 API)' {
-        description '功能③触发: POST /evolve/start (强前置: trace 必须已评估) + 发版/丢弃'
+        description '功能③触发: POST /evolve/start-converse（强前置：sealed EvaluationDossier）+ 发版/丢弃'
         this -> singleAgent '触发进化驱动器'
       }
       evalAgentApi = layer 'app/eval_agent/api.py (评估 API)' {
-        description '功能②触发: POST /eval-agent/start (选 trace) + 查询 + SSE'
+        description '功能②触发: POST /eval-agent/start（选择 ready EvidenceDossier）+ 查询 + SSE'
         this -> evalAgent '触发评估 Agent'
       }
       testsApi = layer 'app/tests/ (单次测试)' {
@@ -192,17 +192,32 @@ model {
         this -> writer.executor.routers 'HTTP /internal/ab/run 跑生成'
       }
 
+      ingestion = layer 'app/ingestion/' {
+        description '唯一 Trace 摄入入口：notify 后拉取事件、Payload、Manifest；按 receipt 连续 sequence、双唯一键和内容 hash 幂等写入，判定 verified/incomplete/conflict/legacy'
+        this -> evoCore '同事务写入事件、receipt、投影和完整性'
+      }
+      dossier = layer 'app/dossier/' {
+        description '只消费 verified creation Trace；从 ArtifactRevision 与受治理 Payload 编译不可变 EvidenceDossierVersion，拒绝不完整来源'
+        this -> evoCore '读写卷宗、制品血缘和拒绝审计'
+      }
+      workbenches = layer 'app/view/' {
+        description '运行观测、血缘、分析三工作台；共用对象 ID 与查询底座，正文按需读取且仅超管访问审计'
+        this -> evoCore '查询结构、血缘、Profile 指标和 Payload 元数据'
+      }
+
       // —— 双 Agent(对等的独立顶层 Agent, 互不依赖, 各自只依赖 core+common) ——
       evalAgent = layer 'app/eval_agent/ (评估 Agent)' {
-        description '功能②: 独立顶层 DeepAgent. 按要素分层: prompt + tools/(trace·surface·content·report) + middleware/no_fs + skills/(空壳). 读 trace 多层 + 流程硬指标 + 内容评分(scoring+rubrics内含) + LLM 诊断. 只诊断不提方案(T3). 按版本对齐要素(V1-V7)'
+        description '功能②: 独立顶层 DeepAgent，只消费 ready EvidenceDossier，产 sealed EvaluationDossier/Score；不读 workspace 或原始 Trace'
         this -> evoCore '读写 (evaluation_sessions 表)'
         this -> harnessConfig '读 harness 设计意图 (read_surface, 按版本)'
       }
       singleAgent = layer 'app/evolve/ (进化 Agent)' {
-        description '功能③: 按要素分层. driver/(agent+prompt+middleware/phase_guard) 委托 subagents/(plan·execute 各 prompt/tools/build 三件套) + skills/(空壳). 吃评估报告产改动, 不自证比分(T1人工发版). P4: 读 trace memory_quality 摘要(flow.py) + 查 reflection(含记忆失败模式) 注入进化上下文'
+        description '功能③: 只消费 sealed EvaluationDossier；每次进化新建 Trace，以 Span Link、来源 Trace 与不可变制品关联，追加实验、候选、发布和回滚事实'
         this -> harnessConfig '执行子代理改 harness 源码'
         this -> evoCore '读写 (evolve_sessions 表 + eval_ref 关联评估)'
       }
+      dossier -> evalAgent 'ready EvidenceDossier 作为唯一评估输入'
+      evalAgent -> singleAgent 'sealed EvaluationDossier 作为唯一进化输入'
 
       // —— 公共设施(跨 Agent 共用, 不属任一业务 Agent) ——
       common = layer 'app/common/ (公共设施)' {
@@ -221,19 +236,19 @@ model {
         this -> harnessSrc '改写/读取 harness 源码'
       }
       versioning = layer 'app/versioning/ (版本谱系+发版)' {
-        description 'snapshot_repo(版本快照 config_json+source_commit) + snapshot_publisher(发版通知) + snapshot_api'
+        description 'snapshot_repo(版本快照 config_json+source_commit) + snapshot_publisher；发布状态 committed→registry_promoted→executor_refresh_ack→activated，失败与回滚追加事实'
       }
       evoCore = layer 'app/core/ (底座)' {
-        description 'DB + LLM + settings + models(trace schema) + git_ops(commit/show_file 按版本读源码)'
+        description 'SQLite 元数据与热查询 + data/trace_payloads 内容寻址正文；Payload 生命周期、删除优先和访问审计'
       }
-      harnessSrc = layer 'harnesses/current/ (Agent 包源码)' {
+      harnessSrc = layer 'harnesses/repo/ (Agent 包源码)' {
         description '被进化 Agent 改写的对象. git 管理, 发版时 commit+push 到 bare repo'
       }
     }
 
     db = database 'Database' {
       technology 'SQLite'
-      description '两端各自的元数据/trace 存储(分库)'
+      description '两端元数据分库；evolution 的 Trace 正文存 data/trace_payloads，事件只留 Payload 引用'
     }
   }
 
@@ -252,7 +267,7 @@ model {
 
   // ---- contracts 共享包(独立, 只被依赖不依赖任何一端) ----
   contracts = shared-package 'contracts/' {
-    description '两端的数据合同. 铁律: 只被依赖, 不 import executor 也不 import evolution. 记忆字段: RuntimeContext.memory_backend + memory_recall_middleware_cls(双注入, 复用T2模式); TraceMemoryQuality(检索质量埋点, P4进化闭环用)'
+    description '两端的数据合同. 铁律: 只被依赖, 不 import executor 也不 import evolution. Trace V2 定义 schema_version、workload、SpanLink、完整性、coverage、Payload、Skill/Middleware/HITL 与 W3C 外部引用'
   }
   writer.executor -> contracts 'import'
   writer.evolution -> contracts 'import'
@@ -337,20 +352,23 @@ views {
     writer.executor.routers -> writer.evolution.testsApi '返回 trace_id'
     writer.evolution.testsApi -> writer.evolution.evoCore '存 manual_tests (version+trace_id)'
 
-    // —— 功能② 评估 Agent: 对 trace 做诊断 ——
-    author -> writer.evolution.evalAgentApi '选一条 trace 评估' {
-      notes '功能②: 用户选 trace, 评估 Agent 诊断流程+内容, 只诊断不提方案'
+    // —— 功能② 证据卷宗 → 评估 Agent ——
+    author -> writer.evolution.dossier '选择 verified creation Trace 编译证据卷宗' {
+      notes '卷宗从 ArtifactRevision 读取冻结正文；incomplete/conflict/legacy 一律拒绝消费'
+    }
+    author -> writer.evolution.evalAgentApi '选择 ready EvidenceDossier 评估' {
+      notes '评估只读证据卷宗，成功后封存 EvaluationDossier/Score'
     }
     writer.evolution.evalAgentApi -> writer.evolution.evalAgent '启动评估 Agent'
     writer.evolution.evalAgent -> writer.evolution.evoCore '写 evaluation_sessions (scores+findings+report)' {
       notes '评估报告落 DB, 作为进化的强前置输入'
     }
 
-    // —— 功能③ 进化 Agent: 吃评估报告产改动 ——
-    author -> writer.evolution.evolveApi '选已评估 trace 进化' {
-      notes '功能③: 强前置(S8) - trace 必须已有评估报告'
+    // —— 功能③ 进化 Agent: 吃封存评估卷宗产改动 ——
+    author -> writer.evolution.evolveApi '选择 sealed EvaluationDossier 进化' {
+      notes '功能③: 强前置 - 评估卷宗必须封存；进化运行新建 Trace 并以 Span Link 关联来源'
     }
-    writer.evolution.evolveApi -> writer.evolution.evoCore '校验: 该 trace 有 done 评估?'
+    writer.evolution.evolveApi -> writer.evolution.evoCore '校验: EvaluationDossier 已 sealed?'
     writer.evolution.evolveApi -> writer.evolution.singleAgent '启动进化驱动器(方案→执行)'
     writer.evolution.singleAgent -> writer.evolution.harnessConfig '执行子代理改 harness 源码'
     writer.evolution.singleAgent -> writer.evolution.evoCore '存 evolve_sessions (status=pending_review)' {

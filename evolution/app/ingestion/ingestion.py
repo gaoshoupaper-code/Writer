@@ -12,12 +12,13 @@ import asyncio
 import logging
 from typing import Any, Literal
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel
 
 import app.core.db as db
 from app.ingestion import importer
 from app.core.settings import settings
+from app.trace.facts import append_outcome
 
 router = APIRouter(tags=["ingestion"])
 logger = logging.getLogger("evolution.ingestion")
@@ -43,26 +44,36 @@ class NotifyBody(BaseModel):
     error: str | None = None
 
 
+class OutcomeBody(BaseModel):
+    outcome_id: str
+    target_type: Literal["trace", "artifact_revision"]
+    target_id: str
+    outcome_type: Literal["copy", "regenerate", "adopt", "edit_diff", "human_rating"]
+    actor_user_id: str | None = None
+    payload: Any | None = None
+    capture_status: Literal["captured", "payload_rejected"]
+
+
 def _fetch_trace_content(
-    trace_id: str, since_seq: int = 0
-) -> tuple[list, str | None, str | None] | None:
+    trace_id: str, since_seq: int = 0, traceparent: str | None = None,
+) -> tuple[list, "TraceRunSummary", dict[str, object]] | None:
     """从执行端 HTTP 拉取 trace 内容（run 摘要 + 事件列表）。
 
     since_seq（D8 增量）：只拉 sequence > since_seq 的事件。首次摄入传 0（全量）。
     执行端 GET /internal/traces/{trace_id}?since_seq=N 支持。
 
     Returns:
-        (events, workspace_id_hint, run_status_hint) 或 None（拉取失败/未找到）。
-        run_status_hint 来自 executor run summary 的 status 字段（权威源），
-        供 importer 纠正"运行中无终结事件被误判 failed"的场景。
+        (events, run_summary, payload_values) 或 None。正文只按事件引用逐个拉取，
+        evolution 落本地受控存储后不再依赖 executor workspace。
     """
     import httpx
-    from contracts.trace import TraceLogEvent
+    from contracts.trace import TraceLogEvent, TraceRunSummary
 
     url = f"{settings.executor_url}/internal/traces/{trace_id}"
     params = {"since_seq": since_seq} if since_seq > 0 else None
     try:
-        resp = httpx.get(url, timeout=_FETCH_TIMEOUT, params=params)
+        headers = {"traceparent": traceparent} if traceparent else None
+        resp = httpx.get(url, timeout=_FETCH_TIMEOUT, params=params, headers=headers)
         if resp.status_code == 404:
             logger.warning("拉取 trace %s：执行端索引未命中（可能进程重启）", trace_id)
             return None
@@ -70,9 +81,21 @@ def _fetch_trace_content(
         data = resp.json()
         events = [TraceLogEvent.model_validate(e) for e in data.get("events", [])]
         run_summary = data.get("run", {}) or {}
-        workspace_hint = run_summary.get("workspace_id")
-        run_status_hint = run_summary.get("status")
-        return events, workspace_hint, run_status_hint
+        run = TraceRunSummary.model_validate(run_summary)
+        payload_values: dict[str, object] = {}
+        for payload_id in {
+            ref.payload_id for event in events for ref in event.payload_refs.values()
+        }:
+            payload_response = httpx.get(
+                f"{settings.executor_url}/internal/traces/{trace_id}/payloads/{payload_id}",
+                timeout=_FETCH_TIMEOUT,
+                headers=headers,
+            )
+            if payload_response.status_code == 200:
+                payload_values[payload_id] = payload_response.json()
+            else:
+                logger.warning("拉取 trace %s payload %s 失败: %s", trace_id, payload_id, payload_response.status_code)
+        return events, run, payload_values
     except Exception as exc:
         logger.warning("拉取 trace %s 失败：%s", exc)
         return None
@@ -101,7 +124,7 @@ def _load_prior_events(trace_id: str) -> tuple[list, int]:
     return prior, seq
 
 
-async def _ingest_async(trace_id: str) -> None:
+async def _ingest_async(trace_id: str, traceparent: str | None = None) -> None:
     """在线程池中拉取 trace 内容并摄入（HTTP + 投影 + 写库，避免阻塞事件循环）。
 
     增量摄入（D8）：读本地高水位 ingested_seq → 只拉增量事件 → 合并旧事件全量投影。
@@ -110,19 +133,20 @@ async def _ingest_async(trace_id: str) -> None:
     - 新双层评估：仅终态触发（completed/cancelled/failed），awaiting_input/running 跳过
     """
     prior_events, since_seq = await asyncio.to_thread(_load_prior_events, trace_id)
-    fetched = await asyncio.to_thread(_fetch_trace_content, trace_id, since_seq)
+    fetched = await asyncio.to_thread(_fetch_trace_content, trace_id, since_seq, traceparent)
     if fetched is None:
         return
-    events, workspace_hint, run_status_hint = fetched
+    events, run_summary, payload_values = fetched
     # 增量场景：本次无新事件（since_seq 已是最新）。
     # 仍可能是状态变迁通知（如 awaiting_input→running，resume 不产生事件只改 index），
     # 故不直接 return：用执行端 run 摘要的 status 覆盖本地，保持状态最终一致。
     if since_seq > 0 and not events:
-        await asyncio.to_thread(_sync_status_only, trace_id)
+        await asyncio.to_thread(_sync_status_only, trace_id, traceparent)
         return
     tid = await asyncio.to_thread(
         importer.ingest_events,
-        events, workspace_hint, None, prior_events, run_status_hint,
+        events, run_summary.workspace_id, None, prior_events, run_summary.status,
+        run_summary, payload_values,
     )
     if tid is None:
         return
@@ -132,9 +156,12 @@ async def _ingest_async(trace_id: str) -> None:
     run_row = db.query_one("SELECT status FROM runs WHERE trace_id=?", (tid,))
     if run_row:
         await asyncio.to_thread(_sync_manual_test_status, tid, run_row["status"])
+        if run_row["status"] in {"completed", "failed", "cancelled", "interrupted"}:
+            from app.trace.otlp import schedule_otlp_export
+            schedule_otlp_export(tid)
 
 
-def _sync_status_only(trace_id: str) -> None:
+def _sync_status_only(trace_id: str, traceparent: str | None = None) -> None:
     """无新事件时的状态同步：从执行端拉 run 摘要，覆盖本地 runs.status。
 
     典型场景：HITL resume（awaiting_input→running）不写 trace 事件，只改 index
@@ -144,7 +171,8 @@ def _sync_status_only(trace_id: str) -> None:
     import httpx
     url = f"{settings.executor_url}/internal/traces/{trace_id}"
     try:
-        resp = httpx.get(url, timeout=_FETCH_TIMEOUT)
+        headers = {"traceparent": traceparent} if traceparent else None
+        resp = httpx.get(url, timeout=_FETCH_TIMEOUT, headers=headers)
         resp.raise_for_status()
         run = resp.json().get("run", {})
     except Exception as exc:
@@ -170,7 +198,11 @@ def _maybe_judge(trace_id: str) -> None:
 
 
 @router.post("/ingestion/notify")
-async def notify(body: NotifyBody, background_tasks: BackgroundTasks) -> dict[str, str]:
+async def notify(
+    body: NotifyBody,
+    background_tasks: BackgroundTasks,
+    request: Request,
+) -> dict[str, str]:
     """接收完成通知，异步拉取 trace 内容并摄入。
 
     返回 202 Accepted（摄入在后台进行，不阻塞执行端的 complete_run 调用）。
@@ -183,8 +215,25 @@ async def notify(body: NotifyBody, background_tasks: BackgroundTasks) -> dict[st
     if not body.trace_id and body.task_id:
         _mark_test_failed_by_task(body.task_id, body.error or "executor task failed")
         return {"status": "accepted", "task_id": body.task_id}
-    background_tasks.add_task(_ingest_async, body.trace_id)
+    background_tasks.add_task(_ingest_async, body.trace_id, request.headers.get("traceparent"))
     return {"status": "accepted", "trace_id": body.trace_id}
+
+
+@router.post("/ingestion/outcomes")
+def ingest_outcome(body: OutcomeBody) -> dict[str, str]:
+    """幂等接收 executor 的终态后用户行为，不修改原 Trace。"""
+    try:
+        outcome_id = append_outcome(
+            outcome_id=body.outcome_id,
+            target_type=body.target_type,
+            target_id=body.target_id,
+            outcome_type=body.outcome_type,
+            actor_user_id=body.actor_user_id,
+            payload=body.payload if body.capture_status == "captured" else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"status": "accepted", "outcome_id": outcome_id}
 
 
 @router.get("/ingestion/active-key")

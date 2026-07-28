@@ -68,7 +68,7 @@ _PATH_RE = re.compile(r"(?:Updated file|Wrote file)\s+(/[\w\-./]+\.\w+)", re.IGN
 
 # compile_rule_version：当前编译规则的版本标识。规则变更时递增。
 # 用于判断：同 trace 是否需要重编译（新规则版本 != 旧包的 compile_rule_version）。
-COMPILE_RULE_VERSION = "v1"
+COMPILE_RULE_VERSION = "v2"
 
 
 def extract_facts(trace_id: str) -> dict[str, Any]:
@@ -108,22 +108,24 @@ def extract_facts(trace_id: str) -> dict[str, Any]:
         "ended_at": run.ended_at,
     }
 
-    # 2. 任务契约（从 run_start.input 提取 + demand.md 走文件系统补）
-    contract = _extract_contract(trace_id, run, events)
-
-    # 3. 流程指标（复用 flow_metrics）
+    # 2. 流程指标（复用 flow_metrics）
     flow_metrics = compute_flow_metrics(detail)
 
-    # 3.5 产物修订快照（第二期：从 run_meta 的 artifact_snapshot 键提取）
-    artifact_revisions = _extract_artifact_revisions(events)
-
-    # 4. 产物交付物（冻结正文全文 + 指纹，B1）。
-    # 复用 eval_extractor 的路径定位逻辑，但升级为冻结正文（截断 + sha256），
-    # 让评估可仅凭卷宗打分（阶段 C 切断工作区旁路的前提）。
-    deliveries = _freeze_deliveries(trace_id)
-
-    # 5. review 文件内容（扩展：覆盖 review subagent 写的 review/*.md）
-    review_artifacts = _extract_review_artifacts(trace_id)
+    if run.schema_version >= 2:
+        revision_records = _load_v2_artifact_revisions(trace_id, events)
+        artifact_revisions = _public_artifact_revisions(revision_records)
+        contract = _extract_v2_contract(run, events, revision_records)
+        deliveries = _freeze_v2_deliveries(revision_records)
+        review_artifacts = _extract_v2_review_artifacts(revision_records)
+        provenance = "trace_time"
+    else:
+        # Legacy traces are only readable for historical inspection. The V2 consumption
+        # gate excludes them, so this compatibility path must not invent V2 facts.
+        artifact_revisions = _extract_legacy_artifact_revisions(events)
+        contract = _extract_legacy_contract(trace_id, run, events)
+        deliveries = _freeze_deliveries(trace_id)
+        review_artifacts = _extract_review_artifacts(trace_id)
+        provenance = "trace_time" if artifact_revisions else "compile_time_snapshot"
 
     # 6. review 调用链（新写）
     review_chain = _build_review_chain(events)
@@ -140,10 +142,7 @@ def extract_facts(trace_id: str) -> dict[str, Any]:
     # 8.5 memory_quality 埋点（B2）：冻结进 facts，进化侧不再直读 run_meta
     memory_quality = _extract_memory_quality(events)
 
-    # 9. provenance 判定：有运行时产物快照 → trace_time；否则 → compile_time_snapshot
-    provenance = "trace_time" if artifact_revisions else "compile_time_snapshot"
-
-    # 10. 覆盖统计
+    # 9. 覆盖统计
     coverage = _compute_coverage(
         contract, flow_metrics, deliveries, review_chain, revise_events,
         recovery_chain, nodes, artifact_revisions,
@@ -299,7 +298,55 @@ def _extract_memory_quality(events: list) -> dict[str, Any]:
 # ── 任务契约提取 ──────────────────────────────────────────────
 
 
-def _extract_contract(trace_id: str, run: Any, events: list) -> dict[str, Any]:
+def _extract_v2_contract(
+    run: Any, events: list, revisions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """优先使用运行时契约快照，缺失 demand 时仅从冻结 revision 补充。"""
+    snapshot: dict[str, Any] = {}
+    for event in reversed(events):
+        if event.type != "run_meta" or not isinstance(event.input, dict):
+            continue
+        candidate = event.input.get("contract_snapshot")
+        if isinstance(candidate, dict):
+            snapshot = candidate
+            break
+
+    contract: dict[str, Any] = {
+        "available": True,
+        "provenance": "trace_time",
+        "user_goal": snapshot.get("user_goal"),
+        "task_type": snapshot.get("task_type") or run.endpoint or run.purpose,
+        "promised_artifacts": snapshot.get("promised_artifacts"),
+        "hard_constraints": snapshot.get("hard_constraints"),
+        "style_preferences": snapshot.get("style_preferences"),
+        "scope": snapshot.get("scope"),
+        "ambiguities": snapshot.get("ambiguities"),
+        "input_references": snapshot.get("input_references"),
+        "endpoint": snapshot.get("endpoint") or run.endpoint,
+        "thread_id": snapshot.get("thread_id") or run.thread_id,
+        "workspace_id": snapshot.get("workspace_id") or run.workspace_id,
+        "session_name": snapshot.get("session_name") or run.session_name,
+        "run_purpose": snapshot.get("run_purpose") or run.purpose or "user_generation",
+        "missing": list(snapshot.get("missing") or []),
+    }
+    demand_text = snapshot.get("demand_md")
+    if not isinstance(demand_text, str) or not demand_text.strip():
+        demand_revision = _latest_revision_by_path(revisions).get("/demand.md")
+        demand_text = demand_revision.get("_content") if demand_revision else None
+    contract["demand_md"] = demand_text[:4000] if isinstance(demand_text, str) else None
+    contract["_demand_parsed"] = False
+    if contract["demand_md"] is None:
+        contract["missing"].append("demand.md 内容（未记录契约快照或不可变 revision）")
+    for field in (
+        "user_goal", "promised_artifacts", "hard_constraints", "style_preferences",
+        "scope", "ambiguities", "input_references",
+    ):
+        if contract[field] is None:
+            contract["missing"].append(f"{field}：V2 trace 未提供")
+    return contract
+
+
+def _extract_legacy_contract(trace_id: str, run: Any, events: list) -> dict[str, Any]:
     """提取任务契约八类信息（首期从 run_start.input + 文件系统补 demand）。
 
     run_start.input 含 6 字段元信息（endpoint/thread_id/workspace_id/session_name/
@@ -440,10 +487,151 @@ def _extract_review_artifacts(trace_id: str) -> dict[str, str]:
     return result
 
 
-# ── 产物修订快照提取（第二期） ────────────────────────────────
+# ── V2 不可变产物修订 ──────────────────────────────────────────
 
 
-def _extract_artifact_revisions(events: list) -> list[dict[str, Any]]:
+def _load_v2_artifact_revisions(
+    trace_id: str, events: list,
+) -> list[dict[str, Any]]:
+    """只从已物化的 ArtifactRevision 与受治理 Payload 重建 V2 产物。
+
+    不能用 workspace 补读：workspace 是当前态，无法证明它就是这次运行交付的
+    内容。任何 V2 artifact event 缺少物化行、正文或 hash 一致性，都是可信链
+    断裂，必须让卷宗编译失败而不是产生被污染的事实。
+    """
+    rows = db.query_all(
+        """SELECT revision.artifact_revision_id, revision.artifact_id,
+                  revision.parent_revision_id, revision.payload_id,
+                  revision.content_hash, revision.producer_event_id,
+                  artifact.logical_key, artifact.artifact_type,
+                  payload.content_hash AS payload_content_hash, payload.deleted_at
+           FROM artifact_revisions revision
+           JOIN artifacts artifact ON artifact.artifact_id=revision.artifact_id
+           JOIN payload_objects payload ON payload.payload_id=revision.payload_id
+           WHERE revision.producer_trace_id=?""",
+        (trace_id,),
+    )
+    materialized = {row["artifact_revision_id"]: row for row in rows}
+    revisions: list[dict[str, Any]] = []
+
+    for event in events:
+        if event.type != "artifact_revision":
+            continue
+        revision_id = event.artifact_revision_id
+        artifact = event.artifact
+        if not revision_id or not isinstance(artifact, dict):
+            raise ValueError(f"V2 artifact event {event.event_id} is missing revision metadata")
+        row = materialized.get(revision_id)
+        if row is None:
+            raise ValueError(f"V2 artifact revision {revision_id} was not materialized")
+        payload_ref = event.payload_refs.get("output")
+        output = event.output
+        content = output.get("content") if isinstance(output, dict) else None
+        expected_hash = artifact.get("content_hash")
+        if not isinstance(content, str):
+            raise ValueError(f"V2 artifact revision {revision_id} has no readable content")
+        actual_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if (
+            not isinstance(expected_hash, str)
+            or actual_hash != expected_hash
+            or actual_hash != row["content_hash"]
+        ):
+            raise ValueError(f"V2 artifact revision {revision_id} content hash mismatch")
+        if (
+            payload_ref is None
+            or row["payload_id"] != payload_ref.payload_id
+            or row["payload_content_hash"] != payload_ref.content_hash
+            or row["deleted_at"] is not None
+        ):
+            raise ValueError(f"V2 artifact revision {revision_id} payload reference mismatch")
+        if (
+            row["producer_event_id"] != event.event_id
+            or row["logical_key"] != artifact.get("logical_key")
+            or row["artifact_type"] != artifact.get("artifact_type", "workspace_file")
+        ):
+            raise ValueError(f"V2 artifact revision {revision_id} metadata mismatch")
+        revisions.append({
+            "artifact_revision_id": revision_id,
+            "file_path": row["logical_key"],
+            "tool": event.tool_name,
+            "fingerprint": actual_hash,
+            "agent_name": event.agent_name,
+            "sequence": event.sequence,
+            "evidence_id": f"evt-{event.event_id}",
+            "content_length": len(content),
+            "parent_revision_id": row["parent_revision_id"],
+            "artifact_type": row["artifact_type"],
+            "_content": content,
+        })
+
+    revisions.sort(key=lambda item: item["sequence"])
+    return revisions
+
+
+def _public_artifact_revisions(revisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep timeline provenance structural; frozen content belongs in deliveries."""
+    return [
+        {key: value for key, value in revision.items() if key != "_content"}
+        for revision in revisions
+    ]
+
+
+def _latest_revision_by_path(revisions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for revision in revisions:
+        path = revision["file_path"]
+        if isinstance(path, str):
+            latest[path] = revision
+    return latest
+
+
+def _primary_agent_for_revision(revision: dict[str, Any]) -> str | None:
+    agent = eval_extractor._normalize_agent_name(revision.get("agent_name"))
+    if agent is not None:
+        return agent
+    path = revision.get("file_path")
+    if not isinstance(path, str):
+        return None
+    for candidate in eval_extractor.EVALUATION_AGENTS:
+        if eval_extractor._path_belongs_to_agent(path, candidate):
+            return candidate
+    return None
+
+
+def _freeze_v2_deliveries(revisions: list[dict[str, Any]]) -> dict[str, dict[str, dict[str, Any]]]:
+    """Freeze only each logical path's final immutable revision for evaluation."""
+    frozen: dict[str, dict[str, dict[str, Any]]] = {}
+    for path, revision in sorted(_latest_revision_by_path(revisions).items()):
+        agent = _primary_agent_for_revision(revision)
+        if agent is None:
+            continue
+        content = revision["_content"]
+        char_count = len(content)
+        truncated = char_count > DELIVERY_FREEZE_CHAR_LIMIT
+        frozen.setdefault(agent, {})[path] = {
+            "content_frozen": content[:DELIVERY_FREEZE_CHAR_LIMIT] if truncated else content,
+            "content_sha256": revision["fingerprint"],
+            "char_count": char_count,
+            "truncated": truncated,
+            "artifact_revision_id": revision["artifact_revision_id"],
+            "sequence": revision["sequence"],
+        }
+    return frozen
+
+
+def _extract_v2_review_artifacts(revisions: list[dict[str, Any]]) -> dict[str, str]:
+    """Return final review outputs from immutable revisions, never current workspace files."""
+    return {
+        path: revision["_content"][:6000]
+        for path, revision in sorted(_latest_revision_by_path(revisions).items())
+        if revision.get("agent_name") in _REVIEW_AGENT_NAMES
+    }
+
+
+# ── Legacy 产物修订快照提取 ────────────────────────────────────
+
+
+def _extract_legacy_artifact_revisions(events: list) -> list[dict[str, Any]]:
     """从 run_meta 事件的 artifact_snapshot 键提取产物修订时间线。
 
     第二期执行端在每次 write_file/edit_file 成功后 emit 一条 run_meta 事件，

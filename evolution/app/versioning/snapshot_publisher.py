@@ -4,8 +4,8 @@
 本模块只保留 notify_executor：发版后 HTTP 通知执行端 reload。
 
 通知机制（降级模式）：
-  evolution 发布新版本 → POST executor /internal/snapshot/refreshed
-  → 执行端 reload_current() 拉最新 main + 重新加载包
+    evolution 发布新版本 → POST executor /internal/reload
+    → 执行端 reload_current() 拉最新 main + 重新加载包
   通知彻底降级：executor_url 未配置/失败 → 静默吞掉（还有 reconcile 兜底）。
 """
 from __future__ import annotations
@@ -36,11 +36,7 @@ def notify_executor(version: int) -> bool:
         return False
     try:
         import httpx
-        resp = httpx.post(
-            f"{executor_url}/internal/snapshot/refreshed",
-            json={"version": version},
-            timeout=2.0,
-        )
+        resp = httpx.post(f"{executor_url}/internal/reload", timeout=10.0)
         if resp.status_code < 300:
             logger.info("已通知执行端 v%s", version)
             return True

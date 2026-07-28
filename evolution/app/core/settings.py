@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     # 默认放 data/ 子目录（2026-07-08）：与源码分离，便于 docker volume 只挂 data/
     # 做增量更新（源码不挂卷，避免旧源码覆盖镜像新源码）。旧库迁移见 update-evolution.sh。
     evolution_db: str = "data/evolution.db"
+    # Trace V2 完整正文内容寻址存储。SQLite 只存元数据与热索引。
+    trace_payload_dir: str = "data/trace_payloads"
+    # 可选单向 OTLP/HTTP JSON 出口。留空时不启动导出 worker；canonical Trace
+    # 的采集、查询、血缘和分析不依赖外部平台。
+    trace_otlp_endpoint: str = ""
+    trace_otlp_headers_json: str = "{}"
+    trace_otlp_timeout_seconds: float = 2.0
     # 执行端服务地址（Phase 3：HTTP 拉取 trace 内容 + 活跃大盘轮询）。
     # 桌面化后双重用途：内网 trace 拉取 + SSO 回调 /api/auth/me 验证。
     executor_url: str = "http://localhost:7788"
@@ -102,6 +109,15 @@ class Settings(BaseSettings):
         path = path.resolve()
         # 确保父目录存在（首次挂载空 volume 时 data/ 可能不存在）
         path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def trace_payload_path(self) -> Path:
+        path = Path(self.trace_payload_dir)
+        if not path.is_absolute():
+            path = self._evolution_root / path
+        path = path.resolve()
+        path.mkdir(parents=True, exist_ok=True)
         return path
 
     @property

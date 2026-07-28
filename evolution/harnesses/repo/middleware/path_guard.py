@@ -80,6 +80,7 @@ class FilesystemPathGuardMiddleware(AgentMiddleware):
         workspace_path: Path,
         allowed_write_paths: tuple[str, ...] = (),
         allowed_patterns: tuple[re.Pattern[str], ...] | None = None,
+        intervention_callback: Callable[..., None] | None = None,
     ) -> None:
         """
         Args:
@@ -92,6 +93,7 @@ class FilesystemPathGuardMiddleware(AgentMiddleware):
         self.workspace_path = workspace_path.resolve()
         self.allowed_write_paths = set(allowed_write_paths)
         self.allowed_patterns = allowed_patterns  # None → normalize 内回退写作默认
+        self.intervention_callback = intervention_callback
 
     # ------------------------------------------------------------------
     # 工具调用拦截（同步 / 异步）
@@ -130,6 +132,7 @@ class FilesystemPathGuardMiddleware(AgentMiddleware):
 
         args = _mapping_value(tool_call, "args")
         if not isinstance(args, dict):
+            self._emit_intervention("block", reason="tool args must be an object")
             return _tool_error(tool_name, _mapping_value(tool_call, "id"), "tool args must be an object")
 
         raw_path = args.get("file_path")
@@ -143,7 +146,16 @@ class FilesystemPathGuardMiddleware(AgentMiddleware):
             )
         except ValueError as exc:
             # 路径不合法，返回错误消息
+            self._emit_intervention("block", reason=str(exc))
             return _tool_error(tool_name, _mapping_value(tool_call, "id"), str(exc))
+
+        if normalized_path != raw_path:
+            self._emit_intervention(
+                "modify",
+                reason="normalize_workspace_write_path",
+                before={"file_path": raw_path},
+                after={"file_path": normalized_path},
+            )
 
         # 将规范化后的路径回写进工具参数（FilesystemBackend 会使用虚拟路径）
         modified_call = {
@@ -154,6 +166,28 @@ class FilesystemPathGuardMiddleware(AgentMiddleware):
             },
         }
         return request.override(tool_call=modified_call)
+
+    def _emit_intervention(
+        self,
+        action: str,
+        *,
+        reason: str,
+        before: Any | None = None,
+        after: Any | None = None,
+    ) -> None:
+        if self.intervention_callback is None:
+            return
+        try:
+            self.intervention_callback(
+                action=action,
+                hook="wrap_tool_call",
+                affected_fields=["tool_call.args.file_path", "control_flow"],
+                reason=reason,
+                before=before,
+                after=after,
+            )
+        except Exception:
+            pass
 
 
 # ======================================================================

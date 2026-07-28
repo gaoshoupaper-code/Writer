@@ -28,6 +28,8 @@ from app.eval_agent.prompt import EVAL_SYSTEM_PROMPT
 from app.eval_agent.tools import clear_content_tasks, make_eval_tools
 from app.common.model_factory import build_agent_model
 from app.trace import TraceMiddleware, TraceCallbackHandler
+from app.trace.facts import add_lineage
+from contracts.trace import TraceSpanLink
 
 logger = logging.getLogger("evolution.eval_agent.agent")
 
@@ -158,13 +160,34 @@ async def run_eval_session(ctx: EvaluationContext) -> dict[str, Any]:
     """
     # D6/D8：先 create_run 拿自观测 trace_id，再构建 agent（middleware 需要 trace_id）。
     if ctx.recorder:
+        compile_trace_id = str((ctx.dossier or {}).get("compile_trace_id") or "")
         handle = ctx.recorder.create_run(
             session_id=ctx.eval_id,
             run_purpose="evolution_eval",
             endpoint="eval-agent.run",
             session_type="eval",  # trace 稳定性重构：持久化 self_trace_id
+            workload="evaluation",
+            links=[TraceSpanLink(
+                target_trace_id=compile_trace_id,
+                relation="consumes",
+                artifact={"type": "evidence_dossier", "id": ctx.dossier_id},
+                attributes={"dossier_version": ctx.dossier_version},
+            )],
+            external_refs={
+                "evaluation_id": ctx.eval_id,
+                "dossier_id": str(ctx.dossier_id),
+                "source_trace_id": ctx.input_trace_id,
+            },
         )
         ctx.trace_id_self = handle.trace_id
+        try:
+            add_lineage(
+                "trace", ctx.trace_id_self, "consumes",
+                "evidence_dossier", str(ctx.dossier_id),
+            )
+        except Exception as exc:
+            ctx.recorder.fail_run(ctx.trace_id_self, exc)
+            raise
 
     agent = build_eval_agent(ctx)
 

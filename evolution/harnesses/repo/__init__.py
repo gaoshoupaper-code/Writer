@@ -171,43 +171,58 @@ def _make_quality_callback(ctx: RuntimeContext):
 
 
 def _make_artifact_snapshot_callback(ctx: RuntimeContext):
-    """构造产物修订快照回调（第二期证据采集，2026-07）。
-
-    ArtifactSnapshotMiddleware 每次写盘成功后调用此回调，传入快照 dict。
-    回调用 trace_recorder.append_event 写一条 run_meta 事件到 trace，
-    供证据编译器重建产物修订时间线。
-
-    trace_recorder 或 trace_id 为 None 时返回 None（不采集）。
-    ctx.artifact_snapshot_callback 非 None 时优先用执行端传入的 callback
-    （执行端可自定义 emit 逻辑）；否则包内构造默认 callback。
-    """
-    # 执行端传入了自定义 callback（推荐路径：执行端知道怎么 emit run_meta）
+    """构造不可变 ArtifactRevision 回调。"""
     if ctx.artifact_snapshot_callback is not None:
         return ctx.artifact_snapshot_callback
 
-    # 降级：包内构造默认 callback（直接用 trace_recorder emit）
+    recorder = ctx.trace_recorder
+    trace_id = ctx.trace_id
+    if recorder is None or not trace_id:
+        return None
+    record_revision = getattr(recorder, "record_artifact_revision", None)
+    if not callable(record_revision):
+        return None
+
+    def _callback(snapshot_data: dict) -> None:
+        try:
+            record_revision(
+                trace_id,
+                snapshot_data.get("agent_name", "unknown"),
+                file_path=snapshot_data["file_path"],
+                content=snapshot_data.get("content", ""),
+                tool_name=snapshot_data.get("tool"),
+                tool_call_id=snapshot_data.get("tool_call_id"),
+                content_hash=snapshot_data.get("fingerprint"),
+            )
+        except Exception:
+            pass
+
+    return _callback
+
+
+def _make_intervention_callback(ctx: RuntimeContext, agent_name: str):
     recorder = ctx.trace_recorder
     trace_id = ctx.trace_id
     if recorder is None or not trace_id:
         return None
 
-    def _callback(snapshot_data: dict) -> None:
+    def _callback(
+        *, action: str, hook: str, affected_fields: list[str], reason: str | None = None,
+        before: Any | None = None, after: Any | None = None,
+    ) -> None:
         try:
-            recorder.append_event(trace_id, {
-                "type": "run_meta",
-                "source": "middleware",
-                "agent_name": snapshot_data.get("agent_name", "unknown"),
-                "input": {"artifact_snapshot": {
-                    "file_path": snapshot_data["file_path"],
-                    "tool": snapshot_data.get("tool"),
-                    "fingerprint": snapshot_data["fingerprint"],
-                    # content 可能很大，按需保留（首期保留，供证据包冻结）
-                    "content_preview": snapshot_data.get("content", "")[:2000],
-                    "content_length": len(snapshot_data.get("content", "")),
-                }},
-            })
+            recorder.record_intervention(
+                trace_id,
+                agent_name,
+                action=action,
+                hook=hook,
+                affected_fields=affected_fields,
+                reason=reason,
+                before=before,
+                after=after,
+            )
         except Exception:
-            pass  # 快照失败不影响写作流程（静默吞掉）
+            pass
 
     return _callback
 
@@ -261,13 +276,16 @@ def assemble(ctx: RuntimeContext):
     #   → WriteResultInspector（在串行化内、ErrorRecovery 内，转抛 WriteFailedError）
     #   → GoalMiddleware（最内层）
     meta_middleware = [
-        ErrorRecoveryMiddleware(),
-        MetaReadOnlyMiddleware(),
-        ReadCacheMiddleware(),
-        FilesystemPathGuardMiddleware(workspace_path),
+        ErrorRecoveryMiddleware(intervention_callback=_make_intervention_callback(ctx, "meta-agent")),
+        MetaReadOnlyMiddleware(intervention_callback=_make_intervention_callback(ctx, "meta-agent")),
+        ReadCacheMiddleware(intervention_callback=_make_intervention_callback(ctx, "meta-agent")),
+        FilesystemPathGuardMiddleware(
+            workspace_path,
+            intervention_callback=_make_intervention_callback(ctx, "meta-agent"),
+        ),
         EncodingGuardMiddleware(),
         FileStateTrackerMiddleware(),
-        FileWriteSerializeMiddleware(),
+        FileWriteSerializeMiddleware(intervention_callback=_make_intervention_callback(ctx, "meta-agent")),
         WriteResultInspectorMiddleware(),
         GoalMiddleware(),
     ]
@@ -295,6 +313,16 @@ def assemble(ctx: RuntimeContext):
     # ── meta skills backend 组合 ──
     effective_backend, skill_sources = compose_skills_backend(ctx.backend, meta_skills)
 
+    # Trace V2：在装配事实发生点冻结可用 Skill catalog 与最终 middleware 顺序。
+    # 运行时实际激活仍由 TraceMiddleware 在成功解析注册 Skill 后单独记录。
+    if ctx.trace_recorder is not None and ctx.trace_id:
+        record_catalog = getattr(ctx.trace_recorder, "record_skill_catalog", None)
+        record_stack = getattr(ctx.trace_recorder, "record_middleware_assembly", None)
+        if callable(record_catalog):
+            record_catalog(ctx.trace_id, "meta-agent", meta_skills, skill_sources)
+        if callable(record_stack):
+            record_stack(ctx.trace_id, "meta-agent", meta_middleware)
+
     # ── subagent middleware 工厂 ──
     # A2 重构后装配顺序（与 meta 一致，去掉 MetaReadOnly 和 Goal）：
     #   ErrorRecovery（最外层）
@@ -305,13 +333,17 @@ def assemble(ctx: RuntimeContext):
     #   → FileWriteSerialize（写串行化）
     #   → WriteResultInspector（最内层，转抛 WriteFailedError）
     def middleware_factory(agent_name: str) -> list:
+        intervention_callback = _make_intervention_callback(ctx, agent_name)
         mw = [
-            ErrorRecoveryMiddleware(),
-            ReadCacheMiddleware(),
-            FilesystemPathGuardMiddleware(workspace_path),
+            ErrorRecoveryMiddleware(intervention_callback=intervention_callback),
+            ReadCacheMiddleware(intervention_callback=intervention_callback),
+            FilesystemPathGuardMiddleware(
+                workspace_path,
+                intervention_callback=intervention_callback,
+            ),
             EncodingGuardMiddleware(),
             FileStateTrackerMiddleware(),
-            FileWriteSerializeMiddleware(),
+            FileWriteSerializeMiddleware(intervention_callback=intervention_callback),
             WriteResultInspectorMiddleware(),
         ]
         if ctx.trace_recorder is not None and ctx.trace_id and ctx.trace_middleware_cls:
@@ -334,6 +366,22 @@ def assemble(ctx: RuntimeContext):
         artifact_cb = _make_artifact_snapshot_callback(ctx)
         if artifact_cb is not None:
             mw.append(ArtifactSnapshotMiddleware(artifact_cb, workspace_path, agent_name))
+        if ctx.trace_recorder is not None and ctx.trace_id:
+            catalog_scopes = {
+                "storybuilding-subagent": "storybuilding",
+                "detail-outline-subagent": "detail-outline",
+                "writing-subagent": "writing",
+            }
+            scope = catalog_scopes.get(agent_name)
+            if scope:
+                paths = _skill_abs_paths(scope)
+                _, runtime_sources = compose_skills_backend(ctx.backend, paths)
+                record_catalog = getattr(ctx.trace_recorder, "record_skill_catalog", None)
+                if callable(record_catalog):
+                    record_catalog(ctx.trace_id, agent_name, paths, runtime_sources)
+            record_stack = getattr(ctx.trace_recorder, "record_middleware_assembly", None)
+            if callable(record_stack) and agent_name not in catalog_scopes:
+                record_stack(ctx.trace_id, agent_name, mw)
         return mw
 
     # ── subagent 装配 ──

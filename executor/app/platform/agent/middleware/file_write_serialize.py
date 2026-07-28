@@ -42,9 +42,10 @@ class FileWriteSerializeMiddleware(AgentMiddleware):
     原子的，不会产生竞争态。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, intervention_callback: Callable[..., None] | None = None) -> None:
         # file_path → 锁；lazy 创建，见 _lock_for。
         self._locks: dict[str, asyncio.Lock] = {}
+        self.intervention_callback = intervention_callback
 
     def _write_file_key(self, request: Any) -> str | None:
         """若为写工具调用，返回其目标 file_path；否则返回 None（不串行化）。"""
@@ -73,7 +74,18 @@ class FileWriteSerializeMiddleware(AgentMiddleware):
         key = self._write_file_key(request)
         if key is None:
             return await handler(request)
-        async with self._lock_for(key):
+        lock = self._lock_for(key)
+        if lock.locked() and self.intervention_callback is not None:
+            try:
+                self.intervention_callback(
+                    action="write_serialization",
+                    hook="awrap_tool_call",
+                    affected_fields=["control_flow", "file_path"],
+                    reason="concurrent_write_same_path",
+                )
+            except Exception:
+                pass
+        async with lock:
             return await handler(request)
 
     def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:

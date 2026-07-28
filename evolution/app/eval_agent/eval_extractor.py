@@ -104,12 +104,16 @@ def extract_deliveries(trace_id: str) -> dict[str, dict[str, str]]:
     """
     # 取 trace 的 workspace_id 和 owner_user_id（用于定位文件系统三层路径）
     run = db.query_one(
-        "SELECT workspace_id, owner_user_id FROM runs WHERE trace_id = ?",
+        "SELECT workspace_id, owner_user_id, schema_version FROM runs WHERE trace_id = ?",
         (trace_id,),
     )
     if run is None:
         logger.warning("extract_deliveries: trace 不存在 %s", trace_id)
         return {}
+    if int(run.get("schema_version") or 1) >= 2:
+        raise RuntimeError(
+            "V2 trace deliveries must be read from immutable ArtifactRevision via its evidence dossier"
+        )
     workspace_id = run["workspace_id"]
     owner_user_id = run["owner_user_id"]
     # 老 trace ALTER TABLE DEFAULT 'unknown' → 三层路径拼不出来，静默跳过
@@ -120,7 +124,6 @@ def extract_deliveries(trace_id: str) -> dict[str, dict[str, str]]:
             owner_user_id,
         )
         return {}
-
     # 取所有 write_file 的 tool_end 事件
     rows = db.query_all(
         """SELECT payload_json FROM event_payloads

@@ -56,8 +56,8 @@ def _get_memory_recall_cls():
 def _make_artifact_snapshot_cb(recorder, trace_id: str | None):
     """构造产物修订快照回调（第二期证据采集，2026-07）。
 
-    ArtifactSnapshotMiddleware 写盘成功后调用，传入快照 dict。
-    回调 emit 一条 run_meta 事件（input.artifact_snapshot），供证据编译器重建产物修订时间线。
+    ArtifactSnapshotMiddleware 写盘成功后调用，传入已回读快照 dict。
+    回调创建 ArtifactRevision 事实；正文由 recorder 经 PayloadGate 引用化保存。
     recorder 或 trace_id 为 None 时返回 None（不采集）。
     """
     if recorder is None or not trace_id:
@@ -65,18 +65,15 @@ def _make_artifact_snapshot_cb(recorder, trace_id: str | None):
 
     def _callback(snapshot_data: dict) -> None:
         try:
-            recorder.append_event(trace_id, {
-                "type": "run_meta",
-                "source": "middleware",
-                "agent_name": snapshot_data.get("agent_name", "unknown"),
-                "input": {"artifact_snapshot": {
-                    "file_path": snapshot_data["file_path"],
-                    "tool": snapshot_data.get("tool"),
-                    "fingerprint": snapshot_data["fingerprint"],
-                    "content": snapshot_data.get("content", ""),
-                    "content_length": len(snapshot_data.get("content", "")),
-                }},
-            })
+            recorder.record_artifact_revision(
+                trace_id,
+                snapshot_data.get("agent_name", "unknown"),
+                file_path=snapshot_data["file_path"],
+                content=snapshot_data.get("content", ""),
+                tool_name=snapshot_data.get("tool"),
+                tool_call_id=snapshot_data.get("tool_call_id"),
+                content_hash=snapshot_data.get("fingerprint"),
+            )
         except Exception:
             pass  # 快照失败不影响写作流程
 
@@ -253,6 +250,26 @@ class MetaAgentService(BaseAgentService):
         if checkpointer is None:
             checkpointer = self.checkpointer
 
+        if trace_id:
+            try:
+                from importlib.metadata import version
+                from app.platform.agent.git_sync import production_commit
+
+                self.trace_recorder.set_run_snapshot(trace_id, {
+                    "harness_version": production_commit() or "unknown",
+                    "deepagents_version": version("deepagents"),
+                    "model_class": f"{model.__class__.__module__}.{model.__class__.__name__}",
+                    "model_name": str(
+                        getattr(model, "model_name", None)
+                        or getattr(model, "model", None)
+                        or model.__class__.__name__
+                    ),
+                })
+            except Exception as exc:
+                self.trace_recorder._mark_capture_degraded(
+                    trace_id, f"run_snapshot_failed:{type(exc).__name__}"
+                )
+
         backend = self._backend_for_workspace(workspace_path)
 
         # 风格解析（D4 就地转换：scope 名 key，styling 字段名查值）
@@ -347,7 +364,15 @@ class MetaAgentService(BaseAgentService):
             self.trace_recorder.fail_run(thread, trace.trace_id, exc)
             raise
 
-    async def generate_stream(self, payload: ScreenplayGenerateRequest, thread: ThreadSummary, *, owner_id: str | None = None, run_purpose: str = "user_generation") -> AsyncIterator[str]:
+    async def generate_stream(
+        self,
+        payload: ScreenplayGenerateRequest,
+        thread: ThreadSummary,
+        *,
+        owner_id: str | None = None,
+        run_purpose: str = "user_generation",
+        traceparent: str | None = None,
+    ) -> AsyncIterator[str]:
         """Stream agent execution events as SSE to the frontend.
 
         SSE 编排骨架（心跳 + astream_events 循环 + interrupt 检测）由
@@ -373,7 +398,12 @@ class MetaAgentService(BaseAgentService):
         if resume_value is not None and trace_id_in:
             trace, is_new = self.trace_recorder.resume_run(thread, trace_id_in)
         else:
-            trace = self.trace_recorder.create_run(thread, "screenplay.generate.stream", run_purpose=run_purpose)
+            trace = self.trace_recorder.create_run(
+                thread,
+                "screenplay.generate.stream",
+                run_purpose=run_purpose,
+                traceparent=traceparent,
+            )
             is_new = True
         if is_new:
             yield _sse("status", {"status": "started", "trace_id": trace.trace_id})

@@ -28,6 +28,20 @@ from langchain_core.messages import ToolMessage
 logger = logging.getLogger(__name__)
 
 _WRITE_TOOLS = frozenset({"write_file", "edit_file"})
+_VERSIONED_ARTIFACT_PATHS = (
+    "/demand.md",
+    "/outline.md",
+    "/storyline.md",
+    "/worldview.md",
+    "/novel.md",
+)
+_VERSIONED_ARTIFACT_PREFIXES = (
+    "/character/",
+    "/storyline/",
+    "/detail/",
+    "/chapter/",
+    "/review/",
+)
 
 
 class ArtifactSnapshotMiddleware(AgentMiddleware):
@@ -87,11 +101,11 @@ class ArtifactSnapshotMiddleware(AgentMiddleware):
             tool_name = str(_mapping_value(tool_call, "name") or "")
 
             file_path = args.get("file_path") or args.get("path") or ""
-            if not file_path:
+            if not _is_versioned_artifact_path(file_path):
                 return
 
             # 拿写入后的完整内容
-            content = self._get_written_content(tool_name, args, file_path)
+            content = self._get_written_content(file_path)
             if content is None:
                 return
 
@@ -101,6 +115,7 @@ class ArtifactSnapshotMiddleware(AgentMiddleware):
                 "agent_name": self._agent_name,
                 "file_path": file_path,
                 "tool": tool_name,
+                "tool_call_id": _mapping_value(tool_call, "id"),
                 "content": content,
                 "fingerprint": fingerprint,
             })
@@ -108,22 +123,15 @@ class ArtifactSnapshotMiddleware(AgentMiddleware):
             # 快照失败不影响写作流程（静默吞掉，与 quality_callback 一致）
             logger.debug("产物快照失败", exc_info=True)
 
-    def _get_written_content(self, tool_name: str, args: dict, file_path: str) -> str | None:
-        """获取写入后的完整内容。
-
-        write_file：args.content 就是完整内容（deepagents write_file 签名含 content）。
-        edit_file：args 只有 old_string/new_string，需从磁盘读最终内容。
-        """
-        if tool_name == "write_file":
-            content = args.get("content")
-            return content if isinstance(content, str) else None
-
-        # edit_file：读磁盘最终态
-        rel = file_path.lstrip("/")
-        abs_path = self._workspace_root / rel
+    def _get_written_content(self, file_path: str) -> str | None:
+        """从受控工作区回读最终内容；工具参数只表示写入意图。"""
+        rel = file_path.replace("\\", "/").lstrip("/")
         try:
+            root = self._workspace_root.resolve()
+            abs_path = (root / rel).resolve()
+            abs_path.relative_to(root)
             return abs_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError, ValueError):
             return None
 
 
@@ -132,6 +140,17 @@ def _mapping_value(mapping: object, key: str) -> Any:
     if isinstance(mapping, dict):
         return mapping.get(key)
     return getattr(mapping, key, None)
+
+
+def _is_versioned_artifact_path(file_path: object) -> bool:
+    """Keep revisions for cross-run evidence, not ephemeral workflow state."""
+    if not isinstance(file_path, str):
+        return False
+    normalized = "/" + file_path.replace("\\", "/").lstrip("/")
+    return (
+        normalized in _VERSIONED_ARTIFACT_PATHS
+        or normalized.startswith(_VERSIONED_ARTIFACT_PREFIXES)
+    )
 
 
 __all__ = ["ArtifactSnapshotMiddleware"]

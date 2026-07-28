@@ -136,6 +136,15 @@ export type TraceRunSummary = {
   // trace 稳定性重构：Pull 主导架构下前端判断"还在跑"的依据 + interrupted 来源
   last_heartbeat_at?: string | null;
   interrupted_reason?: string | null;
+  schema_version?: number;
+  service?: string | null;
+  workload?: TraceWorkload | null;
+  purpose?: string | null;
+  integrity_status?: TraceIntegrityStatus;
+  coverage?: Record<string, TraceCoverageStatus>;
+  run_snapshot?: Record<string, unknown>;
+  links?: TraceSpanLink[];
+  external_refs?: Record<string, string>;
 };
 
 export type TraceDetail = {
@@ -194,6 +203,14 @@ export type TraceListItem = {
   owner_user_id: string;
   owner_username: string | null;
   run_purpose: string;
+  schema_version: number;
+  service: string | null;
+  workload: TraceWorkload | null;
+  integrity_status: TraceIntegrityStatus;
+  coverage: Record<string, TraceCoverageStatus>;
+  skill_activation_count: number;
+  middleware_intervention_count: number;
+  hitl_count: number;
 };
 
 /** trace 列表分页响应（含 total 供分页器计算页码） */
@@ -225,6 +242,109 @@ export type ActiveRun = {
   ingested: boolean;
   /** trace 来源（D9 后端补齐：user_generation / evolution_eval / evolution_evolve） */
   run_purpose: string | null;
+  workload: TraceWorkload | null;
+  integrity_status: TraceIntegrityStatus;
+  coverage: Record<string, TraceCoverageStatus>;
+  skill_activation_count: number;
+  middleware_intervention_count: number;
+  hitl_count: number;
+};
+
+export type TraceWorkload = "creation" | "evidence_compile" | "evaluation" | "evolution";
+export type TraceIntegrityStatus = "verified" | "incomplete" | "conflict" | "legacy";
+export type TraceCoverageStatus = "known" | "partial" | "unknown" | "not_applicable";
+
+export type TraceSpanLink = {
+  target_trace_id: string;
+  target_span_id?: string | null;
+  relation: "triggered_by" | "retry_of" | "resumed_from" | "derived_from" | "consumes" | "produces";
+  artifact_revision_id?: string | null;
+  artifact?: Record<string, unknown> | null;
+  attributes: Record<string, unknown>;
+};
+
+export type ArtifactRevision = {
+  artifact_revision_id: string;
+  artifact_id: string;
+  parent_revision_id: string | null;
+  content_hash: string;
+  producer_trace_id: string;
+  producer_event_id: string | null;
+  harness_version: string | null;
+  created_at: string;
+  artifact_type: string;
+  logical_key: string;
+  payload_kind: string;
+  size_bytes: number;
+  sensitivity: string;
+  expires_at: string | null;
+};
+
+export type ArtifactRevisionListResponse = {
+  trace_id: string;
+  items: ArtifactRevision[];
+  total: number;
+};
+
+export type ArtifactRevisionContentResponse = {
+  artifact_revision_id: string;
+  content: unknown;
+};
+
+export type LineageObjectType =
+  | "trace"
+  | "artifact_revision"
+  | "evidence_dossier"
+  | "evaluation_dossier"
+  | "score"
+  | "experiment"
+  | "candidate"
+  | "release";
+
+export type LineageEdge = {
+  id: number;
+  from_type: LineageObjectType;
+  from_id: string;
+  relation: string;
+  to_type: LineageObjectType;
+  to_id: string;
+  created_at: string;
+};
+
+export type LineageResponse = {
+  object: { type: LineageObjectType; id: string };
+  incoming: LineageEdge[];
+  outgoing: LineageEdge[];
+};
+
+export type WorkloadProfile = {
+  workload: TraceWorkload;
+  sample_size: number;
+  status_denominator: number;
+  statuses: Record<string, number>;
+  success_rate: number | null;
+  integrity: Record<TraceIntegrityStatus, number> & { denominator: number };
+  coverage: {
+    complete: number;
+    denominator: number;
+    fields: Record<string, Record<TraceCoverageStatus, number>>;
+  };
+  duration_ms: { p50: number | null; p90: number | null; p99: number | null };
+  usage: { input_tokens: number; output_tokens: number; total_tokens: number; max_span_depth: number };
+  mechanisms: {
+    skill_activations: number;
+    middleware_interventions: number;
+    retries: number;
+    hitl_events: number;
+  };
+  drilldown_trace_ids: string[];
+  advanced_analysis: { eligible: boolean; missing_conditions: string[] };
+};
+
+export type WorkloadProfilesResponse = {
+  formula_version: string;
+  window: { hours: number | null; started_after: string | null };
+  profiles: WorkloadProfile[];
 };
 
 // ── 宏观统计（/api/stats/*）──
@@ -261,66 +381,4 @@ export type FailurePattern = {
   error_pattern: string;
   count: number;
   sample_trace_ids: string[];
-};
-
-// ── Workspace 产物（executor /api/workspaces/* 响应，trace 详情页「产物」tab 用）──
-
-/** 单章正文（executor workspace 下 chapter/*.md）。 */
-export type NovelChapter = {
-  filename: string;
-  title: string;
-  markdown: string;
-};
-
-/** GET /api/workspaces/{id}/novel 响应。 */
-export type WorkspaceNovelContent = {
-  workspace_id: string;
-  source: string;
-  chapters: NovelChapter[];
-};
-
-/** 单条故事线（storyline/*.md）。 */
-export type StorylineEntry = {
-  filename: string;
-  title: string;
-  markdown: string;
-};
-
-/** GET /api/workspaces/{id}/storyline 响应。 */
-export type WorkspaceStorylineContent = {
-  workspace_id: string;
-  index_markdown: string;
-  entries: StorylineEntry[];
-  file_count: number;
-};
-
-export type StorylineGraphStoryline = {
-  id: string;
-  name: string;
-  type: string;
-  status: string;
-  direction: string;
-  key_events: string[];
-};
-
-export type StorylineGraphEvent = {
-  id: string;
-  name: string;
-  type: string;
-  storylines: string[];
-  group: string;
-  doc_order: number;
-};
-
-/** GET /api/workspaces/{id}/storyline-graph 响应（本 tab 暂只用 markdown 字段，结构化字段为后续画图预留）。 */
-export type WorkspaceStorylineGraphContent = {
-  workspace_id: string;
-  markdown: string;
-  storylines: StorylineGraphStoryline[];
-  events: Record<string, StorylineGraphEvent>;
-  t_map: Record<string, number>;
-  storyline_count: number;
-  event_count: number;
-  generated_at: string;
-  stale: boolean;
 };

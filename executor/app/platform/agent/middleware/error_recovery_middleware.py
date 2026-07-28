@@ -40,7 +40,13 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
     在调用失败时自动重试，耗尽后注入错误恢复建议。
     """
 
-    def __init__(self, *, max_retries: int = 2, retry_delay: float = 0.5) -> None:
+    def __init__(
+        self,
+        *,
+        max_retries: int = 2,
+        retry_delay: float = 0.5,
+        intervention_callback: Callable[..., None] | None = None,
+    ) -> None:
         """
         Args:
             max_retries: 最大重试次数（不含首次调用），默认 2 次
@@ -48,6 +54,7 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
         """
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.intervention_callback = intervention_callback
 
     # ------------------------------------------------------------------
     # 工具调用拦截（同步 / 异步）
@@ -65,7 +72,10 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
                 if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)) or type(exc).__name__ == "GraphInterrupt":
                     raise
                 last_exc = exc
+                if attempt < self.max_retries:
+                    self._emit_intervention("retry", exc)
         # 所有重试都失败，返回包含恢复建议的错误消息
+        self._emit_intervention("short_circuit", last_exc)
         return self._tool_error_message(request, last_exc)
 
     async def awrap_tool_call(self, request: Any, handler: Callable[[Any], Awaitable[Any]]) -> Any:
@@ -80,8 +90,23 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
                 last_exc = exc
                 # 非最后一次重试前等待，延迟按尝试次数递增（0.5s → 1.0s → 1.5s ...）
                 if attempt < self.max_retries:
+                    self._emit_intervention("retry", exc)
                     await asyncio.sleep(self.retry_delay * (attempt + 1))
+        self._emit_intervention("short_circuit", last_exc)
         return self._tool_error_message(request, last_exc)
+
+    def _emit_intervention(self, action: str, exc: BaseException | None) -> None:
+        if self.intervention_callback is None:
+            return
+        try:
+            self.intervention_callback(
+                action=action,
+                hook="wrap_tool_call",
+                affected_fields=["control_flow"],
+                reason=type(exc).__name__ if exc is not None else None,
+            )
+        except Exception:
+            pass
 
     def _tool_error_message(self, request: Any, exc: BaseException) -> ToolMessage:
         """构造包含错误详情和恢复建议的工具错误消息。

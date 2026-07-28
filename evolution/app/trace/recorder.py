@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -44,6 +45,19 @@ from app.core.models import (
 )
 from app.trace.increment import IncrementState, compute_increment
 from app.trace.summary_export import export_trace_summary
+from app.core.settings import settings
+from contracts.trace import (
+    TraceManifest,
+    TraceSpanLink,
+    TraceWorkload,
+    compute_trace_events_hash,
+)
+from contracts.trace.payload import (
+    ContentAddressedPayloadStore,
+    PayloadRejected,
+    sanitize_structural_text,
+)
+from contracts.trace.w3c import create_trace_context
 
 logger = logging.getLogger("evolution.trace.recorder")
 
@@ -108,6 +122,10 @@ class EvolutionTraceRecorder:
         self._drain_task: asyncio.Task[None] | None = None
         # trace 稳定性重构：心跳超时扫描器（检测卡死的 running trace 标 interrupted）。
         self._scanner_task: asyncio.Task[None] | None = None
+        self._capture_degraded: dict[str, list[str]] = {}
+        self._run_links: dict[str, list[TraceSpanLink]] = {}
+        self._run_external_refs: dict[str, dict[str, str]] = {}
+        self._run_workloads: dict[str, TraceWorkload] = {}
 
     # ── 生命周期 ──────────────────────────────────────────────
 
@@ -142,6 +160,10 @@ class EvolutionTraceRecorder:
         *,
         endpoint: str = "",
         session_type: str | None = None,
+        workload: TraceWorkload | None = None,
+        links: list[TraceSpanLink] | None = None,
+        external_refs: dict[str, str] | None = None,
+        traceparent: str | None = None,
     ) -> TraceRunHandle:
         """创建一条 trace run（D8：立即写 runs 行 status=running）。
 
@@ -156,6 +178,8 @@ class EvolutionTraceRecorder:
         trace_id = f"trace-{uuid4().hex}"
         started_at = datetime.now(UTC)
         started_iso = started_at.isoformat()
+        trace_session_id = sanitize_structural_text(session_id, max_length=160) or ""
+        trace_endpoint = sanitize_structural_text(endpoint or run_purpose, max_length=160) or ""
         wal_path = self._wal_path(trace_id, started_at)
         wal_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -165,6 +189,12 @@ class EvolutionTraceRecorder:
         self._started_monotonic[trace_id] = time.perf_counter()
         self._wal_paths[trace_id] = wal_path
         self._run_purposes[trace_id] = run_purpose
+        resolved_workload = workload or _workload_for_purpose(run_purpose)
+        self._run_workloads[trace_id] = resolved_workload
+        self._run_links[trace_id] = list(links or [])
+        w3c_context = create_trace_context(traceparent)
+        self._run_external_refs[trace_id] = dict(external_refs or {})
+        self._run_external_refs[trace_id].update(w3c_context.external_refs)
         self._increment_states[trace_id] = IncrementState()
         # 登记 session_id → trace_id 映射（供 SSE 端点查询）。
         self._session_trace[session_id] = trace_id
@@ -177,18 +207,28 @@ class EvolutionTraceRecorder:
             """INSERT INTO runs
                (trace_id, workspace_id, thread_id, session_name, endpoint,
                 status, started_at, event_count, ingested_at, run_purpose,
-                last_heartbeat_at)
-               VALUES (?, ?, ?, ?, ?, 'running', ?, 0, ?, ?, ?)""",
+                last_heartbeat_at, schema_version, service, workload,
+                integrity_status, coverage_json, run_snapshot_json,
+                external_refs_json, links_json)
+               VALUES (?, ?, ?, ?, ?, 'running', ?, 0, ?, ?, ?, 2, 'evolution', ?,
+                       'incomplete', ?, '{}', ?, ?)""",
             (
                 trace_id,
                 "evolution",       # workspace_id：进化端固定标识
-                session_id,        # thread_id：复用列存 session_id
-                session_id,        # session_name
-                endpoint or run_purpose,
+                trace_session_id,  # thread_id：复用列存 session_id
+                trace_session_id,  # session_name
+                trace_endpoint,
                 started_iso,
                 started_iso,       # ingested_at
                 run_purpose,
                 started_iso,       # last_heartbeat_at：创建即首次心跳
+                resolved_workload,
+                json.dumps({"payload": "known", "token": "unknown", "cost": "unknown"}),
+                json.dumps(self._run_external_refs[trace_id], ensure_ascii=False),
+                json.dumps(
+                    [link.model_dump(mode="json") for link in self._run_links[trace_id]],
+                    ensure_ascii=False,
+                ),
             ),
         )
 
@@ -206,10 +246,11 @@ class EvolutionTraceRecorder:
                 "status": "running",
                 "source": "system",
                 "input": {
-                    "endpoint": endpoint or run_purpose,
-                    "session_id": session_id,
+                    "endpoint": trace_endpoint,
+                    "session_id": trace_session_id,
                     "run_purpose": run_purpose,
                 },
+                "links": self._run_links[trace_id],
             },
         )
         return handle
@@ -388,9 +429,22 @@ class EvolutionTraceRecorder:
                     input_value = result.input_to_store
                     input_context_range = result.input_context_range
 
+            event_id = str(values.get("event_id") or f"{trace_id}-{sequence}")
+            payload_refs, input_value, output_value, tool_args, tool_output = (
+                self._externalize_payloads(
+                    trace_id,
+                    event_type,
+                    input_value,
+                    values.get("output"),
+                    values.get("tool_args"),
+                    values.get("tool_output"),
+                )
+            )
+            payload_refs.update(values.get("_precomputed_payload_refs") or {})
+
             event = TraceLogEvent(
                 trace_id=trace_id,
-                event_id=str(values.get("event_id") or f"{trace_id}-{sequence}"),
+                event_id=event_id,
                 sequence=sequence,
                 type=values["type"],
                 status=values["status"],
@@ -404,18 +458,28 @@ class EvolutionTraceRecorder:
                 node_name=self._optional_str(values.get("node_name")),
                 model_name=self._optional_str(values.get("model_name")),
                 input=input_value,
-                output=_sanitize_tool_call_inputs(values.get("output")),
+                output=_sanitize_tool_call_inputs(output_value),
                 usage=values.get("usage"),
                 tool_calls=_tool_calls_payload(values.get("tool_calls")),
                 tool_call_id=self._optional_str(values.get("tool_call_id")),
                 tool_name=self._optional_str(values.get("tool_name")),
-                tool_args=_preserve_deliverable_args(
-                    values.get("tool_name"), values.get("tool_args")
-                ),
-                tool_output=_sanitize_tool_call_inputs(values.get("tool_output")),
+                tool_args=tool_args,
+                tool_output=_sanitize_tool_call_inputs(tool_output),
                 output_anchor_id=output_anchor_id,
                 input_context_range=input_context_range,
                 error=self._optional_str(values.get("error")),
+                skill_name=self._optional_str(values.get("skill_name")),
+                schema_version=2,
+                span_id=self._optional_str(values.get("span_id") or values.get("run_id")),
+                payload_refs=payload_refs,
+                links=values.get("links") or [],
+                skill_catalog=values.get("skill_catalog") or [],
+                skill_activation=values.get("skill_activation"),
+                middleware_stack=values.get("middleware_stack") or [],
+                intervention=values.get("intervention"),
+                hitl=values.get("hitl"),
+                artifact_revision_id=self._optional_str(values.get("artifact_revision_id")),
+                artifact=values.get("artifact"),
             )
 
             # 入内存缓冲（drain 批量落盘）。
@@ -429,6 +493,56 @@ class EvolutionTraceRecorder:
                 queue.put_nowait(event)
 
             return event
+
+    def _externalize_payloads(
+        self,
+        trace_id: str,
+        event_type: str,
+        input_value: Any,
+        output_value: Any,
+        tool_args: Any,
+        tool_output: Any,
+    ) -> tuple[dict[str, Any], Any, Any, Any, Any]:
+        if event_type in {"run_start", "run_manifest", "capture_degraded"}:
+            return {}, input_value, output_value, tool_args, tool_output
+        refs: dict[str, Any] = {}
+        values = {
+            "input": input_value,
+            "output": output_value,
+            "tool_args": tool_args,
+            "tool_output": tool_output,
+        }
+        result: dict[str, Any] = {}
+        store = ContentAddressedPayloadStore(settings.trace_payload_path)
+        for field_name, value in values.items():
+            if value is None:
+                result[field_name] = None
+                continue
+            try:
+                ref = store.put(value)
+                refs[field_name] = ref
+                db.execute(
+                    """INSERT INTO payload_objects
+                       (payload_id, content_hash, kind, size_bytes, sensitivity, expires_at,
+                        storage_path, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(payload_id) DO UPDATE SET expires_at=excluded.expires_at""",
+                    (
+                        ref.payload_id, ref.content_hash, ref.kind, ref.size_bytes,
+                        ref.sensitivity, ref.expires_at,
+                        str(settings.trace_payload_path / f"{ref.payload_id}.json"), self._now(),
+                    ),
+                )
+                result[field_name] = None
+            except (PayloadRejected, OSError, TypeError, ValueError) as exc:
+                self._mark_capture_degraded(
+                    trace_id, f"payload_{field_name}_rejected:{type(exc).__name__}"
+                )
+                result[field_name] = None
+        return refs, result["input"], result["output"], result["tool_args"], result["tool_output"]
+
+    def _mark_capture_degraded(self, trace_id: str, reason: str) -> None:
+        self._capture_degraded.setdefault(trace_id, []).append(reason)
 
     def append_business_event(
         self,
@@ -497,6 +611,73 @@ class EvolutionTraceRecorder:
             )
             self.flush_sync(trace_id)
 
+        degraded_reasons = self._capture_degraded.get(trace_id, [])
+        if degraded_reasons:
+            self.append_event(
+                trace_id,
+                {
+                    "type": "capture_degraded",
+                    "status": status,
+                    "source": "system",
+                    "input": {"reasons": degraded_reasons},
+                },
+            )
+            self.flush_sync(trace_id)
+
+        events = self._load_events_from_db(trace_id)
+        terminal = next(
+            (
+                event
+                for event in reversed(events)
+                if event.type in {"run_end", "run_error", "run_cancelled"}
+            ),
+            None,
+        )
+        if terminal is None:
+            self._mark_capture_degraded(trace_id, "terminal_event_missing")
+        integrity = "verified" if terminal is not None and not degraded_reasons else "incomplete"
+        if terminal is not None:
+            manifest = TraceManifest(
+                trace_id=trace_id,
+                final_sequence=max(event.sequence for event in events),
+                terminal_event_id=terminal.event_id,
+                events_hash=compute_trace_events_hash(events),
+                payload_ids=sorted(
+                    {
+                        ref.payload_id
+                        for event in events
+                        for ref in event.payload_refs.values()
+                    }
+                ),
+                capture_degraded=integrity != "verified",
+                created_at=self._now(),
+            )
+            prior = db.query_one(
+                "SELECT receipt_revision FROM trace_receipts WHERE trace_id=?", (trace_id,)
+            )
+            revision = int(prior["receipt_revision"] if prior else 0) + 1
+            db.execute(
+                """INSERT INTO trace_receipts
+                   (trace_id, contiguous_seq, max_seen_seq, missing_ranges_json,
+                    manifest_json, manifest_status, receipt_revision, updated_at)
+                   VALUES (?, ?, ?, '[]', ?, ?, ?, ?)
+                   ON CONFLICT(trace_id) DO UPDATE SET
+                     contiguous_seq=excluded.contiguous_seq,
+                     max_seen_seq=excluded.max_seen_seq,
+                     missing_ranges_json='[]', manifest_json=excluded.manifest_json,
+                     manifest_status=excluded.manifest_status,
+                     receipt_revision=excluded.receipt_revision, updated_at=excluded.updated_at""",
+                (
+                    trace_id,
+                    manifest.final_sequence,
+                    manifest.final_sequence,
+                    manifest.model_dump_json(),
+                    integrity,
+                    revision,
+                    self._now(),
+                ),
+            )
+
         # D7：终态批量投影 → 写 nodes 表。
         self._project_and_write_nodes(trace_id, status)
 
@@ -504,10 +685,14 @@ class EvolutionTraceRecorder:
         seq = self._sequences.get(trace_id, 0)
         db.execute(
             """UPDATE runs
-               SET status=?, ended_at=?, duration_ms=?, event_count=?, error=?
+               SET status=?, ended_at=?, duration_ms=?, event_count=?, error=?,
+                   integrity_status=?
                WHERE trace_id=?""",
-            (status, self._now(), duration_ms, seq, error, trace_id),
+            (status, self._now(), duration_ms, seq, self._optional_str(error), integrity, trace_id),
         )
+
+        from app.trace.otlp import schedule_otlp_export
+        schedule_otlp_export(trace_id)
 
         # 导出 summary JSON。
         self._export_summary(trace_id, status)
@@ -785,28 +970,52 @@ class EvolutionTraceRecorder:
         此方法在 to_thread 的线程池 worker 里执行，不占事件循环。
         """
         # 1. 先写 DB（event_payloads）—— 主存储。
-        db_rows = []
+        db_rows: list[tuple[Any, ...]] = []
+        payload_links: list[tuple[str, str, str, str]] = []
         for trace_id, json_line in batch:
             try:
                 data = json.loads(json_line)
+                event_id = str(data["event_id"])
+                event_hash = hashlib.sha256(json_line.encode("utf-8")).hexdigest()
                 db_rows.append((
                     trace_id,
                     data.get("sequence"),
                     data.get("type"),
                     data.get("timestamp"),
                     json_line,
+                    event_id,
+                    event_hash,
+                    json.dumps(data.get("payload_refs") or {}, ensure_ascii=False),
                 ))
+                for field_name, ref in (data.get("payload_refs") or {}).items():
+                    payload_id = ref.get("payload_id") if isinstance(ref, dict) else None
+                    if payload_id:
+                        payload_links.append((trace_id, event_id, str(field_name), str(payload_id)))
             except (json.JSONDecodeError, KeyError):
                 continue
         if db_rows:
             try:
-                db.executemany(
-                    """INSERT INTO event_payloads (trace_id, sequence, type, timestamp, payload_json)
-                       VALUES (?,?,?,?,?)""",
-                    db_rows,
-                )
+                with db.transaction() as conn:
+                    conn.executemany(
+                        """INSERT INTO event_payloads
+                           (trace_id, sequence, type, timestamp, payload_json, event_id,
+                            event_hash, payload_refs_json)
+                           VALUES (?,?,?,?,?,?,?,?)""",
+                        db_rows,
+                    )
+                    if payload_links:
+                        conn.executemany(
+                            """INSERT INTO trace_payload_links
+                               (trace_id, event_id, field_name, payload_id)
+                               VALUES (?,?,?,?)
+                               ON CONFLICT(trace_id, event_id, field_name)
+                               DO UPDATE SET payload_id=excluded.payload_id""",
+                            payload_links,
+                        )
             except Exception:
                 logger.exception("drain 写 DB event_payloads 失败（%d 条）", len(db_rows))
+                for trace_id, _ in batch:
+                    self._mark_capture_degraded(trace_id, "event_write_failed")
 
         # 2. 后写 WAL jsonl —— 按 trace 分组 append。
         grouped: dict[str, list[str]] = {}
@@ -1000,6 +1209,10 @@ class EvolutionTraceRecorder:
         self._increment_states.pop(trace_id, None)
         self._run_purposes.pop(trace_id, None)
         self._differs.pop(trace_id, None)
+        self._capture_degraded.pop(trace_id, None)
+        self._run_links.pop(trace_id, None)
+        self._run_external_refs.pop(trace_id, None)
+        self._run_workloads.pop(trace_id, None)
 
     def _lock_for(self, trace_id: str) -> RLock:
         lock = self._locks.get(trace_id)
@@ -1020,9 +1233,7 @@ class EvolutionTraceRecorder:
         return datetime.now(UTC).isoformat()
 
     def _optional_str(self, value: Any) -> str | None:
-        if value is None:
-            return None
-        return str(value)
+        return sanitize_structural_text(value)
 
 
 # ── 体积控制工具函数（从执行端移植，逻辑一致）──
@@ -1031,6 +1242,14 @@ class EvolutionTraceRecorder:
 def _is_deliverable_tool(tool_name: str) -> bool:
     """判断是否为交付物工具（write_file/edit_file，决策 E15/E20）。"""
     return tool_name in {"write_file", "edit_file"}
+
+
+def _workload_for_purpose(run_purpose: str) -> TraceWorkload:
+    if run_purpose == "evolution_eval":
+        return "evaluation"
+    if run_purpose == "evidence_compile":
+        return "evidence_compile"
+    return "evolution"
 
 
 def _preserve_deliverable_args(tool_name: str | None, tool_args: Any) -> Any:

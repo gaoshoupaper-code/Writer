@@ -84,6 +84,23 @@ def build_deep_subagent(
     if artifact_paths:
         mw.append(ArtifactValidationMiddleware(artifact_paths))
 
+    # TraceMiddleware carries the recorder context for this concrete Agent span.
+    # Record after all package middleware is appended so the order is final for this mount point.
+    trace_middleware = next(
+        (
+            item
+            for item in mw
+            if hasattr(item, "recorder")
+            and hasattr(item, "trace_id")
+            and hasattr(item, "agent_name")
+        ),
+        None,
+    )
+    if trace_middleware is not None:
+        record_stack = getattr(trace_middleware.recorder, "record_middleware_assembly", None)
+        if callable(record_stack):
+            record_stack(trace_middleware.trace_id, trace_middleware.agent_name, mw)
+
     # ---- 2. 调用 create_deep_agent ----
     graph = create_deep_agent(
         model=model,

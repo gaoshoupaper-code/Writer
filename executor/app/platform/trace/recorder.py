@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import importlib.metadata
+import inspect
 import json
+import re
 import time
 from collections import deque
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +23,14 @@ from app.platform.trace.increment import IncrementState, compute_increment
 from app.platform.trace.projector import TraceProjector
 from app.platform.trace.schemas import TraceDetail, TraceLogEvent, TraceRunSummary
 from app.platform.trace.summary_export import export_trace_summary
+from contracts.trace import TraceManifest, compute_trace_events_hash
+from contracts.trace import MiddlewareDescriptor, SkillCatalogEntry
+from contracts.trace.payload import (
+    ContentAddressedPayloadStore,
+    PayloadRejected,
+    sanitize_structural_text,
+)
+from contracts.trace.w3c import create_trace_context
 
 # ── 写盘解耦参数 ──────────────────────────────────────────────
 # 根因：append_event 原来在事件循环线程上同步 open("a")+write，单次生成会写
@@ -45,6 +58,9 @@ _CANCEL_REASON_MESSAGES: dict[str, str] = {
 # 扫描间隔 5min（2h 阈值，无需高频）。
 _ZOMBIE_TIMEOUT_SEC = 2 * 60 * 60  # 2h
 _ZOMBIE_SCAN_INTERVAL = 5 * 60     # 5min
+_TRACE_OBSERVER_ACTIVE: ContextVar[bool] = ContextVar(
+    "writer_trace_observer_active", default=False
+)
 
 
 @dataclass
@@ -99,12 +115,27 @@ class TraceRecorder:
         # generate_stream 入口 create_run 后登记（register_run_task），
         # finally 清理（unregister_run_task），_cleanup_run_state 兜底。
         self._run_tasks: dict[str, asyncio.Task] = {}
+        # 采集失败不能阻断创作，但终态 manifest 必须如实标记。
+        self._capture_degraded: dict[str, list[str]] = {}
+        self._skill_catalog: dict[str, dict[str, SkillCatalogEntry]] = {}
+        self._skill_runtime_paths: dict[str, dict[str, dict[str, str]]] = {}
+        self._artifact_head_lock = RLock()
 
-    def create_run(self, thread: ThreadSummary, endpoint: str, run_purpose: str = "user_generation") -> TraceRunHandle:
+    def create_run(
+        self,
+        thread: ThreadSummary,
+        endpoint: str,
+        run_purpose: str = "user_generation",
+        *,
+        traceparent: str | None = None,
+    ) -> TraceRunHandle:
         trace_id = f"trace-{uuid4().hex}"
         started_at = datetime.now(UTC)
+        w3c_context = create_trace_context(traceparent)
         run_path = self._trace_path(thread, trace_id, started_at)
         run_path.parent.mkdir(parents=True, exist_ok=True)
+        session_name = sanitize_structural_text(thread.session_name, max_length=160) or ""
+        safe_endpoint = sanitize_structural_text(endpoint, max_length=160) or ""
 
         self._locks[trace_id] = RLock()
         self._sequences[trace_id] = 0
@@ -119,14 +150,27 @@ class TraceRecorder:
             trace_id=trace_id,
             workspace_id=thread.workspace_id,
             thread_id=thread.thread_id,
-            session_name=thread.session_name,
+            session_name=session_name,
             workspace_path=thread.workspace_path,
-            endpoint=endpoint,
+            endpoint=safe_endpoint,
             status="running",
             started_at=started_at.isoformat(),
             path=self._relative_trace_path(thread, trace_id, started_at),
+            schema_version=2,
+            service="executor",
+            workload="creation",
+            purpose=run_purpose,
+            integrity_status="incomplete",
+            coverage={"payload": "known", "token": "unknown", "cost": "unknown"},
+            external_refs=w3c_context.external_refs,
         )
-        self._write_run_index(thread, summary)
+        self._run_metadata[trace_id] = {"run_summary": summary.model_dump(mode="json")}
+        try:
+            self._write_run_index(thread, summary)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self._mark_capture_degraded(
+                trace_id, f"run_index_write_failed:{type(exc).__name__}"
+            )
         handle = TraceRunHandle(trace_id=trace_id, queue=self._queues[trace_id])
         self.append_event(
             trace_id,
@@ -135,10 +179,10 @@ class TraceRecorder:
                 "status": "running",
                 "source": "system",
                 "input": {
-                    "endpoint": endpoint,
+                    "endpoint": safe_endpoint,
                     "thread_id": thread.thread_id,
                     "workspace_id": thread.workspace_id,
-                    "session_name": thread.session_name,
+                    "session_name": session_name,
                     # 归属键（D2/D20）：trace 自带 user_id，evolution 摄入时提取。
                     "user_id": thread.user_id,
                     # 防自指断路预留（D12 约束）：区分用户生成 vs 优化执行。
@@ -266,6 +310,16 @@ class TraceRecorder:
                     input_context_range = result.input_context_range
                 # inc_state 为 None（跨重启降级 T6）→ 不增量，input 保持全量。
 
+            payload_refs, input_value, output_value, tool_args, tool_output = self._externalize_payloads(
+                trace_id,
+                event_type,
+                input_value,
+                values.get("output"),
+                values.get("tool_args"),
+                values.get("tool_output"),
+            )
+            payload_refs.update(values.get("_precomputed_payload_refs") or {})
+
             event = TraceLogEvent(
                 trace_id=trace_id,
                 event_id=str(values.get("event_id") or f"{trace_id}-{sequence}"),
@@ -282,18 +336,28 @@ class TraceRecorder:
                 node_name=self._optional_str(values.get("node_name")),
                 model_name=self._optional_str(values.get("model_name")),
                 input=input_value,
-                output=_sanitize_tool_call_inputs(values.get("output")),
+                output=_sanitize_tool_call_inputs(output_value),
                 usage=values.get("usage"),
                 tool_calls=_tool_calls_payload(values.get("tool_calls")),
                 tool_call_id=self._optional_str(values.get("tool_call_id")),
                 tool_name=self._optional_str(values.get("tool_name")),
-                tool_args=_preserve_deliverable_args(
-                    values.get("tool_name"), values.get("tool_args")
-                ),
-                tool_output=_sanitize_tool_call_inputs(values.get("tool_output")),
+                tool_args=tool_args,
+                tool_output=_sanitize_tool_call_inputs(tool_output),
                 output_anchor_id=output_anchor_id,
                 input_context_range=input_context_range,
                 error=self._optional_str(values.get("error")),
+                skill_name=self._optional_str(values.get("skill_name")),
+                schema_version=2,
+                span_id=self._optional_str(values.get("span_id") or values.get("run_id")),
+                payload_refs=payload_refs,
+                links=values.get("links") or [],
+                skill_catalog=values.get("skill_catalog") or [],
+                skill_activation=values.get("skill_activation"),
+                middleware_stack=values.get("middleware_stack") or [],
+                intervention=values.get("intervention"),
+                hitl=values.get("hitl"),
+                artifact_revision_id=self._optional_str(values.get("artifact_revision_id")),
+                artifact=values.get("artifact"),
             )
 
             run_path = self._run_paths.get(trace_id)
@@ -311,12 +375,58 @@ class TraceRecorder:
                     with run_path.open("a", encoding="utf-8") as file:
                         file.write(f"{json_line}\n")
                 except OSError:
-                    pass
+                    self._mark_capture_degraded(trace_id, "event_write_failed")
 
             queue = self._queues.get(trace_id)
             if queue is not None:
                 queue.put_nowait(event)
             return event
+
+    def _externalize_payloads(
+        self,
+        trace_id: str,
+        event_type: str,
+        input_value: Any,
+        output_value: Any,
+        tool_args: Any,
+        tool_output: Any,
+    ) -> tuple[dict[str, Any], Any, Any, Any, Any]:
+        """把语义正文写入本地 payload store，事件只留引用。
+
+        只有身份、采集状态和 manifest 类结构事实保留内联字段。run_meta 可能包含
+        合同、记忆或业务正文，必须与模型和工具载荷一样经过 PayloadGate。
+        """
+        if event_type in {"run_start", "run_manifest", "capture_degraded"}:
+            return {}, input_value, output_value, tool_args, tool_output
+        store = self._payload_store(trace_id)
+        refs: dict[str, Any] = {}
+        values = {
+            "input": input_value,
+            "output": output_value,
+            "tool_args": tool_args,
+            "tool_output": tool_output,
+        }
+        result: dict[str, Any] = {}
+        for field_name, value in values.items():
+            if value is None:
+                result[field_name] = None
+                continue
+            try:
+                refs[field_name] = store.put(value)
+                result[field_name] = None
+            except (PayloadRejected, OSError, TypeError, ValueError) as exc:
+                self._mark_capture_degraded(trace_id, f"payload_{field_name}_rejected:{exc}")
+                result[field_name] = None
+        return refs, result["input"], result["output"], result["tool_args"], result["tool_output"]
+
+    def _payload_store(self, trace_id: str) -> ContentAddressedPayloadStore:
+        run_path = self._run_paths.get(trace_id)
+        if run_path is None:
+            raise KeyError(f"Trace path is not registered: {trace_id}")
+        return ContentAddressedPayloadStore(run_path.parent.parent / "payloads")
+
+    def _mark_capture_degraded(self, trace_id: str, reason: str) -> None:
+        self._capture_degraded.setdefault(trace_id, []).append(reason)
 
     def _drain_active(self) -> bool:
         """drain 协程是否在运行（用于 append_event 选择异步/同步写盘路径）。"""
@@ -655,10 +765,12 @@ class TraceRecorder:
             try:
                 with run_path.open("a", encoding="utf-8") as file:
                     file.writelines(lines)
-            except OSError:
-                # 写盘失败不应中断 drain（trace 是派生数据，不可拖垮主流程）。
-                # 与 generate_storyline_graph 的容错策略一致。
-                pass
+            except OSError as exc:
+                for trace_id, registered_path in list(self._run_paths.items()):
+                    if registered_path == run_path:
+                        self._mark_capture_degraded(
+                            trace_id, f"event_flush_failed:{type(exc).__name__}"
+                        )
 
     def flush_sync(self, trace_id: str) -> None:
         """同步刷掉指定 trace 的残余事件（trace 结束时调用，保证数据完整）。
@@ -684,8 +796,10 @@ class TraceRecorder:
             try:
                 with run_path.open("a", encoding="utf-8") as file:
                     file.writelines(pending)
-            except OSError:
-                pass
+            except OSError as exc:
+                self._mark_capture_degraded(
+                    trace_id, f"event_flush_failed:{type(exc).__name__}"
+                )
 
     def _flush_all_sync(self) -> None:
         """同步刷掉所有残余事件（仅 aclose 关闭时调用）。"""
@@ -727,7 +841,9 @@ class TraceRecorder:
             return None
         return TraceRunSummary.model_validate(run_data)
 
-    def read_trace_events(self, trace_id: str, since_seq: int = 0) -> list[TraceLogEvent] | None:
+    def read_trace_events(
+        self, trace_id: str, since_seq: int = 0, *, hydrate_payloads: bool = False
+    ) -> list[TraceLogEvent] | None:
         """按 trace_id 读取 trace 的事件列表（Phase 3 evolution 拉取用）。
 
         since_seq（D8 增量）：只返回 sequence > since_seq 的事件。0 = 全量。
@@ -742,10 +858,22 @@ class TraceRecorder:
         trace_path = Path(ws_path) / run.path
         if not trace_path.exists():
             return None
-        events = self._read_events(trace_path)
+        events = self._read_events(trace_path, hydrate_payloads=hydrate_payloads)
         if since_seq > 0:
             events = [e for e in events if e.sequence > since_seq]
         return events
+
+    def read_payload(self, trace_id: str, payload_id: str) -> Any:
+        """供 evolution 的受信任拉取端点读取一个已引用的 Payload。"""
+        run = self.find_run_by_trace_id(trace_id)
+        ws_path = self._trace_workspace.get(trace_id)
+        if run is None or ws_path is None:
+            raise KeyError(f"Trace not found: {trace_id}")
+        events = self.read_trace_events(trace_id) or []
+        if not any(ref.payload_id == payload_id for event in events for ref in event.payload_refs.values()):
+            raise KeyError(f"Payload {payload_id} is not referenced by trace {trace_id}")
+        trace_path = Path(ws_path) / run.path
+        return ContentAddressedPayloadStore(trace_path.parent.parent / "payloads").get(payload_id)
 
     def list_recent_runs(self, since_iso: str = "") -> list[dict[str, Any]]:
         """列出近期完成的 trace（Phase 3 evolution scan 兜底用）。
@@ -842,6 +970,291 @@ class TraceRecorder:
         meta = self._run_metadata.setdefault(trace_id, {})
         meta.setdefault("prompt_versions", {})[prompt_name] = version
 
+    def set_run_snapshot(self, trace_id: str, values: dict[str, Any]) -> None:
+        """Merge immutable runtime versions captured during agent assembly."""
+        meta = self._run_metadata.setdefault(trace_id, {})
+        meta.setdefault("run_snapshot", {}).update(values)
+
+    def record_skill_catalog(
+        self,
+        trace_id: str,
+        agent_name: str,
+        skill_roots: list[str],
+        runtime_sources: list[str] | None = None,
+    ) -> None:
+        """冻结本次运行可用 Skill；真实激活由 TraceMiddleware 在工具成功后记录。"""
+        entries: list[SkillCatalogEntry] = []
+        catalog = self._skill_catalog.setdefault(trace_id, {})
+        runtime_map = self._skill_runtime_paths.setdefault(trace_id, {}).setdefault(
+            agent_name, {}
+        )
+        for root_index, root_text in enumerate(skill_roots):
+            root = Path(root_text)
+            files = [root] if root.name == "SKILL.md" else list(root.rglob("SKILL.md"))
+            for skill_file in files:
+                try:
+                    content = skill_file.read_bytes()
+                except OSError:
+                    continue
+                content_hash = hashlib.sha256(content).hexdigest()
+                text = content.decode("utf-8", errors="replace")
+                name = _frontmatter_value(text, "name") or skill_file.parent.name
+                version = _frontmatter_value(text, "version")
+                relative = (
+                    "SKILL.md"
+                    if root.name == "SKILL.md"
+                    else skill_file.relative_to(root).as_posix()
+                )
+                runtime_source = (
+                    runtime_sources[root_index]
+                    if runtime_sources and root_index < len(runtime_sources)
+                    else str(root)
+                )
+                runtime_path = f"{runtime_source.rstrip('/')}/{relative}"
+                entry = SkillCatalogEntry(
+                    skill_id=str(skill_file.resolve()),
+                    name=name,
+                    version=version,
+                    content_hash=content_hash,
+                    source=str(skill_file.parent),
+                    scope=agent_name,
+                    runtime_path=runtime_path.replace("\\", "/"),
+                )
+                catalog[entry.skill_id] = entry
+                runtime_map[_normalize_runtime_path(entry.runtime_path)] = entry.skill_id
+                entries.append(entry)
+        if entries:
+            self._record_mechanism(trace_id, {
+                "type": "skill_catalog", "status": "running", "source": "runtime",
+                "agent_name": agent_name, "skill_catalog": entries,
+            })
+
+    def record_skill_activation(
+        self, trace_id: str, agent_name: str, skill_path: str, *, success: bool, error: str | None = None
+    ) -> None:
+        resolved = str(Path(skill_path).resolve())
+        entry = self._skill_catalog.get(trace_id, {}).get(resolved)
+        if entry is None:
+            return
+        self._record_mechanism(trace_id, {
+            "type": "skill_activation", "status": "completed" if success else "failed",
+            "source": "runtime", "agent_name": agent_name, "skill_name": entry.name,
+            "skill_catalog": [entry], "error": error,
+            "skill_activation": {
+                "skill_id": entry.skill_id,
+                "runtime_path": entry.runtime_path,
+                "trigger": "registered_skill_runtime_read",
+            },
+        })
+
+    def record_skill_activation_from_tool(
+        self,
+        trace_id: str,
+        agent_name: str,
+        tool_args: Any,
+        *,
+        success: bool,
+        trigger_event_id: str | None = None,
+        trigger_span_id: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        if not isinstance(tool_args, Mapping):
+            return
+        path = tool_args.get("file_path") or tool_args.get("path")
+        if not isinstance(path, str):
+            return
+        skill_id = (
+            self._skill_runtime_paths.get(trace_id, {})
+            .get(agent_name, {})
+            .get(_normalize_runtime_path(path))
+        )
+        if skill_id is None:
+            return
+        entry = self._skill_catalog.get(trace_id, {}).get(skill_id)
+        if entry is None:
+            return
+        self._record_mechanism(trace_id, {
+            "type": "skill_activation",
+            "status": "completed" if success else "failed",
+            "source": "runtime",
+            "agent_name": agent_name,
+            "skill_name": entry.name,
+            "skill_catalog": [entry],
+            "parent_event_id": trigger_event_id,
+            "span_id": trigger_span_id,
+            "error": error,
+            "skill_activation": {
+                "skill_id": entry.skill_id,
+                "runtime_path": entry.runtime_path,
+                "trigger": "registered_skill_runtime_read",
+                "trigger_event_id": trigger_event_id,
+                "trigger_span_id": trigger_span_id,
+            },
+        })
+
+    def record_middleware_assembly(
+        self,
+        trace_id: str,
+        agent_name: str,
+        middleware: list[Any],
+        *,
+        mount_location: str | None = None,
+    ) -> None:
+        location = mount_location or f"{agent_name}.custom_middleware"
+        stack = [
+            MiddlewareDescriptor(
+                name=item.__class__.__name__,
+                position=index,
+                config_hash=_middleware_config_hash(item),
+                version=_middleware_version(item),
+                mount_location=location,
+            )
+            for index, item in enumerate(middleware)
+        ]
+        self._record_mechanism(trace_id, {
+            "type": "middleware_assembly", "status": "running", "source": "runtime",
+            "agent_name": agent_name, "middleware_stack": stack,
+        })
+
+    def record_intervention(
+        self, trace_id: str, agent_name: str, *, action: str, hook: str,
+        affected_fields: list[str], reason: str | None = None,
+        before: Any | None = None, after: Any | None = None,
+    ) -> None:
+        """只由真实改变控制流的 middleware 分支调用，no-op hook 不得调用。"""
+        event: dict[str, Any] = {
+            "type": "middleware_intervention", "status": "completed", "source": "runtime",
+            "agent_name": agent_name,
+            "intervention": {"action": action, "hook": hook, "affected_fields": affected_fields, "reason": reason},
+        }
+        if before is not None:
+            event["input"] = before
+        if after is not None:
+            event["output"] = after
+        self._record_mechanism(trace_id, event)
+
+    def record_hitl(
+        self,
+        trace_id: str,
+        agent_name: str,
+        *,
+        phase: str,
+        state: str,
+        tool_call_id: str | None = None,
+    ) -> None:
+        self._record_mechanism(trace_id, {
+            "type": "hitl",
+            "status": "awaiting_input" if state == "requested" else "running",
+            "source": "runtime",
+            "agent_name": agent_name,
+            "tool_call_id": tool_call_id,
+            "hitl": {"phase": phase, "state": state},
+        })
+
+    def _record_mechanism(
+        self, trace_id: str, values: dict[str, Any]
+    ) -> TraceLogEvent | None:
+        if _TRACE_OBSERVER_ACTIVE.get():
+            return None
+        token = _TRACE_OBSERVER_ACTIVE.set(True)
+        try:
+            return self.append_event(trace_id, values)
+        except Exception as exc:
+            self._mark_capture_degraded(
+                trace_id, f"mechanism_capture_failed:{values.get('type')}:{type(exc).__name__}"
+            )
+            return None
+        finally:
+            _TRACE_OBSERVER_ACTIVE.reset(token)
+
+    def record_artifact_revision(
+        self, trace_id: str, agent_name: str, *, file_path: str, content: str,
+        tool_name: str | None = None, parent_revision_id: str | None = None,
+        content_hash: str | None = None, tool_call_id: str | None = None,
+    ) -> str:
+        """在写盘成功且回读完成后记录不可变内容版本。"""
+        logical_key = "/" + file_path.replace("\\", "/").lstrip("/")
+        actual_content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if content_hash is not None and content_hash != actual_content_hash:
+            self._mark_capture_degraded(trace_id, "artifact_readback_hash_mismatch")
+            raise ValueError("artifact readback hash mismatch")
+
+        try:
+            store = self._payload_store(trace_id)
+            payload_ref = store.put({"content": content})
+            if store.get(payload_ref.payload_id) != {"content": content}:
+                raise OSError("artifact payload readback mismatch")
+        except (PayloadRejected, OSError, TypeError, ValueError) as exc:
+            self._mark_capture_degraded(
+                trace_id, f"artifact_payload_failed:{type(exc).__name__}"
+            )
+            raise
+
+        with self._artifact_head_lock:
+            heads_path = self._artifact_heads_path(trace_id)
+            heads = self._read_artifact_heads(trace_id, heads_path)
+            previous = heads.get(logical_key) or {}
+            parent_id = parent_revision_id or previous.get("revision_id")
+            revision_id = f"artifact-rev-{uuid4().hex}"
+            event = self.append_event(trace_id, {
+                "type": "artifact_revision", "status": "completed", "source": "runtime",
+                "agent_name": agent_name, "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "artifact_revision_id": revision_id,
+                "artifact": {
+                    "logical_key": logical_key,
+                    "artifact_type": "workspace_file",
+                    "parent_revision_id": parent_id,
+                    "content_hash": actual_content_hash,
+                },
+                "_precomputed_payload_refs": {"output": payload_ref},
+            })
+            self.flush_sync(trace_id)
+            persisted = any(
+                item.event_id == event.event_id
+                and item.payload_refs.get("output") == payload_ref
+                for item in self._read_events(self._run_paths[trace_id])
+            )
+            if not persisted:
+                self._mark_capture_degraded(trace_id, "artifact_revision_event_missing")
+                raise OSError("artifact revision event was not persisted")
+            heads[logical_key] = {
+                "revision_id": revision_id,
+                "content_hash": actual_content_hash,
+            }
+            self._write_artifact_heads(heads_path, heads)
+            return revision_id
+
+    def _artifact_heads_path(self, trace_id: str) -> Path:
+        run_path = self._run_paths.get(trace_id)
+        if run_path is None:
+            raise KeyError(f"Trace path is not registered: {trace_id}")
+        return run_path.parent.parent / "artifact_heads.json"
+
+    def _read_artifact_heads(self, trace_id: str, path: Path) -> dict[str, dict[str, str]]:
+        if not path.exists():
+            return {}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("artifact heads must be an object")
+            return value
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self._mark_capture_degraded(trace_id, f"artifact_heads_invalid:{type(exc).__name__}")
+            raise
+
+    @staticmethod
+    def _write_artifact_heads(path: Path, heads: dict[str, dict[str, str]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(heads, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+            )
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def _read_run_detail(self, thread: ThreadSummary, trace_id: str) -> TraceDetail | None:
         run_data = self._read_run_index(thread).get(trace_id)
         if run_data is None:
@@ -850,7 +1263,7 @@ class TraceRecorder:
         trace_path = Path(thread.workspace_path) / run.path
         if not trace_path.exists():
             raise FileNotFoundError(f"Trace file is missing: {trace_path}")
-        events = self._read_events(trace_path)
+        events = self._read_events(trace_path, hydrate_payloads=True)
         if run.status == "running":
             run.event_count = len(events)
         projection = self._projector.project(run, events)
@@ -862,7 +1275,7 @@ class TraceRecorder:
             todos=projection.todos,
         )
 
-    def _read_events(self, trace_path: Path) -> list[TraceLogEvent]:
+    def _read_events(self, trace_path: Path, *, hydrate_payloads: bool = False) -> list[TraceLogEvent]:
         events_by_id: dict[str, TraceLogEvent] = {}
         with trace_path.open("r", encoding="utf-8") as file:
             for line in file:
@@ -873,8 +1286,21 @@ class TraceRecorder:
                 if event_data.get("type") == "run_link" and event_data.get("source") == "callback":
                     continue
                 event = TraceLogEvent.model_validate(_sanitize_event_data(event_data))
+                if hydrate_payloads and event.payload_refs:
+                    event = self._hydrate_payloads(trace_path, event)
                 events_by_id.setdefault(event.event_id, event)
         return sorted(events_by_id.values(), key=lambda event: (event.timestamp, event.sequence))
+
+    def _hydrate_payloads(self, trace_path: Path, event: TraceLogEvent) -> TraceLogEvent:
+        """仅本地受控详情读取时回填正文，跨服务传输永远保留引用。"""
+        store = ContentAddressedPayloadStore(trace_path.parent.parent / "payloads")
+        values = event.model_dump()
+        for field_name, ref in event.payload_refs.items():
+            try:
+                values[field_name] = store.get(ref.payload_id)
+            except (OSError, ValueError, json.JSONDecodeError):
+                self._mark_capture_degraded(event.trace_id, f"payload_missing:{ref.payload_id}")
+        return TraceLogEvent.model_validate(values)
 
     def _update_index_status(
         self,
@@ -895,7 +1321,7 @@ class TraceRecorder:
         run["status"] = status
         run["event_count"] = self._sequences.get(trace_id, run.get("event_count", 0))
         if error is not None:
-            run["error"] = error
+            run["error"] = self._optional_str(error)
         runs[trace_id] = run
         self._write_index(thread, runs)
 
@@ -907,6 +1333,7 @@ class TraceRecorder:
         duration_ms: int,
         error: str | None,
     ) -> None:
+        safe_error = self._optional_str(error)
         # trace 结束：先把该 trace 残余事件同步落盘，再更新 index/导出摘要/清理内存。
         # 此时该 trace 已停止产生事件，同步 flush 开销可接受且保证数据完整。
         self.flush_sync(trace_id)
@@ -926,17 +1353,69 @@ class TraceRecorder:
             )
             self.flush_sync(trace_id)  # 确保 run_meta 事件落盘
 
-        runs = self._read_run_index(thread)
-        run = runs.get(trace_id)
-        if run is None:
-            raise KeyError(f"Trace run not found in index: {trace_id}")
+        degraded_reasons = self._capture_degraded.get(trace_id, [])
+        if degraded_reasons:
+            self.append_event(
+                trace_id,
+                {
+                    "type": "capture_degraded",
+                    "status": status,
+                    "source": "system",
+                    "input": {"reasons": degraded_reasons},
+                },
+            )
+            self.flush_sync(trace_id)
+
+        try:
+            runs = self._read_run_index(thread)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self._mark_capture_degraded(
+                trace_id, f"run_index_read_failed:{type(exc).__name__}"
+            )
+            runs = {}
+        run = runs.get(trace_id) or dict(
+            (self._run_metadata.get(trace_id) or {}).get("run_summary") or {}
+        )
+        if not run:
+            self._mark_capture_degraded(trace_id, "run_summary_missing")
+            self._cleanup_run_state(trace_id)
+            return
         run["status"] = status
         run["ended_at"] = self._now()
         run["duration_ms"] = duration_ms
         run["event_count"] = self._sequences[trace_id]
-        run["error"] = error
+        run["error"] = safe_error
+        run_snapshot = dict(run.get("run_snapshot") or {})
+        run_snapshot.update(
+            (self._run_metadata.get(trace_id) or {}).get("run_snapshot") or {}
+        )
+        if prompt_versions:
+            run_snapshot["prompt_versions"] = prompt_versions
+        run["run_snapshot"] = run_snapshot
+        manifest: TraceManifest | None = None
+        try:
+            manifest = self._write_manifest(trace_id)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self._mark_capture_degraded(
+                trace_id, f"manifest_write_failed:{type(exc).__name__}"
+            )
+        run["schema_version"] = 2
+        run["integrity_status"] = (
+            "verified"
+            if manifest is not None and not manifest.capture_degraded
+            else "incomplete"
+        )
+        if manifest is not None:
+            run["manifest"] = manifest.model_dump(mode="json")
+        else:
+            run.pop("manifest", None)
         runs[trace_id] = run
-        self._write_index(thread, runs)
+        try:
+            self._write_index(thread, runs)
+        except OSError as exc:
+            self._mark_capture_degraded(
+                trace_id, f"run_index_write_failed:{type(exc).__name__}"
+            )
 
         # 导出模型可读的执行记录摘要（包括失败的 trace）
         self._export_summary(thread, trace_id, run)
@@ -958,7 +1437,7 @@ class TraceRecorder:
             trace_path = Path(thread.workspace_path) / str(run_data["path"])
             if not trace_path.exists():
                 return
-            events = self._read_events(trace_path)
+            events = self._read_events(trace_path, hydrate_payloads=True)
             run_summary = TraceRunSummary.model_validate(run_data)
             projection = self._projector.project(run_summary, events)
             detail = TraceDetail(
@@ -991,6 +1470,8 @@ class TraceRecorder:
         summary_path = trace_path.with_name(f"{trace_id}_summary.json")
         if summary_path.exists():
             summary_path.unlink()
+        manifest_path = trace_path.with_name(f"{trace_id}.manifest.json")
+        manifest_path.unlink(missing_ok=True)
         del runs[trace_id]
         self._cleanup_run_state(trace_id)
 
@@ -1005,6 +1486,39 @@ class TraceRecorder:
         # task 注册兜底清理：正常路径 generate_stream finally 已 unregister，
         # 这里是极端兜底（finally 未执行 / 进程内异常路径）。
         self._run_tasks.pop(trace_id, None)
+        self._capture_degraded.pop(trace_id, None)
+        self._skill_catalog.pop(trace_id, None)
+        self._skill_runtime_paths.pop(trace_id, None)
+
+    def _write_manifest(self, trace_id: str) -> TraceManifest:
+        run_path = self._run_paths.get(trace_id)
+        if run_path is None:
+            raise KeyError(f"Trace path is not registered: {trace_id}")
+        events = self._read_events(run_path)
+        terminal = next(
+            (event for event in reversed(events) if event.type in {"run_end", "run_error", "run_cancelled"}),
+            None,
+        )
+        if terminal is None:
+            raise ValueError(f"Trace {trace_id} has no terminal event")
+        payload_ids = sorted({ref.payload_id for event in events for ref in event.payload_refs.values()})
+        manifest = TraceManifest(
+            trace_id=trace_id,
+            final_sequence=max(event.sequence for event in events),
+            terminal_event_id=terminal.event_id,
+            events_hash=compute_trace_events_hash(events),
+            payload_ids=payload_ids,
+            capture_degraded=bool(self._capture_degraded.get(trace_id)),
+            created_at=self._now(),
+        )
+        manifest_path = run_path.with_name(f"{trace_id}.manifest.json")
+        temporary = manifest_path.with_suffix(".tmp")
+        try:
+            temporary.write_text(manifest.model_dump_json(), encoding="utf-8")
+            temporary.replace(manifest_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return manifest
 
     def _read_run_index(self, thread: ThreadSummary) -> dict[str, dict[str, Any]]:
         index_path = self._index_path(thread)
@@ -1024,8 +1538,14 @@ class TraceRecorder:
     def _write_index(self, thread: ThreadSummary, runs: dict[str, dict[str, Any]]) -> None:
         index_path = self._index_path(thread)
         index_path.parent.mkdir(parents=True, exist_ok=True)
-        with index_path.open("w", encoding="utf-8") as file:
-            json.dump(runs, file, ensure_ascii=False, indent=2)
+        temporary = index_path.with_name(f".{index_path.name}.{uuid4().hex}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(runs, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            temporary.replace(index_path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _index_path(self, thread: ThreadSummary) -> Path:
         return Path(thread.workspace_path) / "traces" / "index.json"
@@ -1052,9 +1572,57 @@ class TraceRecorder:
         return datetime.now(UTC).isoformat()
 
     def _optional_str(self, value: Any) -> str | None:
-        if value is None:
-            return None
-        return str(value)
+        return sanitize_structural_text(value)
+
+
+def _frontmatter_value(content: str, key: str) -> str | None:
+    match = re.search(rf"^\s*{re.escape(key)}\s*:\s*['\"]?([^'\"\n]+)", content, re.MULTILINE)
+    return match.group(1).strip() if match else None
+
+
+def _normalize_runtime_path(path: str) -> str:
+    normalized = path.replace("\\", "/").rstrip("/")
+    if normalized and not normalized.startswith("/") and ":" not in normalized:
+        normalized = f"/{normalized}"
+    return normalized
+
+
+def _middleware_config_hash(middleware: Any) -> str:
+    config: dict[str, Any] = {}
+    forbidden = ("key", "secret", "token", "password", "cookie", "authorization")
+    for key, value in sorted(vars(middleware).items()):
+        if key.startswith("_") or any(part in key.lower() for part in forbidden):
+            continue
+        if value is None or isinstance(value, bool | int | float | str):
+            config[key] = value
+        elif isinstance(value, Path):
+            config[key] = str(value)
+        elif isinstance(value, (list, tuple, set)) and all(
+            item is None or isinstance(item, bool | int | float | str) for item in value
+        ):
+            config[key] = sorted(value) if isinstance(value, set) else list(value)
+        else:
+            config[key] = f"<{value.__class__.__module__}.{value.__class__.__name__}>"
+    encoded = json.dumps(config, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _middleware_version(middleware: Any) -> str | None:
+    module_name = middleware.__class__.__module__
+    root_package = module_name.split(".", 1)[0]
+    distributions = importlib.metadata.packages_distributions().get(root_package, [])
+    for distribution in distributions:
+        try:
+            return importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    try:
+        source_path = inspect.getsourcefile(middleware.__class__)
+        if source_path:
+            return f"source:{hashlib.sha256(Path(source_path).read_bytes()).hexdigest()[:12]}"
+    except (OSError, TypeError):
+        pass
+    return None
 
 
 def _is_deliverable_tool(tool_name: str) -> bool:
@@ -1084,8 +1652,10 @@ def _preserve_deliverable_args(tool_name: str | None, tool_args: Any) -> Any:
 def _sanitize_event_data(event_data: dict[str, Any]) -> dict[str, Any]:
     event_type = str(event_data.get("type") or "")
     sanitized = dict(event_data)
-    if event_type.startswith("llm"):
-        pass  # input 保留：包含模型完整输入（系统提示词、注入上下文、对话历史）
+    if event_type.startswith("llm") and int(event_data.get("schema_version") or 1) < 2:
+        # Legacy inline model inputs never passed through PayloadGate and cannot
+        # be treated as governed content during compatibility reads.
+        sanitized.pop("input", None)
     # 交付物工具的 args 保留（write_file/edit_file 的 content，决策 E15/E20），
     # 让 trace 含交付物正文 + 中间版本，评估子代理可从 trace 读正文。
     # 其余工具的 args 仍清空（控制体积，实测 write_file 全部仅占 trace 0.5%）。
@@ -1140,7 +1710,7 @@ def _notify_evolution(
     thread: "ThreadSummary",
     trace_id: str,
     status: str,
-    run: dict[str, Any],
+    run: dict[str, Any] | None,
 ) -> None:
     """trace 结束后通知监测服务摄入。
 
@@ -1158,7 +1728,12 @@ def _notify_evolution(
 
         # 桌面化改造（2026-07-07）：内网通知带 X-Notify-Token（evolution NotifyTokenMiddleware 校验）
         notify_token = get_settings().evolution_notify_token
-        headers = {"X-Notify-Token": notify_token} if notify_token else None
+        headers: dict[str, str] = {}
+        if notify_token:
+            headers["X-Notify-Token"] = notify_token
+        traceparent = ((run or {}).get("external_refs") or {}).get("traceparent")
+        if traceparent:
+            headers["traceparent"] = str(traceparent)
 
         httpx.post(
             url,
@@ -1168,7 +1743,7 @@ def _notify_evolution(
                 # 改调 GET /internal/traces/{trace_id} 拉内容）。
                 "status": status,
             },
-            headers=headers,
+            headers=headers or None,
             timeout=_EVOLUTION_NOTIFY_TIMEOUT,
         )
     except Exception:

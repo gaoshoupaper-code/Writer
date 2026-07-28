@@ -30,15 +30,21 @@ import app.core.db as db  # noqa: E402
 from app.core.settings import settings  # noqa: E402
 from app.main import app  # noqa: E402
 
+_old_db = settings.evolution_db
+
 
 def setUpModule() -> None:
     """模块级初始化：重置连接 + 建表。"""
+    settings.evolution_db = _tmp_db.name
     db._conn = None
     db.init_db()
 
 
 def tearDownModule() -> None:
+    if db._conn is not None:
+        db._conn.close()
     db._conn = None
+    settings.evolution_db = _old_db
     try:
         os.unlink(_tmp_db.name)
     except OSError:

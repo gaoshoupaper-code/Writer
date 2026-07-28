@@ -192,6 +192,15 @@ def get_trace_content(
     return TraceContentResponse(run=run, events=events)
 
 
+@router.get("/traces/{trace_id}/payloads/{payload_id}")
+def get_trace_payload(trace_id: str, payload_id: str) -> Any:
+    """受信任的 evolution 拉取入口；终端用户永远不直接访问正文。"""
+    try:
+        return get_trace_recorder().read_payload(trace_id, payload_id)
+    except (KeyError, FileNotFoundError, ValueError):
+        raise HTTPException(status_code=404, detail="trace payload not found")
+
+
 @router.get("/traces", response_model=TraceListResponse)
 def list_traces(since: str = Query("", description="ISO 时间戳，只返回此时间之后的 trace")) -> TraceListResponse:
     """列出近期 trace（evolution scan 兜底用）。

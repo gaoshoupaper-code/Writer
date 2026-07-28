@@ -50,6 +50,8 @@ from app.promote.api import router as promote_router
 from app.promote.scheduler import start_judge_scheduler
 from app.benchmark.api import router as benchmark_router
 from app.trace.recorder import EvolutionTraceRecorder
+from app.trace_payloads import start_payload_lifecycle_scheduler
+from app.view.workbenches import router as trace_workbenches_router
 
 
 @asynccontextmanager
@@ -62,6 +64,7 @@ async def lifespan(app: FastAPI):
     start_judge_scheduler()
     # 用户映射同步：定时从 executor 拉取用户列表 → user_cache 表（trace 历史列表展示用户名）
     start_user_sync_scheduler()
+    start_payload_lifecycle_scheduler()
 
     # D5/D8：创建 recorder 单例 + 崩溃恢复 + 启动 drain + 心跳扫描。
     # 顺序保证：init_db 先于 recorder（recorder 写 DB 依赖表已建）。
@@ -118,6 +121,7 @@ app.add_middleware(NotifyTokenMiddleware)
 # API 路由统一挂 /api 前缀，避免与页面路由（/、/traces、/rules）冲突
 app.include_router(ingestion_router, prefix="/api")
 app.include_router(traces_router, prefix="/api")
+app.include_router(trace_workbenches_router, prefix="/api")
 app.include_router(stats_router, prefix="/api")
 app.include_router(users_router, prefix="/api")
 app.include_router(snapshot_router, prefix="/api")

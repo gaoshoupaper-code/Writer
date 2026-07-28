@@ -10,11 +10,13 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 
 import app.core.db as db
 from app.ingestion import projector
+from app.trace_payloads import delete_trace_payloads, hydrate_event, read_payload
+from app.trace.access import audit_content_access, require_full_content_access
 from app.core.models import (
     TraceContextSegment,
     TraceDetail,
@@ -25,6 +27,16 @@ from app.core.models import (
 )
 
 router = APIRouter(tags=["traces"])
+
+
+def _require_full_content_access(request: Request) -> None:
+    require_full_content_access(request)
+
+
+def _audit_content_access(
+    request: Request, action: str, object_type: str, object_id: str
+) -> None:
+    audit_content_access(request, action, object_type, object_id)
 
 
 class TraceDetailLite(BaseModel):
@@ -57,6 +69,14 @@ class TraceListItem(BaseModel):
     owner_user_id: str = "unknown"   # 归属用户 ID（Phase 3 D16）
     owner_username: str | None = None   # 用户名（LEFT JOIN user_cache，映射不到时 None）
     run_purpose: str = "user_generation"   # trace 来源（D2：区分执行端/进化端）
+    schema_version: int = 1
+    service: str | None = None
+    workload: str | None = None
+    integrity_status: str = "legacy"
+    coverage: dict[str, str] = Field(default_factory=dict)
+    skill_activation_count: int = 0
+    middleware_intervention_count: int = 0
+    hitl_count: int = 0
 
 
 class TraceListResponse(BaseModel):
@@ -74,6 +94,8 @@ def list_traces(
     status: str | None = Query(None, description="按 status 过滤"),
     owner: str | None = Query(None, description="按 owner_user_id 过滤（D16 防串户）"),
     run_purpose: str | None = Query(None, description="按 run_purpose 过滤（evolution_eval/evolution_evolve/user_generation）"),
+    workload: str | None = Query(None, description="按 V2 workload 过滤"),
+    integrity_status: str | None = Query(None, description="按 Trace 完整性过滤"),
     since: str | None = Query(None, description="ISO 8601 时间戳，只返回 started_at >= since 的 trace"),
     until: str | None = Query(None, description="ISO 8601 时间戳，只返回 started_at <= until 的 trace"),
     limit: int = Query(50, ge=1, le=500),
@@ -99,6 +121,12 @@ def list_traces(
     if run_purpose:
         where.append("r.run_purpose = ?")
         params.append(run_purpose)
+    if workload:
+        where.append("r.workload = ?")
+        params.append(workload)
+    if integrity_status:
+        where.append("r.integrity_status = ?")
+        params.append(integrity_status)
     if owner:
         where.append("r.owner_user_id = ?")
         params.append(owner)
@@ -118,7 +146,15 @@ def list_traces(
     total = total_row["c"] if total_row else 0
 
     rows = db.query_all(
-        f"""SELECT r.*, uc.username AS owner_username
+        f"""SELECT r.*, uc.username AS owner_username,
+                   (SELECT COUNT(*) FROM event_payloads e
+                    WHERE e.trace_id=r.trace_id AND e.type='skill_activation')
+                       AS skill_activation_count,
+                   (SELECT COUNT(*) FROM event_payloads e
+                    WHERE e.trace_id=r.trace_id AND e.type='middleware_intervention')
+                       AS middleware_intervention_count,
+                   (SELECT COUNT(*) FROM event_payloads e
+                    WHERE e.trace_id=r.trace_id AND e.type='hitl') AS hitl_count
             FROM runs r
             LEFT JOIN user_cache uc ON r.owner_user_id = uc.user_id
             {where_sql}
@@ -137,6 +173,14 @@ def list_traces(
                 owner_user_id=r.get("owner_user_id") or "unknown",
                 owner_username=r.get("owner_username"),
                 run_purpose=r.get("run_purpose") or "user_generation",
+                schema_version=int(r.get("schema_version") or 1),
+                service=r.get("service"),
+                workload=r.get("workload"),
+                integrity_status=r.get("integrity_status") or "legacy",
+                coverage=json.loads(r.get("coverage_json") or "{}"),
+                skill_activation_count=int(r.get("skill_activation_count") or 0),
+                middleware_intervention_count=int(r.get("middleware_intervention_count") or 0),
+                hitl_count=int(r.get("hitl_count") or 0),
             )
             for r in rows
         ],
@@ -158,12 +202,29 @@ def load_trace_detail(trace_id: str) -> TraceDetail | None:
     if run_row is None:
         return None
     run = _run_summary_from_row(run_row)
-    events = _reconstruct_incremental_inputs(_load_events(trace_id))
+    events = _reconstruct_incremental_inputs([hydrate_event(event) for event in _load_events(trace_id)])
     projection = projector.TraceProjector().project(run, events)
     return TraceDetail(
         run=run, events=events,
         nodes=projection.nodes, context=projection.context,
         todos=projection.todos,
+    )
+
+
+def load_trace_structure(trace_id: str) -> TraceDetail | None:
+    """Project reference-only events without reading governed payload bodies."""
+    run_row = db.query_one("SELECT * FROM runs WHERE trace_id = ?", (trace_id,))
+    if run_row is None:
+        return None
+    run = _run_summary_from_row(run_row)
+    events = [_structural_event(event) for event in _load_events(trace_id)]
+    projection = projector.TraceProjector().project(run, events)
+    return TraceDetail(
+        run=run,
+        events=events,
+        nodes=projection.nodes,
+        context=[],
+        todos=[],
     )
 
 
@@ -176,7 +237,7 @@ def get_trace(trace_id: str) -> TraceDetailLite:
 
     内部加载委托给 load_trace_detail（复用完整加载逻辑），此处收窄成 Lite。
     """
-    detail = load_trace_detail(trace_id)
+    detail = load_trace_structure(trace_id)
     if detail is None:
         raise HTTPException(status_code=404, detail="Trace not found")
     return TraceDetailLite(
@@ -186,6 +247,7 @@ def get_trace(trace_id: str) -> TraceDetailLite:
 
 @router.get("/traces/{trace_id}/events", response_model=list[TraceLogEvent])
 def get_trace_events(
+    request: Request,
     trace_id: str,
     event_ids: str = Query(..., description="逗号分隔的 event_id 列表"),
 ) -> list[TraceLogEvent]:
@@ -197,6 +259,7 @@ def get_trace_events(
     run_row = db.query_one("SELECT * FROM runs WHERE trace_id = ?", (trace_id,))
     if run_row is None:
         raise HTTPException(status_code=404, detail="Trace not found")
+    _require_full_content_access(request)
 
     id_list = [eid.strip() for eid in event_ids.split(",") if eid.strip()]
     if not id_list:
@@ -211,7 +274,7 @@ def get_trace_events(
     if not rows:
         return []
 
-    events = [TraceLogEvent.model_validate(json.loads(r["payload_json"])) for r in rows]
+    events = [hydrate_event(TraceLogEvent.model_validate(json.loads(r["payload_json"]))) for r in rows]
 
     # 增量重建（只针对本次拉取的事件集——但如果需要完整重建，
     # 前端应拉全链事件。这里对拉取的 llm_start 做单条重建降级处理）
@@ -220,14 +283,16 @@ def get_trace_events(
     )
     if has_incremental:
         # 需要全链重建：加载该 trace 所有事件做批量重建，再筛出请求的
-        all_events = _reconstruct_incremental_inputs(_load_events(trace_id))
+        all_events = _reconstruct_incremental_inputs([hydrate_event(event) for event in _load_events(trace_id)])
         wanted = {eid for eid in id_list}
-        return [e for e in all_events if e.event_id in wanted]
+        events = [e for e in all_events if e.event_id in wanted]
+    _audit_content_access(request, "view", "trace_events", trace_id)
     return events
 
 
 @router.get("/traces/{trace_id}/context", response_model=TraceContextSegment)
 def get_trace_context(
+    request: Request,
     trace_id: str,
     anchor_id: str = Query(..., description="context segment 的 anchor_id"),
 ) -> TraceContextSegment:
@@ -239,14 +304,16 @@ def get_trace_context(
     run_row = db.query_one("SELECT * FROM runs WHERE trace_id = ?", (trace_id,))
     if run_row is None:
         raise HTTPException(status_code=404, detail="Trace not found")
+    _require_full_content_access(request)
 
     # context 在投影时产出，没有单独的表——需要投影后按 anchor_id 筛选。
     # 对大 trace 这仍有开销，但只在用户主动打开抽屉时触发（非首屏）。
-    events = _reconstruct_incremental_inputs(_load_events(trace_id))
+    events = _reconstruct_incremental_inputs([hydrate_event(event) for event in _load_events(trace_id)])
     run = _run_summary_from_row(run_row)
     projection = projector.TraceProjector().project(run, events)
     for seg in projection.context:
         if seg.anchor_id == anchor_id:
+            _audit_content_access(request, "view", "trace_context", trace_id)
             return seg
     raise HTTPException(status_code=404, detail="Context segment not found")
 
@@ -257,11 +324,80 @@ def delete_trace(trace_id: str) -> dict[str, str]:
     # 证据卷宗是逻辑外键（无物理 FK），需显式级联删除——证据卷宗冻结了用户需求和正文，
     # 删除原 trace 时必须一并清理，避免冻结内容脱离原 trace 留存（需求 D-删除语义）。
     # 阶段 F 会强化：同步删评估卷宗、纠错裁决、未发布进化记录。
+    delete_trace_payloads(trace_id)
     db.execute("DELETE FROM evidence_dossiers WHERE trace_id = ?", (trace_id,))
     cur = db.execute("DELETE FROM runs WHERE trace_id = ?", (trace_id,))
     if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="Trace not found")
     return {"status": "ok", "deleted": trace_id}
+
+
+class PayloadSearchMatch(BaseModel):
+    payload_id: str
+    trace_ids: list[str]
+    excerpt: str
+
+
+@router.get("/trace-content/payloads/{payload_id}")
+def get_trace_payload_body(payload_id: str, request: Request) -> Any:
+    _require_full_content_access(request)
+    payload = read_payload(payload_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Payload not found or expired")
+    _audit_content_access(request, "view", "payload", payload_id)
+    return payload
+
+
+@router.get("/trace-content/search", response_model=list[PayloadSearchMatch])
+def search_trace_payloads(
+    request: Request,
+    q: str = Query(..., min_length=2, max_length=200),
+    limit: int = Query(50, ge=1, le=100),
+) -> list[PayloadSearchMatch]:
+    """Explicit super-admin search; payload text is never copied into a hot index."""
+    _require_full_content_access(request)
+    rows = db.query_all(
+        """SELECT payload_id FROM payload_objects
+           WHERE deleted_at IS NULL AND (expires_at IS NULL OR expires_at > ?)
+           ORDER BY created_at DESC""",
+        (datetime.now(UTC).isoformat(),),
+    )
+    matches: list[PayloadSearchMatch] = []
+    needle = q.casefold()
+    for row in rows:
+        value = read_payload(row["payload_id"])
+        if value is None:
+            continue
+        rendered = json.dumps(value, ensure_ascii=False)
+        index = rendered.casefold().find(needle)
+        if index < 0:
+            continue
+        trace_rows = db.query_all(
+            "SELECT DISTINCT trace_id FROM trace_payload_links WHERE payload_id=?",
+            (row["payload_id"],),
+        )
+        start = max(0, index - 120)
+        matches.append(
+            PayloadSearchMatch(
+                payload_id=row["payload_id"],
+                trace_ids=[item["trace_id"] for item in trace_rows],
+                excerpt=rendered[start : index + len(q) + 120],
+            )
+        )
+        if len(matches) >= limit:
+            break
+    _audit_content_access(request, "search", "payload", "query")
+    return matches
+
+
+@router.get("/trace-content/traces/{trace_id}/export")
+def export_trace_content(trace_id: str, request: Request) -> dict[str, Any]:
+    _require_full_content_access(request)
+    detail = load_trace_detail(trace_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Trace not found")
+    _audit_content_access(request, "export", "trace", trace_id)
+    return detail.model_dump(mode="json")
 
 
 # ── trace 稳定性重构（设计 20260720_203000）：Pull 模式三接口 ──────────────
@@ -307,7 +443,7 @@ def get_trace_events_since(
     events: list[TraceLogEvent] = []
     max_seq = since_seq
     for r in rows:
-        evt = TraceLogEvent.model_validate(json.loads(r["payload_json"]))
+        evt = _structural_event(TraceLogEvent.model_validate(json.loads(r["payload_json"])))
         events.append(evt)
         if evt.sequence > max_seq:
             max_seq = evt.sequence
@@ -474,6 +610,15 @@ def _run_summary_from_row(run_row: Any) -> TraceRunSummary:
         path="", error=run_row["error"],
         last_heartbeat_at=_row_get(run_row, "last_heartbeat_at"),
         interrupted_reason=_row_get(run_row, "interrupted_reason"),
+        schema_version=int(_row_get(run_row, "schema_version", 1) or 1),
+        service=_row_get(run_row, "service"),
+        workload=_row_get(run_row, "workload"),
+        purpose=_row_get(run_row, "run_purpose"),
+        integrity_status=_row_get(run_row, "integrity_status", "legacy") or "legacy",
+        coverage=json.loads(_row_get(run_row, "coverage_json", "{}") or "{}"),
+        run_snapshot=json.loads(_row_get(run_row, "run_snapshot_json", "{}") or "{}"),
+        links=json.loads(_row_get(run_row, "links_json", "[]") or "[]"),
+        external_refs=json.loads(_row_get(run_row, "external_refs_json", "{}") or "{}"),
     )
 
 
@@ -500,6 +645,21 @@ def _load_events(trace_id: str) -> list[TraceLogEvent]:
         (trace_id,),
     )
     return [TraceLogEvent.model_validate(json.loads(r["payload_json"])) for r in rows]
+
+
+def _structural_event(event: TraceLogEvent) -> TraceLogEvent:
+    """Remove both V2 references' bodies and legacy inline semantic content."""
+    values = event.model_dump()
+    for field_name in ("input", "output", "tool_args", "tool_output"):
+        values[field_name] = None
+    if isinstance(values.get("tool_calls"), list):
+        values["tool_calls"] = [
+            {key: value for key, value in call.items() if key != "args"}
+            if isinstance(call, dict)
+            else call
+            for call in values["tool_calls"]
+        ]
+    return TraceLogEvent.model_validate(values)
 
 
 def _reconstruct_incremental_inputs(events: list[TraceLogEvent]) -> list[TraceLogEvent]:

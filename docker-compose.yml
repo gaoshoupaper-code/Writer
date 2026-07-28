@@ -81,9 +81,8 @@ services:
       # 数据库路径指向 volume（data/evolution.db），否则默认 evolution.db 解析到
       # 工作目录（非 volume），每次重建镜像就丢 llm_configs 等数据。
       - EVOLUTION_DB=data/evolution.db
-      # 证据卷宗编译（2026-07-27）：读取 executor workspace 冻结交付物正文 +
-      # demand.md 任务契约。挂载点见下方 volumes（executor_data 只读）。
-      # 覆盖 evolution/.env 里的相对路径（那是 trace 走 HTTP 时代的遗留）。
+      # V1 legacy 兼容：旧评估提取器仍需只读 workspace；Trace V2 卷宗只从
+      # ArtifactRevision 和受治理 Payload 读取，绝不从可变 workspace 补造历史。
       - EXECUTOR_WORKSPACE=/app/executor/data/workspace
       # 桌面化鉴权（2026-07-07）：SSO 白名单 + 内网通知 token + 加密主密钥。
       # 这三项是安全关键，不写在 .env（避免随源码泄露），由 compose environment 注入。
@@ -99,8 +98,8 @@ services:
       # 共享 harness（与 executor 同一份）
       - harness_data:/app/evolution/harnesses
       - harness_git:/app/evolution/harness.git
-      # 证据卷宗编译（2026-07-27）：只读挂载 executor workspace，读交付物正文 +
-      # demand.md。evolution 不写 workspace（:ro），产物真源仍在 executor。
+      # 仅供 V1 legacy reader 只读兼容；V2 的不可变制品和 Payload 在 evolution_data。
+      # evolution 不写 workspace（:ro），产物真源仍在 executor。
       - executor_data:/app/executor/data:ro
     # 对齐 executor 模式（expose + nginx location）。
     expose:

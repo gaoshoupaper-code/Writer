@@ -11,9 +11,13 @@ import type {
   FailurePattern,
   TraceLogEvent,
   TraceContextSegment,
-  WorkspaceNovelContent,
-  WorkspaceStorylineContent,
-  WorkspaceStorylineGraphContent,
+  ArtifactRevisionContentResponse,
+  ArtifactRevisionListResponse,
+  LineageObjectType,
+  LineageResponse,
+  TraceIntegrityStatus,
+  TraceWorkload,
+  WorkloadProfilesResponse,
 } from "@/lib/types";
 
 // 统一类型从 lib/types.ts 引用（trace 移植后对齐）
@@ -380,6 +384,8 @@ export async function getActiveRuns(): Promise<ActiveRun[]> {
 export async function getTraces(params?: {
   status?: string;
   run_purpose?: string;
+  workload?: TraceWorkload;
+  integrity_status?: TraceIntegrityStatus;
   owner?: string;
   since?: string;
   until?: string;
@@ -389,6 +395,8 @@ export async function getTraces(params?: {
   const qs = new URLSearchParams();
   if (params?.status) qs.set("status", params.status);
   if (params?.run_purpose) qs.set("run_purpose", params.run_purpose);
+  if (params?.workload) qs.set("workload", params.workload);
+  if (params?.integrity_status) qs.set("integrity_status", params.integrity_status);
   if (params?.owner) qs.set("owner", params.owner);
   if (params?.since) qs.set("since", params.since);
   if (params?.until) qs.set("until", params.until);
@@ -396,6 +404,38 @@ export async function getTraces(params?: {
   if (params?.offset) qs.set("offset", String(params.offset));
   const q = qs.toString();
   return evoJson<TraceListResponse>(`/api/traces${q ? "?" + q : ""}`, { method: "GET" });
+}
+
+export async function getLineage(
+  objectType: LineageObjectType,
+  objectId: string,
+): Promise<LineageResponse> {
+  return evoJson<LineageResponse>(
+    `/api/lineage/${encodeURIComponent(objectType)}/${encodeURIComponent(objectId)}`,
+    { method: "GET" },
+  );
+}
+
+export async function getWorkloadProfiles(hours = 720): Promise<WorkloadProfilesResponse> {
+  return evoJson<WorkloadProfilesResponse>(`/api/analysis/profiles?hours=${hours}`, { method: "GET" });
+}
+
+export async function getTraceArtifactRevisions(
+  traceId: string,
+): Promise<ArtifactRevisionListResponse> {
+  return evoJson<ArtifactRevisionListResponse>(
+    `/api/traces/${encodeURIComponent(traceId)}/artifact-revisions`,
+    { method: "GET" },
+  );
+}
+
+export async function getArtifactRevisionContent(
+  revisionId: string,
+): Promise<ArtifactRevisionContentResponse> {
+  return evoJson<ArtifactRevisionContentResponse>(
+    `/api/artifacts/revisions/${encodeURIComponent(revisionId)}/content`,
+    { method: "GET" },
+  );
 }
 
 /** 用户缓存列表（trace 历史页用户筛选下拉用） */
@@ -432,25 +472,6 @@ export async function getTraceContext(
     `/api/traces/${traceId}/context?anchor_id=${encodeURIComponent(anchorId)}`,
     { method: "GET" },
   );
-}
-
-// ── Workspace 产物（trace 详情页「产物」tab 直调 executor）──
-// 走 apiJson（不加 /evolution-api 前缀），session cookie 由 Tauri 共享 cookie jar 自动带。
-// 调用方需确保当前登录用户是该 workspace 的 owner，否则 executor 返 403。
-
-/** 读取 workspace 的全部正文（chapter/*.md）。 */
-export async function getWorkspaceNovel(workspaceId: string): Promise<WorkspaceNovelContent> {
-  return apiJson<WorkspaceNovelContent>(`/api/workspaces/${workspaceId}/novel`, { method: "GET" });
-}
-
-/** 读取故事线索引 + 各线详情（storyline.md + storyline/*.md）。 */
-export async function getWorkspaceStoryline(workspaceId: string): Promise<WorkspaceStorylineContent> {
-  return apiJson<WorkspaceStorylineContent>(`/api/workspaces/${workspaceId}/storyline`, { method: "GET" });
-}
-
-/** 读取故事线流程图（storyline_graph.md，读取时按需重生成）。 */
-export async function getWorkspaceStorylineGraph(workspaceId: string): Promise<WorkspaceStorylineGraphContent> {
-  return apiJson<WorkspaceStorylineGraphContent>(`/api/workspaces/${workspaceId}/storyline-graph`, { method: "GET" });
 }
 
 // ── trace 稳定性重构（Pull 模式新接口，设计 20260720_203000）──

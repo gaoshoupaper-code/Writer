@@ -73,6 +73,9 @@ class MetaReadOnlyMiddleware(AgentMiddleware):
     其他工具调用放行。
     """
 
+    def __init__(self, intervention_callback: Callable[..., None] | None = None) -> None:
+        self.intervention_callback = intervention_callback
+
     def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
         """拦截同步工具调用：写入工具 → 引导提示；否则放行。"""
         blocked = self._block_if_write(request)
@@ -100,7 +103,23 @@ class MetaReadOnlyMiddleware(AgentMiddleware):
         if isinstance(args, dict):
             raw_path = str(args.get("file_path") or "")
         subagent = _resolve_subagent(raw_path)
+        self._emit_intervention("block", reason="meta_agent_read_only")
+        if subagent:
+            self._emit_intervention("route", reason=subagent.split("（", 1)[0])
         return _tool_error(tool_name, tool_call_id, raw_path, subagent)
+
+    def _emit_intervention(self, action: str, *, reason: str) -> None:
+        if self.intervention_callback is None:
+            return
+        try:
+            self.intervention_callback(
+                action=action,
+                hook="wrap_tool_call",
+                affected_fields=["control_flow", "tool_call"],
+                reason=reason,
+            )
+        except Exception:
+            pass
 
 
 # ======================================================================

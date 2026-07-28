@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,9 @@ from typing import Any
 import app.core.db as db
 from app.ingestion import loader, projector
 from app.core.models import TraceLogEvent, TraceNode, TraceRunSummary, TraceUsage
+from contracts.trace import compute_trace_events_hash
+from contracts.trace.payload import ContentAddressedPayloadStore, PayloadRejected
+from app.core.settings import settings
 
 
 def ingest_trace(trace_path: Path, workspace_id_hint: str | None = None) -> str | None:
@@ -38,6 +42,8 @@ def ingest_events(
     trace_path: Path | None = None,
     prior_events: list[TraceLogEvent] | None = None,
     run_status_hint: str | None = None,
+    run_summary_hint: TraceRunSummary | None = None,
+    payload_values: dict[str, Any] | None = None,
 ) -> str | None:
     """摄入已解析的事件列表：投影 + 入库（Phase 3 HTTP 拉取入口）。
 
@@ -55,10 +61,10 @@ def ingest_events(
     Returns:
         摄入的 trace_id；若无有效事件则返回 None。
     """
-    # 合并旧事件（增量场景）：按 sequence 去重，旧+新合并后排序
+    # 合并旧事件（增量场景）：event_id 是幂等键，sequence 只用于连续性校验。
     if prior_events:
-        seen = {e.sequence for e in events}
-        merged = list(events) + [e for e in prior_events if e.sequence not in seen]
+        seen = {e.event_id for e in events}
+        merged = list(events) + [e for e in prior_events if e.event_id not in seen]
         all_events = sorted(merged, key=lambda e: e.sequence)
     else:
         all_events = events
@@ -70,14 +76,46 @@ def ingest_events(
         all_events, trace_path, workspace_id_hint, run_status_hint
     )
 
-    # 幂等：同 trace_id 重复摄入先删旧记录（trace_flags/nodes/events 随 ON DELETE CASCADE）
-    db.execute("DELETE FROM runs WHERE trace_id = ?", (run.trace_id,))
+    if run_summary_hint is not None:
+        run.schema_version = run_summary_hint.schema_version
+        run.service = run_summary_hint.service
+        run.workload = run_summary_hint.workload
+        run.purpose = run_summary_hint.purpose
+        run.coverage = run_summary_hint.coverage
+        run.run_snapshot = run_summary_hint.run_snapshot
+        run.links = run_summary_hint.links
+        run.external_refs = run_summary_hint.external_refs
+        run.manifest = run_summary_hint.manifest
 
-    # ingested_seq = 已处理的最大 sequence（高水位，D7）
-    ingested_seq = max(e.sequence for e in all_events)
-    _write_run(run, owner_user_id, ingested_seq)
-    _write_events(run.trace_id, all_events)
-    _write_nodes(run.trace_id, run, all_events)
+    with db.transaction() as conn:
+        # event_payloads 外键指向 runs；先建立 provisional run，最终完整性同事务回写。
+        _write_run(conn, run, owner_user_id, 0)
+        conflicts = _write_events(conn, run.trace_id, all_events)
+        canonical_events = _load_canonical_events(conn, run.trace_id)
+        run, owner_user_id = _derive_run_summary(
+            canonical_events, trace_path, workspace_id_hint, run_status_hint
+        )
+        if run_summary_hint is not None:
+            run.schema_version = run_summary_hint.schema_version
+            run.service = run_summary_hint.service
+            run.workload = run_summary_hint.workload
+            run.purpose = run_summary_hint.purpose
+            run.coverage = run_summary_hint.coverage
+            run.run_snapshot = run_summary_hint.run_snapshot
+            run.links = run_summary_hint.links
+            run.external_refs = run_summary_hint.external_refs
+            run.manifest = run_summary_hint.manifest
+        payload_complete = _store_payload_metadata(
+            conn, run.trace_id, canonical_events, payload_values or {}
+        )
+        _materialize_artifact_revisions(conn, run, canonical_events)
+        receipt = _upsert_receipt(
+            conn, run, canonical_events, conflicts, payload_complete
+        )
+        run.integrity_status = receipt["integrity_status"]
+        _write_run(conn, run, owner_user_id, receipt["contiguous_seq"])
+        conn.execute("DELETE FROM nodes WHERE trace_id = ?", (run.trace_id,))
+        _write_nodes(conn, run.trace_id, run, canonical_events)
 
     return run.trace_id
 
@@ -158,43 +196,298 @@ def _derive_run_summary(
         event_count=len(events),
         path=str(trace_path) if trace_path else "",
         error=error,
+        schema_version=max(event.schema_version for event in events),
+        service="executor" if max(event.schema_version for event in events) >= 2 else None,
+        workload="creation" if max(event.schema_version for event in events) >= 2 else None,
+        purpose=str(start_input.get("run_purpose") or "user_generation"),
+        integrity_status="incomplete" if max(event.schema_version for event in events) >= 2 else "legacy",
+        coverage={"payload": "unknown", "token": "unknown", "cost": "unknown"},
     ), owner_user_id
 
 
-def _write_run(run: TraceRunSummary, owner_user_id: str = "unknown", ingested_seq: int = 0) -> None:
-    db.execute(
+def _write_run(conn: Any, run: TraceRunSummary, owner_user_id: str = "unknown", ingested_seq: int = 0) -> None:
+    conn.execute(
         """INSERT INTO runs
            (trace_id, workspace_id, thread_id, session_name, endpoint, status,
             started_at, ended_at, duration_ms, event_count, error, ingested_at,
-            owner_user_id, ingested_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            owner_user_id, ingested_seq, schema_version, service, workload, run_purpose,
+            integrity_status, coverage_json, run_snapshot_json, external_refs_json, links_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(trace_id) DO UPDATE SET
+             workspace_id=excluded.workspace_id, thread_id=excluded.thread_id,
+             session_name=excluded.session_name, endpoint=excluded.endpoint, status=excluded.status,
+             started_at=excluded.started_at, ended_at=excluded.ended_at, duration_ms=excluded.duration_ms,
+             event_count=excluded.event_count, error=excluded.error, ingested_at=excluded.ingested_at,
+             owner_user_id=excluded.owner_user_id, ingested_seq=excluded.ingested_seq,
+             schema_version=excluded.schema_version, service=excluded.service, workload=excluded.workload,
+             run_purpose=excluded.run_purpose, integrity_status=excluded.integrity_status,
+             coverage_json=excluded.coverage_json, run_snapshot_json=excluded.run_snapshot_json,
+             external_refs_json=excluded.external_refs_json, links_json=excluded.links_json""",
         (
             run.trace_id, run.workspace_id, run.thread_id, run.session_name, run.endpoint,
             run.status, run.started_at, run.ended_at, run.duration_ms, run.event_count,
             run.error, datetime.now(UTC).isoformat(),
-            owner_user_id, ingested_seq,
+            owner_user_id, ingested_seq, run.schema_version, run.service, run.workload,
+            run.purpose, run.integrity_status, json.dumps(run.coverage),
+            json.dumps(run.run_snapshot), json.dumps(run.external_refs),
+            json.dumps([link.model_dump(mode="json") for link in run.links]),
         ),
     )
 
 
-def _write_events(trace_id: str, events: list[TraceLogEvent]) -> None:
-    rows = [
-        (trace_id, e.sequence, e.type, e.timestamp, json.dumps(e.model_dump(), ensure_ascii=False))
-        for e in events
-    ]
-    db.executemany(
-        """INSERT INTO event_payloads (trace_id, sequence, type, timestamp, payload_json)
-           VALUES (?, ?, ?, ?, ?)""",
-        rows,
+def _load_canonical_events(conn: Any, trace_id: str) -> list[TraceLogEvent]:
+    """只返回已被唯一键规则接受的事实，冲突投递不得进入投影。"""
+    rows = conn.execute(
+        "SELECT payload_json FROM event_payloads WHERE trace_id=? ORDER BY sequence",
+        (trace_id,),
+    ).fetchall()
+    return [TraceLogEvent.model_validate(json.loads(row["payload_json"])) for row in rows]
+
+
+def _write_events(conn: Any, trace_id: str, events: list[TraceLogEvent]) -> bool:
+    """至少一次投递：同内容幂等，不同内容显式进入冲突审计。"""
+    conflicts = False
+    existing_rows = conn.execute(
+        "SELECT event_id, sequence, event_hash, payload_json FROM event_payloads WHERE trace_id=?",
+        (trace_id,),
+    ).fetchall()
+    existing_by_id = {row["event_id"]: row for row in existing_rows if row["event_id"]}
+    existing_by_seq = {row["sequence"]: row for row in existing_rows}
+    for event in events:
+        payload_json = json.dumps(event.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+        event_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        same_id = existing_by_id.get(event.event_id)
+        same_seq = existing_by_seq.get(event.sequence)
+        collision = same_id or same_seq
+        if collision is not None:
+            existing_hash = collision["event_hash"]
+            if not existing_hash:
+                try:
+                    existing = TraceLogEvent.model_validate(
+                        json.loads(collision["payload_json"])
+                    )
+                    existing_json = json.dumps(
+                        existing.model_dump(mode="json"),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    existing_hash = hashlib.sha256(existing_json.encode("utf-8")).hexdigest()
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    existing_hash = "legacy-unreadable"
+            if existing_hash == event_hash:
+                if collision["event_hash"] is None:
+                    conn.execute(
+                        "UPDATE event_payloads SET event_hash=? WHERE trace_id=? AND sequence=?",
+                        (event_hash, trace_id, event.sequence),
+                    )
+                continue
+            conflicts = True
+            key = f"event_id:{event.event_id}" if same_id else f"sequence:{event.sequence}"
+            conn.execute(
+                """INSERT OR IGNORE INTO integrity_conflicts
+                   (trace_id, conflict_key, existing_hash, received_hash, received_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (trace_id, key, existing_hash, event_hash, datetime.now(UTC).isoformat()),
+            )
+            continue
+        conn.execute(
+            """INSERT INTO event_payloads
+               (trace_id, sequence, type, timestamp, payload_json, event_id, event_hash, payload_refs_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (trace_id, event.sequence, event.type, event.timestamp, payload_json, event.event_id,
+             event_hash, json.dumps({key: ref.model_dump(mode="json") for key, ref in event.payload_refs.items()})),
+        )
+        existing_by_id[event.event_id] = {
+            "event_hash": event_hash,
+            "payload_json": payload_json,
+        }
+        existing_by_seq[event.sequence] = {
+            "event_hash": event_hash,
+            "payload_json": payload_json,
+        }
+    return conflicts
+
+
+def _store_payload_metadata(
+    conn: Any,
+    trace_id: str,
+    events: list[TraceLogEvent],
+    payload_values: dict[str, Any],
+) -> bool:
+    """持久化 payload 元数据和引用，返回是否所有引用都有可读正文。"""
+    complete = True
+    store = ContentAddressedPayloadStore(settings.trace_payload_path)
+    for event in events:
+        for field_name, ref in event.payload_refs.items():
+            if ref.payload_id not in payload_values:
+                if not _stored_payload_matches(conn, store, ref.payload_id, ref.content_hash):
+                    complete = False
+            else:
+                try:
+                    stored_ref = store.put(payload_values[ref.payload_id], kind=ref.kind)
+                    if stored_ref.content_hash != ref.content_hash:
+                        complete = False
+                        continue
+                except (PayloadRejected, OSError, ValueError, TypeError):
+                    complete = False
+                    continue
+            storage_path = str(settings.trace_payload_path / f"{ref.payload_id}.json")
+            conn.execute(
+                """INSERT INTO payload_objects
+                   (payload_id, content_hash, kind, size_bytes, sensitivity, expires_at, storage_path, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(payload_id) DO UPDATE SET expires_at=excluded.expires_at""",
+                (ref.payload_id, ref.content_hash, ref.kind, ref.size_bytes, ref.sensitivity,
+                 ref.expires_at, storage_path, datetime.now(UTC).isoformat()),
+            )
+            conn.execute(
+                """INSERT INTO trace_payload_links(trace_id, event_id, field_name, payload_id)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(trace_id, event_id, field_name) DO UPDATE SET payload_id=excluded.payload_id""",
+                (trace_id, event.event_id, field_name, ref.payload_id),
+            )
+    return complete
+
+
+def _stored_payload_matches(
+    conn: Any,
+    store: ContentAddressedPayloadStore,
+    payload_id: str,
+    expected_hash: str,
+) -> bool:
+    row = conn.execute(
+        "SELECT content_hash, deleted_at FROM payload_objects WHERE payload_id=?", (payload_id,)
+    ).fetchone()
+    if row is None or row["deleted_at"] or row["content_hash"] != expected_hash:
+        return False
+    try:
+        prepared = store.gate.prepare(store.get(payload_id))
+    except (PayloadRejected, OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    return prepared.content_hash == expected_hash
+
+
+def _upsert_receipt(
+    conn: Any,
+    run: TraceRunSummary,
+    events: list[TraceLogEvent],
+    conflicts: bool,
+    payload_complete: bool,
+) -> dict[str, Any]:
+    sequences = sorted({event.sequence for event in events if event.sequence > 0})
+    contiguous = 0
+    for sequence in sequences:
+        if sequence != contiguous + 1:
+            break
+        contiguous = sequence
+    max_seen = sequences[-1] if sequences else 0
+    missing_ranges = _missing_ranges(sequences, contiguous, max_seen)
+    terminal_ids = {event.event_id for event in events if event.type in {"run_end", "run_error", "run_cancelled"}}
+    manifest = run.manifest
+    manifest_ok = bool(
+        manifest
+        and manifest.final_sequence == contiguous
+        and manifest.terminal_event_id in terminal_ids
+        and manifest.events_hash == compute_trace_events_hash(events)
+        and sorted(manifest.payload_ids)
+        == sorted({ref.payload_id for event in events for ref in event.payload_refs.values()})
+        and not manifest.capture_degraded
     )
+    prior_conflict = conn.execute(
+        "SELECT 1 FROM integrity_conflicts WHERE trace_id=? LIMIT 1", (run.trace_id,)
+    ).fetchone()
+    if run.schema_version < 2:
+        integrity = "legacy"
+    elif conflicts or prior_conflict is not None:
+        integrity = "conflict"
+    elif manifest_ok and not missing_ranges and payload_complete:
+        integrity = "verified"
+    else:
+        integrity = "incomplete"
+    prior = conn.execute("SELECT receipt_revision FROM trace_receipts WHERE trace_id=?", (run.trace_id,)).fetchone()
+    revision = int(prior["receipt_revision"] if prior else 0) + 1
+    conn.execute(
+        """INSERT INTO trace_receipts
+           (trace_id, contiguous_seq, max_seen_seq, missing_ranges_json, manifest_json,
+            manifest_status, receipt_revision, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(trace_id) DO UPDATE SET contiguous_seq=excluded.contiguous_seq,
+             max_seen_seq=excluded.max_seen_seq, missing_ranges_json=excluded.missing_ranges_json,
+             manifest_json=excluded.manifest_json, manifest_status=excluded.manifest_status,
+             receipt_revision=excluded.receipt_revision, updated_at=excluded.updated_at""",
+        (run.trace_id, contiguous, max_seen, json.dumps(missing_ranges),
+         manifest.model_dump_json() if manifest else None,
+         "verified" if manifest_ok else ("missing" if manifest is None else "invalid"),
+         revision, datetime.now(UTC).isoformat()),
+    )
+    return {"contiguous_seq": contiguous, "integrity_status": integrity}
 
 
-def _write_nodes(trace_id: str, run: TraceRunSummary, events: list[TraceLogEvent]) -> None:
+def _materialize_artifact_revisions(
+    conn: Any, run: TraceRunSummary, events: list[TraceLogEvent]
+) -> None:
+    store = ContentAddressedPayloadStore(settings.trace_payload_path)
+    for event in events:
+        if event.type != "artifact_revision" or not event.artifact_revision_id or not event.artifact:
+            continue
+        payload_ref = event.payload_refs.get("output")
+        if payload_ref is None:
+            continue
+        if not _stored_payload_matches(
+            conn, store, payload_ref.payload_id, payload_ref.content_hash
+        ):
+            continue
+        logical_key = str(event.artifact.get("logical_key") or "")
+        artifact_type = str(event.artifact.get("artifact_type") or "workspace_file")
+        artifact_id = "artifact-" + hashlib.sha256(
+            f"{run.workspace_id}:{artifact_type}:{logical_key}".encode("utf-8")
+        ).hexdigest()[:32]
+        conn.execute(
+            """INSERT INTO artifacts(artifact_id, artifact_type, workspace_id, logical_key, created_at)
+               VALUES (?, ?, ?, ?, ?) ON CONFLICT(artifact_id) DO NOTHING""",
+            (artifact_id, artifact_type, run.workspace_id, logical_key, datetime.now(UTC).isoformat()),
+        )
+        conn.execute(
+            """INSERT INTO artifact_revisions
+               (artifact_revision_id, artifact_id, parent_revision_id, payload_id, content_hash,
+                producer_trace_id, producer_event_id, harness_version, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(artifact_revision_id) DO NOTHING""",
+            (event.artifact_revision_id, artifact_id, event.artifact.get("parent_revision_id"),
+             payload_ref.payload_id, event.artifact.get("content_hash") or payload_ref.content_hash,
+             run.trace_id, event.event_id,
+             run.run_snapshot.get("harness_version"), event.timestamp),
+        )
+        conn.execute(
+            """INSERT INTO lineage_edges(from_type, from_id, relation, to_type, to_id, created_at)
+               VALUES ('trace', ?, 'produces', 'artifact_revision', ?, ?)
+               ON CONFLICT(from_type, from_id, relation, to_type, to_id) DO NOTHING""",
+            (run.trace_id, event.artifact_revision_id, event.timestamp),
+        )
+
+
+def _missing_ranges(sequences: list[int], contiguous: int, max_seen: int) -> list[list[int]]:
+    if max_seen <= contiguous:
+        return []
+    seen = set(sequences)
+    ranges: list[list[int]] = []
+    start: int | None = None
+    for sequence in range(contiguous + 1, max_seen + 1):
+        if sequence not in seen and start is None:
+            start = sequence
+        elif sequence in seen and start is not None:
+            ranges.append([start, sequence - 1])
+            start = None
+    if start is not None:
+        ranges.append([start, max_seen])
+    return ranges
+
+
+def _write_nodes(conn: Any, trace_id: str, run: TraceRunSummary, events: list[TraceLogEvent]) -> None:
     """投影 events → nodes 树 → 写入 nodes 表。"""
     projection = projector.TraceProjector().project(run, events)
     rows = [_node_row(trace_id, node) for node in projection.nodes]
     if rows:
-        db.executemany(
+        conn.executemany(
             """INSERT INTO nodes
                (trace_id, node_id, parent_node_id, kind, label, status,
                 agent_name, agent_role, depth, started_at, ended_at, duration_ms,

@@ -63,6 +63,24 @@ class EvalToolsetVisibilityTest(unittest.TestCase):
             import app.eval_agent.tools.trace  # noqa: F401
 
 
+class FrozenDeliveryScoringTest(unittest.TestCase):
+    """评分器必须直接使用卷宗已冻结的交付物，不能回读旧 trace。"""
+
+    def test_general_group_composes_provided_deliveries(self):
+        from app.eval_agent.scoring import _get_group_artifact_text
+
+        result = _get_group_artifact_text(
+            "general",
+            {
+                "interview": {"/demand.md": "冻结需求"},
+                "writing": {"/chapter/01.md": "冻结正文"},
+            },
+        )
+
+        self.assertIn("冻结需求", result)
+        self.assertIn("冻结正文", result)
+
+
 class EvalReportNoTraceBypassTest(unittest.TestCase):
     """需求 R1：write_eval_report 不调用 load_trace_detail（用 AST 检查实际调用，非注释）。"""
 
@@ -124,17 +142,30 @@ class EvalStartDossierGateTest(unittest.TestCase):
     def setUp(self):
         db.execute(
             "INSERT OR IGNORE INTO runs(trace_id, workspace_id, status, owner_user_id, "
-            "run_purpose, ingested_at) VALUES(?,?,?,?,?,?)",
-            ("trace-c", "ws", "completed", "u1", "user_generation", "2026-01-01"),
+            "run_purpose, ingested_at, schema_version, service, workload, integrity_status) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("trace-c", "ws", "completed", "u1", "user_generation", "2026-01-01",
+             2, "executor", "creation", "verified"),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO runs(trace_id, workspace_id, status, ingested_at, "
+            "schema_version, service, workload, integrity_status) VALUES(?,?,?,?,?,?,?,?)",
+            ("trace-compile-c", "evolution", "completed", "2026-01-01",
+             2, "evolution", "evidence_compile", "verified"),
         )
         from app.dossier import repo as drepo
         self.drepo = drepo
         # 建一个完整卷宗 + 一个 partial 卷宗
         self.did_ready = drepo.create_dossier("trace-c", "u1", compile_rule_version="v1")
+        db.execute("UPDATE evidence_dossiers SET compile_trace_id=? WHERE pack_id=?",
+                   ("trace-compile-c", self.did_ready))
         drepo.update_dossier(self.did_ready, status="compiling")
         drepo.update_dossier(self.did_ready, status="ready",
-                             manifest={"k": "v"}, facts={"topology": {}}, finished=True)
+                             manifest={"k": "v"}, facts={"topology": {}},
+                             index={"entries": []}, finished=True)
         self.did_partial = drepo.create_dossier("trace-c", "u1", compile_rule_version="v1")
+        db.execute("UPDATE evidence_dossiers SET compile_trace_id=? WHERE pack_id=?",
+                   ("trace-compile-c", self.did_partial))
         drepo.update_dossier(self.did_partial, status="compiling")
         drepo.update_dossier(self.did_partial, status="partial",
                              failure_reason="缺口", finished=True)
@@ -143,6 +174,7 @@ class EvalStartDossierGateTest(unittest.TestCase):
         db.execute("DELETE FROM evidence_dossiers WHERE trace_id='trace-c'")
         db.execute("DELETE FROM evaluation_sessions WHERE trace_id='trace-c'")
         db.execute("DELETE FROM runs WHERE trace_id='trace-c'")
+        db.execute("DELETE FROM runs WHERE trace_id='trace-compile-c'")
 
     def test_start_rejects_nonexistent_dossier(self):
         from fastapi import HTTPException
@@ -150,7 +182,9 @@ class EvalStartDossierGateTest(unittest.TestCase):
         import asyncio
         with self.assertRaises(HTTPException) as cm:
             asyncio.run(eval_start(EvalStartRequest(dossier_id="nonexist")))
-        self.assertEqual(cm.exception.status_code, 404)
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertEqual(cm.exception.detail["integrity_status"], "unknown")
+        self.assertIn("dossier", cm.exception.detail["missing_fields"])
 
     def test_start_rejects_partial_dossier(self):
         from fastapi import HTTPException
@@ -158,8 +192,8 @@ class EvalStartDossierGateTest(unittest.TestCase):
         import asyncio
         with self.assertRaises(HTTPException) as cm:
             asyncio.run(eval_start(EvalStartRequest(dossier_id=self.did_partial)))
-        self.assertEqual(cm.exception.status_code, 400)
-        self.assertIn("partial", cm.exception.detail)
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertIn("status=ready", cm.exception.detail["missing_fields"])
 
 
 class EvalDossierSealTest(unittest.TestCase):

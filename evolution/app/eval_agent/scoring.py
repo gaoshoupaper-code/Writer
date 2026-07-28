@@ -154,14 +154,11 @@ def _get_group_artifact_text(
         # 通用五维基于全部交付物，但截断控制总长度
         parts: list[str] = []
         for agent in ("interview", "storybuilding", "detail-outline", "writing"):
-            agent_text = eval_extractor.get_agent_delivery_text(deliveries, agent) if hasattr(eval_extractor, 'get_agent_delivery_text') else ""
-            if not agent_text:
-                # get_agent_delivery_text 需要 trace_id，这里直接从 deliveries 拼
-                files = deliveries.get(agent, {})
-                if files:
-                    agent_text = "\n\n---\n\n".join(
-        f"## 文件: {p}\n\n{c[:2000]}" for p, c in sorted(files.items())
-                    )
+            files = deliveries.get(agent, {})
+            agent_text = "\n\n---\n\n".join(
+                f"## 文件: {path}\n\n{content[:2000]}"
+                for path, content in sorted(files.items())
+            )
             if agent_text:
                 parts.append(f"### {agent} 交付物\n{agent_text[:3000]}")
         return "\n\n".join(parts)

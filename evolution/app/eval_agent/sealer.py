@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import app.core.db as db
+from app.trace.facts import add_lineage, append_score
 
 logger = logging.getLogger("evolution.eval_agent.sealer")
 
@@ -111,6 +112,11 @@ def seal_evaluation_dossier(
     conn = db.get_conn()
     try:
         with db._lock:
+            session = conn.execute(
+                "SELECT self_trace_id FROM evaluation_sessions WHERE eval_id=?",
+                (eval_attempt_id,),
+            ).fetchone()
+            evaluation_trace_id = session["self_trace_id"] if session else None
             cur = conn.execute(
                 """INSERT INTO evaluation_dossiers
                    (dossier_id, eval_attempt_id, source_dossier_id, source_dossier_version,
@@ -139,6 +145,29 @@ def seal_evaluation_dossier(
                 "WHERE eval_id=?",
                 (dossier_id, now, eval_attempt_id),
             )
+            add_lineage(
+                "evidence_dossier", source_dossier_id, "evaluated_by",
+                "evaluation_dossier", dossier_id, conn=conn,
+            )
+            if evaluation_trace_id:
+                add_lineage(
+                    "trace", evaluation_trace_id, "produces",
+                    "evaluation_dossier", dossier_id, conn=conn,
+                )
+            if scores is not None:
+                score_id = append_score(
+                    target_type="trace",
+                    target_id=trace_id,
+                    rubric_id=str(scores.get("rubric_id") or "xianxia"),
+                    rubric_version=str(scores.get("rubric_version") or "unknown"),
+                    score=scores,
+                    actor_user_id=owner_user_id,
+                    conn=conn,
+                )
+                add_lineage(
+                    "evidence_dossier", source_dossier_id, "evaluated_by",
+                    "score", score_id, conn=conn,
+                )
             conn.commit()
     except SealError:
         conn.rollback()

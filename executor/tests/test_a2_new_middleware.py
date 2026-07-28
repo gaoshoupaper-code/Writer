@@ -49,6 +49,8 @@ from _harness_test_pkg.middleware.read_cache import ReadCacheMiddleware  # noqa:
 from _harness_test_pkg.middleware.file_state_tracker import (  # noqa: E402
     FileStateTrackerMiddleware,
 )
+from _harness_test_pkg.middleware.error_recovery import ErrorRecoveryMiddleware  # noqa: E402
+from _harness_test_pkg.middleware.artifact_snapshot import ArtifactSnapshotMiddleware  # noqa: E402
 
 
 # ── 公共工具：构造伪 request（对齐 test_meta_readonly_middleware 模式）──
@@ -88,6 +90,76 @@ def _error_handler(_req: Any) -> Any:
         tool_call_id="t1",
         status="error",
     )
+
+
+class ErrorRecoveryInterventionTest(unittest.TestCase):
+    def test_records_retry_and_terminal_short_circuit(self) -> None:
+        interventions: list[dict[str, Any]] = []
+        middleware = ErrorRecoveryMiddleware(
+            max_retries=1,
+            retry_delay=0,
+            intervention_callback=lambda **item: interventions.append(item),
+        )
+
+        result = middleware.wrap_tool_call(
+            _request("read_file", file_path="/x.md"),
+            lambda _: (_ for _ in ()).throw(OSError("unavailable")),
+        )
+
+        self.assertIsInstance(result, ToolMessage)
+        self.assertEqual([item["action"] for item in interventions], ["retry", "short_circuit"])
+
+
+class ArtifactRevisionCaptureTest(unittest.TestCase):
+    def test_write_revision_uses_successful_disk_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            captured: list[dict[str, Any]] = []
+            middleware = ArtifactSnapshotMiddleware(captured.append, workspace, "writing-subagent")
+            request = _request(
+                "write_file",
+                file_path="/chapter/1.md",
+                content="claimed content",
+            )
+
+            def handler(_request: Any) -> ToolMessage:
+                target = workspace / "chapter" / "1.md"
+                target.parent.mkdir(parents=True)
+                target.write_text("disk content", encoding="utf-8")
+                return ToolMessage(content="Updated", name="write_file", tool_call_id="call-1")
+
+            middleware.wrap_tool_call(request, handler)
+
+            self.assertEqual(captured[0]["content"], "disk content")
+
+    def test_missing_disk_readback_does_not_emit_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            captured: list[dict[str, Any]] = []
+            middleware = ArtifactSnapshotMiddleware(captured.append, Path(tmpdir), "writing-subagent")
+
+            middleware.wrap_tool_call(
+                _request("write_file", file_path="/chapter/missing.md", content="claimed"),
+                lambda _: ToolMessage(content="Updated", name="write_file", tool_call_id="call-1"),
+            )
+
+            self.assertEqual(captured, [])
+
+    def test_runtime_state_log_does_not_create_artifact_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            captured: list[dict[str, Any]] = []
+            middleware = ArtifactSnapshotMiddleware(captured.append, workspace, "writing-subagent")
+
+            def handler(_request: Any) -> ToolMessage:
+                (workspace / "state_log.md").write_text("pipeline state", encoding="utf-8")
+                return ToolMessage(content="Updated", name="write_file", tool_call_id="call-1")
+
+            middleware.wrap_tool_call(
+                _request("write_file", file_path="/state_log.md", content="pipeline state"),
+                handler,
+            )
+
+            self.assertEqual(captured, [])
 
 
 # ======================================================================

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useOutletContext } from "react-router-dom";
+import { GitFork } from "lucide-react";
 import { useTracePolling } from "@/hooks/useTraceStream";
 import { TraceChainTimeline } from "@/components/trace/TraceChainTimeline";
 import { TraceChainDrawer } from "@/components/trace/TraceChainDrawer";
@@ -30,6 +31,7 @@ import type { TraceNode, TraceRunSummary, TraceContextSegment, TraceLogEvent } f
 export default function TraceDetailPage() {
   const { traceId } = useParams<{ traceId: string }>();
   const navigate = useNavigate();
+  const { isSuperAdmin } = useOutletContext<{ isSuperAdmin: boolean }>();
 
   const { detail, isLive, activeSession, loading, error } = useTracePolling(traceId ?? null);
 
@@ -257,6 +259,13 @@ export default function TraceDetailPage() {
           <button className="back-button" onClick={() => navigate(-1)}>← 返回</button>
           <h1>Trace {traceId?.slice(0, 12)}…</h1>
           <StatusBadge status={run.status} />
+          <button
+            type="button"
+            className="lineage-jump-button"
+            onClick={() => navigate(`/lineage?type=trace&id=${encodeURIComponent(traceId || "")}`)}
+          >
+            <GitFork size={14} />血缘
+          </button>
           {isLive && (
             <span className="streaming-badge"><span className="pulse" /> 实时</span>
           )}
@@ -302,6 +311,11 @@ export default function TraceDetailPage() {
             trace 数据完整保留，请根据实际情况手动标记结果。
           </div>
         )}
+        {run.integrity_status && run.integrity_status !== "verified" && (
+          <div className={`integrity-hint integrity-${run.integrity_status}`}>
+            Trace 数据不完整：{integrityLabel(run.integrity_status)}。下游证据、评估和进化流程不可消费。
+          </div>
+        )}
       </header>
 
       {/* run 概要条 */}
@@ -321,6 +335,20 @@ export default function TraceDetailPage() {
         <div className="summary-item">
           <label>节点数</label>
           <span>{nodes.filter((n) => n.kind !== "run").length}</span>
+        </div>
+        <div className="summary-item">
+          <label>工作负载</label>
+          <span>{workloadLabel(run.workload)}</span>
+        </div>
+        <div className="summary-item">
+          <label>完整性</label>
+          <span className={`integrity-text integrity-${run.integrity_status || "legacy"}`}>
+            {integrityLabel(run.integrity_status || "legacy")}
+          </span>
+        </div>
+        <div className="summary-item">
+          <label>Coverage</label>
+          <span>{coverageLabel(run.coverage || {})}</span>
         </div>
         {run.error && (
           <div className="summary-item error">
@@ -389,7 +417,7 @@ export default function TraceDetailPage() {
           />
         )}
         {activeTab === "artifacts" && (
-          <ArtifactsPanel workspaceId={activeRun.workspace_id} />
+          <ArtifactsPanel traceId={traceId ?? ""} canReadContent={isSuperAdmin} />
         )}
       </div>
     </div>
@@ -421,6 +449,28 @@ function interruptedReasonLabel(reason: string): string {
   if (reason === "heartbeat_timeout") return "心跳超时";
   if (reason === "user_marked") return "用户标记";
   return reason;
+}
+
+function integrityLabel(status: string): string {
+  if (status === "verified") return "已验证";
+  if (status === "incomplete") return "不完整";
+  if (status === "conflict") return "冲突";
+  return "旧版未验证";
+}
+
+function workloadLabel(workload: string | null | undefined): string {
+  if (workload === "creation") return "创作";
+  if (workload === "evidence_compile") return "证据编译";
+  if (workload === "evaluation") return "评估";
+  if (workload === "evolution") return "进化";
+  return "未标注";
+}
+
+function coverageLabel(coverage: Record<string, string>): string {
+  const values = Object.values(coverage);
+  if (values.length === 0) return "未知";
+  const known = values.filter((value) => value === "known" || value === "not_applicable").length;
+  return `${known}/${values.length}`;
 }
 
 function formatDuration(ms: number): string {

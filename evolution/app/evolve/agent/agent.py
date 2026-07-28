@@ -33,8 +33,43 @@ from app.evolve.agent.prompt import evolve_system_prompt
 from app.evolve.agent.tools import make_evolve_tools
 from app.evolve.ctx import EvolveContext, set_tool_context
 from app.trace import TraceMiddleware, TraceCallbackHandler
+from app.trace.facts import add_lineage
+from contracts.trace import TraceSpanLink
 
 logger = logging.getLogger("evolution.evolve.agent")
+
+
+def _start_evolution_trace(ctx: EvolveContext, endpoint: str) -> None:
+    """为一次进化工作流创建唯一 Trace；后续对话与落地轮次复用它。"""
+    if not ctx.recorder or ctx.trace_id_self:
+        return
+    evaluation_trace_id = str(ctx.eval_dossier.get("evaluation_trace_id") or "")
+    handle = ctx.recorder.create_run(
+        session_id=ctx.session_id,
+        run_purpose="evolution_evolve",
+        endpoint=endpoint,
+        session_type="evolve",
+        workload="evolution",
+        links=[TraceSpanLink(
+            target_trace_id=evaluation_trace_id,
+            relation="consumes",
+            artifact={"type": "evaluation_dossier", "id": ctx.eval_dossier_id},
+        )],
+        external_refs={
+            "experiment_id": f"experiment-{ctx.session_id}",
+            "evaluation_id": str(ctx.eval_dossier.get("eval_attempt_id") or ""),
+            "evaluation_dossier_id": ctx.eval_dossier_id,
+        },
+    )
+    ctx.trace_id_self = handle.trace_id
+    try:
+        add_lineage(
+            "trace", ctx.trace_id_self, "consumes",
+            "evaluation_dossier", ctx.eval_dossier_id,
+        )
+    except Exception as exc:
+        ctx.recorder.fail_run(ctx.trace_id_self, exc)
+        raise
 
 
 async def _run_agent_streamed(
@@ -361,15 +396,7 @@ async def run_evolve_session(ctx: EvolveContext, trace_id: str) -> dict[str, Any
     ctx.session_status = "running"
     ev_db.update_session(ctx.session_id, status="running")
 
-    # 先 create_run 拿自观测 trace_id，再构建 agent（middleware 需要 trace_id）。
-    if ctx.recorder:
-        handle = ctx.recorder.create_run(
-            session_id=ctx.session_id,
-            run_purpose="evolution_evolve",
-            endpoint="evolve-agent.run",
-            session_type="evolve",  # trace 稳定性重构：持久化 self_trace_id
-        )
-        ctx.trace_id_self = handle.trace_id
+    _start_evolution_trace(ctx, "evolve-agent.run")
 
     # ── 阶段 1：inspect round（探查 + 设计 + 落地，单体兼容模式）──
     # 单体模式下 status 保持 running，FlowGuard 不做阶段门控（conversing 才拦），
@@ -485,15 +512,7 @@ async def run_inspect_round(ctx: EvolveContext, trace_id: str) -> dict[str, Any]
     ctx.session_status = STATUS_RUNNING
     ev_db.update_session(ctx.session_id, status=STATUS_RUNNING)
 
-    # create_run 拿自观测 trace_id
-    if ctx.recorder:
-        handle = ctx.recorder.create_run(
-            session_id=ctx.session_id,
-            run_purpose="evolution_evolve",
-            endpoint="evolve-agent.inspect",
-            session_type="evolve",  # trace 稳定性重构：持久化 self_trace_id
-        )
-        ctx.trace_id_self = handle.trace_id
+    _start_evolution_trace(ctx, "evolve-agent.inspect")
 
     agent = await build_evolve_agent(ctx)
     config: dict[str, Any] = {

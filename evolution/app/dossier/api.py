@@ -26,6 +26,13 @@ from pydantic import BaseModel
 from app.dossier import repo
 from app.dossier.extractor import COMPILE_RULE_VERSION
 from app.view.traces import load_trace_detail
+from app.trace.facts import (
+    ConsumptionRejected,
+    add_lineage,
+    require_verified_creation_trace,
+)
+from app.trace.recorder import EvolutionTraceRecorder
+from contracts.trace import TraceSpanLink
 
 logger = logging.getLogger("evolution.dossier.api")
 
@@ -46,6 +53,12 @@ class CompileStartResponse(BaseModel):
     dossier_id: str
     trace_id: str
     status: str  # started | ready | partial | compiling
+    compile_trace_id: str | None = None
+
+
+def get_recorder() -> EvolutionTraceRecorder | None:
+    from app.main import app
+    return getattr(app.state, "trace_recorder", None)
 
 
 @router.post("/start", response_model=CompileStartResponse, status_code=202)
@@ -59,13 +72,17 @@ async def start_compile(req: CompileStartRequest) -> CompileStartResponse:
     """
     trace_id = req.trace_id
 
-    # 校验 trace 存在
-    run_row = db.query_one(
-        "SELECT owner_user_id, run_purpose FROM runs WHERE trace_id = ?",
-        (trace_id,),
-    )
-    if run_row is None:
-        raise HTTPException(status_code=404, detail=f"trace {trace_id} 不存在")
+    try:
+        run_row = require_verified_creation_trace(trace_id)
+    except ConsumptionRejected as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "integrity_status": exc.integrity_status,
+                "missing_fields": list(exc.missing_fields),
+            },
+        ) from exc
 
     # 防自观测：不能编译进化端自观测 trace
     run_purpose = run_row.get("run_purpose") or "user_generation"
@@ -82,6 +99,7 @@ async def start_compile(req: CompileStartRequest) -> CompileStartResponse:
     if existing:
         return CompileStartResponse(
             dossier_id=existing["dossier_id"], trace_id=trace_id, status=existing["status"],
+            compile_trace_id=existing.get("compile_trace_id"),
         )
 
     # 幂等 2：同规则版本正在编译 → 直接返回
@@ -89,22 +107,68 @@ async def start_compile(req: CompileStartRequest) -> CompileStartResponse:
     if active:
         return CompileStartResponse(
             dossier_id=active["dossier_id"], trace_id=trace_id, status=active["status"],
+            compile_trace_id=active.get("compile_trace_id"),
         )
 
     # 新建卷宗 + 后台编译
     dossier_id = repo.create_dossier(
         trace_id, owner_user_id,
         compile_rule_version=COMPILE_RULE_VERSION,
-        provenance="compile_time_snapshot",  # 首期所有 trace 都是编译时快照
+        provenance=(
+            "trace_time"
+            if db.query_one(
+                "SELECT 1 AS found FROM artifact_revisions WHERE producer_trace_id=? LIMIT 1",
+                (trace_id,),
+            )
+            else "compile_time_snapshot"
+        ),
     )
-    task = asyncio.create_task(_run_compile_bg(trace_id, dossier_id))
+    recorder = get_recorder()
+    if recorder is None:
+        repo.update_dossier(
+            dossier_id, status="failed", failure_reason="Trace recorder unavailable", finished=True
+        )
+        raise HTTPException(status_code=503, detail="Trace recorder unavailable")
+    handle = recorder.create_run(
+        session_id=dossier_id,
+        run_purpose="evidence_compile",
+        endpoint="dossier.compile",
+        workload="evidence_compile",
+        links=[
+            TraceSpanLink(
+                target_trace_id=trace_id,
+                relation="consumes",
+                attributes={"dossier_id": dossier_id},
+            )
+        ],
+        external_refs={"dossier_id": dossier_id, "source_trace_id": trace_id},
+    )
+    compile_trace_id = handle.trace_id
+    db.execute(
+        "UPDATE evidence_dossiers SET compile_trace_id=? WHERE pack_id=?",
+        (compile_trace_id, dossier_id),
+    )
+    add_lineage("trace", compile_trace_id, "consumes", "trace", trace_id)
+    task = asyncio.create_task(
+        _run_compile_bg(trace_id, dossier_id, compile_trace_id, recorder)
+    )
     _running_tasks[dossier_id] = task
 
     logger.info("证据卷宗编译启动: dossier=%s trace=%s", dossier_id, trace_id)
-    return CompileStartResponse(dossier_id=dossier_id, trace_id=trace_id, status="started")
+    return CompileStartResponse(
+        dossier_id=dossier_id,
+        trace_id=trace_id,
+        status="started",
+        compile_trace_id=compile_trace_id,
+    )
 
 
-async def _run_compile_bg(trace_id: str, dossier_id: str) -> None:
+async def _run_compile_bg(
+    trace_id: str,
+    dossier_id: str,
+    compile_trace_id: str,
+    recorder: EvolutionTraceRecorder,
+) -> None:
     """后台执行证据卷宗编译。
 
     compiler.compile_dossier 是同步函数（内含 httpx 阻塞 LLM 调用），
@@ -112,16 +176,39 @@ async def _run_compile_bg(trace_id: str, dossier_id: str) -> None:
     """
     from app.dossier.compiler import compile_dossier
     try:
-        await asyncio.to_thread(compile_dossier, trace_id, dossier_id)
+        result = await asyncio.to_thread(compile_dossier, trace_id, dossier_id)
+        if result.get("status") in {"ready", "partial"}:
+            _record_compile_lineage(trace_id, dossier_id, compile_trace_id)
+            recorder.complete_run(compile_trace_id)
+        else:
+            recorder.fail_run(compile_trace_id, result.get("reason") or "dossier compile failed")
     except asyncio.CancelledError:
         logger.info("证据卷宗编译 %s 被取消", dossier_id)
         repo.update_dossier(dossier_id, status="failed", failure_reason="用户取消", finished=True)
+        recorder.cancel_run(compile_trace_id, reason="user_stop")
         raise
     except Exception as exc:
         logger.exception("证据卷宗编译 %s 后台异常", dossier_id)
         repo.update_dossier(dossier_id, status="failed", failure_reason=str(exc), finished=True)
+        recorder.fail_run(compile_trace_id, exc)
     finally:
         _running_tasks.pop(dossier_id, None)
+
+
+def _record_compile_lineage(
+    source_trace_id: str, dossier_id: str, compile_trace_id: str
+) -> None:
+    add_lineage("trace", compile_trace_id, "produces", "evidence_dossier", dossier_id)
+    revisions = db.query_all(
+        "SELECT artifact_revision_id FROM artifact_revisions WHERE producer_trace_id=?",
+        (source_trace_id,),
+    )
+    for row in revisions:
+        revision_id = row["artifact_revision_id"]
+        add_lineage(
+            "artifact_revision", revision_id, "compiled_into", "evidence_dossier", dossier_id
+        )
+        add_lineage("trace", compile_trace_id, "consumes", "artifact_revision", revision_id)
 
 
 # ── 查询 ──────────────────────────────────────────────────────

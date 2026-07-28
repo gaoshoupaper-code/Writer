@@ -116,6 +116,8 @@ async def _lifespan(application: FastAPI):
     trace_recorder.start_drain()
     # 启动僵尸清理：扫 awaiting_input 超 2h 未 resume 的 trace → cancelled
     trace_recorder.start_zombie_scanner()
+    from app.platform.trace.outcomes import start_outcome_delivery
+    start_outcome_delivery()
     # 启动 harness reconcile：防 push 通知丢失，10分钟周期自愈（去 DB 重构）
     from app.platform.agent.reconcile import start_reconcile
     start_reconcile()
@@ -124,6 +126,8 @@ async def _lifespan(application: FastAPI):
     # 关闭 reconcile 协程
     from app.platform.agent.reconcile import aclose_reconcile
     await aclose_reconcile()
+    from app.platform.trace.outcomes import stop_outcome_delivery
+    await stop_outcome_delivery()
     # 关闭 drain 并刷掉残余事件，保证进程退出前 trace 数据完整。
     await trace_recorder.aclose()
     await _checkpointer_cm.__aexit__(None, None, None)

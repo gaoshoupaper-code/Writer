@@ -34,12 +34,25 @@ import app.core.db as db
 from app.core.settings import settings
 from app.main import app
 
+_old_db = settings.evolution_db
+
 
 def setUpModule() -> None:
     """模块级初始化：重置 DB 连接 + 建表，确保用临时空库。"""
-    # settings 在 import 时已读 EVOLUTION_DB，确认指向临时文件
+    settings.evolution_db = _tmp_db.name
     db._conn = None  # 重置单例连接，强制重连到临时库
     db.init_db()
+
+
+def tearDownModule() -> None:
+    if db._conn is not None:
+        db._conn.close()
+    db._conn = None
+    settings.evolution_db = _old_db
+    try:
+        os.unlink(_tmp_db.name)
+    except OSError:
+        pass
 
 
 class ImportSmokeTest(unittest.TestCase):
@@ -50,10 +63,10 @@ class ImportSmokeTest(unittest.TestCase):
         import app.evolve.ctx  # noqa: F401
         import app.evolve.db  # noqa: F401
         import app.evolve.docs  # noqa: F401
-        import app.evolve.driver.agent  # noqa: F401
-        import app.evolve.driver.middleware.phase_guard  # noqa: F401
-        import app.evolve.subagents.plan.build  # noqa: F401
-        import app.evolve.subagents.execute.build  # noqa: F401
+        import app.evolve.agent.agent  # noqa: F401
+        import app.evolve.agent.middleware.flow_guard  # noqa: F401
+        import app.evolve.agent.tools.flow  # noqa: F401
+        import app.evolve.agent.tools.inspect  # noqa: F401
 
     def test_import_eval_agent_modules(self) -> None:
         import app.eval_agent.api  # noqa: F401
@@ -73,26 +86,33 @@ class EvolveStartGuardTest(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(app)
 
-    def test_start_rejects_unknown_trace(self) -> None:
-        """不存在的 trace 启动进化 → 404。"""
+    def test_start_rejects_unknown_evaluation_dossier(self) -> None:
+        """不存在的评估卷宗启动进化 → 409，且返回缺失事实。"""
         resp = self.client.post(
-            "/api/evolve/start", json={"trace_id": "nonexistent_trace"}
+            "/api/evolve/start", json={"eval_dossier_id": "nonexistent-dossier"}
         )
-        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("dossier", resp.json()["detail"]["missing_fields"])
 
-    def test_start_rejects_unevaluated_trace(self) -> None:
-        """存在但未评估的 trace 启动进化 → 400（强前置：必须先评估）。"""
-        # 先在 runs 表插一条 trace（让它通过 404 校验），但不建评估记录
+    def test_start_rejects_unsealed_evaluation_dossier(self) -> None:
+        """未封存的评估卷宗启动进化 → 409，不启动下游 Trace。"""
         db.execute(
-            """INSERT INTO runs (trace_id, workspace_id, status, ingested_at)
-               VALUES (?, 'ws_test', 'completed', '2026-01-01T00:00:00Z')""",
-            ("trace_no_eval",),
+            """INSERT INTO evaluation_dossiers
+               (dossier_id, eval_attempt_id, source_dossier_id, source_dossier_version,
+                trace_id, owner_user_id, completeness_status, seal_status, created_at)
+               VALUES ('unsealed-dossier', 'eval-unsealed', 'evidence-1', 1,
+                       'trace-source', 'user-1', 'incomplete', 'unsealed', '2026-01-01')"""
         )
-        resp = self.client.post(
-            "/api/evolve/start", json={"trace_id": "trace_no_eval"}
-        )
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("评估", resp.json()["detail"])
+        try:
+            resp = self.client.post(
+                "/api/evolve/start", json={"eval_dossier_id": "unsealed-dossier"}
+            )
+            self.assertEqual(resp.status_code, 409)
+            missing = resp.json()["detail"]["missing_fields"]
+            self.assertIn("seal_status=sealed", missing)
+            self.assertIn("completeness_status=complete", missing)
+        finally:
+            db.execute("DELETE FROM evaluation_dossiers WHERE dossier_id='unsealed-dossier'")
 
 
 class EvolveSessionsQueryTest(unittest.TestCase):

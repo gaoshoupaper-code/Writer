@@ -1,205 +1,210 @@
 import { useEffect, useState } from "react";
+import { Eye, EyeOff, FileText, LoaderCircle } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import {
-  getWorkspaceNovel,
-  getWorkspaceStoryline,
-  getWorkspaceStorylineGraph,
+  getArtifactRevisionContent,
+  getTraceArtifactRevisions,
 } from "@/lib/api";
-import type {
-  NovelChapter,
-  StorylineEntry,
-  WorkspaceNovelContent,
-  WorkspaceStorylineContent,
-  WorkspaceStorylineGraphContent,
-} from "@/lib/types";
+import type { ArtifactRevision } from "@/lib/types";
 
-/**
- * Trace 详情页「产物」tab：预览这次 trace 生成的正文 + 人物故事线。
- *
- * 数据源：直调 executor 的 /api/workspaces/{id}/* 接口（session cookie 由
- * Tauri 共享 cookie jar 自动带）。三个请求并行拉取，单个失败不影响其它——
- * 比如写作还没跑到正文阶段，正文区显示空态，故事线区仍能正常展示。
- *
- * 错误态按 HTTP 状态码区分：401=登录态失效、403=非 owner、404=产物尚未生成。
- * 其它错误归为「读取失败」并展示原始信息，方便定位。
- */
 type ArtifactsPanelProps = {
-  workspaceId: string;
+  traceId: string;
+  canReadContent: boolean;
 };
 
-// 错误信息（从 apiJson 抛的 Error.message 里反解 HTTP 状态码）。
-type ErrorInfo = { httpStatus: number | null; message: string };
-
-// 三类产物各自的加载状态——独立管理，互不阻塞。
-type LoadState<T> =
+type RevisionContentState =
   | { status: "loading" }
-  | { status: "ok"; data: T }
-  | ({ status: "error" } & ErrorInfo);
+  | { status: "open"; content: unknown }
+  | { status: "closed"; content: unknown }
+  | { status: "error"; message: string };
 
-/** 把 catch 到的 error 转成 ErrorInfo。apiJson 抛的 Error.message 是响应体或 "HTTP {status}"。 */
-function toErrorInfo(err: unknown): ErrorInfo {
-  const msg = err instanceof Error ? err.message : String(err);
-  const m = msg.match(/HTTP (\d+)/);
-  return { httpStatus: m ? Number(m[1]) : null, message: msg };
-}
-
-/** 根据 HTTP 状态码返回友好的中文错误文案。 */
-function errorText({ httpStatus, message }: ErrorInfo): string {
-  if (httpStatus === 401) return "登录态已失效，请重新登录后再试。";
-  if (httpStatus === 403) return "当前账号不是该 workspace 的所有者，无法预览产物。";
-  if (httpStatus === 404) return "尚未生成该产物（对应阶段可能还没跑到）。";
-  return `读取失败：${message}`;
-}
-
-export function ArtifactsPanel({ workspaceId }: ArtifactsPanelProps) {
-  const [novel, setNovel] = useState<LoadState<WorkspaceNovelContent>>({ status: "loading" });
-  const [storyline, setStoryline] = useState<LoadState<WorkspaceStorylineContent>>({
-    status: "loading",
-  });
-  const [graph, setGraph] = useState<LoadState<WorkspaceStorylineGraphContent>>({
-    status: "loading",
-  });
+export function ArtifactsPanel({ traceId, canReadContent }: ArtifactsPanelProps) {
+  const [revisions, setRevisions] = useState<ArtifactRevision[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [contents, setContents] = useState<Record<string, RevisionContentState>>({});
 
   useEffect(() => {
     let cancelled = false;
-    // 三个请求互不依赖：任意一个失败不影响其它展示。
-    // 组件卸载（切走 tab）后通过 cancelled 标志丢弃结果，避免 setState on unmounted。
-    setNovel({ status: "loading" });
-    setStoryline({ status: "loading" });
-    setGraph({ status: "loading" });
+    setLoading(true);
+    setError(null);
+    setContents({});
 
-    getWorkspaceNovel(workspaceId)
-      .then((data) => !cancelled && setNovel({ status: "ok", data }))
-      .catch((e) => !cancelled && setNovel({ status: "error", ...toErrorInfo(e) }));
-
-    getWorkspaceStoryline(workspaceId)
-      .then((data) => !cancelled && setStoryline({ status: "ok", data }))
-      .catch((e) => !cancelled && setStoryline({ status: "error", ...toErrorInfo(e) }));
-
-    getWorkspaceStorylineGraph(workspaceId)
-      .then((data) => !cancelled && setGraph({ status: "ok", data }))
-      .catch((e) => !cancelled && setGraph({ status: "error", ...toErrorInfo(e) }));
+    getTraceArtifactRevisions(traceId)
+      .then((response) => {
+        if (!cancelled) setRevisions(response.items);
+      })
+      .catch((reason: unknown) => {
+        if (!cancelled) {
+          setRevisions([]);
+          setError(reason instanceof Error ? reason.message : String(reason));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
 
     return () => {
       cancelled = true;
     };
-  }, [workspaceId]);
+  }, [traceId]);
+
+  async function toggleContent(revisionId: string) {
+    const current = contents[revisionId];
+    if (current?.status === "open") {
+      setContents((states) => ({
+        ...states,
+        [revisionId]: { status: "closed", content: current.content },
+      }));
+      return;
+    }
+    if (current?.status === "closed") {
+      setContents((states) => ({
+        ...states,
+        [revisionId]: { status: "open", content: current.content },
+      }));
+      return;
+    }
+
+    setContents((states) => ({ ...states, [revisionId]: { status: "loading" } }));
+    try {
+      const response = await getArtifactRevisionContent(revisionId);
+      setContents((states) => ({
+        ...states,
+        [revisionId]: { status: "open", content: response.content },
+      }));
+    } catch (reason) {
+      setContents((states) => ({
+        ...states,
+        [revisionId]: {
+          status: "error",
+          message: reason instanceof Error ? reason.message : String(reason),
+        },
+      }));
+    }
+  }
+
+  if (loading) return <div className="artifacts-loading">加载制品版本...</div>;
+  if (error) return <div className="artifacts-error">读取制品版本失败：{error}</div>;
+  if (revisions.length === 0) {
+    return <div className="artifacts-empty">该 Trace 没有生成可跨运行复查的制品版本。</div>;
+  }
 
   return (
     <div className="artifacts-panel">
-      {/* 人物故事线区 */}
-      <section className="artifacts-section">
-        <h3 className="artifacts-section-title">人物故事线</h3>
-        <StorylineBlock storyline={storyline} graph={graph} />
-      </section>
+      <div className="artifact-revision-list">
+        {revisions.map((revision) => {
+          const contentState = contents[revision.artifact_revision_id];
+          const expired = isExpired(revision.expires_at);
+          const isOpen = contentState?.status === "open";
+          return (
+            <article className="artifact-revision" key={revision.artifact_revision_id}>
+              <header className="artifact-revision-header">
+                <div className="artifact-revision-title">
+                  <FileText size={15} aria-hidden="true" />
+                  <div>
+                    <h3>{revision.logical_key}</h3>
+                    <span>{artifactTypeLabel(revision.artifact_type)}</span>
+                  </div>
+                </div>
+                {canReadContent && (
+                  <button
+                    className="artifact-content-toggle"
+                    type="button"
+                    disabled={expired || contentState?.status === "loading"}
+                    onClick={() => toggleContent(revision.artifact_revision_id)}
+                    title={expired ? "正文已过期" : isOpen ? "收起正文" : "查看正文"}
+                    aria-label={expired ? "正文已过期" : isOpen ? "收起正文" : "查看正文"}
+                  >
+                    {contentState?.status === "loading" ? (
+                      <LoaderCircle className="artifact-content-spinner" size={15} />
+                    ) : isOpen ? (
+                      <EyeOff size={15} />
+                    ) : (
+                      <Eye size={15} />
+                    )}
+                  </button>
+                )}
+              </header>
 
-      {/* 正文区 */}
-      <section className="artifacts-section">
-        <h3 className="artifacts-section-title">正文</h3>
-        <NovelBlock novel={novel} />
-      </section>
+              <dl className="artifact-revision-meta">
+                <Meta label="Revision" value={revision.artifact_revision_id} />
+                <Meta label="Content hash" value={revision.content_hash} />
+                <Meta label="Parent" value={revision.parent_revision_id ?? "根版本"} />
+                <Meta label="Producer event" value={revision.producer_event_id ?? "unknown"} />
+                <Meta label="Harness" value={revision.harness_version ?? "unknown"} />
+                <Meta label="Size" value={formatBytes(revision.size_bytes)} />
+                <Meta label="Created" value={formatDateTime(revision.created_at)} />
+                <Meta
+                  label="Retention"
+                  value={expired ? "正文已过期" : formatDateTime(revision.expires_at)}
+                />
+              </dl>
+
+              {!canReadContent && (
+                <div className="artifact-content-restricted">完整正文仅超级管理员可按需查看。</div>
+              )}
+              {contentState?.status === "error" && (
+                <div className="artifacts-error">读取正文失败：{contentState.message}</div>
+              )}
+              {contentState?.status === "open" && (
+                <RevisionContent content={contentState.content} />
+              )}
+            </article>
+          );
+        })}
+      </div>
     </div>
   );
 }
 
-/** 故事线索引 + 流程图 + 各线详情。三者独立加载态。 */
-function StorylineBlock({
-  storyline,
-  graph,
-}: {
-  storyline: LoadState<WorkspaceStorylineContent>;
-  graph: LoadState<WorkspaceStorylineGraphContent>;
-}) {
-  // 两者都还在加载 → 统一 loading 提示，避免出现两行"加载中…"。
-  if (storyline.status === "loading" && graph.status === "loading") {
-    return <div className="artifacts-loading">加载中…</div>;
-  }
-
-  // 两者都成功但都没数据 → 空态（storybuilding 还没跑到）。
-  // 任一为 error / loading / 有数据时走下面的分支渲染。
-  const slEmpty =
-    storyline.status === "ok" &&
-    storyline.data.entries.length === 0 &&
-    !storyline.data.index_markdown;
-  const gEmpty = graph.status === "ok" && !graph.data.markdown;
-  if (slEmpty && gEmpty) {
-    return <div className="artifacts-empty">本次测试未生成故事线（storybuilding 阶段可能还没跑到）。</div>;
-  }
-
+function Meta({ label, value }: { label: string; value: string }) {
   return (
-    <div className="artifacts-subsections">
-      {/* 故事线索引 + 各线详情 */}
-      {storyline.status === "ok" && <StorylineIndex data={storyline.data} />}
-      {storyline.status === "error" && (
-        <div className="artifacts-error">{errorText(storyline)}</div>
-      )}
-      {storyline.status === "loading" && <div className="artifacts-loading">故事线索引加载中…</div>}
-
-      {/* 故事线流程图（markdown 文本） */}
-      {graph.status === "ok" && graph.data.markdown && (
-        <div className="artifacts-md prose-doc storyline-graph-md">
-          <h4 className="artifacts-subsection-title">故事线流程图</h4>
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{graph.data.markdown}</ReactMarkdown>
-        </div>
-      )}
-      {graph.status === "error" && (
-        <div className="artifacts-error">{errorText(graph)}</div>
-      )}
-      {graph.status === "loading" && <div className="artifacts-loading">故事线流程图加载中…</div>}
+    <div>
+      <dt>{label}</dt>
+      <dd title={value}>{value}</dd>
     </div>
   );
 }
 
-/** 故事线索引 + 各条故事线详情。空数据时返回 null（由上层 StorylineBlock 统一处理空态）。 */
-function StorylineIndex({ data }: { data: WorkspaceStorylineContent }) {
-  if (!data.index_markdown && data.entries.length === 0) return null;
-  return (
-    <div className="artifacts-md prose-doc storyline-index-md">
-      {data.index_markdown && (
-        <>
-          <h4 className="artifacts-subsection-title">故事线索引</h4>
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{data.index_markdown}</ReactMarkdown>
-        </>
-      )}
-      {data.entries.length > 0 && (
-        <>
-          <h4 className="artifacts-subsection-title">各条故事线</h4>
-          {data.entries.map((entry: StorylineEntry) => (
-            <div key={entry.filename} className="artifacts-md storyline-entry-md">
-              <h5 className="artifacts-entry-title">{entry.title || entry.filename}</h5>
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{entry.markdown}</ReactMarkdown>
-            </div>
-          ))}
-        </>
-      )}
-    </div>
-  );
+function RevisionContent({ content }: { content: unknown }) {
+  if (typeof content === "string") {
+    return (
+      <div className="artifact-revision-content prose-doc">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+      </div>
+    );
+  }
+  return <pre className="artifact-revision-content">{JSON.stringify(content, null, 2)}</pre>;
 }
 
-/** 正文：按章渲染。 */
-function NovelBlock({ novel }: { novel: LoadState<WorkspaceNovelContent> }) {
-  if (novel.status === "loading") return <div className="artifacts-loading">加载中…</div>;
-  if (novel.status === "error") {
-    return <div className="artifacts-error">{errorText(novel)}</div>;
-  }
-  if (novel.data.chapters.length === 0) {
-    return <div className="artifacts-empty">本次测试未生成正文（writing 阶段可能还没跑到）。</div>;
-  }
-  return (
-    <div className="artifacts-chapters">
-      {novel.data.chapters.map((ch: NovelChapter, idx: number) => (
-        <section key={ch.filename} className="artifacts-chapter">
-          <header className="artifacts-chapter-header">
-            <span className="artifacts-chapter-no">第 {idx + 1} 章</span>
-            <h4 className="artifacts-chapter-title">{ch.title || ch.filename}</h4>
-          </header>
-          <div className="artifacts-md prose-doc">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{ch.markdown}</ReactMarkdown>
-          </div>
-        </section>
-      ))}
-    </div>
-  );
+function artifactTypeLabel(value: string): string {
+  const labels: Record<string, string> = {
+    draft: "写作稿件",
+    evidence_dossier: "证据卷宗",
+    evaluation_dossier: "评估卷宗",
+    candidate_config: "候选配置",
+    release: "发布版本",
+  };
+  return labels[value] ?? value;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatDateTime(value: string | null): string {
+  if (!value) return "永久保留";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function isExpired(value: string | null): boolean {
+  if (!value) return false;
+  const timestamp = new Date(value).getTime();
+  return Number.isNaN(timestamp) || timestamp <= Date.now();
 }

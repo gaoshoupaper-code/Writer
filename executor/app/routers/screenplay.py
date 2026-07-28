@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from app.auth import CurrentUser, current_user
@@ -30,7 +31,13 @@ from app.schemas.screenplay import (
 router = APIRouter()
 
 
-async def _event_generator(payload: ScreenplayGenerateRequest, thread: ThreadSummary, *, owner_id: str | None = None):
+async def _event_generator(
+    payload: ScreenplayGenerateRequest,
+    thread: ThreadSummary,
+    *,
+    owner_id: str | None = None,
+    traceparent: str | None = None,
+):
     """Async generator that yields SSE events from the agent execution."""
     _log("sse_open", channel="generate", thread_id=payload.thread_id, active=generation_started())
     start = time.perf_counter()
@@ -38,7 +45,9 @@ async def _event_generator(payload: ScreenplayGenerateRequest, thread: ThreadSum
     agent_service = get_agent_service()
     thread_store = get_thread_store()
     try:
-        async for chunk in agent_service.generate_stream(payload, thread, owner_id=owner_id):
+        async for chunk in agent_service.generate_stream(
+            payload, thread, owner_id=owner_id, traceparent=traceparent
+        ):
             yield chunk
             if chunk.startswith("event: final"):
                 for line in chunk.split("\n"):
@@ -61,6 +70,7 @@ async def _event_generator(payload: ScreenplayGenerateRequest, thread: ThreadSum
 @router.post("/screenplay/generate/stream")
 async def stream_screenplay(
     payload: ScreenplayGenerateRequest,
+    request: Request,
     user: CurrentUser = Depends(current_user),
 ):
     # AD12：冻结拦截（D16/D26）——余额≤0 不可触发创作
@@ -71,7 +81,12 @@ async def stream_screenplay(
     if thread is None:
         raise HTTPException(status_code=404, detail="Thread not found")
     return StreamingResponse(
-        _event_generator(payload, thread, owner_id=user.user_id),
+        _event_generator(
+            payload,
+            thread,
+            owner_id=user.user_id,
+            traceparent=request.headers.get("traceparent"),
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -120,49 +135,78 @@ class SignalRequest(BaseModel):
     content_preview: str = ""   # 复制的内容片段（前 200 字符，供 debug）
 
 
+class OutcomeRequest(BaseModel):
+    trace_id: str
+    outcome_type: Literal["adopt", "edit_diff", "human_rating"]
+    payload: dict[str, Any]
+
+
 @router.post("/screenplay/copy")
-def track_copy(req: SignalRequest, user: CurrentUser = Depends(current_user)):
+def track_copy(
+    req: SignalRequest,
+    background_tasks: BackgroundTasks,
+    user: CurrentUser = Depends(current_user),
+):
     """记录"用户复制了内容"信号（正信号，数据闭环 E2/D15）。
 
     前端内容面板的"复制"按钮调此端点。recorder 写 user_copy 事件进 trace jsonl，
     进化端 promote 闸门据此判质量（copy = 用户认可）。
     """
-    _append_user_signal(req.trace_id, "user_copy", {
+    outcome_id, capture_status = _enqueue_outcome(req.trace_id, "copy", {
         "user_id": user.user_id,
         "content_preview": req.content_preview[:200],
-    })
-    return {"status": "accepted"}
+    }, background_tasks)
+    return {"status": "accepted", "outcome_id": outcome_id, "capture_status": capture_status}
 
 
 @router.post("/screenplay/regenerate")
-def track_regenerate(req: SignalRequest, user: CurrentUser = Depends(current_user)):
+def track_regenerate(
+    req: SignalRequest,
+    background_tasks: BackgroundTasks,
+    user: CurrentUser = Depends(current_user),
+):
     """记录"用户点了重试/重新生成"信号（负信号，数据闭环 E2/D15）。
 
     前端"重试"按钮调此端点。recorder 写 user_regenerate 事件进 trace jsonl，
     进化端 promote 闸门据此判质量（regenerate = 用户不满意）。
     """
-    _append_user_signal(req.trace_id, "user_regenerate", {
+    outcome_id, capture_status = _enqueue_outcome(req.trace_id, "regenerate", {
         "user_id": user.user_id,
         "content_preview": req.content_preview[:200],
-    })
-    return {"status": "accepted"}
+    }, background_tasks)
+    return {"status": "accepted", "outcome_id": outcome_id, "capture_status": capture_status}
 
 
-def _append_user_signal(trace_id: str, event_type: str, payload: dict) -> None:
-    """写一条用户行为信号事件到 trace jsonl（容错：trace 不存在/已清理则静默跳过）。
+@router.post("/screenplay/outcome")
+def track_outcome(
+    req: OutcomeRequest,
+    background_tasks: BackgroundTasks,
+    user: CurrentUser = Depends(current_user),
+):
+    """记录最终采用、人工编辑差异或人工评分，和已结束 Trace 独立关联。"""
+    payload = dict(req.payload)
+    payload["user_id"] = user.user_id
+    outcome_id, capture_status = _enqueue_outcome(
+        req.trace_id, req.outcome_type, payload, background_tasks
+    )
+    return {"status": "accepted", "outcome_id": outcome_id, "capture_status": capture_status}
 
-    用户复制/重试通常发生在生成完成后，此时 trace sequence 可能已清理。
-    append_event 失败不阻断用户操作（fire-and-forget）。
-    """
-    recorder = get_trace_recorder()
-    try:
-        recorder.append_event(trace_id, {
-            "type": event_type,
-            "status": "completed",
-            "source": "system",
-            "output": payload,
-        })
-    except (KeyError, Exception) as exc:
-        # trace 已结束清理（_sequences 无此 trace_id）或 recorder 未就绪
-        _log("signal_drop", trace_id=trace_id, event_type=event_type,
-             error=str(exc)[:200])
+
+def _enqueue_outcome(
+    trace_id: str,
+    outcome_type: str,
+    payload: dict,
+    background_tasks: BackgroundTasks,
+) -> tuple[str, str]:
+    """Outcome 不改写已结束 Trace；先持久化，响应后尝试投递。"""
+    from app.platform.trace.outcomes import get_outcome_buffer
+
+    buffer = get_outcome_buffer()
+    outcome_id, capture_status = buffer.enqueue(
+        target_trace_id=trace_id,
+        outcome_type=outcome_type,  # type: ignore[arg-type]
+        actor_user_id=str(payload.get("user_id") or "") or None,
+        payload=payload,
+    )
+    background_tasks.add_task(buffer.deliver_pending)
+    return outcome_id, capture_status

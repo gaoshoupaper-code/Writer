@@ -63,6 +63,7 @@ class ReadCacheMiddleware(AgentMiddleware):
         ttl_seconds: int = 300,
         max_cache_size: int = 50,
         track_stats: bool = True,
+        intervention_callback: Callable[..., None] | None = None,
     ) -> None:
         """
         Args:
@@ -73,6 +74,7 @@ class ReadCacheMiddleware(AgentMiddleware):
         self.ttl_seconds = ttl_seconds
         self.max_cache_size = max_cache_size
         self.track_stats = track_stats
+        self.intervention_callback = intervention_callback
 
         # 文件路径 → _CacheEntry
         self._cache: dict[str, _CacheEntry] = {}
@@ -108,6 +110,7 @@ class ReadCacheMiddleware(AgentMiddleware):
             if self.track_stats:
                 self._hits += 1
                 logger.debug("ReadCache HIT: %s (hits=%d, misses=%d)", file_path, self._hits, self._misses)
+            self._emit_cache_hit()
             return self._make_cached_response(request, cached)
 
         # 缓存未命中，调用内层 handler
@@ -146,6 +149,7 @@ class ReadCacheMiddleware(AgentMiddleware):
             if self.track_stats:
                 self._hits += 1
                 logger.debug("ReadCache HIT: %s (hits=%d, misses=%d)", file_path, self._hits, self._misses)
+            self._emit_cache_hit()
             return self._make_cached_response(request, cached)
 
         # 缓存未命中，调用内层 handler
@@ -219,6 +223,19 @@ class ReadCacheMiddleware(AgentMiddleware):
             name="read_file",
             tool_call_id=str(tool_call_id or ""),
         )
+
+    def _emit_cache_hit(self) -> None:
+        if self.intervention_callback is None:
+            return
+        try:
+            self.intervention_callback(
+                action="cache_hit",
+                hook="wrap_tool_call",
+                affected_fields=["control_flow", "tool_output"],
+                reason="read_cache_hit",
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 辅助方法

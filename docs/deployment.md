@@ -43,6 +43,17 @@
 | desktop（写作端 App） | 用户本机 | — | 连 `https://siyen.site/api` | executor session |
 | evolution/desktop（进化端 App） | 管理员本机 | — | 连 `https://siyen.site/evolution-api` | executor session（SSO） |
 
+### Trace V2 持久化与治理
+
+Trace 使用一套 canonical 合同，`executor` 先将事件、Manifest 和正文 Payload 写入本地 workspace 的可靠缓冲，再通知 `evolution` 拉取。`evolution_data` 卷内分为两层：
+
+- `evolution.db`：运行、事件、receipt、完整性、血缘、Outcome、ArtifactRevision 和热查询元数据。
+- `trace_payloads/`：内容寻址的 JSON 正文；事件表只保存 hash、大小、敏感级别、过期时间和引用。
+
+普通正文默认保留 90 天；封存评估或实验的独立快照按封存策略保留。生命周期任务会删除过期且未封存的 Payload；用户或项目删除优先于任何保留策略，并会清理关联正文和索引。运行结构对已有 evolution 授权用户可见，完整正文、全文检索和导出仅 `is_super_admin` 可用，且每次访问写入不可变审计记录。
+
+V2 卷宗、评估和进化只消费完整且可验证的输入：`incomplete`、`conflict`、`legacy` Trace 可以诊断但不能进入下游。旧 V1 记录只读兼容，不根据当前 workspace 补造历史。
+
 ## 文件清单（本次新增/修改）
 
 **部署配置**：
@@ -389,7 +400,7 @@ docker compose logs -f --tail=100   # 全部最近 100 行
 
 > ⚠️ **注意**：容器内**没有 sqlite3 命令行工具**（Dockerfile 只装了 git+curl），
 > 旧版文档里 `docker exec ... sqlite3 ... ".backup"` **跑不通**。
-> 请用 `scripts/backup-prod.sh`（内部用 Python `sqlite3` 模块的 `conn.backup()` 做安全热备）。
+> 请用 `scripts/backup-prod.sh`（内部用 Python `sqlite3` 模块的 `conn.backup()` 做安全热备）。脚本同时归档 executor workspace（稿件与本地 Trace 缓冲）和 evolution 的 `trace_payloads/`；只恢复 SQLite 而遗漏 Payload 会导致 ArtifactRevision 无法还原正文。
 
 ```bash
 # 手动备份

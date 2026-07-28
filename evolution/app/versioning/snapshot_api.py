@@ -17,11 +17,19 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
 
+from app.core import db
 from app.versioning import registry_repo
+from app.trace.facts import append_release_event
 
 router = APIRouter(prefix="/snapshots", tags=["snapshots"])
+
+
+class RollbackRequest(BaseModel):
+    to_version: int
+    reason: str = ""
 
 
 @router.get("")
@@ -40,6 +48,59 @@ def get_production_snapshot() -> dict[str, Any]:
     if snap is None:
         raise HTTPException(status_code=404, detail="无 production 版本")
     return snap
+
+
+@router.post("/rollback")
+def rollback_snapshot(body: RollbackRequest, request: Request) -> dict[str, Any]:
+    """移动 production 指针并 reload executor；确认后记录 rollback_activated。"""
+    current = registry_repo.get_production_version()
+    if current is None:
+        raise HTTPException(status_code=409, detail="无 production 版本可回滚")
+    if current["version"] == body.to_version:
+        raise HTTPException(status_code=409, detail="目标版本已是 production")
+
+    source_candidate_id = f"harness-version-{current['version']}"
+    release = db.query_one(
+        """SELECT release_id FROM release_events_v2
+           WHERE candidate_id=? AND status IN ('activated', 'activation_failed')
+           ORDER BY rowid DESC LIMIT 1""",
+        (source_candidate_id,),
+    )
+
+    from app.core import git_ops
+    from app.versioning.snapshot_publisher import notify_executor
+
+    try:
+        target = registry_repo.rollback(body.to_version, reason=body.reason or None)
+        commit = git_ops.commit_and_push(
+            f"回滚 production v{current['version']} -> v{body.to_version}"
+        )
+        if not notify_executor(body.to_version):
+            raise HTTPException(
+                status_code=502,
+                detail="registry 已回滚并提交，但 executor reload 未确认",
+            )
+        if release:
+            append_release_event(
+                release_id=release["release_id"],
+                status="rollback_activated",
+                candidate_id=source_candidate_id,
+                actor_user_id=getattr(request.state, "user_id", None),
+            )
+        return {
+            "status": "rollback_activated",
+            "from_version": current["version"],
+            "to_version": target["version"],
+            "source_commit": commit,
+            "release_id": release["release_id"] if release else None,
+            "release_tracking": "v2" if release else "legacy",
+        }
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"回滚失败：{exc}") from exc
 
 
 @router.get("/{version}")

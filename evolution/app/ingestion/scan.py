@@ -99,8 +99,9 @@ def _fetch_and_ingest(trace_id: str, workspace_hint: str | None) -> str | None:
     fetched = _fetch_trace_content(trace_id)
     if fetched is None:
         return None
-    events, hint, run_status_hint = fetched
-    # 优先用列表端点返回的 workspace_id；run_status_hint 用于 importer 纠正运行中误判
+    events, run_summary, payload_values = fetched
+    # 优先用列表端点返回的 workspace_id；run summary 保持 V2 manifest 与完整性语义。
     return importer.ingest_events(
-        events, workspace_hint or hint, run_status_hint=run_status_hint
+        events, workspace_hint or run_summary.workspace_id, run_status_hint=run_summary.status,
+        run_summary_hint=run_summary, payload_values=payload_values,
     )
