@@ -35,17 +35,18 @@ class IntegrityDiagnosisTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def _insert_run(
-        self, trace_id: str, *, integrity: str, schema_version: int = 2
+        self, trace_id: str, *, integrity: str, schema_version: int = 2,
+        phase: str | None = None,
     ) -> None:
         db.execute(
             """INSERT INTO runs
                (trace_id, workspace_id, thread_id, session_name, endpoint, status,
                 started_at, event_count, ingested_at, schema_version, service, workload,
-                integrity_status)
+                integrity_status, trace_phase)
                VALUES (?, 'ws', 'thread', 'session', 'create', 'completed',
                        '2026-01-01T00:00:00+00:00', 1, '2026-01-01T00:00:01+00:00',
-                       ?, 'executor', 'creation', ?)""",
-            (trace_id, schema_version, integrity),
+                       ?, 'executor', 'creation', ?, ?)""",
+            (trace_id, schema_version, integrity, phase),
         )
 
     def _insert_receipt(
@@ -76,6 +77,27 @@ class IntegrityDiagnosisTest(unittest.TestCase):
         self.assertEqual(diag.integrity_status, "verified")
         self.assertEqual(diag.missing_checks, [])
         self.assertEqual(diag.affected_downstreams, [])
+
+    def test_pending_phase_returns_neutral_not_fault(self) -> None:
+        """FR-008/AC-010：pending（记录/封存中）返回中性诊断，不当终态 incomplete 故障。
+
+        EVD-005 根因：运行中 trace 完整性是 pending，UI 不得显示"数据损坏/不可消费"。
+        """
+        self._insert_run("trace-rec", integrity="pending", phase="recording", schema_version=2)
+        diag = _compute_integrity_diagnosis("trace-rec")
+        self.assertEqual(diag.integrity_status, "pending")
+        self.assertEqual(len(diag.missing_checks), 1)
+        self.assertEqual(diag.missing_checks[0].check, "integrity_pending")
+        # pending 不算缺口——下游只是暂时等待，不应显示"不可消费"。
+        self.assertEqual(diag.affected_downstreams, [])
+        # 文案明确告知"这不是数据损坏"。
+        self.assertIn("不是数据损坏", diag.missing_checks[0].impact)
+
+    def test_pending_sealing_phase_label_correct(self) -> None:
+        """sealing 阶段的 pending 诊断显示"封存中"文案。"""
+        self._insert_run("trace-seal", integrity="pending", phase="sealing", schema_version=2)
+        diag = _compute_integrity_diagnosis("trace-seal")
+        self.assertIn("封存中", diag.missing_checks[0].impact)
 
     def test_incomplete_with_capture_degraded_gives_specific_check(self) -> None:
         """AC-004：capture_degraded 导致的 incomplete 必须给出具体缺口，非同义反复。"""

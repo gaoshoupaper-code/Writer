@@ -24,6 +24,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from contracts.cancel_state import HARD_STOP_DEADLINE_SECONDS, is_terminal
 from app.eval_agent import repo as eval_repo
 from app.core import db
 from app.evolve import db as ev_db
@@ -518,8 +519,6 @@ def stop_session(session_id: str) -> dict[str, Any]:
     已知边界：Agent 若停在改源码中途，harnesses/current/ 下可能留脏文件，
     本端点不清理（由用户手动 stash / 重置）。
     """
-    from contracts.cancel_state import HARD_STOP_DEADLINE_SECONDS, is_terminal
-
     session = ev_db.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"session {session_id} 不存在")
@@ -547,24 +546,32 @@ def stop_session(session_id: str) -> dict[str, Any]:
 
 
 async def _converge_evolve_cancel(session_id: str, task: asyncio.Task | None) -> None:
-    """进化取消收敛：task.cancel → 等 10s → recorder 强制收敛 → 标 cancelled。"""
+    """进化取消收敛：task.cancel → 等 10s → recorder 强制收敛 → 标 cancelled/cancel_timeout。
+
+    CON-003/EDGE-007：超时未退出标 cancel_timeout（诚实告警，不谎报 cancelled）。
+    """
     recorder = get_recorder()
     trace_id_self = recorder.get_trace_id_by_session(session_id) if recorder else None
 
     if task is not None and not task.done():
         task.cancel()
 
-    if task is not None:
+    # CON-003 真实停止确认：以 task.done() 为准——deadline 后仍未退出才 cancel_timeout。
+    converged_in_time = True
+    if task is not None and not task.done():
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=HARD_STOP_DEADLINE_SECONDS)
-        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
             pass
+    if task is not None and not task.done():
+        converged_in_time = False  # deadline 后仍未退出 → cancel_timeout
 
     if recorder and trace_id_self:
         recorder.cancel_run(trace_id_self, reason="user_stop")
 
-    ev_db.update_session(session_id, status="cancelled")
-    logger.info("进化 session %s 取消收敛完成", session_id)
+    final_status = "cancelled" if converged_in_time else "cancel_timeout"
+    ev_db.update_session(session_id, status=final_status)
+    logger.info("进化 session %s 取消收敛完成 status=%s", session_id, final_status)
 
 
 # ── SSE 实时流 ──────────────────────────────────────────────

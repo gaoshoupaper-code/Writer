@@ -54,7 +54,7 @@ class TraceProjector:
             return projection
 
         projection.nodes.append(_run_node(run, events))
-        state = _ProjectionState(projection)
+        state = _ProjectionState(projection, run.status)
         llm_starts: dict[str, list[_PendingEvent]] = {}
         tool_starts: dict[str, list[_PendingEvent]] = {}
 
@@ -121,6 +121,9 @@ class TraceProjector:
                 state.add_tool_error_node(start, event)
             elif event.type == "run_error":
                 state.add_run_error(event)
+            elif event.type in {"cancel_requested", "run_cancelled", "cancel_timeout"}:
+                # EVD-014：取消时间线事件投影为可见控制节点（旧 projector 完全丢弃）。
+                state.add_cancel_node(event)
             elif event.type in {
                 "skill_activation",
                 "middleware_assembly",
@@ -157,8 +160,11 @@ class TraceProjector:
 
 
 class _ProjectionState:
-    def __init__(self, projection: TraceProjection) -> None:
+    def __init__(self, projection: TraceProjection, run_status: str = "running") -> None:
         self.projection = projection
+        # EDGE-008：run 已终态（cancelled/interrupted/failed）时，未配对的 LLM/tool start
+        # 不得投影为 running——应反映"因取消/中断未完成"。
+        self.run_status = run_status
         self.agent_nodes: set[str] = set()
         self.context_sequence = 0
         # task 边界追踪（栈结构：支持嵌套 task 委托）
@@ -167,6 +173,20 @@ class _ProjectionState:
         self.agent_invocation_counter: dict[str, int] = {}
         self.instance_first_ts: dict[str, str] = {}
         self.instance_last_ts: dict[str, str] = {}
+
+    def _unpaired_start_status(self) -> str:
+        """未配对 start 节点的状态：run 终态决定（cancelled/interrupted → 非 running）。
+
+        EDGE-008：取消/中断时只持久化了 start 无 end，不得伪造正常完成，
+        也不得显示 running——投影为 cancelled/interrupted/failed。
+        """
+        if self.run_status in ("cancelled", "cancel_timeout"):
+            return "cancelled"
+        if self.run_status == "interrupted":
+            return "interrupted"
+        if self.run_status == "failed":
+            return "failed"
+        return "running"
 
     def _agent_node_id(self, event: TraceLogEvent) -> str:
         """根据事件所属 agent 和当前实例追踪状态，返回正确的 node_id。"""
@@ -312,20 +332,21 @@ class _ProjectionState:
 
     def add_running_llm_node(self, pending: _PendingEvent) -> None:
         event = pending.event
+        status = self._unpaired_start_status()
         self.projection.nodes.append(
             TraceNode(
                 node_id=pending.node_id,
                 parent_node_id=self._agent_node_id(event),
                 kind="llm",
                 label=_llm_label(event),
-                status="running",
+                status=status,
                 **self._node_agent_attrs(event),
                 started_at=event.timestamp,
                 model_name=event.model_name,
                 context_anchor_id=_range_start(pending.input_range),
                 input_context_range=pending.input_range,
                 raw_event_ids=[event.event_id],
-                chain_summary=llm_summary(event, is_running=True),
+                chain_summary=llm_summary(event, is_running=(status == "running")),
                 parallel_group_id=pending.parallel_group_id,
             )
         )
@@ -423,20 +444,26 @@ class _ProjectionState:
 
     def add_running_tool_node(self, pending: _PendingEvent) -> None:
         event = pending.event
+        status = self._unpaired_start_status()
+        summary = (
+            f"{event.tool_name or 'Tool'}: 运行中…"
+            if status == "running"
+            else f"{event.tool_name or 'Tool'}: 因{('取消' if status == 'cancelled' else '中断' if status == 'interrupted' else '失败')}未完成"
+        )
         self.projection.nodes.append(
             TraceNode(
                 node_id=pending.node_id,
                 parent_node_id=self._agent_node_id(event),
                 kind="tool",
                 label=_tool_label(event),
-                status="running",
+                status=status,
                 **self._node_agent_attrs(event),
                 started_at=event.timestamp,
                 tool_name=event.tool_name,
                 context_anchor_id=_range_start(pending.input_range),
                 input_context_range=pending.input_range,
                 raw_event_ids=[event.event_id],
-                chain_summary=f"{event.tool_name or 'Tool'}: 运行中…",
+                chain_summary=summary,
                 parallel_group_id=pending.parallel_group_id,
             )
         )
@@ -456,6 +483,48 @@ class _ProjectionState:
                 raw_event_ids=[event.event_id],
                 error=event.error,
                 chain_summary=error_summary(event.error),
+            )
+        )
+
+    def add_cancel_node(self, event: TraceLogEvent) -> None:
+        """取消时间线控制节点（FR-006/EVD-014）：让"用户请求取消/已取消/取消超时"在时间线可见。
+
+        run_cancelled 是确认收敛终态，cancel_requested 是用户请求起点，
+        cancel_timeout 是未收敛的诚实告警态。三者都投影为可见控制节点，
+        让用户能审计取消过程（旧 projector 完全丢弃 run_cancelled，导致取消后无节点可看）。
+        """
+        labels = {
+            "cancel_requested": "用户请求取消",
+            "run_cancelled": "已取消",
+            "cancel_timeout": "取消超时（未收敛）",
+        }
+        status_map = {
+            "cancel_requested": "cancelling",
+            "run_cancelled": "cancelled",
+            "cancel_timeout": "cancel_timeout",
+        }
+        label = labels.get(event.type, "取消")
+        node_id = f"cancel:{event.event_id}"
+        anchor_id = self._append_context(
+            event,
+            kind="error",
+            title=label,
+            content=event.error or label,
+            metadata={"cancel_type": event.type, "timestamp": event.timestamp},
+            related_node_id=node_id,
+        )
+        self.projection.nodes.append(
+            TraceNode(
+                node_id=node_id,
+                parent_node_id="run",
+                kind="error",
+                label=label,
+                status=status_map.get(event.type, "cancelled"),
+                context_anchor_id=anchor_id,
+                output_context_anchor_id=anchor_id,
+                raw_event_ids=[event.event_id],
+                error=event.error,
+                chain_summary=label,
             )
         )
 
@@ -604,7 +673,7 @@ def _run_node(run: TraceRunSummary, events: list[TraceLogEvent]) -> TraceNode:
         started_at=run.started_at,
         ended_at=run.ended_at,
         duration_ms=run.duration_ms,
-        raw_event_ids=[event.event_id for event in events if event.type in {"run_start", "run_end", "run_error"}],
+        raw_event_ids=[event.event_id for event in events if event.type in {"run_start", "run_end", "run_error", "run_cancelled", "cancel_timeout"}],
         error=run.error,
         chain_summary=run_summary(run),
     )

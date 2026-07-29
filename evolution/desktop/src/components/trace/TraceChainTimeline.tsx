@@ -409,9 +409,16 @@ function eventNumberLabel(rawEventIds?: string[]): string | null {
 }
 
 function statusLabel(status: string): string {
+  // DEC-008 四维状态文案：旧代码只识别 completed/failed，其余一律 fallback 成"运行中"，
+  // 导致 cancelled/cancelling/interrupted/cancel_timeout 的节点都错误显示运行中（EVD-014）。
   if (status === "completed") return "完成";
   if (status === "failed") return "失败";
-  return "运行中";
+  if (status === "cancelled" || status === "cancel_timeout") return "已取消";
+  if (status === "cancelling") return "取消中";
+  if (status === "interrupted") return "已中断";
+  if (status === "awaiting_input") return "等待输入";
+  if (status === "running") return "运行中";
+  return status;
 }
 
 function formatDuration(value: number): string {

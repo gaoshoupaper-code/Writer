@@ -244,11 +244,12 @@ function WorkloadBadge({ workload }: { workload: TraceWorkload | null }) {
 
 function IntegrityBadge({ status }: { status: TraceIntegrityStatus }) {
   const labels: Record<TraceIntegrityStatus, string> = {
-    verified: "已验证", incomplete: "不完整", conflict: "冲突", legacy: "旧版",
+    pending: "记录中", verified: "已验证", incomplete: "不完整", conflict: "冲突", legacy: "旧版",
   };
   return (
     <span className={`integrity-badge integrity-${status}`}>
-      {status !== "verified" && <AlertTriangle size={12} />}{labels[status]}
+      {/* pending 是中性态（记录中），不是故障，不显示告警图标 */}
+      {status !== "verified" && status !== "pending" && <AlertTriangle size={12} />}{labels[status]}
     </span>
   );
 }

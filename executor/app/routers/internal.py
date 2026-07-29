@@ -502,14 +502,18 @@ def ab_status(task_id: str) -> dict[str, Any]:
 def ab_stop(task_id: str) -> dict[str, Any]:
     """请求停止运行中的候选执行任务（十秒硬终止，FR-006 / NFR-001 / DEC-002）。
 
-    立即标记 cancelling 并返回（DEC-002 立即反馈），后台线程在 10 秒时限内
-    通过子进程隔离 + 强杀收敛到 cancelled（NFR-001 P100 ≤ 10.0s）。
+    立即持久化取消身份 + 标 cancelling 并返回（DEC-002 立即反馈），后台线程在 10 秒
+    时限内通过子进程协作取消 + 必要时强杀收敛，并让父进程接管 canonical Trace 封存
+    （FR-002/006 根因修复：子进程强杀后不再留下永久 running/incomplete 孤儿）。
 
     - task 不存在 → 404
     - task 已终态（done/failed/cancelled/cancel_timeout）→ 409，幂等返回当前状态
-    - task running/cancelling → 标 cancelling，后台硬终止，返回 cancelling
+    - task running/cancelling → 持久 cancel_id，标 cancelling，后台收敛，返回 cancelling
+    - 重复请求（同一 task 已 cancelling）→ 幂等返回同一 cancel_id 与当前进度（FR-006）
     """
     from contracts.cancel_state import HARD_STOP_DEADLINE_SECONDS, is_terminal
+    from contracts.trace import CancelAudit
+    from uuid import uuid4
 
     task = _ab_tasks.get(task_id)
     if task is None:
@@ -522,42 +526,132 @@ def ab_stop(task_id: str) -> dict[str, Any]:
             detail=f"task {task_id} 已终态（{current_status}），无需停止",
         )
 
+    # 幂等取消身份（FR-006）：同一 task 重复 stop 返回同一 cancel_id，不重复发起收敛。
+    cancel_id = task.get("cancel_id")
+    if cancel_id is None:
+        cancel_id = f"cancel-{uuid4().hex}"
+        task["cancel_id"] = cancel_id
+        cancel_audit = CancelAudit(
+            cancel_id=cancel_id,
+            requested_by="user",
+            requested_at=_now_iso(),
+            reason="user_stop",
+        )
+        task["cancel_audit"] = cancel_audit
+    else:
+        cancel_audit = task["cancel_audit"]
+
+    # 持久化"用户请求取消"事实到 canonical Trace（维度4 时间线起点，FR-006/CON-003）。
+    # 取消意图此前只在内存，强杀/重启即丢；落成 cancel_requested 事件 + index 审计字段。
+    trace_ids: list[str] = list(task.get("trace_ids") or [])
+    main_recorder = get_trace_recorder()
+    for trace_id in trace_ids:
+        try:
+            run = main_recorder.find_run_by_trace_id(trace_id)
+            if run is not None:
+                from app.schemas.screenplay import ThreadSummary
+                thread = ThreadSummary(
+                    thread_id=str(run.thread_id),
+                    workspace_id=str(run.workspace_id),
+                    session_name=str(run.session_name),
+                    workspace_path=main_recorder._trace_workspace.get(trace_id) or run.workspace_path,
+                    created_at=run.started_at,
+                    updated_at=run.started_at,
+                )
+                main_recorder.record_cancel_requested(thread, trace_id, cancel_audit)
+        except Exception:
+            logger.warning("持久化 cancel_requested 失败: task=%s trace=%s", task_id, trace_id, exc_info=True)
+
     # 立即标记 cancelling（DEC-002：用户提交后当前帧可见）。
     _ab_tasks[task_id]["status"] = "cancelling"
-    logger.info("候选执行任务进入取消中: task=%s", task_id)
+    logger.info("候选执行任务进入取消中: task=%s cancel_id=%s", task_id, cancel_id)
 
-    # 后台线程做硬终止收敛（不阻塞 HTTP 响应）。
+    # 后台线程做硬终止收敛 + 父进程接管 canonical Trace 封存（不阻塞 HTTP 响应）。
     worker = task.get("worker")
-    if worker is not None:
+    if worker is not None and not task.get("converge_started"):
+        task["converge_started"] = True  # 防重复请求重复起收敛线程
         import threading
 
         def _converge_cancel() -> None:
-            try:
-                result = worker.stop_and_collect(
-                    deadline=HARD_STOP_DEADLINE_SECONDS
-                )
-                _ab_tasks[task_id]["status"] = result.status
-                if result.trace_id:
-                    _ab_tasks[task_id]["trace_ids"] = [result.trace_id]
-                if result.error:
-                    _ab_tasks[task_id]["error"] = result.error
-                logger.info(
-                    "候选执行任务取消收敛完成: task=%s status=%s",
-                    task_id, result.status,
-                )
-            except Exception:
-                logger.exception("取消收敛异常: task=%s", task_id)
-                _ab_tasks[task_id]["status"] = "cancel_timeout"
+            _run_cancel_convergence(task_id, worker, cancel_audit, main_recorder)
 
         threading.Thread(target=_converge_cancel, daemon=True).start()
-    else:
+    elif worker is None:
         # 无 worker（兼容老任务或 worker 未就绪）：回退协作式取消。
         cancel_event = task.get("cancel_event")
         if cancel_event is not None:
             cancel_event.set()
         _ab_tasks[task_id]["status"] = "cancelled"
+        # 回填取消审计收敛结果。
+        cancel_audit.converge_status = "cancelled"
+        cancel_audit.converged_at = _now_iso()
 
-    return {"status": "cancelling", "task_id": task_id}
+    return {"status": "cancelling", "task_id": task_id, "cancel_id": cancel_id}
+
+
+def _run_cancel_convergence(
+    task_id: str,
+    worker: Any,
+    cancel_audit: Any,
+    main_recorder: Any,
+) -> None:
+    """取消收敛后台线程：协作取消 → 强杀 → 父进程接管 canonical Trace 封存。
+
+    CON-003：只有本地可控执行单元确认退出、Trace 完成 canonical run_cancelled 与封存后，
+    业务对象才提交 cancelled；无法确认时保持 cancelling 或进入 cancel_timeout，不谎报。
+    """
+    from contracts.cancel_state import HARD_STOP_DEADLINE_SECONDS
+
+    trace_id = worker.trace_id
+    try:
+        result = worker.stop_and_collect(deadline=HARD_STOP_DEADLINE_SECONDS)
+        # 子进程若协作退出，自己已写 run_cancelled + 封存；若被强杀，则需父进程接管。
+        converged = result.status
+        _ab_tasks[task_id]["status"] = converged
+        if result.trace_id:
+            _ab_tasks[task_id]["trace_ids"] = [result.trace_id]
+            trace_id = result.trace_id
+        if result.error:
+            _ab_tasks[task_id]["error"] = result.error
+
+        # 父进程接管 canonical Trace 封存（FR-002/006 根因修复）。
+        # seal_external_cancel 幂等：子进程已封存则不覆盖，强杀后无终态则补 run_cancelled + manifest。
+        if trace_id:
+            timeout = converged == "cancel_timeout"
+            try:
+                main_recorder.seal_external_cancel(
+                    trace_id, cancel_audit=cancel_audit, timeout=timeout
+                )
+            except Exception:
+                logger.exception("父进程接管 Trace 封存失败: task=%s trace=%s", task_id, trace_id)
+                if not timeout:
+                    _ab_tasks[task_id]["status"] = "cancel_timeout"
+                    converged = "cancel_timeout"
+
+        cancel_audit.converge_status = "cancelled" if converged == "cancelled" else "cancel_timeout"
+        cancel_audit.converged_at = _now_iso()
+        logger.info(
+            "候选执行任务取消收敛完成: task=%s status=%s cancel_id=%s",
+            task_id, converged, cancel_audit.cancel_id,
+        )
+    except Exception:
+        logger.exception("取消收敛异常: task=%s", task_id)
+        _ab_tasks[task_id]["status"] = "cancel_timeout"
+        cancel_audit.converge_status = "cancel_timeout"
+        cancel_audit.converged_at = _now_iso()
+        # 异常路径仍尝试接管封存为 cancel_timeout（诚实告警，不谎报 cancelled）。
+        if trace_id:
+            try:
+                main_recorder.seal_external_cancel(
+                    trace_id, cancel_audit=cancel_audit, timeout=True
+                )
+            except Exception:
+                logger.exception("异常路径接管封存失败: task=%s trace=%s", task_id, trace_id)
+
+
+def _now_iso() -> str:
+    from datetime import UTC, datetime
+    return datetime.now(UTC).isoformat()
 
 
 # 内存任务表（进程级。生产可换 Redis/DB）

@@ -115,20 +115,25 @@ export default function TraceDetailPage() {
     return () => { ignore = true; };
   }, [drawerNode, traceId]);
 
-  // 完整性诊断：仅当 run.integrity_status 非 verified 且 trace 终态时拉取一次。
-  // 终态前 integrity 通常还是 incomplete（运行中），拉诊断意义不大且浪费请求。
+  // 完整性诊断：run.integrity_status 非 verified 且 trace 终态时拉取。
+  // FR-008：pending（记录中/封存中）是中性态，不拉诊断、不当故障展示（EVD-005 根因）。
+  // 失败时有限重试（最多 3 次，每次退避），避免永久停在"诊断信息暂时不可用"（AC-004）。
   useEffect(() => {
     const status = activeRun?.integrity_status;
     const isTerminal = activeRun?.status
-      ? !["running", "awaiting_input"].includes(activeRun.status)
+      ? !["running", "awaiting_input", "pending", "cancelling"].includes(activeRun.status)
       : false;
-    if (!traceId || !status || status === "verified" || !isTerminal) {
+    // pending 不拉诊断（记录中/校验中，由 banner 显示中性态）；verified 不需要诊断。
+    if (!traceId || !status || status === "verified" || status === "pending" || !isTerminal) {
       setIntegrityDiagnosis(null);
       return;
     }
     let ignore = false;
+    let attempt = 0;
+    const MAX_ATTEMPTS = 3;
+    const backoffMs = [1500, 3000, 6000];
     setIntegrityLoading(true);
-    (async () => {
+    const fetchDiag = async () => {
       try {
         const diag = await getTraceIntegrity(traceId);
         if (!ignore) {
@@ -136,13 +141,19 @@ export default function TraceDetailPage() {
           setIntegrityLoading(false);
         }
       } catch {
-        if (!ignore) {
-          // 诊断加载失败：保留状态标签但不阻断页面（EDGE-007 失败不得伪装成无缺口）。
+        if (ignore) return;
+        attempt += 1;
+        if (attempt >= MAX_ATTEMPTS) {
+          // 重试用尽：保留状态标签，显示可重试的故障态（EDGE-003 诊断服务故障独立语义）。
           setIntegrityDiagnosis(null);
           setIntegrityLoading(false);
+        } else {
+          // 退避重试（诊断依赖的 receipt/manifest 可能正在封存中，稍后可读）。
+          setTimeout(fetchDiag, backoffMs[attempt - 1]);
         }
       }
-    })();
+    };
+    fetchDiag();
     return () => { ignore = true; };
   }, [traceId, activeRun?.integrity_status, activeRun?.status]);
 
@@ -323,16 +334,17 @@ export default function TraceDetailPage() {
           {isLive && (
             <span className="streaming-badge"><span className="pulse" /> 实时</span>
           )}
-          {/* trace 稳定性重构：running 时显示停止按钮；interrupted 时显示收敛按钮 */}
-          {run.status === "running" && activeSession?.session_id && (
+          {/* trace 稳定性重构：running/cancelling 时显示停止按钮；interrupted 时显示收敛按钮。
+              FR-006：cancelling 时按钮显示"取消中…"（受理后立即可见），允许重复点击幂等重试。 */}
+          {(run.status === "running" || run.status === "cancelling") && activeSession?.session_id && (
             <button
               type="button"
               className="stop-button"
-              disabled={stopping}
+              disabled={stopping || run.status === "cancelling"}
               onClick={handleStop}
-              title={`停止 ${activeSession.session_type} session`}
+              title={run.status === "cancelling" ? "取消收敛中，请等待终态" : `停止 ${activeSession.session_type} session`}
             >
-              {stopping ? "停止中…" : "停止"}
+              {run.status === "cancelling" ? "取消中…" : stopping ? "停止中…" : "停止"}
             </button>
           )}
           {run.status === "interrupted" && (
@@ -365,7 +377,14 @@ export default function TraceDetailPage() {
             trace 数据完整保留，请根据实际情况手动标记结果。
           </div>
         )}
-        {run.integrity_status && run.integrity_status !== "verified" && (
+        {run.integrity_status === "pending" && (
+          // FR-008/AC-010：pending 是中性态（记录中/封存中），不是数据损坏。
+          // 不显示故障横幅，只提示用户等待封存校验（EVD-005 根因：运行中不得误报 incomplete）。
+          <div className="integrity-hint integrity-pending">
+            <span>Trace 完整性：{integrityLabel(run.integrity_status)}。运行结束后将自动校验，这不是数据损坏，无需重新运行。</span>
+          </div>
+        )}
+        {run.integrity_status && run.integrity_status !== "verified" && run.integrity_status !== "pending" && (
           <div className={`integrity-hint integrity-${run.integrity_status}`}>
             {integrityLoading ? (
               <span>正在分析完整性缺口…</span>
@@ -536,6 +555,7 @@ function interruptedReasonLabel(reason: string): string {
 
 function integrityLabel(status: string): string {
   if (status === "verified") return "已验证";
+  if (status === "pending") return "记录中（待校验）";
   if (status === "incomplete") return "不完整";
   if (status === "conflict") return "冲突";
   return "旧版未验证";

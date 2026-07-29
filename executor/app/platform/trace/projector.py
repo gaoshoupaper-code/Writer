@@ -121,6 +121,9 @@ class TraceProjector:
                 state.add_tool_error_node(start, event)
             elif event.type == "run_error":
                 state.add_run_error(event)
+            elif event.type in {"cancel_requested", "run_cancelled", "cancel_timeout"}:
+                # EVD-014：取消时间线事件投影为可见控制节点（与 evolution projector 对齐）。
+                state.add_cancel_node(event)
             elif event.type in {
                 "skill_activation",
                 "middleware_assembly",
@@ -459,6 +462,43 @@ class _ProjectionState:
             )
         )
 
+    def add_cancel_node(self, event: TraceLogEvent) -> None:
+        """取消时间线控制节点（FR-006/EVD-014，与 evolution projector 对齐）。"""
+        labels = {
+            "cancel_requested": "用户请求取消",
+            "run_cancelled": "已取消",
+            "cancel_timeout": "取消超时（未收敛）",
+        }
+        status_map = {
+            "cancel_requested": "cancelling",
+            "run_cancelled": "cancelled",
+            "cancel_timeout": "cancel_timeout",
+        }
+        label = labels.get(event.type, "取消")
+        node_id = f"cancel:{event.event_id}"
+        anchor_id = self._append_context(
+            event,
+            kind="error",
+            title=label,
+            content=event.error or label,
+            metadata={"cancel_type": event.type, "timestamp": event.timestamp},
+            related_node_id=node_id,
+        )
+        self.projection.nodes.append(
+            TraceNode(
+                node_id=node_id,
+                parent_node_id="run",
+                kind="error",
+                label=label,
+                status=status_map.get(event.type, "cancelled"),
+                context_anchor_id=anchor_id,
+                output_context_anchor_id=anchor_id,
+                raw_event_ids=[event.event_id],
+                error=event.error,
+                chain_summary=label,
+            )
+        )
+
     def _append_llm_output(self, event: TraceLogEvent, node_id: str) -> str:
         messages = _output_messages(event.output)
         tool_call_names = _tool_call_names(event.tool_calls)
@@ -604,7 +644,7 @@ def _run_node(run: TraceRunSummary, events: list[TraceLogEvent]) -> TraceNode:
         started_at=run.started_at,
         ended_at=run.ended_at,
         duration_ms=run.duration_ms,
-        raw_event_ids=[event.event_id for event in events if event.type in {"run_start", "run_end", "run_error"}],
+        raw_event_ids=[event.event_id for event in events if event.type in {"run_start", "run_end", "run_error", "run_cancelled", "cancel_timeout"}],
         error=run.error,
         chain_summary=run_summary(run),
     )

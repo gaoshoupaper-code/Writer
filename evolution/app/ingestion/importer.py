@@ -86,6 +86,11 @@ def ingest_events(
         run.links = run_summary_hint.links
         run.external_refs = run_summary_hint.external_refs
         run.manifest = run_summary_hint.manifest
+        # 四维正交字段（DEC-008）：executor 权威摘要携带 phase/cancel_audit/revision，
+        # 透传给本地 run（_write_run 会单调保护 revision）。
+        run.trace_phase = run_summary_hint.trace_phase
+        run.cancel_audit = run_summary_hint.cancel_audit
+        run.lifecycle_revision = run_summary_hint.lifecycle_revision
 
     with db.transaction() as conn:
         # event_payloads 外键指向 runs；先建立 provisional run，最终完整性同事务回写。
@@ -105,6 +110,11 @@ def ingest_events(
             run.links = run_summary_hint.links
             run.external_refs = run_summary_hint.external_refs
             run.manifest = run_summary_hint.manifest
+            # 四维正交字段（DEC-008）：receipt 计算可能纠正 phase/integrity，
+            # 但 cancel_audit/revision 必须保留 executor 权威值。
+            run.trace_phase = run_summary_hint.trace_phase
+            run.cancel_audit = run_summary_hint.cancel_audit
+            run.lifecycle_revision = run_summary_hint.lifecycle_revision
         payload_complete = _store_payload_metadata(
             conn, run.trace_id, canonical_events, payload_values or {}
         )
@@ -113,6 +123,13 @@ def ingest_events(
             conn, run, canonical_events, conflicts, payload_complete
         )
         run.integrity_status = receipt["integrity_status"]
+        # FR-008：receipt 计算后同步 trace_phase——verified=sealed，其余非 pending=degraded。
+        # sealed 表示"已封存且结构可信"；degraded 表示"已封存但有缺口/冲突/降级"。
+        if run.integrity_status == "verified":
+            run.trace_phase = "sealed"
+        elif run.integrity_status in ("incomplete", "conflict"):
+            run.trace_phase = "degraded"
+        # legacy / pending 保持原 phase（legacy 无 phase；pending 是运行中，receipt 不应到达）。
         _write_run(conn, run, owner_user_id, receipt["contiguous_seq"])
         conn.execute("DELETE FROM nodes WHERE trace_id = ?", (run.trace_id,))
         _write_nodes(conn, run.trace_id, run, canonical_events)
@@ -180,6 +197,23 @@ def _derive_run_summary(
     # owner_user_id（Phase 3 D2/D20）：从 run_start.input 提取，缺省 'unknown'(T7)。
     owner_user_id = str(start_input.get("user_id") or "unknown")
 
+    schema_version = max(event.schema_version for event in events)
+    is_v2 = schema_version >= 2
+    # FR-008/DEC-008：记录阶段 vs 封存阶段正交。运行中（无终态事件）的 trace 完整性
+    # 是 pending（记录中/待校验），不是终态 incomplete——_upsert_receipt 会在终态后
+    # 用 receipt 事实覆盖为 verified/incomplete。避免运行中被误报为数据损坏（EVD-005）。
+    has_terminal = run_end is not None or run_error is not None or run_cancelled is not None
+    if not is_v2:
+        integrity_status = "legacy"
+        trace_phase = None
+    elif has_terminal:
+        # 终态但 receipt 尚未计算——临时 incomplete，_upsert_receipt 会纠正。
+        integrity_status = "incomplete"
+        trace_phase = "sealed"
+    else:
+        integrity_status = "pending"
+        trace_phase = "recording"
+
     return TraceRunSummary(
         trace_id=trace_id,
         workspace_id=workspace_id,
@@ -196,23 +230,30 @@ def _derive_run_summary(
         event_count=len(events),
         path=str(trace_path) if trace_path else "",
         error=error,
-        schema_version=max(event.schema_version for event in events),
-        service="executor" if max(event.schema_version for event in events) >= 2 else None,
-        workload="creation" if max(event.schema_version for event in events) >= 2 else None,
+        schema_version=schema_version,
+        service="executor" if is_v2 else None,
+        workload="creation" if is_v2 else None,
         purpose=str(start_input.get("run_purpose") or "user_generation"),
-        integrity_status="incomplete" if max(event.schema_version for event in events) >= 2 else "legacy",
+        integrity_status=integrity_status,
+        trace_phase=trace_phase,
         coverage={"payload": "unknown", "token": "unknown", "cost": "unknown"},
     ), owner_user_id
 
 
 def _write_run(conn: Any, run: TraceRunSummary, owner_user_id: str = "unknown", ingested_seq: int = 0) -> None:
+    cancel_audit_json = (
+        json.dumps(run.cancel_audit.model_dump(mode="json"), ensure_ascii=False)
+        if run.cancel_audit is not None
+        else None
+    )
     conn.execute(
         """INSERT INTO runs
            (trace_id, workspace_id, thread_id, session_name, endpoint, status,
             started_at, ended_at, duration_ms, event_count, error, ingested_at,
             owner_user_id, ingested_seq, schema_version, service, workload, run_purpose,
-            integrity_status, coverage_json, run_snapshot_json, external_refs_json, links_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            integrity_status, coverage_json, run_snapshot_json, external_refs_json, links_json,
+            trace_phase, cancel_audit, lifecycle_revision)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(trace_id) DO UPDATE SET
              workspace_id=excluded.workspace_id, thread_id=excluded.thread_id,
              session_name=excluded.session_name, endpoint=excluded.endpoint, status=excluded.status,
@@ -222,7 +263,9 @@ def _write_run(conn: Any, run: TraceRunSummary, owner_user_id: str = "unknown", 
              schema_version=excluded.schema_version, service=excluded.service, workload=excluded.workload,
              run_purpose=excluded.run_purpose, integrity_status=excluded.integrity_status,
              coverage_json=excluded.coverage_json, run_snapshot_json=excluded.run_snapshot_json,
-             external_refs_json=excluded.external_refs_json, links_json=excluded.links_json""",
+             external_refs_json=excluded.external_refs_json, links_json=excluded.links_json,
+             trace_phase=excluded.trace_phase, cancel_audit=excluded.cancel_audit,
+             lifecycle_revision=MAX(runs.lifecycle_revision, excluded.lifecycle_revision)""",
         (
             run.trace_id, run.workspace_id, run.thread_id, run.session_name, run.endpoint,
             run.status, run.started_at, run.ended_at, run.duration_ms, run.event_count,
@@ -231,6 +274,7 @@ def _write_run(conn: Any, run: TraceRunSummary, owner_user_id: str = "unknown", 
             run.purpose, run.integrity_status, json.dumps(run.coverage),
             json.dumps(run.run_snapshot), json.dumps(run.external_refs),
             json.dumps([link.model_dump(mode="json") for link in run.links]),
+            run.trace_phase, cancel_audit_json, run.lifecycle_revision,
         ),
     )
 

@@ -24,7 +24,7 @@ from app.platform.trace.projector import TraceProjector
 from app.platform.trace.schemas import TraceDetail, TraceLogEvent, TraceRunSummary
 from app.platform.trace.summary_export import export_trace_summary
 from contracts.trace import TraceManifest, compute_trace_events_hash
-from contracts.trace import MiddlewareDescriptor, SkillCatalogEntry
+from contracts.trace import CancelAudit, MiddlewareDescriptor, SkillCatalogEntry
 from contracts.trace.payload import (
     ContentAddressedPayloadStore,
     PayloadRejected,
@@ -47,11 +47,13 @@ _FLUSH_BATCH_MAX = 200  # 单批最多写多少行（避免一批太大又阻塞
 _EVOLUTION_NOTIFY_TIMEOUT = 2.0
 
 # HITL cancelled 收尾的来源类型（D5：状态统一 cancelled，error 字段区分来源）。
-CancelReason = Literal["user_stop", "client_disconnect", "timeout"]
+# cancel_timeout 是"10s 内无法确认收敛"的诚实告警态（EDGE-004/007），不当 cancelled。
+CancelReason = Literal["user_stop", "client_disconnect", "timeout", "cancel_timeout"]
 _CANCEL_REASON_MESSAGES: dict[str, str] = {
     "user_stop": "User stopped",
     "client_disconnect": "Stream cancelled (client disconnected)",
     "timeout": "Awaiting input timeout (2h)",
+    "cancel_timeout": "Cancel did not converge within deadline (process unconfirmed)",
 }
 
 # 僵尸清理：awaiting_input 超 2h 未 resume → cancelled（需求决策）。
@@ -177,7 +179,11 @@ class TraceRecorder:
             service="executor",
             workload="creation",
             purpose=run_purpose,
-            integrity_status="incomplete",
+            # FR-008/DEC-008：记录阶段用 pending，不再用 incomplete。
+            # 运行中的 trace 尚未校验，既不是 verified 也不是损坏——下游门禁照常关闭，
+            # 但 UI 不得把"记录中"误展示为终态 incomplete 故障（EVD-005 根因）。
+            integrity_status="pending",
+            trace_phase="recording",
             coverage={"payload": "known", "token": "unknown", "cost": "unknown"},
             external_refs=refs,
         )
@@ -598,6 +604,189 @@ class TraceRecorder:
         )
         self._finalize_run(thread, trace_id, "failed", duration_ms, error_message)
         return event
+
+    # ── 取消身份与父进程接管收尾（FR-006, FR-002, DEC-008 维度4）────────────────
+
+    def record_cancel_requested(
+        self,
+        thread: ThreadSummary,
+        trace_id: str,
+        cancel_audit: CancelAudit,
+    ) -> None:
+        """持久化"用户请求取消"事实（维度4 时间线起点，FR-006/CON-003）。
+
+        取消意图此前只活在内存（mp.Event / threading.Event），强杀或重启即丢失。
+        本方法把它落成一条 cancel_requested 事件 + index 里的 cancel_audit 字段，
+        使取消请求不因子进程终止、服务重启、页面关闭或 trace_id 尚未产生而消失。
+        幂等：同一 cancel_id 重复写不产生第二条事件（按 cancel_audit.cancel_id 去重）。
+        """
+        lock = self._lock_for(trace_id)
+        with lock:
+            # 幂等：若 index 已记录同一 cancel_id，直接返回（重复停止请求命中此路径）。
+            existing = self.find_run_by_trace_id(trace_id)
+            if existing is not None and existing.cancel_audit is not None:
+                if existing.cancel_audit.cancel_id == cancel_audit.cancel_id:
+                    return
+            # 写 cancel_requested 事件（让时间线可见"用户请求取消"节点）。
+            self.append_event(
+                trace_id,
+                {
+                    "type": "cancel_requested",
+                    "status": "cancelling",
+                    "source": "system",
+                    "input": {
+                        "cancel_id": cancel_audit.cancel_id,
+                        "requested_by": cancel_audit.requested_by,
+                        "reason": cancel_audit.reason,
+                    },
+                },
+            )
+            self._write_cancel_audit(thread, trace_id, cancel_audit)
+
+    def _write_cancel_audit(
+        self, thread: ThreadSummary, trace_id: str, cancel_audit: CancelAudit
+    ) -> None:
+        """把取消审计写进 index（单调 bump lifecycle_revision，防旧快照覆盖）。"""
+        try:
+            runs = self._read_run_index(thread)
+        except (OSError, ValueError, json.JSONDecodeError):
+            runs = {}
+        run = runs.get(trace_id)
+        if run is None:
+            return
+        run["cancel_audit"] = cancel_audit.model_dump(mode="json")
+        run["lifecycle_revision"] = int(run.get("lifecycle_revision", 0) or 0) + 1
+        runs[trace_id] = run
+        try:
+            self._write_index(thread, runs)
+        except OSError as exc:
+            self._mark_capture_degraded(
+                trace_id, f"cancel_audit_write_failed:{type(exc).__name__}"
+            )
+
+    def seal_external_cancel(
+        self,
+        trace_id: str,
+        *,
+        cancel_audit: CancelAudit,
+        timeout: bool = False,
+    ) -> bool:
+        """父进程接管子进程 canonical Trace 的取消收尾（FR-002/006, EVD-006/007 根因修复）。
+
+        隔离子进程被强杀后，子进程的 _finalize_run 永远不会跑——canonical Trace 永久
+        running/incomplete、无 manifest、无 run_cancelled。本方法是父进程的幂等接管协议，
+        泛化自 _cancel_zombie_no_memory：从磁盘 index 重建最小活跃态 → 若无终态事件则补
+        run_cancelled（或 timeout=True 时的 cancel_timeout）→ 生成 manifest → 更新 index
+        （status + integrity + trace_phase + cancel_audit + revision）→ notify evolution。
+
+        全程受 can_transition_to 单调保护：若子进程在 SIGKILL 落地前已写入 completed/failed
+        终态事件，本方法不会覆盖它（CON-003/EDGE-001）。
+
+        timeout=True 时写 cancel_timeout 诚实告警态（EDGE-007：进程边界不可确认不强杀），
+        绝不谎报 cancelled。
+
+        返回 True 表示成功接管封存；False 表示 trace 不可发现或已是不可覆盖终态。
+        """
+        run = self.find_run_by_trace_id(trace_id)
+        if run is None:
+            return False
+        ws_path = self._trace_workspace.get(trace_id)
+        if ws_path is None:
+            return False
+        # 单调保护：已合法终态（且非可恢复的 cancel_timeout）则不接管。
+        current_status = run.status
+        if current_status in ("completed", "failed", "cancelled", "interrupted"):
+            return False
+        from app.schemas.screenplay import ThreadSummary as ThreadSummarySchema
+        thread = ThreadSummarySchema(
+            thread_id=str(run.thread_id),
+            workspace_id=str(run.workspace_id),
+            session_name=str(run.session_name),
+            workspace_path=ws_path,
+            created_at=run.started_at,
+            updated_at=run.started_at,
+        )
+        run_path = Path(ws_path) / run.path
+        # 临时重建最小活跃态，让 append_event/_finalize_run 能工作（同 _cancel_zombie_no_memory）。
+        self._locks[trace_id] = RLock()
+        # 用事件高水位（磁盘上的真实 sequence）而非陈旧 index event_count（EVD-008）。
+        self._sequences[trace_id] = self._disk_event_high_water(run_path)
+        self._run_paths[trace_id] = run_path
+        # 跨进程/跨重启无法恢复 monotonic 时钟——从 index 的 started_at（ISO）算 duration。
+        duration_ms = self._duration_from_started(run.started_at)
+        try:
+            # 先把已持久化的取消审计补进 index（若 record_cancel_requested 未写过）。
+            self._write_cancel_audit(thread, trace_id, cancel_audit)
+            reason: CancelReason = "cancel_timeout" if timeout else "user_stop"
+            terminal_status = "cancel_timeout" if timeout else "cancelled"
+            error_message = _CANCEL_REASON_MESSAGES[reason]
+            # 检查磁盘是否已有终态事件（子进程 SIGKILL 前可能已写入）。
+            events = self._read_events(run_path)
+            has_terminal = any(
+                e.type in {"run_end", "run_error", "run_cancelled"} for e in events
+            )
+            if not has_terminal:
+                # 无终态事件：补写 run_cancelled（或 cancel_timeout）作为 manifest 的终态锚点。
+                evt_type = "cancel_timeout" if timeout else "run_cancelled"
+                self.append_event(
+                    trace_id,
+                    {
+                        "type": evt_type,
+                        "status": terminal_status,
+                        "source": "system",
+                        "duration_ms": duration_ms,
+                        "error": error_message,
+                    },
+                )
+            # _finalize_run 完成 manifest 生成 + integrity 收敛 + notify evolution。
+            # 注意：传入的 terminal_status 必须与已写事件一致。
+            self._finalize_run(thread, trace_id, terminal_status, duration_ms, error_message)
+            return True
+        finally:
+            # _finalize_run → _cleanup_run_state 已清内存，兜底再清一次。
+            self._locks.pop(trace_id, None)
+            self._sequences.pop(trace_id, None)
+            self._run_paths.pop(trace_id, None)
+
+    def _duration_from_started(self, started_at: str | None) -> int:
+        """跨进程/跨重启的 duration 计算：从 index 的 started_at（ISO）算到当前。
+
+        _duration_ms 依赖 monotonic 时钟（进程内），父进程接管时该时钟已无效。
+        退化为 wall-clock 差值（毫秒），解析失败时返回 0（duration 仅为观测信息）。
+        """
+        if not started_at:
+            return 0
+        try:
+            started = datetime.fromisoformat(started_at)
+            return max(0, int((datetime.now(UTC) - started).total_seconds() * 1000))
+        except (ValueError, TypeError):
+            return 0
+
+    def _disk_event_high_water(self, run_path: Path) -> int:
+        """从磁盘 jsonl 读真实事件高水位（最大 sequence），修 EVD-008 陈旧 event_count 污染。
+
+        index 的 event_count 只在创建/终态/显式中间态变更时更新，运行中保持初始值；
+        父进程接管时若信任它会从错误 sequence 续写。直接读 jsonl 末尾 sequence 最可靠。
+        读失败时退化为 0（append_event 会从 1 开始，最坏情况是 sequence 不连续——
+        但这只在 jsonl 本身损坏时发生，此时 trace 已 capture_degraded）。
+        """
+        try:
+            lines = run_path.read_text(encoding="utf-8").splitlines()
+            max_seq = 0
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    data = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                seq = data.get("sequence")
+                if isinstance(seq, int) and seq > max_seq:
+                    max_seq = seq
+            return max_seq
+        except OSError:
+            return 0
 
     # ── 写盘解耦：后台 drain + 同步 flush ────────────────────────
 
@@ -1467,6 +1656,16 @@ class TraceRecorder:
         if prompt_versions:
             run_snapshot["prompt_versions"] = prompt_versions
         run["run_snapshot"] = run_snapshot
+        # FR-008/DEC-008：封存阶段先标 sealing（让 UI 显示"封存中/校验中"，不误报 incomplete）。
+        run["trace_phase"] = "sealing"
+        run["lifecycle_revision"] = int(run.get("lifecycle_revision", 0) or 0) + 1
+        runs[trace_id] = run
+        try:
+            self._write_index(thread, runs)
+        except OSError as exc:
+            self._mark_capture_degraded(
+                trace_id, f"run_index_write_failed:{type(exc).__name__}"
+            )
         manifest: TraceManifest | None = None
         try:
             manifest = self._write_manifest(trace_id)
@@ -1475,11 +1674,15 @@ class TraceRecorder:
                 trace_id, f"manifest_write_failed:{type(exc).__name__}"
             )
         run["schema_version"] = 2
+        run["trace_phase"] = (
+            "sealed" if manifest is not None and not manifest.capture_degraded else "degraded"
+        )
         run["integrity_status"] = (
             "verified"
             if manifest is not None and not manifest.capture_degraded
             else "incomplete"
         )
+        run["lifecycle_revision"] = int(run.get("lifecycle_revision", 0) or 0) + 1
         if manifest is not None:
             run["manifest"] = manifest.model_dump(mode="json")
         else:

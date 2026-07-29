@@ -175,12 +175,18 @@ def ingest_trace_now(trace_id: str, traceparent: str | None = None) -> str | Non
 
 
 def _sync_status_only(trace_id: str, traceparent: str | None = None) -> None:
-    """无新事件时的状态同步：从执行端拉 run 摘要，覆盖本地 runs.status。
+    """无新事件时的状态同步：从执行端拉 run 摘要，同步本地 runs 状态维度。
 
     典型场景：HITL resume（awaiting_input→running）不写 trace 事件，只改 index
     status。此时增量拉取无新事件，但本地 status 仍需同步，否则进化端永远停在旧状态。
+
+    EVD-008 根因修复：不再用执行端 index 的 event_count 覆盖本地——执行端 index 的
+    event_count 只在终态/显式中间态更新，运行中保持初始 0，会与本地真实摄入高水位
+    （runs.ingested_seq）撕裂。本方法只同步状态相关维度，event_count 始终以本地
+    摄入事实为准。
     拉取失败静默（下次 scan/notify 会补）。
     """
+    import json as _json
     import httpx
     url = f"{settings.executor_url}/internal/traces/{trace_id}"
     try:
@@ -194,9 +200,27 @@ def _sync_status_only(trace_id: str, traceparent: str | None = None) -> None:
     status = run.get("status")
     if not status:
         return
+    # 四维正交同步（DEC-008）：只更新状态/阶段/完整性/取消审计/revision 等维度，
+    # 绝不碰 event_count（EVD-008）——它以本地已摄入事件数为准。
+    sets = ["status = ?"]
+    params: list = [status]
+    for field in ("trace_phase", "integrity_status"):
+        val = run.get(field)
+        if val is not None:
+            sets.append(f"{field} = ?")
+            params.append(val)
+    cancel_audit = run.get("cancel_audit")
+    if cancel_audit is not None:
+        sets.append("cancel_audit = ?")
+        params.append(_json.dumps(cancel_audit, ensure_ascii=False))
+    revision = run.get("lifecycle_revision")
+    if revision is not None:
+        sets.append("lifecycle_revision = ?")
+        params.append(int(revision))
+    params.append(trace_id)
     db.execute(
-        "UPDATE runs SET status = ?, event_count = ? WHERE trace_id = ?",
-        (status, run.get("event_count"), trace_id),
+        f"UPDATE runs SET {', '.join(sets)} WHERE trace_id = ?",
+        params,
     )
 
 
@@ -295,8 +319,10 @@ def _mark_test_failed_by_task(task_id: str, error: str) -> None:
 def _sync_manual_test_status(trace_id: str, run_status: str) -> None:
     """trace 摄入完成后，按 trace_id 同步关联的手动测试记录状态（D-Q3, FR-007）。
 
-    completed → done；failed → failed；cancelled → cancelled（CON-003: 取消不是失败）。
-    running/awaiting_input 是中间态，不触发终态判定。
+    completed → done；failed → failed；cancelled → cancelled（CON-003: 取消不是失败）；
+    cancel_timeout → failed（取消未收敛，是可诊断的技术故障，不是用户取消）；
+    interrupted → failed（无存活 owner 的中断，需重新运行）。
+    running/awaiting_input/cancelling/pending 是中间态，不触发终态判定。
     终态单调（CON-003）：已终态的记录不被迟到摄入覆写。
     """
     try:
@@ -309,8 +335,8 @@ def _sync_manual_test_status(trace_id: str, run_status: str) -> None:
         # 单调终态保护（CON-003）：已终态的记录不重复更新。
         if is_terminal(row["status"]):
             return
-        if run_status in ("running", "awaiting_input"):
-            return  # 中间态：测试记录保持 running，等终态再判定
+        if run_status in ("running", "awaiting_input", "cancelling", "pending"):
+            return  # 中间态：测试记录保持原状，等终态再判定
         if run_status == "completed":
             test_repo.mark_done(row["test_id"], trace_id)
         elif run_status == "failed":
@@ -318,5 +344,12 @@ def _sync_manual_test_status(trace_id: str, run_status: str) -> None:
         elif run_status == "cancelled":
             # CON-003: 用户取消不得被映射为 failed（EVD-006 根因修复）。
             test_repo.mark_cancelled(row["test_id"], trace_id=trace_id)
+        elif run_status == "cancel_timeout":
+            # EDGE-007：取消未在时限内收敛（进程边界不可确认）——是可诊断的技术故障，
+            # 映射为 failed 让用户知道需重新运行，而非假装已取消。
+            test_repo.mark_failed(row["test_id"], "取消超时未收敛，请重新运行", trace_id=trace_id)
+        elif run_status == "interrupted":
+            # FR-009/EDGE-006：无存活 owner 的中断态——历史孤儿，需重新运行。
+            test_repo.mark_failed(row["test_id"], "执行中断（无存活 owner）", trace_id=trace_id)
     except Exception:
         logger.exception("同步手动测试状态失败 trace=%s", trace_id)

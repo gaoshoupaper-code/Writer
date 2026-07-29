@@ -17,14 +17,17 @@ from enum import Enum
 
 
 class CancelState(str, Enum):
-    """取消状态机的权威状态字典（FR-006, DEC-002）。
+    """取消状态机的权威状态字典（FR-006, DEC-002/008）。
 
-    状态流转：running → cancelling → cancelled | cancel_timeout
-    cancelling 是用户提交停止后、硬终止确认前的可见中间态（立即反馈，DEC-002）。
-    cancel_timeout 是受理后 10.0 秒仍无法确认全部收敛的诚实终态（EDGE-004），
-    不得伪装成 cancelled。
+    状态流转：pending → running → cancelling → cancelled | cancel_timeout
+      - pending：任务已建但 worker/执行尚未登记（EDGE-005 取消早于 worker 建立时起点）。
+      - cancelling：用户提交停止后、硬终止确认前的可见中间态（立即反馈，DEC-002）。
+      - cancelled：确认全部收敛后的终态。
+      - cancel_timeout：受理后 10.0 秒仍无法确认全部收敛的诚实终态（EDGE-004），
+        不得伪装成 cancelled；仅可在后台取得真实停止证明后前进为 cancelled。
     """
 
+    PENDING = "pending"              # 任务已建、执行尚未登记（可被取消请求直接命中）
     RUNNING = "running"
     CANCELLING = "cancelling"        # 已受理停止，正在硬终止（立即可见中间态）
     CANCELLED = "cancelled"          # 确认全部收敛后的终态
@@ -77,9 +80,11 @@ def can_transition_to(current: str | None, target: str) -> bool:
 
 
 def canonical_status(raw: str | None) -> str:
-    """对外统一状态字典（FR-007 兼容性：现有 done/completed 命名内部保留，对外统一）。
+    """对外统一状态字典（FR-007/CON-009 兼容性）。
 
-    旧客户端未知 cancelling 时仍能获得非成功终态和可理解错误（FR-006 兼容性）。
+    混合版本窗口里旧客户端/旧读取路径遇到新增的 cancelling/cancel_timeout/pending 时，
+    必须得到可理解的非成功状态——既不崩溃，也不误报成功或把取消超时当完成（CON-009）。
+    内部 done/completed 命名保留，对外统一为 completed。
     """
     if raw is None:
         return "unknown"

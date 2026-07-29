@@ -54,6 +54,17 @@ def _worker_main(
     必须是模块级函数（multiprocessing spawn 可 pickle），不能是闭包或 lambda。
     子进程内重建全部依赖（recorder / settings / drain），不继承父进程内存状态。
     """
+    # CON-008/EVD-019：在 POSIX 上让子进程成为独立会话/进程组组长。
+    # spawn 默认继承父进程进程组，_force_terminate 的 killpg 会误杀父进程和同组任务。
+    # setsid 后 os.getpgid(child_pid) == child_pid，killpg 才安全（只杀本 worker 派生树）。
+    # Windows 无进程组概念，taskkill /T 已按进程树精确终止，不需要。
+    if sys.platform != "win32":
+        try:
+            import os as _os
+            _os.setsid()
+        except (OSError, PermissionError):
+            # setsid 失败（极罕见）不阻断启动——_force_terminate 会退化为只 kill 单 PID。
+            logger.warning("子进程 setsid 失败，强杀将退化为单 PID 终止", exc_info=True)
     try:
         # 子进程内独立初始化（spawn 模式不继承父进程的已初始化全局变量）。
         from app.platform.trace import TraceRecorder
@@ -308,7 +319,9 @@ class IsolatedGenerationWorker:
 def _force_terminate(process: mp.Process) -> None:
     """跨平台强杀子进程（Windows taskkill / POSIX SIGKILL）。
 
-    RSK-002：强杀隔离进程不破坏父进程状态——子进程的内存/文件句柄随进程消亡。
+    CON-008/RSK-006：强杀隔离进程不得破坏父进程或同组其他任务——只作用于目标 worker
+    及其派生执行。POSIX killpg 必须先确认子进程是独立进程组组长（getpgid(pid)==pid），
+    否则只 kill 单 PID。_worker_main 已在 POSIX 上 setsid 建立独立会话/进程组。
     """
     pid = process.pid
     if pid is None:
@@ -318,10 +331,21 @@ def _force_terminate(process: mp.Process) -> None:
             # Windows: taskkill /T /F 杀进程树（含子进程，如 LLM HTTP 连接的线程）。
             os.system(f"taskkill /PID {pid} /T /F >nul 2>&1")
         else:
-            # POSIX: SIGKILL 进程组（start_new_session=True 时子进程是组长）。
+            # POSIX：先确认子进程是独立进程组组长（setsid 后成立），才 killpg 整组。
+            # 若 getpgid(pid) != pid（setsid 失败或竞态），绝不能 killpg——那会命中
+            # 父进程的进程组，误杀 executor 和同组并发任务（CON-008 事故场景）。
             import signal
             try:
-                os.killpg(os.getpgid(pid), signal.SIGKILL)
+                child_pgid = os.getpgid(pid)
+                if child_pgid == pid:
+                    # 确认是组长：killpg 安全，整组（worker + 其派生的 LLM/工具子进程）终止。
+                    os.killpg(child_pgid, signal.SIGKILL)
+                else:
+                    # 非组长：只 kill 单 PID（漏掉派生子进程的风险 < 误杀父进程的风险）。
+                    logger.warning(
+                        "子进程 pid=%s 非进程组长（pgid=%s），退化为单 PID 终止", pid, child_pgid
+                    )
+                    os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 os.kill(pid, signal.SIGKILL)
     except Exception:

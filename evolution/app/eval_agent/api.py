@@ -24,6 +24,8 @@ import app.core.db as db
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+from contracts.cancel_state import HARD_STOP_DEADLINE_SECONDS
+
 from app.eval_agent import repo as eval_repo
 from app.eval_agent.agent import run_eval_session
 from app.eval_agent.ctx import EvaluationContext
@@ -433,8 +435,6 @@ def stop_session(eval_id: str) -> dict[str, Any]:
     立即标记 cancelling 并返回（DEC-002），后台 asyncio task 在 10 秒时限内
     收敛到 cancelled（协作式 cancel + recorder 强制收敛）。
     """
-    from contracts.cancel_state import HARD_STOP_DEADLINE_SECONDS, is_terminal
-
     session = eval_repo.get_session(eval_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"评估 session {eval_id} 不存在")
@@ -455,8 +455,11 @@ def stop_session(eval_id: str) -> dict[str, Any]:
 
 
 async def _converge_eval_cancel(eval_id: str, task: asyncio.Task | None) -> None:
-    """评估取消收敛：task.cancel → 等 10s → recorder 强制收敛 → 标 cancelled。
+    """评估取消收敛：task.cancel → 等 10s → recorder 强制收敛 → 标 cancelled/cancel_timeout。
 
+    CON-003/EDGE-007：只有 task 确认退出（10s 内协作取消成功）才标 cancelled；
+    超时未退出标 cancel_timeout（诚实告警，不谎报 cancelled）。recorder.cancel_run
+    仍强制收敛 trace runs.status（让 trace 不永久 running），但业务终态以真实停止为准。
     NFR-001：从 stop 受理起不超过 10.0 秒收敛到 cancelled 或 cancel_timeout。
     """
     recorder = get_recorder()
@@ -466,20 +469,28 @@ async def _converge_eval_cancel(eval_id: str, task: asyncio.Task | None) -> None
     if task is not None and not task.done():
         task.cancel()
 
-    # 2. 等待协作式退出（给足 10 秒，NFR-001）。
-    if task is not None:
+    # 2. 等待协作式退出（给足 10 秒，NFR-001）。记录是否在时限内真正退出。
+    # CON-003 真实停止确认：以 task.done() 为准——超时后仍未退出（卡在 C 层阻塞）
+    # 才算未收敛。wait_for/shield 的取消传播细节不作为判据，直接看 task 是否结束。
+    converged_in_time = True
+    if task is not None and not task.done():
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=HARD_STOP_DEADLINE_SECONDS)
-        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            pass  # task 被取消或超时，继续强制收敛
+        except asyncio.TimeoutError:
+            pass  # 超时，下面用 task.done() 复核
+        except (asyncio.CancelledError, Exception):
+            pass  # task 被取消或异常，下面用 task.done() 复核
+    if task is not None and not task.done():
+        converged_in_time = False  # deadline 后仍未退出 → cancel_timeout
 
-    # 3. recorder 强制收敛（即便 task.cancel 无效，runs.status 也收敛）。
+    # 3. recorder 强制收敛（即便 task.cancel 无效，runs.status 也收敛，不永久 running）。
     if recorder and trace_id_self:
         recorder.cancel_run(trace_id_self, reason="user_stop")
 
-    # 4. 推进终态。
-    eval_repo.update_session(eval_id, status="cancelled")
-    logger.info("评估 session %s 取消收敛完成", eval_id)
+    # 4. 推进终态：CON-003 真实停止确认。超时未退出 → cancel_timeout，不谎报 cancelled。
+    final_status = "cancelled" if converged_in_time else "cancel_timeout"
+    eval_repo.update_session(eval_id, status=final_status)
+    logger.info("评估 session %s 取消收敛完成 status=%s", eval_id, final_status)
 
 
 # ── SSE 实时流 ──────────────────────────────────────────────

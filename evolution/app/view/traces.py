@@ -18,6 +18,7 @@ from app.ingestion import projector
 from app.trace_payloads import delete_trace_payloads, hydrate_event, read_payload
 from app.trace.access import audit_content_access, require_full_content_access
 from app.core.models import (
+    CancelAudit,
     TraceContextSegment,
     TraceDetail,
     TraceLogEvent,
@@ -324,6 +325,27 @@ def _compute_integrity_diagnosis(trace_id: str) -> IntegrityDiagnosis:
                 )
             ],
             affected_downstreams=["evidence_compile", "evaluation", "evolution"],
+        )
+
+    # FR-008/AC-010：pending 是记录/封存中的中性态——既非完整也非损坏。
+    # UI 不得把它当终态 incomplete 故障展示（EVD-005 根因）。下游门禁照常关闭（pending
+    # 不可消费），但诊断告知用户"记录中/校验中"，等终态再判，而非"数据有缺口"。
+    if integrity == "pending":
+        phase = run_row.get("trace_phase") or "recording"
+        phase_label = {"recording": "记录中", "sealing": "封存中", "degraded": "封存异常"}.get(phase, "处理中")
+        return IntegrityDiagnosis(
+            trace_id=trace_id,
+            integrity_status="pending",
+            recoverable=True,
+            missing_checks=[
+                IntegrityCheck(
+                    check="integrity_pending",
+                    stage="完整性校验",
+                    impact=f"Trace 正在{phase_label}，尚未进行完整性校验——这不是数据损坏",
+                    recovery="等待运行结束并封存后，完整性会自动校验；无需重新运行",
+                )
+            ],
+            affected_downstreams=[],  # pending 不算缺口，下游只是暂时等待
         )
 
     if integrity == "verified":
@@ -798,7 +820,21 @@ def _run_summary_from_row(run_row: Any) -> TraceRunSummary:
         run_snapshot=json.loads(_row_get(run_row, "run_snapshot_json", "{}") or "{}"),
         links=json.loads(_row_get(run_row, "links_json", "[]") or "[]"),
         external_refs=json.loads(_row_get(run_row, "external_refs_json", "{}") or "{}"),
+        # 四维正交生命周期（DEC-008）：phase/cancel_audit/revision 透传给桌面统一投影。
+        trace_phase=_row_get(run_row, "trace_phase"),
+        cancel_audit=_parse_cancel_audit(_row_get(run_row, "cancel_audit")),
+        lifecycle_revision=int(_row_get(run_row, "lifecycle_revision", 0) or 0),
     )
+
+
+def _parse_cancel_audit(raw: Any) -> CancelAudit | None:
+    """从 runs.cancel_audit（JSON 文本）解析 CancelAudit，None/损坏返回 None。"""
+    if not raw:
+        return None
+    try:
+        return CancelAudit.model_validate(json.loads(raw) if isinstance(raw, str) else raw)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:

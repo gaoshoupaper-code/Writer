@@ -1165,6 +1165,13 @@ def _init_trace_v2_tables(conn: sqlite3.Connection) -> None:
             ("run_snapshot_json", "TEXT NOT NULL DEFAULT '{}'"),
             ("external_refs_json", "TEXT NOT NULL DEFAULT '{}'"),
             ("links_json", "TEXT NOT NULL DEFAULT '[]'"),
+            # 四维正交生命周期（DEC-008，CON-009 兼容扩展，旧数据默认值）：
+            #   trace_phase —— recording/sealing/sealed/degraded；旧记录为 NULL。
+            #   cancel_audit —— CancelAudit 的 JSON；未取消为 NULL。
+            #   lifecycle_revision —— 单调递增，桌面据此拒绝旧快照覆盖；旧记录为 0。
+            ("trace_phase", "TEXT"),
+            ("cancel_audit", "TEXT"),
+            ("lifecycle_revision", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column not in run_columns:
                 conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {ddl}")

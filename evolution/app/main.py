@@ -58,6 +58,19 @@ from app.view.workbenches import router as trace_workbenches_router
 async def lifespan(app: FastAPI):
     # 启动：建表（幂等）+ 启动兜底扫描 + 启动活跃大盘轮询
     db.init_db()
+    # FR-009/DEC-006：启动时证据化迁移历史孤儿 Trace（升级前永久 running/incomplete）。
+    # 幂等：已迁移的跳过；只处理无存活 owner 的孤儿，不伪造 verified。
+    from app.ingestion.orphan_migrate import migrate_orphans
+    import logging
+    orphan_log = logging.getLogger("evolution.orphan_migrate")
+    try:
+        orphan_result = migrate_orphans()
+        if orphan_result["scanned"]:
+            orphan_log.info(
+                "历史孤儿迁移：%s", orphan_result,
+            )
+    except Exception:
+        orphan_log.exception("历史孤儿迁移失败（不影响启动）")
     start_scan_scheduler()
     start_active_poller()
     # 数据闭环：启动 promote judge 调度器（后台定时扫描生产 trace → judge）

@@ -15,9 +15,21 @@ from typing import Any, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-TraceStatus = Literal["running", "awaiting_input", "completed", "failed", "cancelled", "interrupted"]
+# ── 四维正交生命周期契约（DEC-008）──
+# 维度1 业务状态：覆盖 pending→running→cancelling→终态 的主路径与 cancel_timeout→cancelled 恢复边。
+#   awaiting_input 是 HITL 挂起态（running 的变体），与新增的取消收敛态正交。
+TraceStatus = Literal[
+    "pending", "running", "awaiting_input",
+    "cancelling",  # 已受理停止、执行收敛中（立即可见中间态，FR-006）
+    "completed", "failed",
+    "cancelled", "cancel_timeout",  # 取消类终态（cancel_timeout 仅可恢复为 cancelled）
+    "interrupted",  # 无存活 owner 的历史/失联中断态（FR-009）
+]
 TraceWorkload = Literal["creation", "evidence_compile", "evaluation", "evolution"]
-TraceIntegrityStatus = Literal["verified", "incomplete", "conflict", "legacy"]
+# 维度3 完整性：recording/sealing 期间为 pending（不可与 verified/incomplete 终态混用，FR-008/CON-007）。
+TraceIntegrityStatus = Literal["pending", "verified", "incomplete", "conflict", "legacy"]
+# 维度2 Trace 记录阶段：recording→sealing→{sealed|degraded}，与业务状态、完整性正交（FR-008）。
+TracePhase = Literal["recording", "sealing", "sealed", "degraded"]
 TraceCoverageStatus = Literal["known", "partial", "unknown", "not_applicable"]
 TracePayloadKind = Literal["semantic_full", "reference_only", "structural"]
 TraceEventType = Literal[
@@ -26,7 +38,12 @@ TraceEventType = Literal[
     "run_error",
     "run_meta",
     "run_awaiting",
+    # 维度4 取消时间线（FR-006）：request/accept 让"用户取消"在时间线可见，
+    # run_cancelled 是确认收敛终态，cancel_timeout 是 10s 内无法确认收敛的诚实告警态。
+    "cancel_requested",
+    "cancel_accepted",
     "run_cancelled",
+    "cancel_timeout",
     "llm_start",
     "llm_end",
     "llm_error",
@@ -92,6 +109,24 @@ class TraceManifest(BaseModel):
     payload_ids: list[str] = Field(default_factory=list)
     capture_degraded: bool = False
     created_at: str
+
+
+class CancelAudit(BaseModel):
+    """取消身份与收敛审计（维度4，FR-006/CON-003/DEC-008）。
+
+    一次用户停止请求对应一个稳定幂等的 cancel_id，跨 executor/evolution/桌面贯穿，
+    保证取消意图不因子进程强杀、服务重启、页面关闭或 trace_id 尚未产生而丢失。
+    converge_status 记录最终收敛结果（cancelled/cancel_timeout），让取消时间线可审计。
+    全部字段可空：未发起取消的 trace 为 None；部分字段在收敛完成前缺失。
+    """
+
+    cancel_id: str
+    requested_by: str | None = None
+    requested_at: str | None = None
+    reason: str | None = None
+    accepted_at: str | None = None
+    converged_at: str | None = None
+    converge_status: Literal["cancelled", "cancel_timeout"] | None = None
 
 
 class SkillCatalogEntry(BaseModel):
@@ -164,10 +199,23 @@ class TraceRunSummary(BaseModel):
     links: list[TraceSpanLink] = Field(default_factory=list)
     external_refs: dict[str, str] = Field(default_factory=dict)
     manifest: TraceManifest | None = None
+    # 四维正交生命周期（DEC-008，全部向后兼容默认值）：
+    #   trace_phase —— 记录/封存阶段，与业务状态、完整性正交；旧索引缺省 None。
+    #   cancel_audit —— 取消身份审计（CancelAudit），未取消即 None。
+    #   lifecycle_revision —— 单调递增，桌面据此拒绝旧快照覆盖新状态（CON-006）；旧索引缺省 0。
+    trace_phase: TracePhase | None = None
+    cancel_audit: CancelAudit | None = None
+    lifecycle_revision: int = 0
 
     @property
     def trace_incomplete(self) -> bool:
-        return self.integrity_status != "verified"
+        """下游可信消费门禁（CON-001/FR-004）。
+
+        pending（记录/封存中、尚未校验）既不是完整也不是损坏——下游继续关闭，
+        但 UI 不得把它当终态 incomplete 展示（FR-008/AC-010）。仅 verified 放行，
+        仅非 pending 的非 verified 才算真"不完整"。
+        """
+        return self.integrity_status not in ("verified", "pending")
 
 
 class TraceLogEvent(BaseModel):

@@ -58,6 +58,7 @@ STATUS_PUBLISHED = "published"           # 已发版（终态）
 STATUS_DISCARDED = "discarded"           # 已丢弃（终态，working 区已 reset）
 STATUS_FAILED = "failed"                 # 失败（落地失败，等用户丢弃清理）
 STATUS_CANCELLED = "cancelled"           # 已取消（用户主动停止）
+STATUS_CANCEL_TIMEOUT = "cancel_timeout"  # 取消超时（10s 内未收敛，诚实告警态，EDGE-007）
 
 # 占用 working 区的活跃状态——同时只允许一个（决策 G 单会话锁）。
 ACTIVE_STATUSES = frozenset({
@@ -67,6 +68,7 @@ ACTIVE_STATUSES = frozenset({
 # 终态——不可再变更。
 TERMINAL_STATUSES = frozenset({
     STATUS_PUBLISHED, STATUS_DISCARDED, STATUS_CANCELLED,
+    STATUS_CANCEL_TIMEOUT,  # CON-003/EDGE-007：取消超时也是终态（不谎报 cancelled）
 })
 
 

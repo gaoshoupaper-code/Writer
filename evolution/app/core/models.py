@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from contracts.trace import (
+    CancelAudit,
     TraceAgentRole,
     TraceContextKind,
     TraceContextRange,
@@ -40,6 +41,7 @@ from contracts.trace import (
 )
 
 __all__ = [
+    "CancelAudit",
     "TraceAgentRole",
     "TraceContextKind",
     "TraceContextRange",

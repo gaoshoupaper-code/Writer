@@ -35,7 +35,9 @@ router = APIRouter(prefix="/tests", tags=["tests"])
 
 # executor /internal/ab/run 轮询配置（与 evolve/tools.py 对齐）
 _EXEC_TIMEOUT = 30.0
-_POLL_TIMEOUT = 600.0  # 10 分钟（一次完整写作管线）
+# DEC-004/CON-005：不设固定业务总时限。Agent 任务合理总时长不固定，旧 10 分钟时限
+# 既误杀长任务又只更新一侧状态（mark_failed 不停止 executor），制造 task/test/trace 三状态分裂。
+# 轮询持续到 executor 返回终态（done/failed/cancelled/cancel_timeout）或本地被用户停止。
 _POLL_INTERVAL = 3.0
 
 
@@ -44,17 +46,18 @@ def _executor_url(path: str) -> str:
 
 
 def _poll_task_status(test_id: str, task_id: str) -> None:
-    """后台轮询 executor /ab/status 直到 done/failed/cancelled，回填 trace_id + 驱动终态。
+    """后台轮询 executor /ab/status 直到终态，回填 trace_id + 驱动终态。
 
+    DEC-004/CON-005：不设固定业务总时限。轮询持续到 executor 返回终态
+    （done/failed/cancelled/cancel_timeout/interrupted）或本地测试被用户停止。
     与 ingest 通知链路（_sync_manual_test_status）互为兜底：先到者更新，后到者
     因 status 已终结而跳过（mark_done/mark_failed/mark_cancelled 检查 status）。
     """
-    deadline = time.time() + _POLL_TIMEOUT
     not_found_count = 0
     try:
-        while time.time() < deadline:
+        while True:
             time.sleep(_POLL_INTERVAL)
-            # 测试已被停止（stop 端点标了 cancelled）→ 退出轮询，不再驱动终态
+            # 测试已被停止（stop 端点标了 cancelling/cancelled）→ 退出轮询，不再驱动终态
             row = test_repo.get_test(test_id)
             if row and row["status"] in ("done", "failed", "cancelled"):
                 return
@@ -83,11 +86,12 @@ def _poll_task_status(test_id: str, task_id: str) -> None:
             if resp.status_code != 200:
                 continue
             data = resp.json()
+            status = data.get("status")
             # running 期间也可能已有 trace_id（executor create_run 后立即回填）
             trace_ids = data.get("trace_ids", [])
-            if trace_ids and data["status"] == "running":
+            if trace_ids and status == "running":
                 test_repo.set_trace_id(test_id, trace_ids[0])
-            if data["status"] == "done":
+            if status == "done":
                 if trace_ids:
                     test_repo.set_trace_id(test_id, trace_ids[0])
                 # done 的终态以 ingest 链路为准（trace 摄入后 _sync_manual_test_status 标 done）；
@@ -95,7 +99,7 @@ def _poll_task_status(test_id: str, task_id: str) -> None:
                 if row and row["status"] not in ("done", "failed", "cancelled"):
                     test_repo.mark_done(test_id, trace_ids[0] if trace_ids else "")
                 return
-            if data["status"] == "failed":
+            if status == "failed":
                 # trace 可能已创建（assemble 前的 create_run）但后续抛异常；回填 trace_id
                 # 让用户能从失败记录点进去看部分 trace。
                 failed_trace_ids = data.get("trace_ids") or []
@@ -105,16 +109,30 @@ def _poll_task_status(test_id: str, task_id: str) -> None:
                     failed_trace_ids[0] if failed_trace_ids else None,
                 )
                 return
-            if data["status"] == "cancelled":
-                # executor 在边界处停了（run_ab_generation 已 cancel_run 收尾）
+            if status in ("cancelled", "cancel_timeout"):
+                # executor 已收敛取消（run_ab_generation cancel_run 收尾，或父进程接管封存）。
+                # cancel_timeout 是取消未收敛的诚实告警——映射为 failed（可诊断技术故障），
+                # cancelled 映射为 cancelled（CON-003 用户取消不是失败）。
                 if trace_ids:
                     test_repo.set_trace_id(test_id, trace_ids[0])
                 if row and row["status"] not in ("done", "failed", "cancelled"):
-                    test_repo.mark_cancelled(test_id, trace_ids[0] if trace_ids else None)
+                    if status == "cancelled":
+                        test_repo.mark_cancelled(test_id, trace_ids[0] if trace_ids else None)
+                    else:  # cancel_timeout
+                        test_repo.mark_failed(
+                            test_id, "取消超时未收敛，请重新运行",
+                            trace_ids[0] if trace_ids else None,
+                        )
                 return
-        # 超时
-        if row and row["status"] not in ("done", "failed", "cancelled"):
-            test_repo.mark_failed(test_id, "轮询超时（10 分钟无结果）")
+            if status == "interrupted":
+                # executor task 中断（无存活 owner）——映射为 failed 让用户重新运行。
+                interrupted_trace_ids = data.get("trace_ids") or []
+                test_repo.mark_failed(
+                    test_id, "执行中断（无存活 owner）",
+                    interrupted_trace_ids[0] if interrupted_trace_ids else None,
+                )
+                return
+            # status == "cancelling"：保持轮询，等收敛到 cancelled/cancel_timeout。
     except Exception as exc:
         logger.exception("轮询测试 %s 状态失败", test_id)
         try:

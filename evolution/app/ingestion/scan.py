@@ -48,6 +48,11 @@ def _scan_once() -> int:
     - evolution 没有 → 新 trace，拉取摄入
     - status 不一致 → 状态变迁（如 awaiting_input→completed），重拉摄入
     - status 一致 → 跳过
+
+    EVD-009 根因修复：status 一致（两端都 running）不再无脑跳过——补三方对账：
+    若关联的 manual_tests/eval/evolve session 已终态，而 trace 两端都还 running，
+    说明是强杀/超时产生的孤儿（task/test/trace 三状态分裂），必须重拉摄入让 receipt
+    按真实事件重新判定，否则该 trace 永久伪装为活跃。
     """
     import httpx
 
@@ -74,21 +79,61 @@ def _scan_once() -> int:
             continue
         executor_status = item.get("status", "")
         local_status = ingested_status.get(trace_id)
-        # 跳过条件：已摄入且 status 一致（无变迁）
+        # 跳过条件：已摄入且 status 一致（无变迁）—— 但 EVD-009 还需三方对账。
         if local_status is not None and local_status == executor_status:
+            # trace 稳定性重构：interrupted 是本地判定，executor 不知，不得被覆盖。
+            if local_status == "interrupted":
+                continue
+            # 两端都 running 时，检查关联业务对象是否已终态（孤儿检测，EVD-009）。
+            if local_status in ("running", "awaiting_input", "cancelling") and _associated_business_terminal(trace_id):
+                logger.info(
+                    "孤儿 trace 检测: %s 两端 %s 但关联业务对象已终态，强制重拉摄入",
+                    trace_id, local_status,
+                )
+            else:
+                continue
+        # interrupted 本地态不被 executor 覆盖（仅 UI 手动收敛）。
+        if local_status == "interrupted" and executor_status == "running":
             continue
-        # trace 稳定性重构（设计 20260720_203000）：evolution 的 interrupted 状态是
-        # 进程重启/心跳超时的本地判定，executor 不知道。兜底摄入不能覆盖它——
-        # 否则 recover_pending 标的 interrupted 会被 executor 的 running 立即覆盖。
-        # interrupted 只能由用户在 UI 手动收敛（POST /traces/{id}/resolve）。
-        if local_status == "interrupted":
-            continue
-        # 新 trace 或 status 变迁 → 拉取摄入
+        # 新 trace 或 status 变迁或孤儿 → 拉取摄入
         tid = _fetch_and_ingest(trace_id, item.get("workspace_id"))
         if tid:
             count += 1
             logger.info("兜底摄入: %s (变更: %s→%s)", tid, local_status, executor_status)
     return count
+
+
+# 业务终态集合（与各 session 表的终态对齐）。
+_BUSINESS_TERMINAL_STATUSES = {
+    "done", "failed", "cancelled", "cancel_timeout", "interrupted",
+    "completed",  # evaluation_sessions 用 completed
+    "published", "discarded",  # evolve_sessions 终态
+}
+
+
+def _associated_business_terminal(trace_id: str) -> bool:
+    """EVD-009 三方对账：检查 trace 关联的业务对象（test/eval/evolve）是否已终态。
+
+    若关联对象已终态而 trace 仍 running，说明发生了 task/test/trace 三状态分裂
+    （强杀/超时只改了一侧），该 trace 是孤儿——调用方应强制重拉摄入。
+    任一关联表命中终态即返回 True；无关联或关联仍在跑返回 False。
+    """
+    from contracts.cancel_state import is_terminal
+
+    # manual_tests.trace_id（单次测试被测对象）
+    row = db.query_one("SELECT status FROM manual_tests WHERE trace_id=?", (trace_id,))
+    if row is not None:
+        if is_terminal(row["status"]) or row["status"] in _BUSINESS_TERMINAL_STATUSES:
+            return True
+    # evolve/eval session 的 self_trace_id（自观测录像）
+    for table, col in (("evolve_sessions", "self_trace_id"), ("evaluation_sessions", "self_trace_id")):
+        try:
+            row = db.query_one(f"SELECT status FROM {table} WHERE {col}=?", (trace_id,))
+        except Exception:
+            continue
+        if row is not None and row["status"] in _BUSINESS_TERMINAL_STATUSES:
+            return True
+    return False
 
 
 def _fetch_and_ingest(trace_id: str, workspace_hint: str | None) -> str | None:

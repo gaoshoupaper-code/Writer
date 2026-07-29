@@ -1,12 +1,16 @@
 // ── Trace 类型（搬迁自 evolution/frontend/lib/types.ts，仅保留 trace 相关 + 新增监测类型）──
 
+// DEC-008 四维正交业务状态：pending→running→cancelling→终态（cancel_timeout 仅可恢复为 cancelled）。
 export type TraceStatus =
+  | "pending"
   | "running"
   | "awaiting_input"
+  | "cancelling"
   | "completed"
   | "failed"
   | "cancelled"
-  | "interrupted"; // trace 稳定性重构：进程重启/心跳超时后的中间态，用户手动收敛
+  | "cancel_timeout"
+  | "interrupted"; // 进程重启/心跳超时后的中断态，用户手动收敛
 
 export type TraceEventType =
   | "run_start"
@@ -14,6 +18,9 @@ export type TraceEventType =
   | "run_error"
   | "run_awaiting"
   | "run_cancelled"
+  | "cancel_requested" // DEC-008 维度4：用户请求取消（时间线可见节点）
+  | "cancel_accepted"
+  | "cancel_timeout" // 取消未收敛的诚实告警终态
   | "llm_start"
   | "llm_end"
   | "llm_error"
@@ -145,6 +152,21 @@ export type TraceRunSummary = {
   run_snapshot?: Record<string, unknown>;
   links?: TraceSpanLink[];
   external_refs?: Record<string, string>;
+  // DEC-008 四维正交生命周期：phase/cancel_audit/revision（旧记录缺省 undefined/0）。
+  trace_phase?: TracePhase | null;
+  cancel_audit?: CancelAudit | null;
+  lifecycle_revision?: number;
+};
+
+// FR-006 取消身份审计：稳定幂等 cancel_id 贯穿 trace/审计/下游，跨进程不丢。
+export type CancelAudit = {
+  cancel_id: string;
+  requested_by?: string | null;
+  requested_at?: string | null;
+  reason?: string | null;
+  accepted_at?: string | null;
+  converged_at?: string | null;
+  converge_status?: "cancelled" | "cancel_timeout" | null;
 };
 
 export type TraceDetail = {
@@ -251,7 +273,10 @@ export type ActiveRun = {
 };
 
 export type TraceWorkload = "creation" | "evidence_compile" | "evaluation" | "evolution";
-export type TraceIntegrityStatus = "verified" | "incomplete" | "conflict" | "legacy";
+// FR-008/DEC-008：pending 是记录/封存中的中性态（既非完整也非损坏），sealed 后才进终态值。
+export type TraceIntegrityStatus = "pending" | "verified" | "incomplete" | "conflict" | "legacy";
+// 四维正交：Trace 记录阶段，与业务状态、完整性正交（recording/sealing/sealed/degraded）。
+export type TracePhase = "recording" | "sealing" | "sealed" | "degraded";
 export type TraceCoverageStatus = "known" | "partial" | "unknown" | "not_applicable";
 
 export type TraceSpanLink = {
