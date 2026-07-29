@@ -50,6 +50,20 @@ def compile_dossier(trace_id: str, dossier_id: str) -> dict[str, Any]:
         # 标记 compiling
         repo.update_dossier(dossier_id, status="compiling")
 
+        # 0. 编译资格门槛：只有源 trace 跑完（completed）才具备编译资格。
+        # 没跑完的 trace（failed / cancelled）根本没有可信产物——primary/review
+        # subagent 来不及写出白名单路径下的交付物。让它进入提取只会被
+        # _check_critical_evidence 判 failed，并把"没资格编译"误报成"编译发现
+        # 无产物"，混淆两类性质不同的问题。这里按运行资格直接拦下。
+        eligible_gap = _check_compile_eligibility(trace_id)
+        if eligible_gap:
+            reason = f"不具备编译资格：{eligible_gap}"
+            repo.update_dossier(
+                dossier_id, status="failed", failure_reason=reason,
+                finished=True,
+            )
+            return {"status": "failed", "reason": reason, "llm_calls": 0}
+
         # 1. 提取事实层
         facts = extract_facts(trace_id)
 
@@ -159,6 +173,35 @@ def compile_dossier(trace_id: str, dossier_id: str) -> dict[str, Any]:
             finished=True,
         )
         return {"status": "failed", "reason": str(exc), "llm_calls": llm_calls}
+
+
+# ── 编译资格门槛 ──────────────────────────────────────────────
+
+# 源 trace 只有 completed 才有可信产物可言。failed / cancelled 意味着主链未走完，
+# primary/review subagent 来不及写出白名单路径下的交付物——编译这种 trace 没有意义。
+# （running 理论上不会到达此处：编译由 API 层在 trace 落终态后触发，但即便误触，
+#  running 也不该被当作可编译，故不在白名单内。）
+_COMPILE_ELIGIBLE_RUN_STATUS = frozenset({"completed"})
+
+
+def _check_compile_eligibility(trace_id: str) -> str | None:
+    """检查源 trace 是否具备被编译的资格。不具备返回原因，具备返回 None。
+
+    这是运行资格判定（区别于 _check_critical_evidence 的产物完整性判定）：
+      - 源 trace 没跑完（failed / cancelled / running）→ 没有可信产物可提取，
+        直接拦下，避免误把"没资格"报成"编译发现无产物"。
+      - runs 记录缺失 → 同样拦下（契约/产物都无从谈起）。
+    只有 completed 的 trace 才进入后续提取与关键证据检查。
+    """
+    run = db.query_one(
+        "SELECT status FROM runs WHERE trace_id = ?", (trace_id,),
+    )
+    if run is None:
+        return f"源 trace 不存在（runs 记录缺失，trace_id={trace_id}）"
+    status = run.get("status")
+    if status not in _COMPILE_ELIGIBLE_RUN_STATUS:
+        return f"源 trace 未完成（status={status}），仅 completed 的 trace 可编译"
+    return None
 
 
 # ── 关键证据检查 ──────────────────────────────────────────────

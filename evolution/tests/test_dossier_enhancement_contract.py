@@ -250,5 +250,69 @@ class DossierImmutabilityTest(unittest.TestCase):
         self.assertEqual(d["status"], "ready")
 
 
+class CompileEligibilityGateTest(unittest.TestCase):
+    """编译资格门槛：未完成的 trace 直接拦下，不进入提取与产物检查。
+
+    覆盖 _check_compile_eligibility —— 防止"trace 没跑完"被误报成
+    "编译发现无产物交付物"（两类性质不同的问题）。
+    """
+
+    def setUp(self):
+        from app.dossier import repo
+        self._repo = repo
+        # seed 一条失败的 trace（主链未走完，无产物）
+        db.execute(
+            "INSERT INTO runs(trace_id, workspace_id, status, owner_user_id, run_purpose, "
+            "ingested_at, endpoint) VALUES(?,?,?,?,?,?,?)",
+            ("trace-failed", "ws", "failed", "u1", "user_generation",
+             "2026-01-01", "create"),
+        )
+
+    def tearDown(self):
+        db.execute("DELETE FROM evidence_dossiers WHERE trace_id='trace-failed'")
+        db.execute("DELETE FROM runs WHERE trace_id='trace-failed'")
+
+    def test_failed_trace_rejected_with_eligibility_reason(self):
+        """失败的 trace 走资格门槛，reason 明确区分于"无产物交付物"。"""
+        from app.dossier.compiler import compile_dossier
+        did = self._repo.create_dossier(
+            "trace-failed", "u1", compile_rule_version="v1",
+        )
+        result = compile_dossier("trace-failed", did)
+        self.assertEqual(result["status"], "failed")
+        # reason 必须是"不具备编译资格"，而不是"关键证据缺失：无任何产物交付物"
+        self.assertIn("不具备编译资格", result["reason"])
+        self.assertNotIn("无任何产物交付物", result["reason"])
+        # 卷宗落库状态与 reason 一致
+        d = self._repo.get_dossier(did)
+        self.assertEqual(d["status"], "failed")
+        self.assertIn("不具备编译资格", d["failure_reason"])
+
+    def test_nonexistent_trace_rejected(self):
+        """runs 记录缺失同样拦下（而非进提取后抛 KeyError）。"""
+        from app.dossier.compiler import compile_dossier
+        did = self._repo.create_dossier(
+            "trace-nonexist", "u1", compile_rule_version="v1",
+        )
+        result = compile_dossier("trace-nonexist", did)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("不具备编译资格", result["reason"])
+
+    def test_completed_trace_passes_eligibility_gate(self):
+        """completed 的 trace 通过资格门槛（后续产物检查仍各自独立判定）。"""
+        from app.dossier.compiler import _check_compile_eligibility
+        # 用一条 completed trace 验证：应返回 None（具备资格）
+        db.execute(
+            "INSERT INTO runs(trace_id, workspace_id, status, owner_user_id, run_purpose, "
+            "ingested_at, endpoint) VALUES(?,?,?,?,?,?,?)",
+            ("trace-ok", "ws", "completed", "u1", "user_generation",
+             "2026-01-01", "create"),
+        )
+        try:
+            self.assertIsNone(_check_compile_eligibility("trace-ok"))
+        finally:
+            db.execute("DELETE FROM runs WHERE trace_id='trace-ok'")
+
+
 if __name__ == "__main__":
     unittest.main()
