@@ -5619,7 +5619,6 @@ html[data-theme="dark"] {
   letter-spacing: 0.05em;
   color: var(--muted, #868e96);
 }
-}
 
 .shell-nav-item {
   display: flex;
