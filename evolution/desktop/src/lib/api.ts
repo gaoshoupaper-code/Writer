@@ -1081,7 +1081,8 @@ export async function deleteTest(testId: string): Promise<{ status: string; dele
 export interface Snapshot {
   version: number;
   parent_version: number | null;
-  source_commit: string | null;
+  commit_hash: string | null;
+  executable: boolean;
   change_summary: string | null;
   status: string; // production | retired
   created_at: string;
@@ -1093,12 +1094,14 @@ export interface HarnessElementView {
   prompt: { body: string };
   skills: { path: string; name: string; description: string | null; content: string | null; load_error: string | null }[];
   middlewares: {
-    hook: string | null;
+    hook: string | null; // 旧桌面客户端兼容字段；新客户端使用 hooks
+    hooks: string[];
     group: string | null;
-    class_name: string | null;
+    class_name: string;
     params: Record<string, any>;
     source_path: string | null;
     description: string | null;
+    optional: boolean;
   }[];
 }
 

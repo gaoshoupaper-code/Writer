@@ -3,68 +3,18 @@
   "production": 6,
   "versions": [
     {
-      "version": 1,
-      "parent_version": null,
-      "change_summary": "初始包（从 current/ 迁移建立独立 harness 仓库，源码为迁移时 current/ 最终态）",
-      "eval_score": null,
-      "eval_status": "pending",
-      "created_at": "2026-06-27T03:09:22.471310+00:00",
-      "source_session": null,
-      "migrated": true,
-      "migrated_note": "从旧 DB harness_snapshots 迁移。旧 commit 2782f1c/98fc128/b8a171d 属于已废弃的整个项目仓库，源码不可在新仓库精确重建。registry 将旧 v1/v2/v3 合并为新仓库 v1（迁移时的最终态）。"
-    },
-    {
-      "version": 2,
-      "parent_version": 1,
-      "change_summary": "去 DB 重构 Phase 3：删除 use_config 死代码分支（assemble 简化、删 assembler.py 依赖）",
-      "eval_score": null,
-      "eval_status": "pending",
-      "created_at": "2026-07-13T12:30:00+00:00",
-      "source_session": null
-    },
-    {
-      "version": 3,
-      "parent_version": 2,
-      "change_summary": "feat(memory): Phase 2 可进化记忆要素（补登记：原 commit c08aa65 未走 publish 流程）",
-      "eval_score": null,
-      "eval_status": "pending",
-      "created_at": "2026-07-14T04:37:30+00:00",
-      "source_session": null,
-      "backfilled": true,
-      "backfill_note": "Phase 2 commit 直接进 harness repo 未走 publish_version，导致 registry 漏登记。本次补登记让 version 号对齐 commit 位置映射。"
-    },
-    {
-      "version": 4,
-      "parent_version": 3,
-      "change_summary": "feat(memory): Phase 4 检索质量埋点 + assemble 接线 quality_callback（补登记：原 commit 9478b17 未走 publish 流程）",
-      "eval_score": null,
-      "eval_status": "pending",
-      "created_at": "2026-07-14T04:51:08+00:00",
-      "source_session": null,
-      "backfilled": true,
-      "backfill_note": "Phase 4 commit 同 Phase 2 漏登记，本次补登记。"
-    },
-    {
-      "version": 5,
-      "parent_version": 4,
-      "change_summary": "feat(memory): NWM 记忆系统重构 — 去 Graphiti，自研叙事学类型化记忆（补登记：原 commit 2822cc0）",
-      "eval_score": null,
-      "eval_status": "pending",
-      "created_at": "2026-07-17T16:10:32+00:00",
-      "source_session": null,
-      "backfilled": true,
-      "backfill_note": "NWM 重构改动此前仅落主仓库(25de1a6)未进 harness repo，本次 commit 2822cc0 补进 + 补登记 v5。"
-    },
-    {
       "version": 6,
-      "parent_version": 5,
+      "parent_version": null,
       "change_summary": "fix(infra): A2 加固中间件链复活（EncodingGuard/ReadCache/FileStateTracker/WriteResultInspector）+ 合并服务器 v3 发版的 storybuilding 迭代护栏（StorybuildingIterationLimitMiddleware）",
       "eval_score": null,
       "eval_status": "pending",
       "created_at": "2026-07-20T11:30:00+00:00",
       "source_session": null,
       "merged_from": "server-aa7cfe8",
-      "merge_note": "合并本地 A2 修复（56130cc）与服务器 v3 发版（aa7cfe8）的有价值改动。排除服务器 large_tool_results/ 污染；ReadCache 以本地为准（全 agent 装配），去掉服务器在 storybuilding.py 里重复的装配。"
+      "merge_note": "合并本地 A2 修复（56130cc）与服务器 v3 发版（aa7cfe8）的有价值改动。排除服务器 large_tool_results/ 污染；ReadCache 以本地为准（全 agent 装配），去掉服务器在 storybuilding.py 里重复的装配。",
+      "commit_hash": null,
+      "executable": false,
+      "migration_reason": "bind_current_head_on_startup"
     }
   ],
   "rollback_log": []

@@ -1,15 +1,17 @@
 import { useState } from "react";
 import type { ProcessorChange } from "@/lib/api";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { MIDDLEWARE_GROUP_LABELS } from "@/lib/harness-constants";
 
 /** middleware 展示元信息（HarnessElementView.middlewares 的元素类型） */
 interface MWInfo {
-  hook: string | null;
+  hooks: string[];
   group: string | null;
-  class_name: string | null;
+  class_name: string;
   params: Record<string, any>;
   source_path: string | null;
   description: string | null;
+  optional: boolean;
 }
 
 /**
@@ -21,9 +23,11 @@ interface MWInfo {
 export function MiddlewareNode({
   mw,
   change,
+  activeHook,
 }: {
   mw: MWInfo;
   change?: ProcessorChange;
+  activeHook: string;
 }) {
   const [open, setOpen] = useState(false);
 
@@ -40,26 +44,39 @@ export function MiddlewareNode({
   return (
     <>
       <div className={`mw-node ${diffClass}`} onClick={() => setOpen(true)}>
-        <div className="mw-node-class">{mw.class_name || "（未知类）"}</div>
-        <div className="mw-node-group">{mw.group || "—"}</div>
+        <div className="mw-node-class">{mw.class_name}</div>
+        <div className="mw-node-group">
+          {mw.group ? MIDDLEWARE_GROUP_LABELS[mw.group] ?? mw.group : "—"}
+          {mw.optional ? " · 条件" : ""}
+        </div>
       </div>
 
       <Sheet open={open} onOpenChange={setOpen}>
         <SheetContent side="right">
           <SheetHeader>
-            <SheetTitle>{mw.class_name || "（未知类）"}</SheetTitle>
+            <SheetTitle>{mw.class_name}</SheetTitle>
           </SheetHeader>
 
           <div className="mw-sheet-body">
-            {/* 元信息：hook / group */}
+            {/* 元信息：当前泳道位置 / 完整 hooks / 分组 */}
             <div className="mw-sheet-meta">
               <div className="mw-detail-row">
-                <span className="mw-detail-label">hook：</span>
-                <span className="mw-detail-val">{mw.hook || "—"}</span>
+                <span className="mw-detail-label">当前 hook：</span>
+                <span className="mw-detail-val">{activeHook}</span>
+              </div>
+              <div className="mw-detail-row">
+                <span className="mw-detail-label">全部 hooks：</span>
+                <span className="mw-detail-val">{mw.hooks.join(" / ") || "—"}</span>
               </div>
               <div className="mw-detail-row">
                 <span className="mw-detail-label">group：</span>
-                <span className="mw-detail-val">{mw.group || "—"}</span>
+                <span className="mw-detail-val">
+                  {mw.group ? MIDDLEWARE_GROUP_LABELS[mw.group] ?? mw.group : "—"}
+                </span>
+              </div>
+              <div className="mw-detail-row">
+                <span className="mw-detail-label">挂载条件：</span>
+                <span className="mw-detail-val">{mw.optional ? "满足运行条件时启用" : "固定启用"}</span>
               </div>
             </div>
 

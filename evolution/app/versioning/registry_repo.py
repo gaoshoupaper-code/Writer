@@ -115,14 +115,14 @@ def get_production_version_number() -> int | None:
 def get_version_commit(version: int) -> str | None:
     """取某版本对应的不可变 git commit hash（FR-005 / CON-004 / DEC-006）。
 
-    优先读 registry entry 的显式 commit_hash 绑定（C1 修复 EVD-007）。
-    仅当旧版本无显式绑定且无法迁移时，才回退到 git log 推导（已标记不可执行）。
+    只读 registry entry 的显式 commit_hash 绑定（C1 修复 EVD-007）。
+    旧版本无显式绑定时返回 None，不再用 git log 推导。
     """
     v = get_version(version)
     if v is None:
         return None
 
-    # 优先：显式绑定的 commit_hash（C1 新增，不可变源码身份）。
+    # 显式绑定的 commit_hash 是唯一不可变源码身份。
     explicit_commit = v.get("commit_hash")
     if explicit_commit:
         return explicit_commit
@@ -134,6 +134,75 @@ def get_version_commit(version: int) -> str | None:
         "版本 v%s 无显式 commit 绑定，不可执行（需迁移或重跑）", version
     )
     return None
+
+
+def prune_unexecutable_history_and_bind_production(commit_hash: str) -> dict[str, Any]:
+    """Remove unusable migrated versions and recover the current production baseline.
+
+    A registry created before explicit commit binding may contain only entries that can
+    no longer be executed safely. The current production entry is recoverable because
+    the worktree HEAD is the exact package currently served; older unbound entries are
+    not recoverable and are removed instead of remaining selectable.
+    """
+    data = _read()
+    production_version = data.get("production")
+    production = next(
+        (v for v in data.get("versions", []) if v.get("version") == production_version),
+        None,
+    )
+    if production is None:
+        return {"changed": False, "removed_versions": [], "production": None}
+
+    removed_versions = sorted(
+        v["version"]
+        for v in data["versions"]
+        if not v.get("commit_hash") and v["version"] != production_version
+    )
+    retained = [
+        v
+        for v in data["versions"]
+        if v.get("commit_hash") or v["version"] == production_version
+    ]
+
+    changed = retained != data["versions"]
+    if not production.get("commit_hash"):
+        production["commit_hash"] = commit_hash
+        production["executable"] = True
+        production.pop("migration_reason", None)
+        changed = True
+
+    retained_versions = {v["version"] for v in retained}
+    for version in retained:
+        if version.get("parent_version") not in retained_versions:
+            if version.get("parent_version") is not None:
+                changed = True
+            version["parent_version"] = None
+
+    if not changed:
+        return {
+            "changed": False,
+            "removed_versions": [],
+            "production": production_version,
+        }
+
+    data["versions"] = retained
+    data["rollback_log"] = [
+        item
+        for item in data.get("rollback_log", [])
+        if item.get("from") in retained_versions and item.get("to") in retained_versions
+    ]
+    _write(data)
+    logger.info(
+        "清理不可执行 Harness 历史版本 %s，production v%s 绑定 %s",
+        removed_versions,
+        production_version,
+        commit_hash,
+    )
+    return {
+        "changed": True,
+        "removed_versions": removed_versions,
+        "production": production_version,
+    }
 
 
 # ── 写入（发布 / 回滚）──
@@ -287,6 +356,7 @@ __all__ = [
     "list_versions",
     "get_production_version_number",
     "get_version_commit",
+    "prune_unexecutable_history_and_bind_production",
     "publish_version",
     "bind_version_commit",
     "rollback",

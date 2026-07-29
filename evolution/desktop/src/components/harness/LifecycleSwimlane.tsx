@@ -82,12 +82,14 @@ function SwimlaneRow({
     changeMap.set(`${pc.key.hook}:${pc.key.group}`, pc);
   });
 
-  // 按 hook 分组 middleware
+  // 一个 middleware 可以实现多个生命周期 hook；同一挂载实例会出现在对应的每一列。
   const byHook = new Map<string, HarnessElementView["middlewares"]>();
   agent.middlewares.forEach((mw) => {
-    const hook = mw.hook ?? "__unhooked__";
-    if (!byHook.has(hook)) byHook.set(hook, []);
-    byHook.get(hook)!.push(mw);
+    const hooks = mw.hooks.length > 0 ? mw.hooks : ["__unhooked__"];
+    hooks.forEach((hook) => {
+      if (!byHook.has(hook)) byHook.set(hook, []);
+      byHook.get(hook)!.push(mw);
+    });
   });
 
   return (
@@ -103,12 +105,13 @@ function SwimlaneRow({
         return (
           <div key={hook} className="swimlane-cell">
             {mws.map((mw, i) => {
-              const change = changeMap.get(`${mw.hook}:${mw.group}`);
+              const change = changeMap.get(`${hook}:${mw.group}`);
               return (
                 <MiddlewareNode
                   key={`${mw.class_name}-${i}`}
                   mw={mw}
                   change={change}
+                  activeHook={hook}
                 />
               );
             })}
@@ -116,7 +119,7 @@ function SwimlaneRow({
         );
       })}
 
-      {/* 未挂载到任何已知 hook 的 middleware（hook=null）单独提示 */}
+      {/* 没有可识别 hook 的外部/动态 middleware 单独提示 */}
       {byHook.has("__unhooked__") && (
         <div className="swimlane-row-collapsed" style={{ gridColumn: "1 / -1" }}>
           <span>⚠ {byHook.get("__unhooked__")!.length} 个 middleware 未挂载生命周期</span>

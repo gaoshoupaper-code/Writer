@@ -19,12 +19,23 @@ export const HOOK_ORDER = [
 
 /** agent 机器名 → 中文角色名（对齐后端 _SUBAGENT_ROLE_MAP，meta_pipeline 前端补充为"主控"） */
 export const AGENT_LABELS: Record<string, string> = {
+  meta: "主控",
   meta_pipeline: "主控",
   interview: "需求访谈",
   storybuilding: "故事构建",
+  storybuilding_review: "故事审查",
   detail_outline: "细纲生成",
+  detail_outline_review: "细纲审查",
   writing: "正文写作",
+  writing_review: "正文审查",
   general_purpose: "通用助手",
+};
+
+export const MIDDLEWARE_GROUP_LABELS: Record<string, string> = {
+  base: "基础链",
+  meta: "主控专属",
+  agent: "Agent 专属",
+  runtime: "运行时注入",
 };
 
 /** 获取 agent 中文名，未知 agent 回退机器名 */

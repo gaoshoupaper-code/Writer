@@ -9,6 +9,7 @@
 #    1b. repo/ 种子初始化：repo/ 不存在时从镜像种子 /app/harness_seed/repo 复制
 #    1c. git 仓库初始化：init_work_repo() 确保 repo/ 有 .git、remote 配好、
 #        main 已 push 到 bare repo（executor 才能 pull）
+#    1d. 版本注册表收敛：删除无 commit 的迁移历史，并把当前 production 绑定到 HEAD
 #
 # 2. golden 基准层同步（原有逻辑）
 #    golden 是镜像只读模板，每次启动从 seed 全量覆盖到 volume。
@@ -92,6 +93,15 @@ from app.core.git_ops import init_work_repo
 init_work_repo()
 print('[entrypoint] harness 仓库初始化完成')
 " || echo "[entrypoint] ⚠ harness 仓库初始化失败（非致命，继续启动）"
+
+# 1d. 显式 commit 绑定上线前的历史版本无法安全执行。保留当前 production 作为
+#     新谱系根（工作树 HEAD 就是当前实际包），删除其余无绑定记录，避免前端继续展示。
+cd /app/evolution && python -c "
+from app.core.git_ops import current_commit
+from app.versioning.registry_repo import prune_unexecutable_history_and_bind_production
+result = prune_unexecutable_history_and_bind_production(current_commit())
+print('[entrypoint] harness 版本注册表收敛:', result)
+" || echo "[entrypoint] ⚠ harness 版本注册表收敛失败（非致命，继续启动）"
 
 # ── 2. golden 基准层同步 ──
 SEED_DIR="/app/evalset_seed/golden"

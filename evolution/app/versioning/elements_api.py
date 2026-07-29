@@ -28,9 +28,10 @@ from typing import Any
 import yaml
 from fastapi import APIRouter, HTTPException, Query
 
-from app.core.git_ops import show_file, log_oneline
+from app.core.git_ops import show_file
 from app.versioning import registry_repo
 from app.versioning.constants import MEMORY_FILES, MEMORY_ROLE_ORDER, TOOL_SCOPE_MAP
+from app.versioning.middleware_projection import build_middleware_projection
 
 logger = logging.getLogger("evolution.elements_api")
 
@@ -62,13 +63,26 @@ router = APIRouter(prefix="/snapshots", tags=["snapshots"])
 
 # subagent 机器名 → 中文角色名。
 # harness 包里 subagents/ 的 build_* 一一对应（与 assemble 装配顺序一致）。
-_SUBAGENT_ORDER = ["interview", "storybuilding", "detail_outline", "writing"]
+_AGENT_SPECS = [
+    ("meta", "meta", "meta_system.md"),
+    ("general_purpose", "subagent", None),
+    ("interview", "subagent", "interview_system.md"),
+    ("storybuilding", "subagent", "storybuilding_system.md"),
+    ("storybuilding_review", "reviewer", "storybuilding_review.md"),
+    ("detail_outline", "subagent", "detail_outline_system.md"),
+    ("detail_outline_review", "reviewer", "detail_outline_review.md"),
+    ("writing", "subagent", "writing_system.md"),
+    ("writing_review", "reviewer", "writing_review.md"),
+]
 _SUBAGENT_ROLE_MAP: dict[str, str] = {
+    "general_purpose": "通用助手",
     "interview": "需求访谈",
     "storybuilding": "故事构建",
+    "storybuilding_review": "故事审查",
     "detail_outline": "细纲生成",
+    "detail_outline_review": "细纲审查",
     "writing": "正文写作",
-    "general_purpose": "通用助手",
+    "writing_review": "正文审查",
 }
 
 
@@ -76,15 +90,8 @@ _SUBAGENT_ROLE_MAP: dict[str, str] = {
 
 
 def _version_to_commit(version: int) -> str | None:
-    """version 编号 → git commit hash（通过 git log 顺序映射）。"""
-    v = registry_repo.get_version(version)
-    if v is None:
-        return None
-    log = log_oneline()
-    commits = [line.split()[0] for line in log if line.strip()]
-    if 1 <= version <= len(commits):
-        return commits[len(commits) - version]
-    return None
+    """Resolve a version only through its explicit immutable commit binding."""
+    return registry_repo.get_version_commit(version)
 
 
 def _list_files_at_commit(commit: str, subdir: str) -> list[str]:
@@ -151,26 +158,36 @@ def _build_skill_infos(commit: str | None) -> list[dict[str, Any]]:
     return skills
 
 
-def _build_middleware_infos(commit: str | None) -> list[dict[str, Any]]:
-    """扫 middleware/ 目录，读每个 .py 的类名 + 模块 docstring（用途说明）。"""
+_ASSEMBLY_SOURCE_PATHS = (
+    "__init__.py",
+    "subagents/interview.py",
+    "subagents/storybuilding.py",
+    "subagents/detail_outline.py",
+    "subagents/writing.py",
+    "subagents/factory.py",
+    "subagents/reviewers/storybuilding.py",
+    "subagents/reviewers/detail_outline.py",
+    "subagents/reviewers/writing.py",
+)
+
+
+def _build_middleware_stacks(commit: str | None) -> dict[str, list[dict[str, Any]]]:
+    """Read versioned assembly sources and project the mounted middleware stacks."""
     if not commit:
-        return []
-    py_files = [f for f in _list_files_at_commit(commit, "middleware") if f.endswith(".py")]
-    middlewares: list[dict[str, Any]] = []
-    for f in py_files:
-        class_name = f.rsplit("/", 1)[-1].rsplit(".", 1)[0]  # 文件名（snake_case）
-        description: str | None = None
+        return {}
+    paths = set(_ASSEMBLY_SOURCE_PATHS)
+    paths.update(
+        path
+        for path in _list_files_at_commit(commit, "middleware")
+        if path.endswith(".py")
+    )
+    sources: dict[str, str] = {}
+    for path in paths:
         try:
-            src = show_file(commit, f)
-            description = ast.get_docstring(ast.parse(src))
+            sources[path] = show_file(commit, path)
         except Exception:  # noqa: BLE001
-            logger.debug("middleware docstring 解析失败: %s @ %s", f, commit)
-        middlewares.append({
-            "class_name": class_name,
-            "source_path": f,
-            "description": description,
-        })
-    return middlewares
+            logger.debug("middleware 装配源码读取失败: %s @ %s", path, commit)
+    return build_middleware_projection(sources)
 
 
 def _build_tool_infos(commit: str | None) -> list[dict[str, Any]]:
@@ -180,7 +197,7 @@ def _build_tool_infos(commit: str | None) -> list[dict[str, Any]]:
     各不相同（global/middleware/agent/memory）。作用域从 TOOL_SCOPE_MAP 查得，
     查不到填 {kind: "unknown"} 兜底，前端会显示"⚠ 未登记作用域"提醒补登记。
 
-    与 _build_middleware_infos 的差异：描述只取 docstring 首句（需求 D8），且
+    与 middleware 投影的差异：描述只取 docstring 首句（需求 D8），且
     多一个 scope 字段；排除 __init__.py（包初始化不是 tool）。
     """
     if not commit:
@@ -234,36 +251,30 @@ def build_elements_view(version: int) -> dict[str, Any]:
     """
     commit = _version_to_commit(version)
     skills = _build_skill_infos(commit)
-    middlewares = _build_middleware_infos(commit)
+    middleware_stacks = _build_middleware_stacks(commit)
     tools = _build_tool_infos(commit)
 
-    agents: list[dict[str, Any]] = []
-
-    # meta agent：prompt 从 prompts/meta_system.md 读
-    agents.append({
-        "name": "meta",
-        "kind": "meta",
-        "prompt": {"body": _read_prompt(commit, "meta_system.md")},
-        "skills": [s for s in skills if s["path"].startswith("skills/meta/")],
-        "middlewares": middlewares,
-    })
-
-    # subagents：按固定装配顺序，各自读 prompt
-    for sub_name in _SUBAGENT_ORDER:
-        # subagent 的 prompt 文件名规律：{name}_system.md
-        prompt_file = f"{sub_name}_system.md"
-        sub_skills = [s for s in skills if s["path"].startswith(f"skills/{sub_name}")]
-        agents.append({
-            "name": sub_name,
-            "kind": "subagent",
-            "prompt": {"body": _read_prompt(commit, prompt_file)},
-            "skills": sub_skills,
-            "middlewares": [],  # subagent 的 middleware 是通用三件套，不单独展示
-        })
+    agents = [
+        {
+            "name": name,
+            "kind": kind,
+            "prompt": {"body": _read_prompt(commit, prompt_file) if prompt_file else ""},
+            "skills": [
+                skill
+                for skill in skills
+                if kind != "reviewer" and skill["path"].startswith(f"skills/{name}")
+            ],
+            "middlewares": middleware_stacks.get(name, []),
+        }
+        for name, kind, prompt_file in _AGENT_SPECS
+    ]
 
     relations = [
-        {"from": "meta", "to": s, "role": _SUBAGENT_ROLE_MAP.get(s, s)}
-        for s in _SUBAGENT_ORDER
+        {"from": "meta", "to": name, "role": _SUBAGENT_ROLE_MAP[name]}
+        for name in ("general_purpose", "interview", "storybuilding", "detail_outline", "writing")
+    ] + [
+        {"from": parent, "to": f"{parent}_review", "role": _SUBAGENT_ROLE_MAP[f"{parent}_review"]}
+        for parent in ("storybuilding", "detail_outline", "writing")
     ]
 
     return {
@@ -366,7 +377,7 @@ def get_source(
     """读指定版本指定文件的源码全文（middleware 懒加载用）。"""
     commit = _version_to_commit(version)
     if not commit:
-        raise HTTPException(status_code=404, detail=f"版本 v{version} 无对应 commit（可能为迁移历史版本）")
+        raise HTTPException(status_code=404, detail=f"版本 v{version} 无可执行 commit 绑定")
 
     try:
         content = show_file(commit, path)
