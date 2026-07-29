@@ -29,23 +29,40 @@ import UpdateBanner from "@/components/UpdateBanner";
  *   - 超管专属 3 项：进化端模型 / 执行端模型 / 管理后台（仅 super_admin）
  */
 type NavItem = { to: string; label: string; end: boolean; icon: LucideIcon };
+type NavGroup = { title: string; items: NavItem[] };
 
-const BASE_NAV_ITEMS: NavItem[] = [
-  { to: "/", label: "运行观测", end: true, icon: Activity },
-  { to: "/lineage", label: "血缘", end: false, icon: GitFork },
-  { to: "/analysis", label: "分析", end: false, icon: ChartNoAxesCombined },
-  { to: "/dossiers", label: "证据卷宗", end: false, icon: Package },
-  { to: "/evaluation", label: "评估", end: false, icon: ClipboardCheck },
-  { to: "/evolve", label: "进化", end: false, icon: Dna },
-  { to: "/harness", label: "Harness 要素", end: false, icon: Wrench },
-  { to: "/versions", label: "版本谱系", end: false, icon: FileArchive },
-  { to: "/dataset", label: "数据集", end: false, icon: Database },
-  { to: "/tests", label: "单次测试", end: false, icon: FlaskConical },
+// 导航重组为对象驱动四分组（FR-009 / DEC-003）：
+// 观测 / 质量闭环 / 系统资产 / 管理。
+// 保留所有现有路由，跨页保留对象上下文（test→trace→dossier→eval→evolve→version）。
+const NAV_GROUPS: NavGroup[] = [
+  {
+    title: "观测",
+    items: [
+      { to: "/", label: "运行观测", end: true, icon: Activity },
+      { to: "/lineage", label: "血缘", end: false, icon: GitFork },
+      { to: "/analysis", label: "分析", end: false, icon: ChartNoAxesCombined },
+    ],
+  },
+  {
+    title: "质量闭环",
+    items: [
+      { to: "/tests", label: "单次测试", end: false, icon: FlaskConical },
+      { to: "/dossiers", label: "证据卷宗", end: false, icon: Package },
+      { to: "/evaluation", label: "评估", end: false, icon: ClipboardCheck },
+      { to: "/evolve", label: "进化", end: false, icon: Dna },
+    ],
+  },
+  {
+    title: "系统资产",
+    items: [
+      { to: "/harness", label: "Harness 要素", end: false, icon: Wrench },
+      { to: "/versions", label: "版本谱系", end: false, icon: FileArchive },
+      { to: "/dataset", label: "数据集", end: false, icon: Database },
+    ],
+  },
 ];
 
-// 超管专属导航（仅 super_admin 可见，D20 + D8：两个配置项和管理后台都仅超管）。
-// 原"配置"项（/config，所有用户可见）拆为两个超管项：进化端模型 / 执行端模型。
-// 原 admin 4 项（用户/邀请码/积分流水/积分设置）收敛为"管理后台"父入口，进入后 tab 切换。
+// 超管专属导航（仅 super_admin 可见）。单独成组。
 const SUPER_ADMIN_NAV_ITEMS: NavItem[] = [
   { to: "/config/evolution", label: "进化端模型", end: false, icon: BrainCircuit },
   { to: "/config/executor", label: "执行端模型", end: false, icon: PenTool },
@@ -85,9 +102,10 @@ export default function Shell() {
     return <div className="shell-loading">加载中…</div>;
   }
 
-  const navItems = me.is_super_admin
-    ? [...BASE_NAV_ITEMS, ...SUPER_ADMIN_NAV_ITEMS]
-    : BASE_NAV_ITEMS;
+  // 构建分组导航（FR-009）：基础三组 + 超管组（仅超管可见）。
+  const groups = me.is_super_admin
+    ? [...NAV_GROUPS, { title: "管理", items: SUPER_ADMIN_NAV_ITEMS }]
+    : NAV_GROUPS;
 
   async function handleLogout() {
     try {
@@ -106,22 +124,27 @@ export default function Shell() {
           <span className="shell-brand-text">思衍进化</span>
         </div>
         <nav className="shell-nav">
-          {navItems.map((item) => {
-            const Icon = item.icon;
-            return (
-              <NavLink
-                key={item.to}
-                to={item.to}
-                end={item.end}
-                className={({ isActive }) =>
-                  `shell-nav-item ${isActive ? "active" : ""}`
-                }
-              >
-                <Icon className="shell-nav-icon" size={16} />
-                <span>{item.label}</span>
-              </NavLink>
-            );
-          })}
+          {groups.map((group) => (
+            <div key={group.title} className="shell-nav-group">
+              <div className="shell-nav-group-title">{group.title}</div>
+              {group.items.map((item) => {
+                const Icon = item.icon;
+                return (
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    end={item.end}
+                    className={({ isActive }) =>
+                      `shell-nav-item ${isActive ? "active" : ""}`
+                    }
+                  >
+                    <Icon className="shell-nav-icon" size={16} />
+                    <span>{item.label}</span>
+                  </NavLink>
+                );
+              })}
+            </div>
+          ))}
         </nav>
         <div className="shell-user">
           <div className="shell-user-info">

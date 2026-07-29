@@ -1,6 +1,8 @@
 /* ── Tailwind CSS v4 ── */
 @import "tailwindcss";
 @import "tw-animate-css";
+/* 进化桌面设计令牌（FR-011 / DEC-008：中性密集 Swiss/grid + 双主题） */
+@import "./tokens.css";
 
 /*
  * shadcn/ui 主题 Token → 映射到现有设计变量
@@ -5606,6 +5608,17 @@ html[data-theme="dark"] {
   flex-direction: column;
   gap: 2px;
   padding: 0 12px;
+  overflow-y: auto;
+}
+.shell-nav-group { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
+.shell-nav-group-title {
+  padding: 8px 10px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted, #868e96);
+}
 }
 
 .shell-nav-item {

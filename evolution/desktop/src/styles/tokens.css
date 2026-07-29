@@ -1,0 +1,153 @@
+/**
+ * 进化桌面设计令牌系统（FR-011 / CON-009 / DEC-008）。
+ *
+ * 中性密集 Swiss/grid 视觉系统：
+ *   - 浅色主题：灰白底
+ *   - 深色主题：石墨底
+ *   - 青绿色：交互强调
+ *   - 语义状态色：成功/警告/失败/取消/信息（可区分）
+ *
+ * 双主题并存，保留用户偏好。旧暖色令牌（--bg/--ink 等）保留兼容，
+ * 新令牌以 --evo- 前缀声明，页面迁移时逐步切换。
+ */
+
+/* ── 浅色主题：灰白底 ── */
+:root {
+  /* 中性表面层（Swiss/grid 密度） */
+  --evo-bg: #f8f9fa;
+  --evo-surface: #ffffff;
+  --evo-surface-2: #f1f3f5;
+  --evo-surface-3: #e9ecef;
+  /* 文字 */
+  --evo-ink: #1a1d21;
+  --evo-ink-secondary: #495057;
+  --evo-ink-muted: #868e96;
+  /* 线条 */
+  --evo-line: #dee2e6;
+  --evo-line-strong: #ced4da;
+  /* 交互强调：青绿色 */
+  --evo-accent: #0d9488;
+  --evo-accent-hover: #0f766e;
+  --evo-accent-soft: rgba(13, 148, 136, 0.08);
+  /* 语义状态色（可区分） */
+  --evo-success: #15803d;
+  --evo-success-soft: rgba(21, 128, 61, 0.1);
+  --evo-warning: #b45309;
+  --evo-warning-soft: rgba(180, 83, 9, 0.1);
+  --evo-danger: #dc2626;
+  --evo-danger-soft: rgba(220, 38, 38, 0.1);
+  --evo-cancelled: #6b7280;
+  --evo-cancelled-soft: rgba(107, 114, 128, 0.1);
+  --evo-info: #2563eb;
+  --evo-info-soft: rgba(37, 99, 235, 0.1);
+  /* 间距刻度（4px 基准，密集） */
+  --evo-space-1: 4px;
+  --evo-space-2: 8px;
+  --evo-space-3: 12px;
+  --evo-space-4: 16px;
+  --evo-space-6: 24px;
+  --evo-space-8: 32px;
+  /* 排版 */
+  --evo-font-sans: -apple-system, "Segoe UI", system-ui, sans-serif;
+  --evo-font-mono: "SF Mono", "Cascadia Code", Consolas, monospace;
+  --evo-text-xs: 11px;
+  --evo-text-sm: 12px;
+  --evo-text-base: 13px;
+  --evo-text-lg: 15px;
+  --evo-leading-tight: 1.4;
+  /* 圆角（克制） */
+  --evo-radius-sm: 4px;
+  --evo-radius-md: 6px;
+  --evo-radius-lg: 8px;
+  /* 阴影（克制，密集风格不用大阴影） */
+  --evo-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --evo-shadow-md: 0 2px 8px rgba(0, 0, 0, 0.08);
+  /* 焦点环（可访问性 NFR-003） */
+  --evo-focus-ring: 0 0 0 2px var(--evo-accent);
+}
+
+/* ── 深色主题：石墨底 ── */
+:root[data-theme="dark"],
+.dark {
+  --evo-bg: #1a1d21;
+  --evo-surface: #25282e;
+  --evo-surface-2: #2d3138;
+  --evo-surface-3: #383d45;
+  --evo-ink: #e9ecef;
+  --evo-ink-secondary: #adb5bd;
+  --evo-ink-muted: #6c757d;
+  --evo-line: #3a3f47;
+  --evo-line-strong: #495057;
+  --evo-accent: #2dd4bf;
+  --evo-accent-hover: #5eead4;
+  --evo-accent-soft: rgba(45, 212, 191, 0.12);
+  --evo-success: #4ade80;
+  --evo-success-soft: rgba(74, 222, 128, 0.12);
+  --evo-warning: #fbbf24;
+  --evo-warning-soft: rgba(251, 191, 36, 0.12);
+  --evo-danger: #f87171;
+  --evo-danger-soft: rgba(248, 113, 113, 0.12);
+  --evo-cancelled: #9ca3af;
+  --evo-cancelled-soft: rgba(156, 163, 175, 0.12);
+  --evo-info: #60a5fa;
+  --evo-info-soft: rgba(96, 165, 250, 0.12);
+  --evo-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --evo-shadow-md: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+/* ── 减少动效偏好（NFR-003 可访问性） ── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ── 键盘焦点可见性（NFR-003） ── */
+:focus-visible {
+  outline: 2px solid var(--evo-accent);
+  outline-offset: 2px;
+}
+
+/* ── 统一组件样式（FR-010 / FR-011 / AC-010）── */
+
+/* StatusBadge：语义状态色徽章 */
+.evo-status-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px var(--evo-space-2);
+  border-radius: var(--evo-radius-sm);
+  font-size: var(--evo-text-xs);
+  font-weight: 500;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.evo-status-success { background: var(--evo-success-soft); color: var(--evo-success); }
+.evo-status-warning { background: var(--evo-warning-soft); color: var(--evo-warning); }
+.evo-status-danger { background: var(--evo-danger-soft); color: var(--evo-danger); }
+.evo-status-cancelled { background: var(--evo-cancelled-soft); color: var(--evo-cancelled); }
+.evo-status-info { background: var(--evo-info-soft); color: var(--evo-info); }
+
+/* 三态分离（EDGE-007）*/
+.evo-state-empty, .evo-state-error, .evo-state-stale {
+  padding: var(--evo-space-6);
+  text-align: center;
+  color: var(--evo-ink-muted);
+  font-size: var(--evo-text-sm);
+}
+.evo-state-error { color: var(--evo-danger); }
+.evo-state-stale { color: var(--evo-warning); background: var(--evo-warning-soft); border-radius: var(--evo-radius-md); }
+.evo-retry-button {
+  margin-top: var(--evo-space-2);
+  padding: var(--evo-space-1) var(--evo-space-3);
+  border: 1px solid var(--evo-line-strong);
+  border-radius: var(--evo-radius-sm);
+  background: var(--evo-surface);
+  color: var(--evo-ink);
+  cursor: pointer;
+  font-size: var(--evo-text-sm);
+}
+.evo-retry-button:hover { border-color: var(--evo-accent); color: var(--evo-accent); }
