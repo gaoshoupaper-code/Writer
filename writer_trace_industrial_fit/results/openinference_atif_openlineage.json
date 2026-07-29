@@ -1,0 +1,140 @@
+{
+  "mechanism_name": "OpenInference、ATIF 与 OpenLineage 交换适配",
+  "primary_problem": "确定 Writer 是否需要用外部格式交换 Agent 运行轨迹和制品血缘，以及交换时由谁定义事实。核心不是把三套标准都接入，而是防止 OpenInference 的 Span 属性、ATIF 的离线轨迹文档或 OpenLineage 的 Job/Run/Dataset 反过来成为 Writer 内部模型，造成第二套 Trace、语义丢失、敏感载荷外泄和跨流程因果链断裂。",
+  "evidence_objects": [
+    "OpenInference 当前官方规范：它是建立在 OpenTelemetry 之上的 AI 可观测语义约定；每条 OpenInference Trace 都是合法 OTLP Trace，并以 AGENT、LLM、CHAIN、TOOL、RETRIEVER、RERANKER、EMBEDDING、GUARDRAIL、EVALUATOR、PROMPT 等 openinference.span.kind 和 input/output、消息、Tool、Token、成本属性增强 Span。它解决在线运行语义交换，不定义 Writer 的持久制品、卷宗、发布或完整性闸门。",
+    "OpenInference 隐私配置：官方提供隐藏输入、输出、消息、Prompt、Tool 定义、embedding 文本/向量和图片长度等开关，默认多数为不隐藏，并以 __REDACTED__ 表示主动遮盖。该能力适合 exporter 防御，但不能满足 Writer 的‘禁止秘密、CoT、embedding 和媒体正文进入 Trace’这一源端准入约束。",
+    "openinference-semantic-conventions 0.1.30：2026-05-22 发布，PyPI 元数据标为 Production/Stable；但包仍是 0.1.x，规范没有像 OpenTelemetry 那样为每组属性公开 Stable/Development 状态表，2026-06 至 07 月各 instrumentation 仍在快速增加 reasoning、框架和 Tool 行为。Writer 因而只能把它当活跃的兼容语义，不能作为内部稳定契约。",
+    "ATIF v1.7：Harbor 的 Agent Trajectory Interchange Format RFC，状态 Active、日期 2026-04、当前版本 v1.7。它用一个版本化 JSON 文档保存 agent 配置、顺序 steps、system/user/agent 消息、Tool call 与 observation、逐步/汇总 Token 和成本、子 Agent 轨迹及 continuation，目标是调试、可视化、SFT 和 RL 的离线复用。",
+    "ATIF v1.7 的成熟度证据：v1.7 相对 v1.6 对 session_id、trajectory_id 和 SubagentTrajectoryRef 有明确破坏性变更；Harbor v0.20.0 于 2026-07-18 发布，而 harbor-atif2otel 首版仍为 0.1.0（2026-07-17）。它已经有模型、校验器和多种 Agent 适配，但仍是 Harbor 主导的快速演进格式，不是跨标准组织的稳定运行遥测协议。",
+    "Harbor harbor-atif2otel 0.1.0：官方转换器把 Trajectory 变成根 AGENT Span，把会话轮次、LLM、Tool 和子 Agent 投影为 OpenInference/OTel Span，并会生成确定性 TraceId、推算 Tool 时间、截断大属性、把 LLM 与 Tool 作为兄弟节点。这直接证明 ATIF 与在线 Trace 只能做有损投影，不能互相替代或往返还原。",
+    "OpenLineage 1.52.0：2026-07-23 发布；当前核心 JSON Schema 标识为 2-0-2。其成熟对象模型以 namespace+name 标识 Job/Dataset，以 UUID runId 标识一次 Job Run，通过 START、RUNNING、COMPLETE、ABORT、FAIL、OTHER RunEvent 和输入/输出 Dataset 编织血缘，并以版本化 Facet 扩展父运行、源码位置、数据集版本、质量和错误等元数据。它解决数据管道血缘，不解决 Agent 调用树。"
+  ],
+  "writer_classification": "兼容适配，非 Writer 核心机制",
+  "writer_problem_match": [
+    "Writer 当前真正的事实链已经存在于自身服务：executor 产生运行事件，evolution 通过 notify + since_seq 拉取写入 runs/event_payloads；证据卷宗按 trace_id 和规则版本封存，评估从 ready 卷宗启动，进化绑定评估卷宗，registry 再以 source_session、parent_version、git commit 和回滚记录连接发布。当前缺的是统一的内部 Trace/Span/Event、PayloadObject、ArtifactRevision 和 Outcome 语义，不是外部格式。",
+    "OpenInference 只在 Writer 需要把一次运行投到 Phoenix、MLflow、Grafana 或其他 OTLP/OpenInference 后端时有直接价值。它能交换 Agent、LLM、Tool、检索和评估调用的公共外形，但没有 Skill 激活、Middleware 有序装配与有效干预、证据卷宗完整性或发布回滚的标准语义。",
+    "ATIF 只在 Writer 未来要把已完成创作/评估轨迹交给 Harbor 类 benchmark、训练或跨 Agent 回放工具时有价值。当前 Writer 的主目标是开发者与质量人员在线诊断和跨卷宗因果分析，并没有外部 SFT/RL 轨迹交换需求；为此现在实现 ATIF 会把研究工作流复杂度提前带入生产。",
+    "OpenLineage 只在 Writer 未来要向企业数据目录或既有 OpenLineage 后端发布稿件 revision、卷宗、评估数据集和发行版本的输入输出关系时有价值。进化端自己的血缘页面需要的是封闭的 ArtifactRevision-Dossier-Evaluation-Experiment-Release 图，不需要通用数据目录。",
+    "三种格式使用 Trace、Trajectory、Session、Run、Job、Dataset 等不同身份空间。若直接复用名称，现有 runs.trace_id 很容易同时承担 Writer 运行主键、OTel TraceId、ATIF session_id 和 OpenLineage runId，最终无法判断一次跨服务执行、一个离线轨迹文档和一个持久业务运行是否同一对象。"
+  ],
+  "adoption_decision": "仅保留单向兼容边界；第一阶段不实现完整适配器",
+  "minimal_writer_form": [
+    "内部唯一真相源固定为 Writer 自有的版本化契约：有界 Trace/Span/Event 与 Span Link 解释执行，PayloadObject 保存通过准入的语义载荷，ArtifactRevision 和卷宗/评估/实验/发行对象解释持久血缘，Outcome/Score 解释运行后的质量结果。任何外部格式都是由这些事实生成的只读 Projection，禁止反向驱动内部状态。",
+    "先只维护一份小型、可测试的 Exchange Mapping 规范，不引入三套 SDK：为每个目标列出 source_schema_version、target_schema_version、字段映射、明确省略项、降级项、PayloadPolicy 版本和兼容性测试样例。只有出现真实外部消费者后才实现对应 exporter。",
+    "第一优先级若出现外部 Trace 后端，只实现 Writer 到 OTel/OpenInference 的单向 exporter profile：AGENT、LLM、TOOL、必要的 CHAIN/RETRIEVER/EVALUATOR 映射到公共 SpanKind；writer.run.id、workload、版本、Integrity 和 artifact/payload 引用保留在 writer.* 命名空间；Skill、Middleware、HITL 和业务血缘仍用 Writer 自有事件/属性，不强塞进相似但错误的标准种类。",
+    "ATIF 只预留‘终态轨迹导出’决策点：来源 Trace 必须完整、载荷已通过 PayloadGate、所有 ArtifactRevision 已冻结；导出时固定 schema_version、exporter_version、source_trace_id 和 omission manifest。reasoning_content、prompt/completion token_ids、秘密、embedding、媒体正文和任意未准入 extra 一律不导出。第一阶段不写 ATIF 文件、不接 Harbor validator，也不提供 ATIF 导入。",
+    "OpenLineage 只预留‘外部制品血缘发布’决策点：将来仅在有真实目录消费者时，把固定工作负载投影为 Job、一次已提交操作投影为 Run、不可变 ArtifactRevision/卷宗版本投影为输入输出 Dataset，并用版本/hash Facet；Writer 自有 ID 与 OpenLineage UUID/namespace 映射必须有显式表。第一阶段不部署 OpenLineage client、后端或自定义 Facet。",
+    "为未来每次实际投影保留轻量 ExportProjection 记录即可：projection_id、target、source_trace_id/source_object_id、source/target schema version、policy_version、status、coverage、omissions、attempt、created_at 和 last_error。它用于证明导出了什么和哪里有损，不复制完整载荷，也不建设通用集成平台。",
+    "进化端仍只建设运行观测、Writer 血缘和分工作负载分析三种视图。外部适配器若启用，只在 Trace 检查器显示一个投影状态和目标链接；不新增 OpenInference、ATIF、OpenLineage 三套页面。"
+  ],
+  "explicit_non_goals": [
+    "不建设‘万能 Agent 事件模型’来求三种格式字段并集，也不要求 OpenInference、ATIF 与 OpenLineage 之间可无损往返。三者分别是在线 Span 语义、离线轨迹文档和数据血缘事件，统一会抹掉边界。",
+    "不建设第二套 Trace 存储、第二套采集 SDK 或第二条 evidence ingestion 链；外部 exporter 不能绕过 Writer 的 Trace 契约、PayloadGate、完整性判定和访问审计。",
+    "不在第一阶段实现外部格式导入、双向同步、批量历史迁移、跨厂商 round-trip、一键切换后端或插件市场；外国 Trace 不能直接成为证据卷宗、评估或进化输入。",
+    "不因 OpenInference 有 GUARDRAIL 就把所有 Middleware 映射为 GUARDRAIL，不因有 CHAIN 就把 Skill 或证据卷宗映射为 CHAIN，也不因 OpenLineage 有 Dataset 就把每条 Prompt、Tool result 或 Span 都做成 Dataset。",
+    "不使用 ATIF 的 reasoning_content、prompt_token_ids、completion_token_ids、logprobs 或任意 extra 保存 Writer 明确禁止或不需要的数据；格式字段可选不等于 Writer 应采集。",
+    "不把 OpenInference 的 input.value/output.value、ATIF 的完整 messages 或 OpenLineage Facet 当作大稿件的长期对象存储。完整内容仍由 PayloadObject/ArtifactRevision 受控保存，外部投影默认只带引用、hash 和允许摘要。",
+    "不引入 OpenLineage 服务、Harbor 运行时、Phoenix/MLflow 或 Arize 产品作为 Writer 可用性的前置依赖，也不为尚不存在的企业目录、训练平台或跨产品交换需求预先实现认证、队列和配置界面。"
+  ],
+  "trace_boundary": [
+    "Writer 边界保持已冻结规则：一次创作请求一个 Trace；证据编译、评估和进化分别创建新 Trace；同步 Tool/Subagent 是当前 Trace 的子 Span；异步流程以 source Trace、Span Link、ArtifactRevision 和卷宗业务键关联。外部格式不得把它们合成一条跨天 Trace。",
+    "OpenInference Projection 的单位是一条 Writer Trace。它复用该 Trace 已确定的树和 Link，只增加兼容属性；不会把 evidence/evaluation/evolution 的来源关系改写为父子 Span。OpenInference 的 session.id 最多是分组属性，不是因果键，也不替代 writer.run.id。",
+    "ATIF 的单位是一份已完成 Agent trajectory 文档，而非在线 Span 树。若未来导出，创作、评估或进化各自按来源 Trace 生成独立文档；同步子 Agent 可用 v1.7 embedded trajectory/ref 表达，但证据卷宗、发布和异步进化不会为了格式方便嵌入同一 trajectory。",
+    "OpenLineage 的 Run 只表示一次产生/消费持久对象的业务操作，不等于 OTel Span 或现有 runs 表中的任意节点。一次卷宗编译、评估封存、候选实验或发布将来可各投影成一个 Run；LLM、Tool、Skill 和 Middleware 不投影成 Job。",
+    "长期流程仍由 Writer 业务对象 DAG 表达。OpenLineage 的输入输出 Dataset 边可在将来做外部副本，ATIF continuation 只表示轨迹文件续段，OpenInference Trace 只表示一次有界执行，三者都不拥有完整业务 Workflow。"
+  ],
+  "async_causality": [
+    "OpenInference 建立在 OTel 上，可保留 Writer 已有的 parent、Span Link 和 W3C 上下文；异步触发、重试、恢复和派生仍使用 Writer 限定关系 triggered_by、retry_of、resumed_from、derived_from 及稳定业务 ID。没有 Link 的 OpenInference 树不能推断异步因果。",
+    "ATIF v1.7 的 subagent_trajectory_ref 能解析嵌入或外部子 Agent 轨迹，continued_trajectory_ref 能串接上下文压缩后的文件，但它没有通用的跨服务触发、重试 attempt、多输入 Link 或发布因果模型。导出器只能表达确有对应语义的子 Agent/续段关系，其余保留 source_trace_id 引用并标 unsupported。",
+    "OpenLineage ParentRunFacet 适合表达调度层父 Run，输入/输出 Dataset 可把多个 Run 编织为血缘图，但它不是 OTel Span Link。Writer 的 executor notify、evolution 拉取、重试和 HITL 恢复不能靠 ParentRunFacet 重建。",
+    "任何 exporter 都不得用相同 session_id、相近时间或文件路径猜关系；映射只能来自已验证的 source_trace_id/source_span_id、Link、artifact_revision_id、dossier/evaluation/experiment/release 外键。"
+  ],
+  "agent_semantics": [
+    "OpenInference 可直接复用的最小集合是：Agent/Subagent 执行到 AGENT，模型调用到 LLM，Tool handler 到 TOOL，确定性编排到 CHAIN，真实检索到 RETRIEVER，真实评估调用到 EVALUATOR。PROMPT 只在 Writer 确有独立模板调用 Span 时使用，普通 Prompt 载荷不是单独 Span。",
+    "Skill 没有 OpenInference 原生生命周期：必须继续显式记录 available/read/activated/completed/failed、版本、内容 hash、触发位置和关联 Span。Middleware 也不能仅靠 GUARDRAIL 表示：有序装配表与 modified/blocked/routed/retried/cache_hit/context_compacted/hitl/short_circuited 等有效干预继续使用 Writer 事件；只有真正的安全/质量 guardrail 检查才可额外投影为 GUARDRAIL。",
+    "ATIF 可复用 agent.name/version/model_name、顺序 system/user/agent step、Tool call 与 observation 的 source_call_id、子 Agent ref、llm_call_count 和 context_management。它不能原生表达精确 Span 起止、并行树、Middleware 前后载荷、Skill 激活状态、重试 attempt 和完整 HITL 状态机；禁止为追求兼容把这些事实压入无约束 extra 后声称已覆盖。",
+    "OpenLineage 没有 Agent、LLM、Tool、Skill、Middleware 或 HITL 运行语义；它只接收最终业务操作和持久输入输出对象。",
+    "ATIF 的 reasoning_content 虽为可选字段，但 Writer 明确不采集 provider CoT；用户可见解释、机制 reason_code、Middleware diff、Tool 参数/结果和制品 revision 已足够解释行为，不能以交换兼容为由改变该边界。"
+  ],
+  "artifact_lineage": [
+    "Writer 的权威链保持为 Trace produces/consumes ArtifactRevision，ArtifactRevision compiled_into EvidenceDossierVersion，EvidenceDossierVersion evaluated_by EvaluationDossier，候选版本 compared_in CandidateExperiment，selected_for ReleaseVersion，并记录 activated/rolled_back。它使用稳定对象 ID、版本、hash 和外键，不依赖任何外部后端。",
+    "OpenInference 的 input/output/message/document 属性只是某个 Span 的观测载荷；即使正文完整，也没有 artifact_id、revision 父链、卷宗冻结或发布状态，不能作为历史稿件证据。外部 Span 默认只持 artifact_revision_id、payload_ref、sha256 和允许摘要。",
+    "ATIF 是一次 trajectory 快照，steps 和 observation 可以包含产物内容，但没有跨 trajectory 的不可变 ArtifactRevision、卷宗版本或发行谱系。未来导出只携带已有 revision 引用，不能从 ATIF 文件反向生成或覆盖 Writer 血缘。",
+    "OpenLineage 的 Job/Run/InputDataset/OutputDataset 和 DatasetVersionFacet 是最接近 Writer 制品血缘的交换词汇；但 namespace+name 与 UUID runId 不等于 Writer 对象 ID，Facet 也不能替代本地唯一约束。若未来实现，必须用显式映射表和 Writer 自定义、版本化 Facet 暴露 revision/hash/source trace，且只发布元数据。",
+    "如果源 Trace 因 90 天策略删除语义载荷，Writer 的 ArtifactRevision、卷宗、实验和发行血缘仍可按各自生命周期存在；ATIF/OpenInference 副本不能延长或绕过删除，OpenLineage 外部目录只留下允许的 tombstone/元数据。"
+  ],
+  "capture_timing": [
+    "所有事实先在发生位置进入 Writer：模型有效输入在调用前、可见输出在返回后、Tool 有效参数在 Middleware/HITL 修改后且 handler 前、Tool 结果在可见返回后、Skill/Middleware 生命周期在干预发生时、ArtifactRevision 在成功写入并回读 hash 后、Outcome 在用户或发布行为发生时固定。外部适配器不得成为唯一采集点。",
+    "OpenInference 若将来启用，结构 Span 可随 Writer Span 结束异步投影；任何完整语义内容都只能读取已经被 PayloadGate 接受的 PayloadObject。Exporter 在 Span 结束时固定 source schema、mapping version、policy version 和 omission 状态。",
+    "ATIF 只能在来源 Trace 达终态、Integrity/Coverage 验证完成、所有引用可解析后生成不可变快照。trace_incomplete、运行中、awaiting_input 或仅有 mutable workspace 当前文件的运行不得导出成看似完整的训练/评测轨迹。",
+    "OpenLineage 将来只在业务提交边界发事件：操作开始可发 START，ArtifactRevision/卷宗/评估/发行事务提交后发 COMPLETE 并附确定输入输出；失败或取消发 FAIL/ABORT。不能从迟到 Span 推测一份制品已经提交。",
+    "同一源对象因 mapping 或目标 schema 升级重新导出时创建新 ExportProjection，保留旧投影版本；禁止静默重写历史并让外部结果看似来自当时版本。"
+  ],
+  "payload_policy": [
+    "统一 PayloadGate 是所有交换之前的硬边界。OpenInference 的 hide_* 默认开关和后端 masking 只作为第二道防线，不能让未经准入的原始 Prompt、Tool body、HTTP header 或 provider 响应先进入 Span 再删除。",
+    "OpenInference 默认导出 structural 数据：类型、状态、耗时、Token/成本、模型与机制版本、不透明业务 ID、内容 hash、payload/artifact 引用和 Integrity。只有目标属于 Writer 受控信任域、访问/删除能力等价且用途获准时，才可按 payload_kind 投影 semantic_full；不能用 input.value/output.value 承载长篇正文。",
+    "ATIF 若未来导出，只从 semantic_full 允许字段生成 system/user/agent message、Tool 参数与可见结果；固定删除秘密、Authorization/Cookie、CoT/reasoning、prompt/completion token ID、embedding/vector、媒体正文/base64、未允许 headers/body。被删除字段进入 omission manifest，不用占位文本伪装成完整内容。",
+    "OpenLineage 只发送对象 ID、类型、版本、hash、状态、时间、允许的源码/harness 版本和关系；稿件、Prompt、Tool 参数、卷宗正文、评估冻结证据、用户身份与 workspace 标题不进入 Dataset/Facet。namespace 使用非敏感稳定命名，不把内部路径或用户名泄露给目录。",
+    "外部副本必须服从 Writer 的 30 天热、90 天语义载荷删除与 subject 级删除计划；若目标不能证明删除、访问控制和审计能力等价，就只允许 structural projection。每次 reveal/export 继续写 PayloadAccessAudit。"
+  ],
+  "integrity_coverage": [
+    "Writer 的 Integrity 才决定下游资格。创作可在观测故障时完成并标 trace_incomplete，但证据、评估、进化和 ATIF/OpenLineage 业务投影不得消费它；OpenInference 可为诊断导出不完整运行，但必须显式带 writer.integrity.status=incomplete、缺口类型和最后序号，不能显示为完整成功 Trace。",
+    "每个 ExportProjection 记录 mapped、omitted_by_policy、unsupported、not_applicable、source_missing、truncated 六类字段/事件计数和映射版本。外部 schema 校验成功只证明格式合法，不证明来源完整、因果正确或制品可审计。",
+    "OpenInference 没有 Skill/Middleware/Artifact 血缘的完整性要求；ATIF validator 主要校验 required 字段、step 顺序、Tool observation 引用、时间和字段适用性；OpenLineage schema 主要校验事件对象和 Facet。三者的通过结果都不能把 Writer unknown/missing 改成 not_applicable 或零。",
+    "有损转换必须可见。例如 ATIF 单 step 聚合多个 LLM call、缺少精确 Tool 时间或 harbor-atif2otel 截断属性时，Projection 标 lossy；OpenLineage 只覆盖持久对象时，运行节点覆盖率标 not_applicable，而不是声称全 Trace 已交换。",
+    "外部对象可查询但 Writer source ID 无法解析时标 orphaned_projection；Writer 对象存在但目标缺失时标 export_missing。两者都不影响本地事实，但能让开发者定位兼容出口故障。"
+  ],
+  "delivery_failure": [
+    "内部 Trace/载荷/制品写入和完整性判定先完成，兼容 exporter 后执行。OpenInference、ATIF 或 OpenLineage 目标不可用不得阻断创作、卷宗封存或发布，也不得把已完整的本地 Trace 改成 trace_incomplete；只把对应 ExportProjection 标 failed。",
+    "第一阶段没有实际 exporter，因此不引入消息总线、通用 connector 队列或跨目标重试框架。出现真实消费者时，每个 adapter 使用有界任务表/现有后台执行能力，按 projection_id 幂等，记录 attempt、last_error、next_retry_at 和终态。",
+    "OpenInference/OTLP 投递接受遥测可能丢失的事实，外部后端只能用于辅助观测；ATIF 文件将来应在完整生成和校验后原子发布；OpenLineage 事件将来按稳定映射的 runId、事件阶段和 source object 去重。任何重试都不能重新读取 mutable workspace 来改变原内容。",
+    "映射异常、策略阻断、目标不支持和网络失败必须分开：policy_blocked/unsupported 是确定性终态，network_failed 可重试，source_incomplete 永不进入业务交换。失败摘要可进运行检查器，但不把秘密或被阻断值写入错误文本。"
+  ],
+  "metrics_scores_outcomes": [
+    "OpenInference 可交换模型、Token、成本、耗时和 EVALUATOR 调用外形，但没有 Writer 的复制、重新生成、最终采用、人工编辑 diff、人工评分、候选 uplift、发布激活和回滚 Outcome 模型。它最多携带这些对象的 ID 或低敏摘要。",
+    "ATIF 有逐 step 和 final_metrics，可选 reward、logprobs、Token ID 等训练字段，但它的 reward 不等于 Writer 经版本化 rubric、固定证据卷宗和人工反馈产生的 Score，也没有发布后结果。Writer 不为对齐训练格式采集额外研究指标。",
+    "OpenLineage 可用 DataQuality Facet 表达数据资产质量，但把稿件评分和候选版本提升塞进数据质量 Facet 会丢失 evaluator、rubric、baseline、样本和决策语义；第一阶段不做该映射。",
+    "OutcomeRecord、ScoreRecord、ExperimentRun 和 ReleaseOutcome 继续是 Writer 分析真相源，并关联 Trace 与 ArtifactRevision。将来 exporter 只投影目标确有原生、等价语义的子集，其余标 unsupported，而不是塞入任意 metadata/extra/facet。",
+    "跨版本质量改善必须在 Writer 的固定 dataset revision、evaluator revision、baseline/candidate 和足够样本上计算；任一交换格式能携带同一分数都不构成因果或 uplift 证据。"
+  ],
+  "explanatory_limit": [
+    "OpenInference 能解释外部后端所收到的 Agent/LLM/Tool 调用树、公共输入输出和资源指标；若 Writer 专有 Skill/Middleware 事件、完整 PayloadObject 或业务血缘未导出，它不能解释哪个机制实际介入、哪份冻结制品被后续消费。",
+    "ATIF 能解释或回放一份离线对话/行动/观察顺序，但可选时间戳不等于精确 Span 时序，step 不等于并行执行树，continuation/subagent ref 不等于跨服务因果，且 Writer 禁止 CoT 后不能声称包含内部推理。",
+    "OpenLineage 能解释哪个 Job Run 声明消费/产生哪些 Dataset 以及其版本/Facet，但不能解释 LLM 选择、Tool 参数、Skill/Middleware、HITL、重试或一次稿件 revision 内部如何产生。",
+    "ExportProjection 只能证明 Writer 按某版本规则声明并发送过某些事实，不能证明目标最终长期保存、正确展示或用于决策；目标查询结果也不能反向覆盖 Writer。",
+    "三种格式都不能仅凭相关链证明某 Skill、Prompt、Middleware 或 harness 版本导致质量改善；最终解释仍需 Writer 的完整运行、不可变制品、评估证据、Outcome 和受控实验共同成立。"
+  ],
+  "writer_ui_impact": [
+    "第一阶段不增加页面。运行观测、血缘、分析继续只展示 Writer 内部事实，并在 schema 中预留 projection 状态而不暴露空功能。",
+    "真实 adapter 上线后，只在 Trace/Artifact 抽屉增加‘外部投影’小节，显示 target、mapping/schema version、status、coverage/omissions、最后错误和目标深链；不复制外部 Trace Viewer 或数据目录。",
+    "ATIF 导出若未来出现，应作为完整 Trace 的受审计导出动作，而不是第四种 Trace 详情；OpenLineage 外部链接放在 Artifact/Lineage 节点上，而不是把外部 DAG 嵌回进化端。"
+  ],
+  "official_sources": [
+    "OpenInference 官方规范首页（当前文档，2026-07-28 核验）：https://arize-ai.github.io/openinference/spec/ 。用于核对其 OTel 上层定位、Trace/Span 模型、SpanKind 和合规声明。",
+    "OpenInference 官方 Semantic Conventions（当前文档，2026-07-28 核验）：https://arize-ai.github.io/openinference/spec/semantic_conventions.html 。用于核对 AGENT、LLM、TOOL、GUARDRAIL、EVALUATOR、session.id、消息、Tool、Token 和成本属性。",
+    "OpenInference 官方 Configuration（当前文档，2026-07-28 核验）：https://arize-ai.github.io/openinference/spec/configuration.html 。用于核对 hide inputs/outputs/messages/tools/embeddings/images、默认值和 __REDACTED__ 行为。",
+    "OpenInference 官方 PyPI 包（0.1.30，2026-05-22）：https://pypi.org/project/openinference-semantic-conventions/ 。用于核对当前版本和 Production/Stable classifier；版本号与 classifier 分开解读。",
+    "OpenInference 官方 GitHub Releases（2026-06 至 07 月当前发布）：https://github.com/Arize-ai/openinference/releases 。用于核对 LangChain、Google ADK、Pydantic AI 等 instrumentation 仍在 0.1.x 活跃演进。",
+    "Harbor ATIF 官方 RFC（Active，ATIF-v1.7，2026-04）：https://github.com/harbor-framework/harbor/blob/main/rfcs/0001-trajectory-format.md 。用于核对 root/step/tool/observation/metrics/subagent/continuation 字段、版本历史和 v1.7 破坏性变化。",
+    "Harbor ATIF 官方文档（当前文档，2026-07-28 核验）：https://harborframework.com/docs/agents/trajectory-format 。用于核对适用目标、校验器、支持 Agent 和当前 v1.7。",
+    "Harbor atif2otel 官方 README（0.1.0，2026-07-17）：https://github.com/harbor-framework/harbor/tree/main/packages/harbor-atif2otel 。用于核对 ATIF 到 OpenInference/OTel 的层级映射、属性截断和当前支持面。",
+    "Harbor v0.20.0 官方 Release（2026-07-18）：https://github.com/harbor-framework/harbor/releases/tag/v0.20.0 。用于核对 Harbor 当前产品版本，避免把 ATIF RFC 状态误当独立标准组织成熟度。",
+    "OpenLineage 官方对象模型 1.52.0（当前文档，2026-07-28 核验）：https://openlineage.io/docs/spec/object-model/ 。用于核对 RunEvent、JobEvent、DatasetEvent 与 Job/Run/Dataset 身份。",
+    "OpenLineage 官方 Run Cycle 1.52.0（当前文档，2026-07-28 核验）：https://openlineage.io/docs/spec/run-cycle/ 。用于核对 START、RUNNING、COMPLETE、ABORT、FAIL、OTHER 状态。",
+    "OpenLineage 官方核心 Schema（当前 main，schema id 2-0-2，2026-07-28 核验）：https://github.com/OpenLineage/OpenLineage/blob/main/spec/OpenLineage.json 。用于核对 eventTime、producer、schemaURL、UUID runId、namespace/name 和 Facet 扩展边界。",
+    "OpenLineage 1.52.0 官方 Release（2026-07-23）：https://github.com/OpenLineage/OpenLineage/releases/tag/1.52.0 。用于核对当前版本及 ParentRunFacet、Python/Java transport 等持续维护状态。",
+    "Writer 当前代码事实：executor/evolution 的 trace contract 与摄入、evolution/app/ingestion/ingestion.py、证据/评估卷宗、进化绑定、version registry，以及 evolution/desktop 的 Trace/Artifact/Version 页面。用于核对 Writer 已有真相源和当前 mutable workspace 产物缺口。"
+  ],
+  "standard_maturity": "OpenInference 是可生产使用但仍快速演进的 0.1.x 事实标准，适合受版本隔离的外部 Trace profile；ATIF-v1.7 是 2026-04 才进入 Active、仍发生破坏性变化的 Harbor 项目格式，适合未来按需离线导出，不适合当前生产内核；OpenLineage 1.52.0 和核心 Schema 2-0-2 是成熟的数据血缘标准，但 Agent 运行语义与 Writer 领域适配性低。成熟度不能代替问题匹配：三者都只属于 Writer 兼容边界。",
+  "conflicts_with_writer": [
+    "OpenInference 倾向把完整 input/output/messages/tools 平铺到 Span，官方隐藏开关默认多数为 false；Writer 保存长篇生产内容且源端禁止秘密、CoT、embedding 和媒体正文，必须先 PayloadGate、再按引用投影，不能直接挂通用 instrumentor。",
+    "OpenInference 没有 Writer 所需的 Skill 生命周期、Middleware 装配顺序和有效干预、trace_incomplete 消费闸门、ArtifactRevision、证据卷宗与发布回滚。照搬 SpanKind 会让页面看似标准化，实则丢掉最关键机制。",
+    "ATIF 明确追求完整 interaction history、reasoning、Token ID、logprobs、reward、SFT/RL 和可回放；Writer 的目标是开发者/质量诊断与进化闭环，且禁止 CoT。只为工业兼容实现全量 ATIF 会采集超出业务目标的数据。",
+    "ATIF 的顺序 step 与 Writer 的并行 Span、跨服务 Link、Middleware 前后差异、HITL 暂停/恢复和 retry attempt 不同；harbor-atif2otel 通过推算时间与层级才能生成 Span，证明两者不是同一 Trace 系统。",
+    "OpenLineage 以数据平台 Job/Dataset 和通用目录为中心。Writer 的稿件 revision、两级卷宗、候选实验与 release activation 是封闭领域对象；把每种对象泛化成 Dataset/Facet 会增加 UUID、namespace、自定义 schema 和外部后端，却不改善进化端分析。",
+    "三套方案都允许 metadata/extra/facet 扩展，但 Writer 核心字段若只塞无约束 JSON，就无法用唯一约束、状态机、幂等键和完整性规则保护。兼容字段必须从 typed 内部对象投影，而不是先自由采集后解释。",
+    "工业平台通常为多框架、多租户、多后端追求广覆盖；Writer 要做专而精。当前只需冻结映射和隔离原则，等出现 Phoenix/Harbor/OpenLineage 的真实消费者再增加一个单向 adapter，避免为‘可能兼容’建立长期维护面。"
+  ],
+  "uncertain": []
+}

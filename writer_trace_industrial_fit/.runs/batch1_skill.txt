@@ -1,0 +1,27 @@
+## 任务
+调研以下 item，输出结构化 JSON 到 D:\Desktop\Writer\writer_trace_industrial_fit\results\skill_activation.json
+
+name: Skill 显式激活语义
+category: Writer 核心机制
+relevance: 核心
+description: 研究如何区分可用、读取、激活、完成和失败，并记录版本与内容 hash，而不是从 read_file 事后猜测。
+evidence_objects: [DeepAgents Skills, Claude Code Skills, Codex Skills]
+
+## 字段定义
+读取 D:\Desktop\Writer\writer_trace_industrial_fit\fields.yaml 获取所有字段定义。
+
+## 搜索策略
+读取 C:\Users\h2640\.agents\skills\deep-research\references\general-web.md，按其搜索源和查询策略做 Web 搜索。时间范围是 2025-07-28 至 2026-07-28，并以当前官方文档为准。
+
+## 输出要求
+1. 按 fields.yaml 定义的字段输出 JSON。
+2. 不确定的字段值标注 [不确定]。
+3. JSON 末尾添加 uncertain 数组，列出所有不确定的字段名。
+4. 所有字段值使用中文。
+5. 只修改指定 JSON 文件，不修改项目代码、需求文档或其他调研结果。
+6. 以 Writer 现有 executor/evolution、创作到证据卷宗到评估到进化到发布架构为判断中心；机制必须归类为 Writer 核心、兼容适配或不采用，不能为了通用性增加机制。
+
+## 验证
+完成后运行：
+python C:\Users\h2640\.agents\skills\deep-research\scripts\validate_json.py -f D:\Desktop\Writer\writer_trace_industrial_fit\fields.yaml -j D:\Desktop\Writer\writer_trace_industrial_fit\results\skill_activation.json
+验证通过后才算完成。

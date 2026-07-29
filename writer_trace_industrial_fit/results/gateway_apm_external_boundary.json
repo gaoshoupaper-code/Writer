@@ -1,0 +1,302 @@
+{
+  "mechanism_name": "网关、APM 与外部观测平台边界",
+  "primary_problem": "明确 LiteLLM、Portkey、Helicone、Kong AI Gateway、Bedrock AgentCore、Datadog 和 Grafana 能从模型/工具流量或显式埋点中看到什么，以及它们无法自动知道哪些 Writer 业务事实；在保留可选统一入口、路由诊断、成本观测和 OTLP 兼容价值的同时，防止外部平台取代 Writer 自有 Trace、稿件 revision、证据卷宗、评估、进化和发布真相源。",
+  "evidence_objects": [
+    {
+      "对象": "LiteLLM Gateway v1.93.0",
+      "当前能力": [
+        "提供共享的 OpenAI-compatible 模型入口、虚拟 key、预算/花费、跨部署与供应商路由。Router 明确负责负载均衡、同组重试、fallback、timeout 和 cooldown；数据库/花费/日志回调在响应返回后异步执行。",
+        "OTel v2 是显式 opt-in，一次代理请求形成一条包含 HTTP、鉴权、guardrail、LLM、数据库和 cache 的树，并可续接入站 W3C traceparent。它默认只输出元数据，Prompt/Response 正文须显式开启。",
+        "可选择 raw request/response logging，也提供发送到 logging integration 前的 scrub/masking hook；这证明完整正文外发是配置选择，而不是完成证据的默认保证。"
+      ],
+      "不可见或不保证": "只能完整观察经过代理的模型请求及代理自己的内部步骤；看不到 Writer 进程内真实 Agent/Subagent、Skill 激活、Middleware 干预、HITL、稿件 revision 和长期业务血缘。响应后异步日志也不能证明与客户端响应同时持久完成。",
+      "Writer 取舍": "保留未来以 base_url 接入的传输兼容和外部诊断能力，不把 LiteLLM 数据库、虚拟 key、路由记录或 OTel Trace 变成 Writer 业务契约。"
+    },
+    {
+      "对象": "Portkey Gateway v1.15.2",
+      "当前能力": [
+        "提供统一 AI Gateway、供应商路由、自动重试/fallback、缓存、限流、guardrail、请求日志以及以 Trace/Span 组织的外部观测。",
+        "Logs 默认可呈现完整 request/response raw object、token、成本、延迟、错误、路由和自定义 metadata；单请求 DO NOT TRACK 或组织级 Metrics Only 可降低正文留存，但切换不会追溯删除历史日志。标准套餐文档给出的保留期为 Developer 3 天、Production 30 天。",
+        "自动重试最多 5 次，默认覆盖 429/500/502/503/504/529，采用指数退避并可遵守 Retry-After；最终响应头 x-portkey-retry-attempt-count 可给出摘要。Fallback 可在非 2xx 或指定状态码触发，timeout/retry/fallback 耗尽后向客户端返回失败。",
+        "Traces 依靠 gateway 请求、显式 trace/span 标识、SDK 或 OTel instrumentation 关联多个操作；支持 W3C traceparent，并可接收应用 OTLP traces/logs。Agent、链和业务名称仍来自调用方属性。",
+        "官方文档对 retry attempt 是否逐次成为独立可见 Span 的描述不一致：automatic retries 页面称尝试不会逐条记录且总响应时间合并为一条日志，Traces 页面又描述 retry 配置下的失败/成功请求可按 Span 分组。"
+      ],
+      "不可见或不保证": "无论 UI 是否展示 retry span，平台都不能仅凭网络日志自动恢复 Writer 的 DeepAgent 调用树、Skill/Middleware/HITL 或制品血缘；未经过 Portkey、被采样、被 3/30 天等保留策略删除或版本行为不同的事实不在其覆盖范围。其 OTel 文档对 /v1/otel 与 /v1/logs/otel 端点也有不同表述。",
+      "Writer 取舍": "不依赖逐次重试可见性；任何接入都把 Portkey ID、路由和尝试信息视为诊断 external_refs，并在目标版本验收实际行为。"
+    },
+    {
+      "对象": "Helicone Gateway / Observability v2025.08.21-1",
+      "当前能力": [
+        "Gateway 观察实际经过 ai-gateway.helicone.ai 的模型请求，负责协议转换、跨 provider 路由，并记录 usage、cost、performance 和 error。支持自动/手工 fallback、可选 retry、限流和 provider prompt caching。",
+        "Session ID、Path、Name 由应用通过 Header 提供；Session 还能汇集显式上报的 LLM、向量库、Tool 和自定义日志。官方明确 Path 表示概念工作类型而非时间顺序。",
+        "/v1/trace/log 接收含 traceId、spanId、attributes、events、links、时间和 status 的 OTel 风格 JSON，但当前 schema 没有证明它等同完整 OTLP Collector，也未证明与 Gateway request/session 自动映射。"
+      ],
+      "不可见或不保证": "Session 层级和手工 Trace 是应用声明，不是 Helicone 自动发现的 Agent 调用事实；所核验页面没有给出可承担业务证据的固定 retention、字段级默认脱敏、不可变性或完成性保证。Provider-routing 与 error-handling 页面对 PTB/BYOK 优先顺序还有不同表述。",
+      "Writer 取舍": "只保留可选 Gateway/外部日志兼容，不把 Session path、手工 span、计费 fallback 顺序或 SaaS 数据留存当作 Writer 合同。"
+    },
+    {
+      "对象": "Kong AI Gateway 3.x",
+      "当前能力": [
+        "AI Proxy/Advanced 可观察经过网关的 provider/model、请求参数、输入输出、response ID、finish reason、token、延迟、成本、cache、guardrail 和错误；MCP/A2A 代理还能看到协议中的 method、tool、session/task/context 和状态。",
+        "启用 OpenTelemetry/Zipkin 插件后可导出 Span；3.14+ 的 AI OTLP Metrics 将 LLM、MCP、A2A 的计数和直方图定时推给 Collector。Audit log 可经标准 logging plugin 外发。",
+        "支持多种负载均衡、fallback、timeout、retry 和 circuit breaker；但模型响应出现 tool call 只证明模型请求调用工具，不证明工具实际执行或成功。"
+      ],
+      "不可见或不保证": "输入输出属性和 audit payload 可能含 Prompt、PII、secret；PII Sanitizer 的审计字段甚至可能同时含 original 与 sanitized 值。成本还依赖显式价格配置。当前 GitHub OSS 最新 release 为 3.9.3，而官方能力页覆盖 3.13/3.14，目标 edition/version 必须单独验收。",
+      "Writer 取舍": "只采用实际部署版本已验证的网关/OTel 能力。Kong 的协议与插件事实不提升为 Writer Agent、评估或业务血缘真相。"
+    },
+    {
+      "对象": "Amazon Bedrock AgentCore",
+      "当前能力": [
+        "AgentCore Gateway 可统一代理 API、Lambda、服务、其他 Agent、HTTP/A2A 和模型请求，提供入站/出站认证、MCP 转换、语义工具发现与审计。",
+        "AgentCore Observability 产生 OpenTelemetry-compatible spans、metrics 和 logs 到 CloudWatch，可展示 session、执行路径、延迟、token 和错误。",
+        "AgentCore 同时包含 Runtime、Gateway、Memory、Identity、Browser、Code Interpreter、Observability、Evaluations 和 Policy 等完整托管 Agent 平台能力。"
+      ],
+      "不可见或不保证": "只有托管或显式接入 AgentCore 的运行才获得其完整语义；将 Writer 迁入 Runtime 才可能改变这一边界，但那会替换当前 DeepAgent/Harness 责任和部署模型。",
+      "Writer 取舍": "不采用 AgentCore Runtime、Memory、Harness 或发布闭环；只把 Gateway/OTel 互操作作为未来 AWS 场景的兼容可能。"
+    },
+    {
+      "对象": "Datadog LLM Observability / APM",
+      "当前能力": [
+        "支持 LLM、workflow、agent、tool、task、embedding 和 retrieval Span，并能关联 APM、日志和基础设施；自动/手工 instrumentation 可采集 token、成本、延迟、错误、模型参数以及可选输入输出。",
+        "支持 OTel GenAI、OpenInference 风格属性和 Span Links；跨 Trace Link 可保留，但 Execution Graph 只绘制同一 Trace 内关系。",
+        "其采样、索引和 retention 是运维检索模型；LLM Observability client-side sampling 与 APM sampling 还有独立行为。"
+      ],
+      "不可见或不保证": "Agent/Tool 分类依赖 SDK、手工 Span 或语义属性，是应用声明而非平台自动识别；典型 APM 可搜索保留窗口和采样不能证明 Writer 证据完整。",
+      "Writer 取舍": "可作为 OTLP/APM 诊断后端，但不把 Datadog Trace、Execution Graph、Score 或 retention 当作内部卷宗与长期因果链。"
+    },
+    {
+      "对象": "Grafana Cloud AI Observability / Tempo",
+      "当前能力": [
+        "AI Observability 以 OpenTelemetry 为入口，覆盖 LLM、Agent、VectorDB、MCP 和 GPU 的性能、错误、成本、token、日志与评估，并可与 Application Observability、Alloy、Prometheus/Loki/Tempo 组合。",
+        "Tempo 提供高规模分布式 Trace 存储和查询，适合跨 executor、evolution、网关及基础设施定位延迟和故障。",
+        "Tempo 官方说明 Trace 没有天然可知的最终完成点，后续 Span 仍可能到达；超大 Trace 的完整查询和展示也存在现实边界。"
+      ],
+      "不可见或不保证": "Grafana 只理解实际收到的 OTel/日志/指标及其属性，不会自动产生 Writer 的稿件、卷宗、评估、进化和发布外键，也不能用 Tempo 查询成功证明业务事件无缺失。",
+      "Writer 取舍": "只作为可替换外部诊断与 dashboard 后端，Writer 页面不复制其全栈观测产品。"
+    }
+  ],
+  "writer_classification": "兼容适配",
+  "writer_problem_match": [
+    "executor 若未来需要集中管理多个模型供应商、区域、密钥、配额、fallback 或 cache，可把 LiteLLM、Portkey、Helicone、Kong 作为 DeepAgent 下方的可选传输入口；它们解决的是模型访问运营问题，不是 Agent 机制记录问题。",
+    "Kong 或 AgentCore Gateway 若未来代理企业 Tool/MCP/A2A，可提供认证、协议转换、路由和协议级审计；Writer 仍必须在 DeepAgent Tool 执行钩子记录真实调用、HITL 和结果。",
+    "Datadog、Grafana 以及网关自带 OTel 能补足 executor/evolution 的网络、数据库、缓存、模型供应商和基础设施诊断，适合定位延迟、429/5xx、fallback、token/cost 与出口故障。",
+    "外部平台提供的运营指标可与 Writer Profile 指标对照，发现供应商账单、路由、cache 或采样异常；但 Score、Outcome 和版本比较仍由 Writer 自有对象计算。",
+    "当前仓库没有这些 Gateway/APM 的运行依赖，Writer 已有双端 recorder、稳定事件 ID、卷宗/评估/发布关系，因此本项只需冻结边界和兼容面，不产生首期部署需求。"
+  ],
+  "adoption_decision": "仅保留兼容",
+  "minimal_writer_form": [
+    "第一阶段不选定、部署或绑定任何 Gateway/APM 产品。Writer 的模型工厂只需继续允许受控配置 OpenAI-compatible base_url、model 和 secret，使未来网关接入停留在传输配置层，不改 DeepAgent、Harness、Tool 或 Trace 合同。",
+    "Writer Canonical Trace Contract、trace_id/span_id/event_id、PayloadObject、ArtifactRevision、EvidenceDossierVersion、EvaluationDossier、EvolutionSession 和 ReleaseVersion 始终先在内部形成。外部平台数据只能是可丢弃、可重建的诊断投影。",
+    "建立严格 ID 空间：Writer ID 保持业务真源；OTel trace/span ID、gateway request ID、provider response ID、vendor trace/session ID 只写入版本化 external_refs。不得用外部 session、request 或 sticky-routing ID 覆盖 Writer ID。",
+    "可信内部 Gateway/APM 链路可传播 W3C traceparent，使外部 Span 嵌套或 Link；不在 tracestate/baggage 放稿件、用户身份、卷宗或其他业务正文，也不向不可信第三方传播可反查业务对象的高敏 ID。",
+    "模型调用只记录一个 Writer 逻辑 LLM Span；若网关通过 allowlisted response headers/同步 metadata 返回 request ID、实际模型、cache hit、route 或 attempt 摘要，则作为诊断字段附加。网关隐藏的 provider retry 不伪造成 Writer 子 Span，coverage 标 unknown。",
+    "每条调用链明确一个重试策略所有者，并设置总 attempt/timeout 上限。若应用与网关都必须重试，Writer 记录外层 attempt，外部平台记录内层 attempt，二者用 external_ref 关联并单独统计，避免乘法重试、重复成本和无法解释的延迟。",
+    "Gateway 对 Prompt、响应、Tool 参数或结果的 guardrail、重写、缓存和路由不得成为不可见语义变换。Writer 场景默认使用透明传输；确需变换时，只有目标版本能同步返回受控 before/after 摘要、policy/version 和结果，且内部 recorder 已捕获后，才允许进入证据覆盖。",
+    "外部观测只通过共享、默认关闭的 OTLP/adapter 单向导出脱敏结构字段、状态、指标、摘要和 opaque correlation ID。不得在七个产品间分别植入 SDK，也不得从其 API 反向导入 Trace 来补事实。",
+    "Writer UI 最多展示 integration configured/healthy/degraded、最后导出错误、external_refs 和外链；运行时间线、血缘、完整性、评估和进化视图继续完全查询内部数据库。"
+  ],
+  "explicit_non_goals": [
+    "不建设通用 AI Gateway 管理面、供应商市场、虚拟 key/预算/团队、多租户计费、路由 DSL、语义路由或企业配额系统；没有真实需求时不引入代理服务。",
+    "不以 Bedrock AgentCore Runtime、Memory、Identity、Browser、Code Interpreter、Evaluations 或 Policy 替换 Writer 强制采用的 DeepAgent、Harness、Memory 和进化闭环。",
+    "不复制 Datadog/Grafana/Kong 的服务地图、日志搜索、基础设施 SLO、告警编排、自定义 dashboard builder 或全栈运营控制台。",
+    "不把 Helicone Session、Portkey Trace、Kong request ID、LiteLLM OTel Trace、Datadog Execution Graph 或 Tempo Trace 当作 Agent 运行、Workflow 或业务 lineage 主键。",
+    "不默认开启 raw request/response、Prompt/Completion、Tool payload、A2A payload、guardrail blocked content 或审计原值外发。",
+    "不为兼容副本建设 exactly-once 队列、无限期 outbox、全量历史 backfill、vendor-neutral 查询层或第三方数据仓库。",
+    "不在 Writer UI 重建第三方指标和 Trace 明细；诊断深挖通过受控外链进入所选后端。"
+  ],
+  "trace_boundary": [
+    "Writer Trace 描述一次有界创作、证据编译、评估或进化运行；Gateway Trace 通常只描述一条经过代理的 HTTP/模型/工具请求，APM Trace 只覆盖实际埋点且在同一传播上下文中的有界执行。三者边界可以关联，但不能合并为同一业务对象。",
+    "LiteLLM 的 one trace per request、Portkey/Helicone 的 Trace/Session、Kong 的 AI Span 和 AgentCore/Datadog/Grafana 的 OTel Trace 均不跨越 Writer 的稿件 revision -> 卷宗 -> 评估 -> 进化 -> 发布长期链；该链只由内部业务外键组成。",
+    "Gateway 内部 auth、guardrail、cache、router、provider retry 可成为外部请求 Trace 的子 Span，但 Writer 只把整个远端调用视为一个逻辑 LLM/Tool 操作。没有同步返回的逐次事实不能从外部 UI 截图或事后查询反灌。",
+    "外部 session/conversation/path 只能做分组。Helicone Path 明确不是时间顺序；其他平台的 session/agent 名称也依赖应用声明，不能推断 parent/child、因果方向或完成状态。",
+    "HITL 暂停、长时间恢复和异步 evolution 阶段继续按 Writer 已冻结规则结束活动 Span并新建有界执行，通过内部 Link 和业务 ID 关联；外部 APM 是否能绘制跨 Trace Link 不改变该语义。"
+  ],
+  "async_causality": [
+    "executor 到可信内部网关及 executor/evolution 同步 HTTP 可注入 W3C traceparent；接收端创建远程父子 Span。外部 OTel ID 回写 external_refs，Writer trace_id 继续经已鉴权业务字段和数据库传递。",
+    "网关发起的 provider fallback/retry 是其内部异步或同步因果；若只返回最终响应，Writer 将物理 attempt 数、失败原因和成本覆盖标 unknown，不虚构 Link。若返回稳定 attempt references，可作为一个逻辑调用的诊断集合保存。",
+    "Writer 的 ingest、证据编译、评估、进化、发布与 HITL resume 仍使用 triggered_by、retry_of、derived_from、resumed_from 等内部 Link 和业务外键；Datadog Execution Graph 不能绘制跨 Trace Link、Tempo 或其他后端采样均不影响内部导航。",
+    "OTLP/log exporter 是 canonical event 持久化后的异步副作用，不成为原运行的 parent；重试导出使用同一 OTel span identity/mapping_version 并允许外部去重，不创建假的业务 attempt。",
+    "不得接受任意公网 Gateway 提供的未校验 traceparent 作为 Writer 根因果，也不得通过 Baggage 传播 secret、用户正文或长期 lineage。信任边界、采样和 header allowlist 必须由部署配置固定。"
+  ],
+  "agent_semantics": [
+    "Gateway 能直接证明的是它实际接收、变换、路由和返回的模型/HTTP/MCP/A2A 协议事实。Kong 看到模型 tool call 只证明模型提出调用；Helicone/Portkey 的 Tool/Session/Span 也可能是应用主动上报，均不能证明 Tool handler 已执行或成功。",
+    "Datadog、Grafana 和 OTel 后端中的 agent/tool/workflow 类型依赖 SDK、手工 Span 或 GenAI/OpenInference 属性，是 Writer instrumentation 的声明，不是平台从网络自动识别的真实 DeepAgent 拓扑。",
+    "任何产品都不会仅凭模型流量恢复 Subagent 的 parent/child、Skill 匹配/激活、Harness Middleware 有序装配与 before/after 干预、HITL request/decision、上下文压缩或文件系统副作用。",
+    "AgentCore 在其托管 Runtime 内能提供更完整 Agent 执行路径，但 Writer 不迁移 Runtime；因此其外部 Gateway/Observability 与其他平台一样只拥有接入范围内的事实。",
+    "Writer 继续从 DeepAgent/LangGraph callback、Tool wrapper、Skill loader、Middleware 和业务服务产生 canonical 节点/事件；外部平台只接收经过 PayloadGate 的公共投影。"
+  ],
+  "artifact_lineage": [
+    "Trace -> ArtifactRevision -> EvidenceDossierVersion -> EvaluationDossier -> EvolutionSession/Experiment -> ReleaseVersion/commit/rollback 的关系只在 Writer 数据库、registry 和 git 中持久化。外部 Trace 到期或删除后，该 DAG 必须仍可完整遍历。",
+    "可向外部 Span 导出低敏 opaque artifact/dossier/version correlation ID 或 hash，便于从 Writer 跳到 APM；不导出稿件标题、正文、完整 evidence、评语或发布秘密。外部 ID 反向存于 export mapping，而不是业务表主键。",
+    "Gateway cache、prompt cache、request log、session 和 provider response ID 不是 ArtifactRevision；它们只能说明某次传输或供应商响应，不能替代 Writer 对有效输入、可见输出和人工修订的冻结。",
+    "Kong LLM-as-Judge、Grafana/Datadog evaluation、Portkey/Helicone feedback 等外部评分如未来启用，只能成为带 source/version 的外部 ScoreObservation；不能自动改变 EvaluationDossier、实验采纳或发布状态。",
+    "第三方 retention/deletion 与 Writer 业务删除各自执行。删除外部副本成功不证明内部正文已删除，外部副本丢失也不删除内部卷宗；二者通过审计记录关联。"
+  ],
+  "capture_timing": [
+    "Agent/Subagent/LLM/Tool/Skill/Middleware/HITL 和稿件事实在 Writer 进程内生命周期发生时先写 canonical recorder；不能等 Gateway/APM 日志回来后事后猜测。",
+    "模型请求发出前固定 Writer effective input 与逻辑 call ID；响应流结束、失败或取消时固定 visible output、usage 和状态。同步返回的 gateway/provider request ID、实际模型、cache/route 摘要在此时写 external_refs。",
+    "Gateway 的路由、provider attempt、cache 和 guardrail 事实只能在网关处理期间产生；LiteLLM 等响应后异步花费/日志可能晚到。Writer 页面把它们标 diagnostic_pending/available/unknown，不等待其落库才完成创作。",
+    "APM Span 在对应有界操作结束时结束，Batch/Collector 异步导出；Trace 后端晚到 Span 不重新打开 Writer 已封口 Trace，也不改变 Integrity/Coverage。",
+    "人工反馈、评估、线上采用和发布结果在未来发生时创建新的 Outcome/Score/Trace 并引用来源，不向已经结束的 Gateway/APM 请求追加业务真相。"
+  ],
+  "payload_policy": [
+    "Gateway 作为模型传输层必然接触实际 Prompt/响应，但观测留存必须默认 no-body：LiteLLM raw logging/正文 OTel、Kong input/output/audit payload、Helicone/Portkey 完整日志以及 AgentCore/Datadog/Grafana 的内容采集均保持关闭，除非单独安全评审和显式授权。Portkey DO NOT TRACK/Metrics Only、LiteLLM turn_off_message_logging/no-log 只能作为产品侧补充控制。",
+    "外部导出 allowlist 只包含 service/environment/version、operation、状态、时间、token/cost 摘要、model/provider、cache/route/error 类别、mapping_version 和 opaque correlation ID；不包含 Prompt、稿件、Tool 参数/结果、HITL 决定、评语、Authorization、provider key、cookie、原始 header/body 或 CoT。",
+    "完整语义继续保存为通过 Writer PayloadGate 的 PayloadObject。外部平台的 scrub、PII sanitizer、Collector processor 或 Sensitive Data Scanner 只是第二道防线；尤其 Kong sanitizer audit 可能保留 original 值，不能替代源端 allowlist。",
+    "SaaS 区域、SOC2、加密和自托管选项不等于 Writer 的 retention/deletion 合同。接入前必须确认数据区域、默认内容采集、保留期、删除 API、子处理方和访问审计，但本机制不预建通用合规模块。",
+    "若 Gateway 代理 Tool/MCP/A2A，其参数和结果遵循与模型正文相同的 PayloadPolicy；协议 method/tool/status 可外发，业务正文默认 reference-only 或不外发。",
+    "external_refs 和 dashboard URL 本身也按 workspace/actor 鉴权，页面默认只显示 vendor、状态和短 ID；完整外链访问由第三方 RBAC继续控制。"
+  ],
+  "integrity_coverage": [
+    "Writer Trace 完整性只按内部 event sequence、required node/event、PayloadObject 可解析性和终态计算。外部平台有数据、漂亮的 Trace 树或成功 dashboard 均不能把 trace_incomplete 改为 complete。",
+    "为每个外部集成单独记录 configured、propagated、accepted/queued、exported、partial、dropped、failed、sampled、retention_expired 和 unknown；不得用单一 exported=true 表示端到端可查询。",
+    "Gateway coverage 分母仅是实际经过该 Gateway 的请求。直连 provider、客户端取消前、网关前 Middleware、网关后 Tool 执行和其他服务流量均不在其自动覆盖范围。",
+    "APM coverage 受 instrumentation、tail/head sampling、attribute limits、queue overflow、backend indexing 和 retention 影响；Datadog/Grafana/Kong 的外部统计只作为 best-effort 诊断。",
+    "隐藏 retry/fallback、cache 内部命中、Prompt 重写或价格配置缺失时，对 provider attempt、物理成本、实际输入和路由解释分别标 unknown/partial；Portkey 语义 cache 还会忽略 system prompt，不能作为 Writer 逐次执行或证据缓存。",
+    "Portkey 重试可见性与 OTel endpoint、Helicone PTB/BYOK 顺序、Kong 文档版本能力等文档冲突已经转化为接入验收项，不进入 Writer 固定语义，因此本调研没有待决字段。"
+  ],
+  "delivery_failure": [
+    "若 Gateway 被配置为模型必经 base_url，其 DNS、认证、限流、timeout、全部 upstream fallback 耗尽或 circuit breaker 全开属于真实模型调用失败，按 Writer LLM/Tool 失败、重试和 Trace 终态处理；不能因其同时承担观测而 fail-open。",
+    "Gateway 之外的 OTLP、APM、日志或 trace-log exporter 失败必须 fail-open：不抛回 Agent 主流程，不回滚稿件或 canonical Trace，只记录 external_export_degraded、队列深度、最后错误和 dropped 数。",
+    "避免应用、Gateway、SDK 与 provider 四层各自隐式重试。统一总 deadline/attempt budget；不可关闭的内部重试需在集成说明中固定，并把物理 attempt/cost coverage 标 partial 或 unknown。",
+    "Gateway 的响应后异步日志、花费写入和外部 Collector 可能乱序、重复或永久丢失。external_refs 按 vendor + request/trace/span ID + mapping_version 幂等；同 ID 冲突只告警，不覆盖内部事实。",
+    "Exporter 队列满或外部后端背压只丢弃/延迟兼容副本，不阻塞 Agent。若 Gateway 主路径自身背压，则由客户端 deadline 和熔断结束调用，不无限排队。",
+    "不从第三方平台反向扫描并导入缺失 Trace，不承诺 exactly once，也不做无限期 backfill。必要的短期诊断重放从内部脱敏投影重新产生并带 backfill 标记。"
+  ],
+  "metrics_scores_outcomes": [
+    "Gateway/APM 可稳定补充 request/error/rate-limit、端到端与 provider latency、TTFT/TPOT、token、估算 cost、cache hit、fallback/route、吞吐和基础设施指标；这些适合运营诊断与供应商对账。",
+    "所有指标保留 source、vendor、deployment、model、price_config_version、sampling 状态和时间窗。外部 cost 可能因隐藏失败 attempt、价格配置、异步写入或供应商账单口径而不同，不能覆盖 Writer 内部 usage。",
+    "外部平台提供的 evaluation、judge、feedback 或 anomaly 只形成 ExternalScoreObservation；Writer ScoreRecord/EvaluationDossier 仍绑定明确 rubric、evidence dossier version、evaluator version 和 artifact revision。",
+    "Outcome 仍是人工采用、继续编辑、回滚、发布表现等后续业务事实。Gateway 成功、低延迟、cache hit 或 APM 无错误不等于稿件质量好，也不能自动触发进化采纳。",
+    "跨版本分析以 Writer Profile 和版本化内部对象为分母；外部指标可作为诊断维度 join，但 sampled/unknown 数据不得进入要求完整性的进化训练或发布门禁。"
+  ],
+  "explanatory_limit": [
+    "外部平台能解释请求是否到达代理、选了哪个可见 provider/model、是否遇到 429/5xx/timeout、是否 fallback/cache、token/cost 如何变化，以及网络、数据库、Collector 或基础设施哪里慢。",
+    "它们不能仅凭模型或 Tool 流量证明哪个 Agent/Subagent 发起、为何激活某 Skill、哪层 Middleware 改了输入、HITL 如何决定、上下文被如何压缩，或 Tool 是否真的产生预期副作用。",
+    "Gateway 看到的 Prompt 可能是 Writer 发出后的版本，Writer 看到的输入可能又不是 provider 最终接收版本；没有受控变换回执时，任一侧都不能单独证明端到端 effective input。",
+    "Session/Trace 树、相邻时间和相关指标只能证明观测相关性，不能证明稿件 revision、评估得分、实验采纳或发布 Outcome 的业务因果。",
+    "采样、attribute 截断、异步日志失败、retention 到期和晚到 Span 都会形成不可观测区；外部查询无结果必须显示 unknown，而不是解释为操作未发生。",
+    "AgentCore 这类托管平台若完整承载运行可扩大可见范围，但 Writer 当前不在其 Runtime 内；不能把产品能力列表当作当前系统事实。"
+  ],
+  "writer_ui_impact": [
+    "系统设置只需一个可选外部观测区：vendor/endpoint、启用状态、PayloadPolicy profile、最近成功/错误、队列与 dropped 数；不提供路由或 dashboard 通用编辑器。",
+    "内部 Trace 详情在相关 LLM/Tool/HTTP 节点显示 gateway/provider/OTel external_refs、route/cache 摘要、coverage 状态和受控外链；默认时间线、调用树和载荷仍来自 Writer。",
+    "分析页对外部 token/cost/latency 明确标来源、采样与时间窗，不与内部完整指标静默相加；第三方深度分析通过外链完成。",
+    "血缘、卷宗、评估、进化与发布页面不新增第三方主视图；外部平台不可用时 Writer 核心 UI 与操作保持完整。"
+  ],
+  "official_sources": [
+    {
+      "来源": "LiteLLM Gateway Quickstart、Life of a Request 与 Provider Failover",
+      "地址": "https://docs.litellm.ai/docs/learn/gateway_quickstart ; https://docs.litellm.ai/docs/proxy/architecture ; https://docs.litellm.ai/docs/proxy/reliability",
+      "用途": "确认统一 OpenAI-compatible 入口、虚拟 key/预算、Router 重试/fallback/cooldown、cache/数据库检查，以及响应后异步花费和 logging callback。"
+    },
+    {
+      "来源": "LiteLLM OpenTelemetry v2、Scrub Logged Data 与 Raw Request/Response Logging",
+      "地址": "https://docs.litellm.ai/docs/observability/opentelemetry_v2 ; https://docs.litellm.ai/docs/observability/scrub_data ; https://docs.litellm.ai/docs/observability/raw_request_response",
+      "用途": "确认 one trace per proxy request、traceparent 续接、正文默认不采集、raw logging 显式开启和发送前 scrub/masking；raw request 是 LiteLLM 转换后实际发往供应商的请求，不等于 Writer 原对象。"
+    },
+    {
+      "来源": "LiteLLM Logging Specification、Proxy Logging 与 Caching",
+      "地址": "https://docs.litellm.ai/docs/proxy/logging_spec ; https://docs.litellm.ai/docs/proxy/logging ; https://docs.litellm.ai/docs/proxy/caching",
+      "用途": "核对日志中的 trace/request/model/token/cost/cache/error/MCP 信息、关闭正文与每请求 no-log 控制，以及 cache hit/no-store/TTL 不能证明本次发生新模型推理。"
+    },
+    {
+      "来源": "LiteLLM v1.93.0 官方 release",
+      "地址": "https://github.com/BerriAI/litellm/releases/tag/v1.93.0",
+      "用途": "锁定 2026-07-19 当前核验版本。"
+    },
+    {
+      "来源": "Portkey AI Gateway 产品文档",
+      "地址": "https://docs.portkey.ai/docs/product/ai-gateway.md",
+      "用途": "核对统一 Gateway、路由、重试/fallback、cache、guardrail、限流和请求运营能力。"
+    },
+    {
+      "来源": "Portkey Traces、Logs 与 OpenTelemetry 文档",
+      "地址": "https://docs.portkey.ai/docs/product/observability/traces.md ; https://docs.portkey.ai/docs/product/observability/logs.md ; https://docs.portkey.ai/docs/product/observability/opentelemetry.md",
+      "用途": "核对外部 Trace/Span 分组、完整 request/response 日志、3/30 天标准保留期、应用声明属性、traceparent 和 OTel 互操作边界，并记录 OTel endpoint 文档口径差异。"
+    },
+    {
+      "来源": "Portkey Automatic Retries、Fallbacks、Timeouts、Cache 与 Request Logging 配置",
+      "地址": "https://docs.portkey.ai/docs/product/ai-gateway/automatic-retries ; https://docs.portkey.ai/docs/product/ai-gateway/fallbacks ; https://docs.portkey.ai/docs/product/ai-gateway/request-timeouts ; https://docs.portkey.ai/docs/product/ai-gateway/cache-simple-and-semantic ; https://docs.portkey.ai/docs/product/administration/configuring-request-logging",
+      "用途": "确认重试状态码/次数/退避/响应头、fallback 与 timeout 耗尽、语义 cache 忽略 system prompt，以及 DO NOT TRACK/Metrics Only 的非追溯性。"
+    },
+    {
+      "来源": "Portkey Gateway v1.15.2 官方 release",
+      "地址": "https://github.com/Portkey-AI/gateway/releases/tag/v1.15.2",
+      "用途": "锁定 2026-01-12 当前非预发布版本，并提醒 SaaS 文档与自托管版本需分别验收。"
+    },
+    {
+      "来源": "Helicone Gateway Overview、Provider Routing 与 Error Handling",
+      "地址": "https://docs.helicone.ai/gateway/overview.md ; https://docs.helicone.ai/gateway/provider-routing.md ; https://docs.helicone.ai/gateway/concepts/error-handling.md",
+      "用途": "确认 Gateway 可见范围、路由/fallback/retry 和全部尝试失败后的客户端错误，并识别 PTB/BYOK 顺序口径冲突。"
+    },
+    {
+      "来源": "Helicone Sessions、Trace Log、Custom Rate Limits 与 Data Autonomy",
+      "地址": "https://docs.helicone.ai/features/sessions.md ; https://docs.helicone.ai/rest/trace/post-v1tracelog.md ; https://docs.helicone.ai/features/advanced-usage/custom-rate-limits.md ; https://docs.helicone.ai/references/data-autonomy.md ; https://github.com/Helicone/helicone/releases/tag/v2025.08.21-1",
+      "用途": "确认 Session 为 header/app 声明、Path 非时间顺序、Trace JSON 字段、限流形态、数据控制声明及当前 release。"
+    },
+    {
+      "来源": "Kong LLM OpenTelemetry 与 AI Audit Log Reference",
+      "地址": "https://developer.konghq.com/ai-gateway/llm-open-telemetry.md ; https://developer.konghq.com/ai-gateway/ai-audit-log-reference.md",
+      "用途": "核对 GenAI/Tool/MCP/A2A 可观测字段、输入输出敏感载荷警告、审计内容和平台事实/应用语义边界。"
+    },
+    {
+      "来源": "Kong AI OTel Metrics、Load Balancing 与 3.9.3 release",
+      "地址": "https://developer.konghq.com/ai-gateway/ai-otel-metrics.md ; https://developer.konghq.com/ai-gateway/load-balancing.md ; https://github.com/Kong/kong/releases/tag/3.9.3",
+      "用途": "核对 metrics 开关、路由/retry/circuit breaker、3.13/3.14 功能门槛与当前 OSS release 差异。"
+    },
+    {
+      "来源": "Amazon Bedrock AgentCore Overview 与 Gateway",
+      "地址": "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/what-is-bedrock-agentcore.html ; https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway.html",
+      "用途": "确认完整托管 Agent 平台范围，以及 Gateway 对 API/Lambda/Agent/MCP/A2A/模型的代理、认证、发现和审计能力。"
+    },
+    {
+      "来源": "Amazon Bedrock AgentCore Observability",
+      "地址": "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability.html",
+      "用途": "确认 OTel-compatible metrics/spans/logs、CloudWatch session/执行路径/延迟/token/error 视图。"
+    },
+    {
+      "来源": "Datadog LLM Observability Instrumentation、Terms 与 OTel Instrumentation",
+      "地址": "https://docs.datadoghq.com/llm_observability/instrumentation/ ; https://docs.datadoghq.com/llm_observability/terms/ ; https://docs.datadoghq.com/llm_observability/instrumentation/otel_instrumentation/",
+      "用途": "确认 LLM/workflow/agent/tool/task 等 Span、输入输出与 token/cost 采集、应用声明语义、OTel GenAI 和 Span Links。"
+    },
+    {
+      "来源": "Datadog Data Security and RBAC 与 Trace Retention",
+      "地址": "https://docs.datadoghq.com/llm_observability/data_security_and_rbac/ ; https://docs.datadoghq.com/tracing/trace_pipeline/trace_retention/",
+      "用途": "确认应用侧脱敏责任、Sensitive Data Scanner，以及 sampling/indexing/retention 不能承担业务证据完整性。"
+    },
+    {
+      "来源": "Grafana Cloud AI Observability 与 Application Observability",
+      "地址": "https://grafana.com/docs/grafana-cloud/monitor-applications/ai-observability.md ; https://grafana.com/docs/grafana-cloud/monitor-applications/application-observability.md",
+      "用途": "确认 OTel-native LLM/Agent/VectorDB/MCP/GPU 观测，以及 OTel SDK、Alloy、Grafana Cloud 的应用观测组成。"
+    },
+    {
+      "来源": "Grafana Tempo Introduction",
+      "地址": "https://grafana.com/docs/tempo/latest/introduction.md",
+      "用途": "确认 Tempo 分布式 Trace 定位、Trace 无天然完成终点和超大 Trace 查询边界。"
+    },
+    {
+      "来源": "Writer 当前 Trace/卷宗实现与本批既有边界结论",
+      "地址": "contracts/trace/__init__.py ; executor/app/platform/trace/recorder.py ; evolution/app/trace/recorder.py ; evolution/app/core/db.py ; writer_trace_industrial_fit/results/otel_genai_otlp_boundary.json ; writer_trace_industrial_fit/results/payload_governance.json",
+      "用途": "核对 Writer 已有双端 recorder、ID/事件/节点、PayloadGate 目标、卷宗/评估/进化/发布关系和 OTLP 单向投影边界，避免以产品能力臆造当前架构。"
+    }
+  ],
+  "standard_maturity": [
+    "LiteLLM、Portkey、Helicone、Kong 均是成熟可用的 Gateway/LLM observability 产品，但功能受 SaaS、自托管 edition、具体版本和配置开关影响；不能只按当前网页假定部署行为。",
+    "LiteLLM OTel v2 为 opt-in；Kong GenAI Span/AI metrics 分别要求 3.13+/3.14+ 且需显式插件配置；Helicone Trace Log 是 OTel 风格 JSON 摄入；Portkey 的 retry 可见性文档存在口径冲突。",
+    "AgentCore 是成熟托管平台方向，但对 Writer 属于架构替代而非可直接嵌入核心；只保留 Gateway/OTel 兼容。",
+    "Datadog/Grafana 的 APM、OTel 接收、指标和诊断能力成熟；LLM/Agent 语义仍依赖应用 instrumentation、发展中的 GenAI conventions、采样和 vendor retention。",
+    "因此工业原则可直接采用：可选网关、标准传播、单向脱敏出口、外部 ID 映射、运维诊断。任何 vendor schema、session 语义、retry 明细和长期保留均不进入 Writer 稳定合同。"
+  ],
+  "conflicts_with_writer": [
+    "Gateway 的核心价值是集中路由、鉴权、预算和运营，而 Writer 当前问题是 DeepAgent 运行事实、稿件血缘和进化闭环。取舍：不因工业产品丰富就引入新控制面，只保留 transport compatibility。",
+    "网关重试、fallback、guardrail、Prompt 重写和 cache 可能在 Writer recorder 之外改变物理执行。取舍：默认透明传输、统一重试所有者；看不到的 attempt/变换明确标 unknown，不能伪造完整性。",
+    "外部平台倾向把 Prompt/Completion/Tool payload 放进 Span 或日志以便调试，Writer 的长篇稿件和秘密治理要求源端最小披露。取舍：完整正文只进 PayloadObject，外部固定 no-body allowlist。",
+    "APM 接受采样、队列丢弃、晚到 Span、索引和有限 retention，Writer 证据卷宗要求可验证完整和长期业务外键。取舍：APM 永远是 best-effort 副本，canonical recorder 失败才影响证据消费。",
+    "Helicone/Portkey Session、Kong Tool call、Datadog Agent Span 等工业 UI 容易被误读为自动发现语义。取舍：区分平台实际协议事实与应用声明，Agent/Skill/Middleware/HITL 只信内部钩子。",
+    "AgentCore 希望承载 Runtime、Memory、Tool、身份、观测和评估的一体化平台，与 Writer 强制 DeepAgent 和已有 Harness/Evolution 责任重叠。取舍：不采用 Runtime，只保留 AWS Gateway/OTel 互操作可能。",
+    "外部 cost、judge、evaluation 和 cache 指标适合运营，却可能因隐藏 attempt、价格配置和采样与 Writer 数据不一致。取舍：保留 source/version/coverage，不覆盖 Score、Outcome 或发布门禁。",
+    "同时支持七个 vendor SDK 会造成依赖、字段和故障面膨胀。取舍：最多一个 OpenAI-compatible model endpoint 与一个共享 OTLP adapter；vendor 差异留在部署配置和 external link，不进入领域代码。"
+  ],
+  "uncertain": []
+}

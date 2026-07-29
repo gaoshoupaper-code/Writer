@@ -1,0 +1,177 @@
+{
+  "mechanism_name": "深层智能体执行拓扑与因果观测",
+  "primary_problem": "可靠区分一次创作运行中的智能体委托、子智能体、模型调用、工具副作用、技能加载、中间件效果和人工中断，并把这些运行事实连接到稿件、证据卷宗、评估、进化与发布，而不把流式消息、检查点或供应商追踪界面误当成业务真相源。",
+  "evidence_objects": [
+    {
+      "对象": "深层智能体框架",
+      "当前成熟度": "当前正式版本为 0.6.12（2026-06-25）。同步子智能体、固定中间件栈、工具级人工审批和原生追踪属于核心能力；异步子智能体在 Python 0.5.0 起仍被官方标为预览，深层智能体事件流页面标为测试版。",
+      "可核验结论": "同步子智能体由父智能体的 task 工具调用，父运行阻塞到子图返回；每次调用无状态、上下文隔离，父级回调与元数据向子图传播，子图以 lc_agent_name 标识。异步子智能体另建 thread 和 run，返回 task_id，官方要求把子运行视为独立 trace 并用 thread_id 关联。"
+    },
+    {
+      "对象": "有状态图运行时",
+      "当前成熟度": "当前正式版本为 1.2.9（2026-07-10）。检查点、线程、人工中断、子图与重试为正式核心能力；DeltaChannel 明确为测试版。",
+      "可核验结论": "检查点按 super-step 保存，成功任务的 pending writes 可避免同一步内重复执行；人工中断必须使用持久化 checkpointer 和同一 thread_id，恢复会从中断所在节点开头重跑，因此中断前副作用必须幂等。"
+    },
+    {
+      "对象": "深层智能体追踪服务",
+      "当前成熟度": "LangSmith Python SDK 当前正式版本为 0.10.10（2026-07-23），对 LangGraph/DeepAgents 有原生自动追踪、子智能体筛选、反馈与评估能力；它是成熟外部观测产品，不是 Writer 业务证据真源。",
+      "可核验结论": "一次 operation 是 trace，单个工作单元是 run/span，多轮对话用 thread_id/session_id 连接多个 trace；DeepAgents 自动把子智能体名称写入 lc_agent_name。内部服务可用受信任的 langsmith-trace/baggage 头延续父上下文，但官方警告不得信任公网来路的这些头。"
+    },
+    {
+      "对象": "OpenAI 智能体开发工具包",
+      "当前成熟度": "当前正式版本为 0.19.0（2026-07-27），内置 trace/span、智能体、模型生成、函数工具、handoff、guardrail 与人工审批追踪，适合作为工业语义对照；Writer 不采用其运行时。",
+      "可核验结论": "官方把单个端到端 workflow operation 定义为 trace，把带开始/结束时间和 parent_id 的操作定义为 span，用 group_id 连接同一对话的多个 trace；RunState 可序列化人工审批并恢复最初顶层运行。"
+    }
+  ],
+  "writer_classification": "Writer 核心",
+  "writer_problem_match": "直接服务 executor 的一次写作生成：meta 智能体通过同步 task 委托 interview、storybuilding、detail_outline、writing 及其 review-revise 子图，TraceMiddleware 记录模型和工具，LangGraph checkpointer 支撑 ask_user 中断/恢复；随后 evolution 拉取 trace，编译不可变证据卷宗，仅用 ready 卷宗启动评估，封存评估卷宗，再永久绑定进化会话并以 git commit、registry 版本和 executor 热加载完成发布。该机制既要支持在线排障，也要为卷宗完整性、跨版本评估和进化归因提供可验证输入。",
+  "adoption_decision": "改造后采用",
+  "minimal_writer_form": [
+    "保留现有自建 TraceRecorder、TraceMiddleware、回调父子关系、增量摄入、投影、证据卷宗和发布链，不替换为第三方观测后端。",
+    "一次 executor 逻辑生成从首次 invoke 到 completed、failed 或 cancelled 为一个根 trace；awaiting_input/interrupted 是同一 trace 的非终态，使用同一 trace_id 与 thread_id 恢复。",
+    "根 trace 下只保留有业务解释力的智能体/子智能体、模型调用、工具调用和错误 span；task 委托即使在界面隐藏，也必须保留 dispatch/tool_call_id 到子智能体实例的因果边。",
+    "技能只记录实际加载的技能名称、版本/指纹和来源；中间件记录运行时装配清单、顺序、版本以及产生业务效果的事件，不为每个 hook 制造节点。",
+    "trace 只记录运行事实与受控载荷；稿件正文、review 产物、memory_quality 和契约覆盖由版本化证据卷宗冻结，评估卷宗和发布版本继续作为后续真源。",
+    "只补齐 attempt_no/retry_of、causal_links、capture_status、payload_ref/hash、连续序号与投递状态等必要字段；供应商导出器只能是可关闭、脱敏、失败不阻断主流程的兼容适配。"
+  ],
+  "explicit_non_goals": [
+    "不引入通用异步子智能体平台、Agent Protocol 远程调度、任意 DAG 工作流编排器或跨团队 worker 池；Writer 当前创作阶段需要同步、可收敛的单次因果链。",
+    "不把 LangSmith、OpenAI Traces 或任何 SaaS 仪表盘作为 Writer 的执行、卷宗、评估或发布真源。",
+    "不追踪逐 token 流、完整思维链、每次中间件 hook、每个检查点全量状态或所有文件读写；消息通道与 trace/span 通道继续分离。",
+    "不把 skill 当成独立智能体，不把 middleware 当成业务阶段，不把 thread/checkpoint 当成长事务或证据卷宗。",
+    "不为了统一标准把 executor→evolution→评估→进化→发布强塞进一个超长父子 span 树；这些是由不可变产物连接的多个工作单元。",
+    "不宣称追踪能提供恰好一次副作用、创作质量证明、模型内部推理或反事实因果。"
+  ],
+  "trace_boundary": [
+    "Trace：一次用户生成或一次 evolution 自观测运行的端到端逻辑 operation；HITL 暂停和同 thread 恢复仍属于同一 trace。一次对话的后续新生成是新 trace，由 thread_id 聚合。",
+    "Span/Run：有开始与终结的工作单元。Writer 最少覆盖一次智能体实例、同步子智能体实例、一次模型调用尝试和一次工具调用尝试；父子关系只表达真实的同步嵌套。",
+    "Event：无持续时间或作为 span 状态补充的事实，包括 run_start、awaiting_input、resume、人工决定、artifact_snapshot、memory_quality、run_end、cancel 和发布链接；事件必须带单调 sequence 与稳定 event_id。",
+    "长期 Workflow：trace→证据卷宗版本→评估尝试/封存评估卷宗→进化会话→source_commit/快照版本。它不是 DeepAgents/LangGraph 的单个运行对象，应由显式业务外键和不可变产物表达。",
+    "LangGraph checkpoint 是某 thread 在 super-step 的可恢复状态，DeepAgents event stream 是运行事件的应用投影；二者都不能替代 Writer 的 trace 完整性清单或卷宗。"
+  ],
+  "async_causality": [
+    "同进程同步链：run_id/parent_run_id 表达嵌套，tool_call_id/dispatch_id 把 task 工具调用连接到具体子智能体实例，lc_agent_name/agent_name 提供稳定角色名，checkpoint_ns 或流式 namespace 只作运行实例定位。",
+    "并行 fan-out：每个子调用是独立 child span，共享同一 dispatch group；join 结果记录所等待的 child IDs。排序使用源端 sequence，不以可能漂移的 wall-clock 时间推断因果。",
+    "重试：同一逻辑 operation_id 下每次尝试建立独立 span，记录 attempt_no、retry_of、触发异常与退避；不得用后一次结果覆盖前一次失败。LangGraph 当前可提供 node_attempt、run_id、checkpoint_id 和 task_id。",
+    "跨服务异步链：executor 通知、evolution 拉取、卷宗编译、评估、进化和发布各自开 trace，用 causal_links 记录 origin_trace_id/origin_span_id、dossier_id、eval_dossier_id、session_id、source_commit。异步工作不伪装成仍存活的同步 child span。",
+    "若未来启用 DeepAgents 异步子智能体，遵循官方语义：子任务为独立 trace/thread，task_id 即 thread_id，父 trace 只记录 launch/check/update/cancel；当前仅保留可兼容的链接字段，不启用该预览机制。",
+    "LangSmith 的分布式头只可作为内部受信任服务的可选导出上下文，Writer 的 canonical 关联仍是自有 ID；公网入口必须剥离供应商 baggage，避免调用方篡改追踪元数据。"
+  ],
+  "agent_semantics": [
+    "Agent：根 DeepAgent/CompiledStateGraph 的一次实例运行；记录 agent_name、角色、harness/提示词/模型版本和终态。",
+    "Subagent：当前 Writer 采用同步 task 委托。每次调用是新的无状态、隔离上下文实例，父级阻塞直至其返回单一结果；同名子智能体多次调用必须按 invocation/dispatch ID 分开。reviewer 是真实子智能体实例，不靠文件名臆造。",
+    "LLM：每次 provider 模型请求为一个 span attempt，开始时冻结实际模型、输入引用和提示版本，结束时记录输出引用、token/成本、工具调用计划或错误。流式 token 不是独立 span。",
+    "Tool：从工具调用被接受到返回/抛错为 span；对写文件、发版等副作用，start 只能表示意图，只有成功返回并校验产物后才是 completed。tool_call_id 是模型计划与执行结果的连接键。",
+    "Skill：DeepAgents 以 progressive disclosure 读取 SKILL.md，本身没有可靠的独立执行生命周期。Writer 只在 SkillsMiddleware 确认加载或对应资源实际读取时记录 skill_used 与内容指纹；仅凭普通 read_file 路径推断时标为 inferred。",
+    "Middleware：它是按顺序包裹模型/工具或在 graph 节点运行的装配层，不是业务流程节点。记录 stack manifest；只有记忆召回、积分扣费、artifact snapshot、重试/恢复、HITL 等有业务后果的 middleware 显式发 event。",
+    "HITL：GraphInterrupt 是正常控制流而非错误。中断已由 checkpointer 持久化后记录 awaiting_input，恢复必须复用 thread_id；记录 interrupt_id、请求、决定、决定者、时间和恢复 attempt，且中断前副作用必须幂等。",
+    "Workflow：Writer 的创作→卷宗→评估→进化→发布由业务状态机和外键连接，不新增一个通用 Agent/Workflow 类型替代现有服务边界。"
+  ],
+  "artifact_lineage": [
+    "运行期最小链为 trace_id/span_id/event_id→agent_name/tool_call_id→artifact logical path+revision+sha256；写盘成功并重新读取校验后才产生 artifact revision，预览文本只用于诊断。",
+    "证据卷宗以 dossier_id、trace_id、version、compile_rule_version 和 provenance 冻结 contract、deliveries、review_chain、memory_quality、coverage；正文携带冻结内容、全文指纹、字符数和 truncated 标志。",
+    "trace_time 快照优先；compile_time_snapshot 只能明确标作编译时回读，不能声称等于运行当时内容。若运行后工作区已变且无运行时指纹，相关证据应为 unknown/partial。",
+    "终态卷宗不可原地修改，纠错生成新版本并 supersede 旧版本；仅 ready 卷宗可启动评估。评估尝试永久绑定 bound_dossier_id，产出的 sealed eval dossier 再被进化会话永久绑定。",
+    "发布链保留 eval finding→accepted evolution point→design change→applied change/validation→session_id→registry version→source_commit→production snapshot→executor refresh；任何 score 或结论都必须能沿这些 ID 回到冻结证据。",
+    "Trace 删除前若某证据已进入长期数据集或发布链，先保留必要的冻结内容、哈希和 provenance；不能留下指向已删除原文却仍显示为完整的悬空证据。"
+  ],
+  "capture_timing": [
+    "根 trace 在调用 agent 前创建并持久化 run_start；同时冻结 owner/workspace/thread、run_purpose、harness registry 版本/source_commit、模型、提示词、技能和中间件装配清单。",
+    "task 被接受时写 delegation start，子图真正启动时写 subagent start；子图返回 Command/ToolMessage 后写 completed，异常或中断分别写 failed/awaiting，不依赖后处理从时间邻近关系猜测。",
+    "模型和工具在 handler 前写 start，在 handler 成功后写 end，在异常传播前写 error；每次 LangGraph retry 都是新 attempt。工具副作用的完成事件必须晚于持久化与校验。",
+    "HITL 只有在 interrupt 已经 surfaced 且 checkpoint 可恢复后才把根运行置 awaiting_input；resume 先记录决定和恢复因果，再回 running。节点会从开头重跑，故重复 start 必须以 attempt ID 去重而不是吞掉。",
+    "产物在每次成功写/改后记录 revision+hash；卷宗在 trace 到终态且事件已 flush/摄入完整后编译。编译时回读必须记录 provenance 与采集时间。",
+    "根 trace 只有在所有在途 span 已终结、缓冲已 flush、event_count/sequence 已固定后进入终态并通知 evolution；通知失败不改变执行终态，但改变 delivery/capture 完整性。",
+    "评估 score 在评估卷宗封存时终结；进化 outcome 在发布或丢弃时终结；生产结果在 registry/source_commit 与 executor refresh 回执写入后终结。"
+  ],
+  "payload_policy": [
+    "默认本地采集。trace 保存结构化 envelope、受控摘要、增量上下文范围、payload_ref 与 sha256，不重复保存每轮完整系统提示、长正文和 token 流；可评估正文由卷宗事实层一次冻结。",
+    "凭据、令牌、Cookie、连接串和明确个人敏感信息在写盘前脱敏，不允许依赖前端遮罩。模型/工具完整输入输出只在确有证据需要时保存，并给出 captured、redacted、truncated、reference_only 状态。",
+    "原始 trace、工作区正文、卷宗、评估卷宗和发布物按 owner/workspace 隔离；原始载荷回钻、导出和人工查看必须鉴权并记录访问审计，普通列表/大盘只读摘要。",
+    "trace 采用较短、可配置保留期；不可变卷宗、评估卷宗、golden 数据与发布版本按产品/账号生命周期保留。删除规则必须处理派生物、引用和审计 tombstone，不能照搬 LangSmith SaaS 的 400 天保留期。",
+    "第三方导出默认关闭或严格脱敏、采样且可按租户禁用。LangSmith 可隐藏/转换 inputs、outputs、metadata；OpenAI Agents SDK 的敏感数据捕获默认开启且零数据保留组织不可使用 tracing，因此二者都不能承载 Writer 必需证据。",
+    "哈希用于完整性与去重，不代替访问控制；加密密钥、删除证明和保留策略属于 Writer 数据治理，不塞进 DeepAgent middleware 的通用配置。"
+  ],
+  "integrity_coverage": [
+    "运行完整性与业务证据完整性分开：trace 可 completed 但卷宗仍因事件缺口、产物漂移或契约未覆盖而 partial；只有 deterministic coverage gate 通过才是 ready。",
+    "每个 trace 校验 run_start、唯一连续 sequence、event_id 唯一、span start/end/error 配对、无悬空 parent/tool_call、明确终态、声明 event_count 与实收数量一致；断点恢复后的重复事件按稳定键幂等合并。",
+    "每项字段/证据显式表达 captured、redacted、truncated、inferred、unknown 或 not_applicable；unknown 不能折算成失败或成功，not_applicable 必须带规则与理由。",
+    "子智能体覆盖按契约适用阶段和实际 dispatch 计算；skill/middleware 没有可靠信号时不得仅凭文件存在判定已执行。并行分支、重试、HITL 和取消都必须进入覆盖矩阵。",
+    "卷宗 manifest 继续用 promised_artifacts、applicable_stages、hard_constraints、style_preferences 和 scope 的确定性矩阵；缺失适用项即不完整，Agent 自述完成不能越过闸门。",
+    "所有推断项携带 provenance、confidence 和原始 event/span 引用；一旦原始载荷被删除或脱敏到无法复核，派生结论随之显示证据受限。"
+  ],
+  "delivery_failure": [
+    "采集路径采用本地追加缓冲/JSONL（或等价 WAL）先落地，后台批量 drain；终态同步 flush。append/flush 的 I/O 错误不能继续静默吞掉，应更新 trace_delivery_status、计数、日志和告警，但不让观测故障中断作者的生成。",
+    "executor→evolution 的 notify 只是加速信号，失败后由 evolution 游标拉取/兜底扫描恢复；摄入以 trace_id+event_id 或 trace_id+sequence 唯一键幂等 upsert，可安全重试。",
+    "乱序按源端 sequence 重排，时间戳只作展示；存在 gap 时保留 raw 事件并暂停最终投影/卷宗 ready，等待补拉或明确标 partial/unknown，不能把后到事件覆盖先到事件。",
+    "背压时优先保留 run、delegation、HITL、tool side effect、artifact hash、error、terminal 等控制/证据事件；消息 token 和重复大 payload 属独立通道，可降采样或丢弃并记录 dropped_count。",
+    "进程退出先停止新事件、drain 残余并核对 event_count；崩溃恢复从本地持久数据和 checkpoint 重建。检查点 durability 可按风险选择 sync，但 checkpoint 成功不代表 trace 投递成功。",
+    "通知、投影、摘要导出或第三方 exporter 失败均可重试且不得反写执行结果；下游评估/发布闸门只消费完整且 provenance 清楚的卷宗。"
+  ],
+  "metrics_scores_outcomes": [
+    "运行指标来自 span：端到端与各 agent/LLM/tool 延迟、模型 token/成本、工具错误、重试次数、HITL 等待时长、取消、并行度、事件缺口与投递延迟。",
+    "Score 是带 evaluator 名称/版本、rubric、证据卷宗版本和时间的评估产物，不是 trace 的内生真值。LangSmith feedback 可绑定 run，OpenAI 可显示 span，但 Writer 继续把正式 scores 封存在评估卷宗。",
+    "Outcome 分三层：执行结果（完成/失败/取消/等待）、作者行为结果（复制、重生成、人工接受/否决）和发布结果（进化点采纳、基准变化、published/discarded、生产回调）。三层不得压成一个总分。",
+    "跨版本分析以同一冻结数据集/契约、harness version/source_commit、模型/提示词版本和 evaluator version 对齐；比较 baseline/candidate 时保留每个 case 的 trace 与 dossier 链。",
+    "在线信号只能发现问题，离线 golden/benchmark 才用于回归与版本决策；质量分数必须与格式/完整性硬闸门并列，不能用平均分掩盖必需产物缺失。"
+  ],
+  "explanatory_limit": [
+    "能解释实际调用了哪个 agent/subagent/model/tool、先后与同步父子关系、输入输出的已采集部分、耗时/错误/重试/HITL 决定，以及哪些冻结产物进入了评估和发布。",
+    "不能证明模型内部为何作出决定、未记录的 middleware/网络/沙箱副作用、被脱敏或截断的内容、没有显式因果 ID 的跨服务关系，也不能仅凭时间相邻证明因果。",
+    "Skill 的普通文件读取不等于技能生效，middleware 被装配不等于改变了结果；这两类只能在显式 activation/effect 事件存在时作强结论。",
+    "LangGraph replay、interrupt resume 和 retry 会重新执行节点或尝试，trace 能展示重复但不能自动保证副作用幂等或恰好一次。",
+    "completed 只表示运行收敛，不表示契约完整、稿件优质、事实正确或优于基线；LLM-as-judge 分数也不能替代冻结证据、人工判断和回归闸门。",
+    "compile_time_snapshot 可能晚于实际运行并受工作区后续修改影响；只有运行时 revision/hash 或不可变存储能证明当时产物。",
+    "采样、丢失、截断、删除和权限受限必须在 UI/分析中显式展示，否则任何解释都可能产生虚假完整感。"
+  ],
+  "writer_ui_impact": [
+    "运行观测页保留一棵简洁树：根运行→agent/subagent→LLM/tool，展示重试 attempt、并行组、HITL、错误、投递/覆盖缺口；task 因果可折叠但不可丢失。",
+    "新增或强化一条业务血缘视图：trace→证据卷宗版本→评估卷宗→进化会话/进化点→git commit/快照→生产回调，节点可回钻冻结证据和 provenance。",
+    "分析页分开展示运行指标、质量 score 和业务 outcome，并按 harness/model/evaluator 版本对齐；红acted/truncated/inferred/unknown/partial 使用明确状态，不用空值伪装正常。",
+    "逐 token 消息继续走独立 Pull/SSE 消息通道，trace 页面不恢复 token 瀑布；middleware/skill 默认只在诊断抽屉展示装配与使用证据。"
+  ],
+  "official_sources": [
+    {
+      "来源": "LangChain 官方：Deep Agents 概览、子智能体、异步子智能体、定制、中断和事件流",
+      "地址": "https://docs.langchain.com/oss/python/deepagents/overview ; https://docs.langchain.com/oss/python/deepagents/subagents ; https://docs.langchain.com/oss/python/deepagents/async-subagents ; https://docs.langchain.com/oss/python/deepagents/customization ; https://docs.langchain.com/oss/python/deepagents/human-in-the-loop ; https://docs.langchain.com/oss/python/deepagents/event-streaming",
+      "核验日期": "2026-07-28"
+    },
+    {
+      "来源": "LangChain 官方：Deep Agents 0.6.12 源码与发布记录",
+      "地址": "https://github.com/langchain-ai/deepagents/blob/deepagents%3D%3D0.6.12/libs/deepagents/deepagents/middleware/subagents.py ; https://github.com/langchain-ai/deepagents/blob/deepagents%3D%3D0.6.12/libs/deepagents/deepagents/middleware/async_subagents.py ; https://github.com/langchain-ai/deepagents/releases/tag/deepagents%3D%3D0.6.12",
+      "核验日期": "2026-07-28"
+    },
+    {
+      "来源": "LangGraph 官方：中断、检查点、事件流和故障恢复",
+      "地址": "https://docs.langchain.com/oss/python/langgraph/interrupts ; https://docs.langchain.com/oss/python/langgraph/checkpointers ; https://docs.langchain.com/oss/python/langgraph/event-streaming ; https://docs.langchain.com/oss/python/langgraph/fault-tolerance ; https://github.com/langchain-ai/langgraph/releases/tag/1.2.9",
+      "核验日期": "2026-07-28"
+    },
+    {
+      "来源": "LangSmith 官方：Deep Agents tracing、观测概念、分布式追踪、敏感数据防护与评估概念",
+      "地址": "https://docs.langchain.com/langsmith/trace-deep-agents ; https://docs.langchain.com/langsmith/observability-concepts ; https://docs.langchain.com/langsmith/distributed-tracing ; https://docs.langchain.com/langsmith/mask-inputs-outputs ; https://docs.langchain.com/langsmith/evaluation-concepts ; https://github.com/langchain-ai/langsmith-sdk/releases/tag/v0.10.10",
+      "核验日期": "2026-07-28"
+    },
+    {
+      "来源": "OpenAI 官方：Agents SDK tracing、人工审批、运行与多智能体编排",
+      "地址": "https://openai.github.io/openai-agents-python/tracing/ ; https://openai.github.io/openai-agents-python/human_in_the_loop/ ; https://openai.github.io/openai-agents-python/running_agents/ ; https://openai.github.io/openai-agents-python/multi_agent/ ; https://github.com/openai/openai-agents-python/releases/tag/v0.19.0",
+      "核验日期": "2026-07-28"
+    }
+  ],
+  "standard_maturity": [
+    "DeepAgents 0.6.12 为当前正式发布；Writer 本机为 0.6.1，项目声明 deepagents>=0.5.0。同步 subagent、中间件、HITL 可作为核心；异步 subagent 明确预览、Deep Agents event streaming 明确测试版，均不作为 Writer 核心依赖。",
+    "LangGraph 1.2.9 为当前正式发布；Writer 本机为 1.2.0，项目下限仍是 langgraph>=0.2.0，范围过宽。检查点/interrupt/retry 语义可依赖，但需要锁定并测试实际版本；DeltaChannel 仍为测试版。",
+    "LangSmith SDK 0.10.10 与 SaaS 观测/评估已成熟，但其 400 天 SaaS trace 保留、供应商 headers 和数据平面不符合 Writer 自有证据真源要求，只保留可选兼容。",
+    "OpenAI Agents SDK 0.19.0 的 trace/span、group_id、RunState/HITL 是成熟对照；Writer 后端强制 DeepAgent，故不引入第二套运行时。",
+    "DeepAgents 官方文档中 filesystem permission interrupt 要求 deepagents>=0.6.8，Writer 当前 0.6.1 不能假定可用；这项能力不进入本次最小方案。"
+  ],
+  "conflicts_with_writer": [
+    "工业追踪产品倾向把完整模型/工具输入输出直接上传并长期留存；Writer 内容是用户稿件、提示词和凭据，必须本地优先、写前脱敏、引用/哈希化，并由卷宗冻结必要正文。",
+    "LangSmith/OpenAI 把 feedback/score 直接附在 run 上很方便，但 Writer 已确认评估只读 ready 证据卷宗并封存不可变评估卷宗；正式 score 必须服从该链，不能绕回 mutable trace。",
+    "DeepAgents 异步 subagent 会把子任务拆成独立 thread/run，并带来远程服务、worker、轮询、取消和跨 trace 关联；Writer 当前同步创作阶段和 review-revise 上限不需要这些复杂度，因此不采用。",
+    "DeepAgents/LangGraph 新事件流能提供 lifecycle cause 与 typed projections，但 Writer 当前消息/trace 双通道和 Pull UI 已解决稳定性问题；只借鉴明确因果字段，不为升级到 v3 重写前端流协议。",
+    "LangGraph 的 SQLite checkpointer 官方定位偏本地/实验，Writer 当前单机工作负载可继续使用并以持久化测试守住 HITL；它不是 trace 审计存储，也不能掩盖 recorder 静默 I/O 失败。",
+    "Writer 当前 projector 会隐藏 task 工具节点并按 agent_name/时间推断部分 review/revise，artifact snapshot 只存预览且失败可能静默；界面可以隐藏噪声，但底层必须保留 dispatch 因果、完整性状态和运行时指纹，否则卷宗只能明确降级为 inferred/compile_time_snapshot。",
+    "通用分布式追踪喜欢把跨服务请求延续成一棵树；Writer 的 ingestion、卷宗、评估、进化和发布跨越异步任务与人工决策，应以 causal link 和业务外键连接多个 trace，避免虚假父子时长。"
+  ],
+  "uncertain": []
+}

@@ -1,0 +1,119 @@
+{
+  "mechanism_name": "专用运行、血缘与分工作负载分析界面",
+  "primary_problem": "把进化端当前混在同一 Trace 模块里的单次运行调试、跨流程因果追踪和长期质量分析拆成三个职责明确但共享底座的工作面：开发者能够还原一次 Agent 运行，质量人员能够沿创作制品追到卷宗、评估、候选和发布结果，双方又能在不混算创作、证据、评估与进化工作负载的前提下比较版本和质量变化。",
+  "evidence_objects": [
+    "LangSmith Observability：当前官方概念将一次 operation 定义为一条 trace、离散工作单元定义为 run/span，并以 project、thread、metadata、tag 和 feedback 支撑筛选与分析；其 UI 能检查单次运行，也能在 dashboard、annotation、experiment 等独立入口做聚合，但没有 Writer 的 ArtifactRevision、证据卷宗和发布激活语义。",
+    "Langfuse Observability：当前官方数据模型将一次 request/operation 组织为 trace，将 LLM、Tool、Retrieval 等步骤组织为可嵌套 observation，并用 session、attribute、score、dataset/experiment 和 dashboard 分别承载会话、筛选、质量与聚合；其产品证明运行检查和聚合分析可以共享采集底座而不必成为同一个页面。",
+    "Phoenix Tracing：当前官方文档基于 OpenTelemetry 接收 trace/span，以 project、session、annotation、metric 和 evaluation 组织调试与质量信息；它验证了 vendor-neutral Trace 可以服务多种观察入口，但其 project 分区和通用 annotation 不是 Writer 的工作负载或业务血缘。",
+    "Datadog Agent Observability：当前官方产品把 Agent 运行监控、问题排查和质量改善放进更广的 APM/基础设施体系，适合作为“通用工业控制台会扩张到什么范围”的边界样本；Writer 不需要复制服务地图、日志关联、基础设施 SLO 和任意 dashboard。",
+    "Writer 当前实现：evolution desktop 已有 monitor、history、trace-detail、dossiers、evaluation、evolve 和 versions 等页面；trace-detail 只含调用链、Token 图表和直接读取当前 workspace 的产物，monitor 的双 Tab 只过滤活跃运行，统计概览、所谓 Skill 排行和失败模式仍全局混算。"
+  ],
+  "writer_classification": "Writer 核心",
+  "writer_problem_match": [
+    "当前 monitor.tsx 的创作/进化 Tab 只作用于 activeRuns；成功率、错误率、Token、延迟、Agent 统计和失败模式由无 run_purpose 过滤的全局接口返回。不同服务、工作负载、完整性状态和版本被放进同一分母，页面切换后数字语义并没有随之切换。",
+    "当前 /stats/skills 实际按 nodes.kind=agent 和 agent_name 聚合，前端标题却写“skill 统计”；flow_metrics 又通过 agent_name 后缀猜 Subagent、通过 source=middleware 统计干预，并在 tool_args 缺失时无法识别重复读取。界面正在展示名称精确但语义错误的指标。",
+    "当前 trace-detail 的“产物”Tab 根据 workspace_id 直接读取 executor 当前 novel/storyline 文件，而不是读取该 Trace 产生的 ArtifactRevision。历史 Trace 打开后可能展示后来被修改的内容，无法回答该次运行实际输入输出制品是什么。",
+    "当前 Trace 列表只按创作和进化两类 run_purpose 切分，没有证据编译工作负载，也没有 service、agent role、execution mode、trace purpose、schema/harness 版本、Integrity、Coverage、来源 Link 和 Outcome 筛选；证据、评估、进化虽已有独立业务页，却没有统一血缘入口。",
+    "开发者需要逐步排查 Agent/Subagent、LLM、Tool、Skill、Middleware、HITL 和载荷；质量人员需要从采用稿件追到证据卷宗、评估分数、候选 uplift 和发布/回滚。把两类任务压成同一时间线会不断增加 Tab，却仍回答不了跨运行因果链。"
+  ],
+  "adoption_decision": "改造后采用",
+  "minimal_writer_form": [
+    "不建设两套 Trace 系统。保留一套版本化 Writer 观测契约、一套事件/载荷/制品引用摄入、一套权限与查询底座；在进化端提供三个明确入口：运行观测、血缘、分析。三个入口共享 trace_id、span_id、link、artifact_revision_id、dossier/evaluation/experiment/release ID，但各自拥有独立查询模型、指标 Profile、默认过滤和保留展示策略。",
+    "运行观测以一次 Trace 为中心。列表默认按 workload/service/integrity/status/version 过滤；详情页固定显示运行状态、Integrity、Coverage、来源/去向 Link、Agent/harness/model/Skill/Middleware 版本和输出 revision。主体使用执行树加时间线，节点抽屉展示受控输入输出、attempt、execution_disposition、Skill 生命周期、有效 Middleware 干预、HITL 和错误，不把业务血缘节点塞进调用树。",
+    "血缘入口以 ArtifactRevision 或业务对象为中心，而不是以 Span 为中心。封闭边类型限定为 Trace produces/consumes ArtifactRevision、ArtifactRevision compiled_into EvidenceDossierVersion、evaluated_by EvaluationDossier、compared_in CandidateExperiment、selected_for ReleaseVersion、activated/rolled_back；支持从任一节点双向下钻到对应运行、制品、卷宗和版本页。",
+    "分析入口以工作负载 Profile 为中心：公共维度只复用执行状态、Integrity、Coverage、耗时、Token、成本和版本；创作、证据、评估、进化分别提供自己的 Outcome/Score 指标与分母。默认不提供跨工作负载总成功率、总排行榜或单一质量分；任何图表都能回钻到样本 Trace/Artifact/Outcome。",
+    "保留 dossiers、evaluation、evolve、versions 作为领域工作台。血缘页只聚合关系与状态并深链到这些页面，不复制卷宗编译、评估启动、进化共创、发布和回滚操作；运行观测同样只负责诊断，不成为 Agent 控制台。",
+    "第一阶段只交付 Writer 所需的固定视图和固定查询：Trace Explorer/Inspector、创作到发布的 Lineage Explorer、四个工作负载基础分析 Profile。保存查询、任意 dashboard、跨租户报表和自由图谱编辑均不进入范围。"
+  ],
+  "explicit_non_goals": [
+    "不复制 LangSmith、Langfuse、Phoenix 或 Datadog 的完整产品信息架构，不建设通用 LLM Observability SaaS、任意项目/环境管理、Prompt playground、标注平台、通用数据集平台或自定义 dashboard builder。",
+    "不建设通用 APM 服务地图、日志检索、基础设施指标、告警编排、SLO、计费、模型网关监控或跨团队多租户运营控制台；这些能力不能帮助 Writer 解释制品、卷宗和进化闭环。",
+    "不把业务血缘渲染成一棵伪调用树，不把所有 Trace 通过 thread/session 强行连成长 Trace，也不在 DAG 中开放任意节点与任意边。Writer 只允许已冻结的对象类型和关系。",
+    "不根据 Agent 名称、Tool 名称、source=middleware、事件文本或页面路径推断工作负载、Subagent、Skill、Middleware 干预和制品归属；缺少显式语义时展示 unknown/legacy_unknown。",
+    "不把可视化当作数据修复层。页面不能用排序、合并或补零掩盖 sequence gap、冲突、未摄入终态、悬空 revision 或旧 schema；Integrity 未验证时必须显式降级。",
+    "不在第一阶段实现复杂因果归因、自动根因分析、自然语言问数、任意 cohort builder 或跨版本统计显著性工作台；先让单次运行和业务血缘可信，再做有限的版本对比。"
+  ],
+  "trace_boundary": [
+    "运行观测遵守已冻结边界：一次创作请求一条 Trace，HITL 恢复仍在同一 Trace；同步 Tool/Subagent 是当前 Trace 子 Span；证据编译、评估和进化分别新建 Trace，并以 Span Link、来源 Trace 和业务对象关联。",
+    "Trace Inspector 只展示当前 Trace 的父子执行结构；异步来源和下游运行显示为 related trace/link，不伪装成子 Span。用户点 related trace 时切换到另一条 Trace，点 Artifact/Dossier/Release 时进入血缘视图。",
+    "长周期业务对象不保持开放 Span。证据卷宗、评估卷宗、实验和发布状态由不可变版本或 append-only 事件表达，血缘页将它们投影为 DAG；运行耗时与业务等待时间分开。",
+    "Analysis 只消费已验证的 Trace 与版本化 Outcome/Score，不创建新的 Trace 语义；执行失败、摄入失败、质量不佳和发布失败保留不同状态轴。"
+  ],
+  "async_causality": [
+    "跨服务列表和详情以 W3C trace context/Span Link 表达技术因果，以 source_trace_id、artifact_revision_id、dossier_id/version、eval_dossier_id、experiment_id 和 release_version 表达长期业务因果；UI 同时显示两者但不互相替代。",
+    "血缘投影必须保留 attempt 和幂等身份。证据重编译、评估重试、候选重跑和发布重试形成新版本或新 attempt，不能覆盖旧节点；重复摄入按稳定 ID 合并，冲突显示 integrity_conflict。",
+    "Lineage Explorer 默认从选中 revision 向前显示其真实输入，向后显示直接消费者；用户主动扩展才加载更远层级，避免把所有历史运行铺成不可读大图。并行候选与回滚分支保持分叉，不压平为单线时间轴。",
+    "当异步 Link 或业务外键缺失时，界面显示断链节点、缺失原因和可诊断 ID；不得按时间接近、workspace 相同或名称相同自动补边。"
+  ],
+  "agent_semantics": [
+    "运行详情的一级节点区分 Agent/Workflow、Subagent、LLM、Tool 和 significant operation；Skill、Middleware、HITL、cache/retry/context_compact 等作为明确生命周期或干预覆盖在目标节点上，必要时才有自己的 operation Span。",
+    "每个 Agent 节点显示 agent role、execution mode、模型、harness/app release、最终 Skill 目录快照和最终 Middleware 有序栈。Skill 只有显式 activated 才标为使用；Middleware 只有 intervention Event 才标为介入，stack 中已装配但未介入与 telemetry unsupported 分开。",
+    "Tool/LLM 节点显示 executed、blocked、short_circuited、cache_hit、replaced 或 unknown；重试展开为 logical operation 下的 attempts。HITL 显示 interrupt、人工 decision、恢复结果和等待时长，不显示跨数小时悬空 Span。",
+    "工作负载分类来自显式 service、workload、agent_role、execution_mode 和 trace_purpose。创作、证据编译、评估和进化各自可由多个 Agent/Workflow 实现，页面不再用 Agent 名称或 run_purpose 的两类枚举承担领域边界。"
+  ],
+  "artifact_lineage": [
+    "Trace 详情的产物区域改为只读取本次运行声明的 ArtifactRevision：显示逻辑 Artifact、revision、parent revision、hash、media type、producer Span、输入 revision 和受控内容引用。当前按 workspace_id 读取最新文件的 ArtifactsPanel 只能作为创作工作区预览，不能继续标为历史 Trace 产物。",
+    "血缘页以 ArtifactRevision 为核心连接 Trace、EvidenceDossierVersion、EvaluationDossier、CandidateExperiment、ReleaseVersion 和 ReleaseEvent。路径、git commit、Trace、卷宗和发布版本保持不同节点类型，避免一个“版本”概念吞掉所有身份。",
+    "卷宗和评估节点显示 completeness/integrity、冻结输入版本、rubric/evaluator/dataset revision 和关键分数；实验节点显示 baseline/candidate、配对样本与决策；发布节点分别显示 committed、registry_promoted、executor_refresh_ack、activated、activation_failed 和 rollback_activated。",
+    "从运行、卷宗、评估、进化或版本业务页进入血缘时使用同一 selection URL/state，支持复制稳定深链；历史内容只通过 revision/content_ref 展开，不能读取当前 mutable workspace 替代。"
+  ],
+  "capture_timing": [
+    "界面本身不生成运行事实。Agent/Workflow 启动、Skill 激活、Middleware 干预、ArtifactRevision 产生和 Trace 终态均按各机制的事实发生时机采集；UI 只读取版本化投影和受控载荷。",
+    "运行中页面可轮询连续事件前缀并展示 live 状态，但 final_sequence 未验证前固定标为 collecting/incomplete；不能因为 executor 返回 completed 或前端暂时无新事件就显示“完整”。",
+    "Trace 封口后再产生的复制、重生成、采用、人工编辑、评分和发布结果写独立 Outcome/Score/ReleaseEvent，相关页按时间增量刷新；不重新打开已完成 Trace，也不改变原执行树。",
+    "Lineage 投影在 Artifact/Dossier/Evaluation/Experiment/Release 事务提交后更新；投影延迟显示 last_projected_at 和 source revision，失败时保留旧投影并标 stale，而不是展示半条新边。",
+    "分析聚合只在 Integrity verified、指标 schema 可识别且 Outcome 版本解析成功后纳入可信分母；迟到 Outcome 可以重算对应时间窗，但必须保留 as_of 和样本量。"
+  ],
+  "payload_policy": [
+    "Trace Explorer 默认只加载结构字段、hash、大小和摘要；完整 Prompt、稿件、Tool 参数/结果、人工编辑和评估证据通过 payload_ref 按需读取。开发者和内部质量人员都可按权限展开，但每次查看或导出敏感正文写访问审计。",
+    "列表、图表、DAG 标签和搜索索引不放完整正文、秘密、CoT、embedding 或媒体内容。被策略拒绝的载荷显示 blocked_by_policy 与安全 reason_code；媒体只显示受控 asset_ref、hash、类型和尺寸。",
+    "运行详情明确显示载荷状态 full/masked/redacted/expired/unavailable，并区分策略阻止、保留期到期、摄入缺失和权限不足；任何一种都不能用空字符串或“无内容”混淆。",
+    "完整语义载荷按已确认策略保留 90 天并进行冷热分层；超过载荷期后仍可保留经批准的结构事件、hash、版本、Integrity、Score/Outcome 和血缘。官方卷宗/数据集/发布制品遵循其独立生命周期，不靠 Trace UI 私自复制全文。"
+  ],
+  "integrity_coverage": [
+    "所有运行列表和详情同时展示 execution status、delivery/integrity status 与 coverage summary。completed+integrity_incomplete 必须醒目标记且不可进入证据、评估和进化选择器；failed+integrity_verified 仍可作为可靠失败样本。",
+    "Trace Inspector 的结构检查至少可回钻 final_sequence、missing_ranges、conflict_keys、父子/Link 缺口、终态 manifest、payload/artifact reference；Coverage 分别展示 Agent、LLM/Tool、Skill、Middleware、Artifact 和 Outcome，不合并成一个百分比。",
+    "Analysis 对 unknown、missing、not_applicable 分别计数和过滤，分母只包含相同 schema/workload 下的 applicable 样本。旧 Trace 只能进入 legacy 诊断视图，默认不参与趋势和版本对比。",
+    "Lineage 每个节点显示自身完整性，并对悬空边、不可解析 revision、deployment_diverged 和 stale projection 单独标记；上游 Trace verified 不代表下游卷宗、评估或发布也完整。"
+  ],
+  "delivery_failure": [
+    "运行页采用连续 sequence 游标而非 max seen 游标；乱序事件可以暂存但不可越过 missing_ranges。轮询或 SSE 失败时保留最后可信前缀、显示断开时间并允许重连，不将页面空白解释为无事件。",
+    "三类视图读取各自的 read model。Trace 投影、Lineage 投影或 Analysis 聚合失败互不覆盖源事件和业务对象；页面展示 projection stale/failed，并提供来源 ID 下钻，避免一个模块故障让整个观测区不可用。",
+    "大载荷和历史正文按需加载，失败只影响对应抽屉；结构树、Integrity 和血缘仍可显示。权限拒绝、载荷过期、对象不存在和网络失败使用不同错误状态。",
+    "观测底座失败不阻断创作，但 Trace 标记 trace_incomplete；证据、评估和进化入口在服务端执行消费闸门，不能只靠按钮 disabled。分析聚合跳过不完整样本并报告被排除数量。"
+  ],
+  "metrics_scores_outcomes": [
+    "公共运行 Profile：按 workload/service/schema/harness version 统计 verified run 数、执行状态、Integrity/Coverage、延迟、LLM/Tool/Agent 数、Token、成本和错误；不提供混合工作负载成功率作为首要 KPI。",
+    "创作 Profile：采用 revision、复制、重新生成、人工编辑距离/耗时、人工评分、内容评估分和最终选用率；证据 Profile：卷宗 ready/partial/failed、revision/provenance/contract coverage、编译耗时；评估 Profile：rubric/evaluator revision、证据引用完整性、分数分布和校准；进化 Profile：候选通过率、相同 dataset/evaluator 下的 paired uplift、回归数、发布激活和回滚结果。",
+    "Skill/Middleware/版本维度只来自显式激活、有效栈与 intervention；所谓 Skill 排行不得继续按 agent_name 聚合。高基数字段留在 Trace 查询，不直接作为时序指标 label。",
+    "每个 Score/Outcome 显示目标 Trace/Span/ArtifactRevision、来源、rubric/version、时间和强弱等级。复制/重生成属于弱行为信号，人工采用/编辑/评分和受控评估属于更强证据；图表不能把它们求成无解释的总分。",
+    "版本 uplift 只比较相同 dataset_revision、evaluator_revision、模型策略和适用工作负载的样本，展示 baseline、candidate、样本量、缺失与置信边界；Lineage 证明来源关系，不单独证明质量因果。"
+  ],
+  "explanatory_limit": [
+    "三类视图合起来能够回答：一次运行发生了什么、哪个 Agent/Skill/Middleware/HITL 机制介入、使用了哪些版本、输入输出制品是什么、异步下游如何关联、候选是否改善、是否真正发布激活或回滚。",
+    "运行树不能解释跨 Trace 的长期业务状态，血缘图不能还原每次 LLM/Tool 的完整时序，聚合图不能代替单次证据；界面必须通过深链组合三者，而不是声称某一页包办全部解释。",
+    "Trace、Outcome 和血缘只能显示可观测事实。没有受控实验时不能证明某个 Skill、Middleware、Prompt 或模型单独导致质量变化；没有 provider 返回信息时也不能观察内部推理、路由、缓存和重试。",
+    "旧数据缺少显式语义时只能显示 unknown/legacy，不得由名称、时间邻近或文件现状回填。完整 Prompt/稿件不可见可能来自权限、策略或过期，不能等同于采集失败。",
+    "外部产品的 project/session/dashboard 证明了常见界面分工，但没有形成 vendor-neutral UI 标准；Writer 的内部契约、消费闸门和封闭血缘对象才是产品真相源。"
+  ],
+  "writer_ui_impact": "进化端侧栏将 Trace 相关入口收敛为“观测”下的运行、血缘、分析三项；历史列表并入运行观测，不再保留一个统计全局混算、列表双 Tab、详情又独立的松散 Trace 模块。运行详情顶部先显示 workload、执行状态、Integrity、Coverage、版本和来源/去向，主体保留调用链与 Token，但新增机制与受控制品区；当前 workspace 产物预览移出历史 Trace 真相区。血缘提供创作到发布的固定 DAG，并深链现有卷宗、评估、进化和版本页面。分析按四个工作负载切换各自 Profile，共享筛选框架但不共享错误分母和质量排行榜。敏感载荷默认折叠并按需审计展开，所有 incomplete/unknown/stale 状态可回钻到缺口。",
+  "official_sources": [
+    "LangSmith 官方 Observability Concepts（当前文档，2026-07-28 核验）：https://docs.langchain.com/langsmith/observability-concepts.md 。定义 project、单次 operation 的 trace、离散 run/span、跨 trace thread、feedback、tag 和 metadata，证明单次运行结构与聚合/筛选可以共享数据模型。",
+    "LangSmith 官方文档索引（当前文档，2026-07-28 核验）：https://docs.langchain.com/llms.txt 。当前独立列出 trace filtering、inline annotation、evaluator score audit、dashboard、experiment、data export、messages view 和敏感输入输出控制，说明成熟平台不会把所有任务压在一个 Trace 详情页。",
+    "Langfuse 官方 Observability Overview（当前文档，2026-07-28 核验）：https://langfuse.com/docs/observability/overview.md 。说明一次请求的完整生命周期由 Trace 和嵌套 observation 表达，并把 latency/cost debugging、evaluation、dataset/experiment 和 dashboard 作为共享采集上的不同能力。",
+    "Langfuse 官方 Data Model（当前文档，2026-07-28 核验）：https://langfuse.com/docs/observability/data-model.md 。定义 Observation、Trace、Session 及 attribute/filter，并明确可通过 OpenTelemetry 发往多个观测目的地；这支持“一套关联协议与底座、多种页面和后端消费者”，不支持复制两套内部 Trace 真相源。",
+    "Phoenix 官方 Tracing Overview（当前文档，2026-07-28 核验）：https://arize.com/docs/phoenix/tracing/llm-traces.md 。以 OpenTelemetry Trace 接收 Agent 路径，并分别提供 Project、Session、Annotation、Metrics、Evaluation 等入口，证明运行检查、反馈和分析是不同观察任务。",
+    "Phoenix 官方 Projects（当前文档，2026-07-28 核验）：https://arize.com/docs/phoenix/tracing/llm-traces/projects.md 。强调隔离不同应用/环境以避免混算并支持跨实现比较；Writer 只借鉴语义隔离，采用明确 workload Profile，而不引入通用 Project 管理。",
+    "Datadog 官方 Agent Observability（当前文档，2026-07-28 核验）：https://docs.datadoghq.com/llm_observability/ 。定位为监控、排障和改善 LLM/Agent 的完整平台，同时处于 Datadog 全栈环境；Writer 将其作为通用 APM 边界样本，不复制基础设施和运营能力。"
+  ],
+  "standard_maturity": "Trace/span 层级、项目/会话分组、metadata/filter、按需查看输入输出、Score/annotation 和独立分析入口已在 LangSmith、Langfuse、Phoenix、Datadog 等成熟产品中稳定存在；OpenTelemetry 提供底层 Trace 交换，但不存在 vendor-neutral 的 Agent 观测 UI 或 Artifact-Dossier-Evaluation-Release 血缘标准。Writer 应采用成熟的任务分离原则和运行检查交互，内部三视图及封闭血缘仍属于项目专用契约。",
+  "conflicts_with_writer": [
+    "工业平台常以 project/environment/session 作为最高组织维度；Writer 真正需要的是 service、workload、trace purpose、ArtifactRevision、卷宗和发布版本。照搬 Project 会增加一层标签，却仍无法表达创作到进化的因果链。",
+    "Langfuse/LangSmith 等把 Prompt 管理、数据集、实验、Annotation 和 dashboard 扩展为完整产品；Writer 已有证据卷宗、评估卷宗、benchmark、进化共创和 registry，观测 UI 应深链这些真相源而不是平行重建。",
+    "Phoenix/Datadog 的通用指标与服务视图适合多应用运营；Writer 当前首要问题是不同 Agent 工作负载混算和语义推断错误。先实现固定 Profile 和完整性分母，比自定义 dashboard 或 APM 服务地图更贴合架构。",
+    "成熟 Trace UI 往往直接展示当前 observation 的输入输出，但 Writer 保存完整创作内容且需要敏感控制和 90 天冷热策略，因此必须通过 payload_ref 按需审计查看，不能把大正文复制进每个列表、树节点或 DAG。",
+    "当前 Writer 的 ArtifactsPanel 从 mutable workspace 读取最新文件，与工业 Trace 页面常见的“显示该 observation 当时 input/output”假设冲突；在 ArtifactRevision 落地前宁可显示 capture unavailable，也不能用当前文件冒充历史制品。",
+    "把 monitor/history/trace-detail 简单合并成更大的单页仍会混淆职责。Writer 的最小正确形态是共享底座上的运行、血缘、分析三视图，并保留卷宗、评估、进化和版本领域工作台。"
+  ],
+  "uncertain": []
+}

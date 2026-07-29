@@ -1,0 +1,133 @@
+{
+  "mechanism_name": "Artifact 与进化血缘",
+  "primary_problem": "把一次创作运行产生的稿件修订，稳定连接到证据卷宗、评估卷宗、候选实验、进化会话、发布版本、生产激活和回滚事件，使任何评分、改动或线上版本都能沿不可变标识回到当时实际生成并被评估的内容，而不是依赖可变文件路径、最新工作区或一条跨数天的超长 Trace。",
+  "evidence_objects": [
+    "OpenLineage：官方对象模型以 Job、Run、Dataset 和可扩展 Facet 表达一次运行读写哪些数据集，以及父运行、版本、模式和列级血缘等附加事实。它是成熟的运行到数据对象血缘词汇，但不负责保存 Artifact 内容，也没有证据卷宗、评估卷宗、候选实验、发布激活和回滚的产品语义。",
+    "MLflow Tracking and Artifacts：官方 Tracking 以 Experiment 组织 Run，在 Run 下记录参数、指标、标签、数据集输入和 Artifact URI；Artifact Store 保存文件，Model Registry 再提供版本和可移动别名。它证明“运行元数据与大对象分离、实验固定输入、指标回链运行”是成熟模式，但其核心仍偏模型训练与模型发布，不能直接充当 Writer 稿件和卷宗真相源。",
+    "LangSmith Datasets and Experiments：官方数据集由 Example 组成，Example 可记录 source_run_id；数据集支持按时间点读取版本并移动版本标签，Experiment 把目标应用在固定数据集上执行，Run 关联 reference_example_id，反馈和比较实验再绑定运行或实验。它适合借鉴评估集版本、实验和反馈关系，但不定义任意稿件 Artifact 的内容寻址、证据封存或 harness 发布回滚。"
+  ],
+  "writer_classification": "Writer 核心",
+  "writer_problem_match": [
+    "executor 当前在 write_file 或 edit_file 成功后发出 run_meta.artifact_snapshot，含 file_path、tool、fingerprint、content、agent_name 和事件顺序；evolution 已能据此提取修订时间线，但缺少独立 artifact_id、artifact_revision_id、父修订和持久内容引用，文件路径与事件序号仍承担了过多身份语义。",
+    "证据卷宗已经按 trace_id 追加版本，冻结 manifest、facts、semantic、index 和角色视图；评估尝试永久绑定证据卷宗，评估卷宗再原子封存 source_dossier_id、版本、scores、findings 和 frozen_evidence；进化会话永久绑定评估卷宗。这条链已经具备正确骨架，需补足稿件修订和候选实验两个稳定对象。",
+    "registry.json 已保存 version、parent_version、source_session、评估元数据、production 指针和 rollback_log，源码与 registry 同一 git commit；但“registry 已发布”“executor 已收到刷新”“生产实际激活”应是三个可区分事实，通知失败不能被 published 状态掩盖。",
+    "benchmark 已按 golden_revision 固定数据集，以 case、harness_version、trace_id、eval_id 和 scores 形成跨版本矩阵；它可作为候选实验的执行明细，但仍需一个稳定 experiment_id 把候选配置、基线、输入版本、尝试、卷宗和发布决策收拢起来。"
+  ],
+  "adoption_decision": "改造后采用",
+  "minimal_writer_form": [
+    "建立逻辑 Artifact 与不可变 ArtifactRevision 两层。Artifact 表示同一交付物槽位，至少由 workspace_id、artifact_kind 和 logical_name 定位；ArtifactRevision 表示一次成功持久化后的准确内容，至少含 revision_id、artifact_id、parent_revision_id、sha256、content_ref、media_type、size、created_at、producer_trace_id、producer_span_id、producer_event_id、harness_version 和 agent_name。路径只是属性，不是主键。",
+    "ArtifactRevision 必须在写盘成功、回读成功并计算内容哈希后产生；同一 artifact_id 的修订形成父链，重复上报相同 producer_event_id 或相同修订幂等。trace 事件只保留 revision_id、哈希和受控摘要，大正文进入内容寻址存储或由不可变工作区快照引用。",
+    "证据卷宗继续是 trace 的版本化不可变派生物，但 manifest 和 facts 必须显式列出 consumed_revision_ids、produced_revision_ids、缺失修订和采集 provenance；ready 闸门要求所有承诺交付物都能解析到冻结修订。重编译产生新 dossier version，并以 supersedes 指向旧版，不原地改写。",
+    "评估卷宗继续一对一绑定评估尝试，并永久绑定 source_dossier_id 与 source_dossier_version；Score、finding、positive pattern 和 frozen evidence 额外绑定具体 artifact_revision_id 或 evidence_id。评估器名称、rubric 版本、模型版本和数据集 revision 一并冻结，避免未来重跑改变历史解释。",
+    "新增轻量 CandidateExperiment 对象，至少含 experiment_id、source_eval_dossier_id、baseline_harness_version、candidate_source_commit、dataset_revision、evaluator_revision、状态和决策；每次执行 attempt 使用独立 attempt_id，并关联 trace_id、artifact_revision_ids、eval_dossier_id 与 benchmark batch。它只收拢 Writer 已有测试和 benchmark，不建设通用实验平台。",
+    "ReleaseVersion 继续以 registry version 和 git commit 为内容真相，增加 selected_experiment_id 或 source_eval_dossier_id、source_session、parent_version。另建 append-only ReleaseEvent 表达 publish_requested、committed、registry_promoted、executor_refresh_ack、activated、activation_failed、rollback_requested、rollback_activated；production 指针是当前投影，事件日志才是历史。"
+  ],
+  "explicit_non_goals": [
+    "不引入 OpenLineage 服务、MLflow Tracking Server、LangSmith SaaS 或通用数据目录作为 Writer 真相源；只借鉴其稳定对象关系和术语。",
+    "不把每个 Prompt、Token、临时流式片段或普通读取都做成 ArtifactRevision；只有需要跨运行复查、评估、发布或审计的持久交付物才进入血缘。",
+    "不建设任意有向图数据库、通用列级血缘、全公司数据治理、模型注册中心、实验搜索平台或可编程工作流引擎。Writer 的对象种类和边类型保持封闭。",
+    "不把 git commit、文件路径、Trace、证据卷宗和发布版本压成同一个 revision 概念；它们分别表示源码快照、逻辑位置、运行、证据封存和生产发行。",
+    "不声称血缘关系本身证明某个修订、Skill、Prompt 或 harness 改动导致了质量变化；因果结论仍需受控实验和足够样本。"
+  ],
+  "trace_boundary": [
+    "一次 executor 创作或一次候选测试仍是一条短 Trace；Agent、Subagent、LLM、Tool 和 review-revise 是其中的 Span，成功持久化稿件时产生 artifact_revision_created Event。Trace 结束不删除 ArtifactRevision，Artifact 也不因新 Trace 而更换逻辑身份。",
+    "证据卷宗编译、评估、候选实验编排、进化对话、发布和回滚各自是独立 Workflow 或 Trace，通过业务外键和 Link 语义连接，不作为原创作 Trace 的长寿命子 Span。",
+    "OpenLineage 的 Run 到 Dataset 输入输出关系可映射为 Writer Trace 到 ArtifactRevision 的 consumes 或 produces 边；Facet 只作为导出适配，不反向限制 Writer 的卷宗和发布对象。",
+    "MLflow 和 LangSmith 的 Experiment 概念对应固定输入版本下的一组尝试，不对应用户的一次普通创作；Writer 的 CandidateExperiment 只覆盖为评估或发布决策而运行的受控候选。"
+  ],
+  "async_causality": [
+    "executor 先持久化内容，再回读计算 sha256，并以 producer_event_id 原子写 ArtifactRevision 和 trace 事件；事件投递到 evolution 采用至少一次语义，producer_event_id 与 revision_id 幂等，sequence 只决定同一来源 Trace 内的顺序。",
+    "证据卷宗编译任务以 trace_id、compile_rule_version 和明确的输入 revision 集合作为幂等键；异步重试生成新的 compile attempt，但成功卷宗版本只追加一次。缺少事件或内容对象时标 partial，不从当前工作区猜测旧修订。",
+    "评估重试使用稳定 logical_eval_id 与新的 eval_attempt_id，每个尝试最多封存一个评估卷宗；进化会话只能绑定一个已 sealed 的评估卷宗，后续重评不会悄悄替换。",
+    "CandidateExperiment 下每个执行使用独立 attempt_id，retry_of 指向前次尝试；相同 dataset_revision、candidate_source_commit、模型和 evaluator_revision 才能合并比较，失败尝试不得被成功重试覆盖。",
+    "发布与回滚通过 ReleaseEvent 串联 registry 变更、git commit、executor 刷新回执和实际激活；跨服务只传 release_id、version、commit 和 causal link，不伪造同步父子 Span。"
+  ],
+  "agent_semantics": [
+    "Agent 或 Subagent 是 ArtifactRevision 的生产者作用域，Tool 是发生写入的直接执行者，LLM 输出只有在被成功持久化后才成为 ArtifactRevision；流式文本、工具意图和模型自述完成都不是修订证据。",
+    "ArtifactSnapshotMiddleware 负责在写入副作用之后捕获准确修订，但它不是业务作者，也不能吞掉捕获失败。捕获失败可不阻断用户创作，却必须发 capture_degraded 事实并使卷宗完整性降级。",
+    "review Agent 产生的审稿文件也是独立 ArtifactRevision；被审稿 revision、review revision 和 revise 后 revision 通过 reviews、revises、supersedes 边连接，不能只靠文件名和时间猜测。",
+    "Skill、Prompt、Memory 和 Middleware 作为 revision 的 provenance 引用进入生产边；HITL 的接受、拒绝或修改作为 Decision Event 连接相关 revision，但不伪装成 Artifact。",
+    "进化 Agent 产生的是候选源码改动和设计、变更记录等 ArtifactRevision；只有 CandidateExperiment、人工发布决定和 ReleaseEvent 完成后，候选才成为 ReleaseVersion。"
+  ],
+  "artifact_lineage": [
+    "最小对象链为 producer Trace、Span、Event → ArtifactRevision → EvidenceDossierVersion → EvaluationDossier → CandidateExperiment 与 EvolveSession → ReleaseVersion → ReleaseEvent；逻辑 Artifact、数据集 revision、评估器 revision 和 git commit 是链上的辅助锚点。",
+    "最小边集合为 produces、consumes、parent_revision、supersedes、included_in、derived_from、evaluates、tested_in、selected_by、published_as、activated_as 和 rolled_back_to。每条边都携带创建时间、来源服务、producer_event_id 或事务标识，并且只追加不改写。",
+    "证据卷宗与 ArtifactRevision 是多对多：一份卷宗可冻结多份稿件、review 和契约修订；同一修订也可进入重编译的多个卷宗版本。卷宗 status 和 completeness 决定可否评估，不由 Trace completed 单独决定。",
+    "评估卷宗永久绑定一个证据卷宗版本，但其中各 finding 和 score 应落到具体 revision 或 evidence ref；无法定位到具体修订的整体结论保留 dossier 级作用域，禁止伪造精细归因。",
+    "候选实验固定 source_eval_dossier、baseline、candidate commit、dataset revision 和 evaluator revision；它产生多次 attempt 与评估结果，人工选择后 ReleaseVersion 引用被采纳实验。未运行受控实验也可人工发布，但必须显式标记 validation_status=waived 和决策理由。",
+    "发布版本以 registry version 加不可变 git commit 定位，parent_version 表达演进父链；回滚不是删除或改写版本，而是追加 rollback 事件并把 production 投影移到历史 ReleaseVersion。回滚后新创作 Trace 必须记录实际激活的 version 和 commit。"
+  ],
+  "capture_timing": [
+    "写入时：write_file 或 edit_file 返回成功后立即回读准确字节，计算 sha256，持久化内容对象和 ArtifactRevision，再发 artifact_revision_created；任何一步失败都记录明确阶段和 capture_degraded。",
+    "运行终结时：recorder flush 并确认 sequence 缺口、悬空写入和 revision 解析状态；Trace terminal 与 artifact capture completeness 分开终结。",
+    "卷宗编译时：只消费已摄入且可解析的 revision，冻结输入集合、编译规则版本和 provenance；历史 Trace 只能降级为 compile_time_snapshot，并明确它不能证明运行当时内容。",
+    "评估启动时：冻结 source dossier version、dataset revision、evaluator revision、模型配置和评估尝试；封存时在单事务内写评估卷宗并把尝试置 completed。",
+    "实验启动时：在任何 attempt 前冻结 baseline、candidate source commit、数据集和评估器；全部尝试结束或人工停止后终结实验，保留失败、取消和重试。",
+    "发布时：源码改动与 registry 元数据进入同一 git commit后写 committed，production 指针成功推进后写 registry_promoted，executor 回执后写 activated；回滚同样以实际激活回执终结。"
+  ],
+  "payload_policy": [
+    "Trace 事件只保存 artifact_id、revision_id、父修订、sha256、content_ref、大小、类型、逻辑路径和生产者引用，不在每个事件重复正文。当前 artifact_snapshot 把 content 放入 trace 的做法应迁移为受控内容引用，兼容期可双读但只能有一个内容真相源。",
+    "文本和小型结构化卷宗可采用内容寻址对象或数据库不可变 JSON；大型附件、图片和未来音视频放对象存储，数据库只存 URI、哈希、媒体类型、大小和加密信息。哈希用于完整性，不用于隐藏秘密。",
+    "正文、Prompt、memory 和冻结证据按 owner 与 workspace 鉴权；列表和分析页只返回摘要，回钻完整内容需访问审计。进入第三方导出前默认脱敏或排除，不让 OpenLineage、MLflow 或 LangSmith 成为敏感正文副本。",
+    "原始 trace 使用较短保留期；被 ready 卷宗、sealed 评估卷宗、golden 数据集或 ReleaseVersion 引用的 revision、哈希和必要冻结内容按产品生命周期保留。删除采用引用检查、受控级联和 tombstone，不能留下看似完整的悬空边。"
+  ],
+  "integrity_coverage": [
+    "每个 artifact_revision_created 必须解析到一个内容对象，sha256 回读一致，producer Trace、Event 和逻辑 Artifact 可解析；路径变更不改变 artifact_id，内容变化必须产生新 revision_id。",
+    "每份证据卷宗分别报告 promised_artifact_coverage、revision_resolution_coverage、content_hash_coverage、event_sequence_coverage 和 provenance_quality；任一适用必需项缺失则不得 ready。未知、缺失和不适用必须分开。",
+    "每份评估卷宗必须解析 source dossier version，所有 evidence_ref 必须存在，Score 必须带 evaluator revision；每个进化会话必须解析 bound_eval_dossier_id，发布版本必须解析 source_session、parent_version 和 git commit。",
+    "CandidateExperiment 的所有 attempt 必须解析固定输入版本和输出 trace；跨版本比较只允许相同 dataset_revision 与 evaluator_revision。人工豁免实验必须显式可见，不能用空 experiment_id 冒充已验证。",
+    "ReleaseVersion 的完整状态至少区分 committed、registry_promoted、activated 和 activation_failed；production 指针与 executor 实际版本不一致时显示 deployment_diverged，并阻止把它报告为成功上线。",
+    "当前 Writer 的 artifact snapshot 回调使用空 catch 吞异常，且 notify_executor 返回失败后进化 session 仍可进入 published；两者都必须视为完整性缺口，而不是可接受的最佳努力语义。"
+  ],
+  "delivery_failure": [
+    "ArtifactRevision 写入使用本地事务或 outbox：内容对象和 revision 成功而 trace 投递失败时可补发同一 producer_event_id；重复投递幂等，绝不重复生成修订。观测故障不应撤销已经成功的用户写入。",
+    "当前 artifact snapshot 回调不得继续静默 pass。若辅助采集失败，至少写本地降级记录、错误阶段和待补偿项；无法记录任何降级事实时把 Trace integrity 标为 unknown，后续卷宗不能 ready。",
+    "摄入乱序按源 sequence 重建，缺口触发补拉；超过收敛窗口仍缺失则保留 partial。背压优先保留 revision、终态、HITL、错误和发布事件，Token 流和重复正文可降采样。",
+    "卷宗、评估和实验重试均使用新 attempt 标识并保留 retry_of；封存事务失败不写半份卷宗，实验部分完成保留每个 attempt 的独立终态。",
+    "发布采用可恢复状态机。registry 或 git commit 失败时不推进生产；executor 通知失败时保留 committed 或 registry_promoted 状态并重试，不能直接标 activated；回滚也必须等待目标 commit 在 executor 生效并回报实际版本。",
+    "若 registry 指针、git 历史和 executor 激活版本发生分叉，系统以不可变 commit 和 executor 回执诊断，不自动猜测；修复产生新的 ReleaseEvent，禁止改写旧日志。"
+  ],
+  "metrics_scores_outcomes": [
+    "血缘完整性指标：revision 捕获成功率、回读哈希一致率、事件缺口率、悬空 content_ref 数、卷宗 revision 覆盖率、评估 evidence_ref 解析率、发布链可解析率和 deployment_diverged 时长。",
+    "运行指标属于 Trace，稿件和 review 属于 ArtifactRevision，Score 和 finding 属于 EvaluationDossier，实验 uplift 属于 CandidateExperiment，published、activated、activation_failed 和 rolled_back 属于 ReleaseEvent；五类事实不能压进一个 run score。",
+    "跨版本质量比较固定 dataset_revision、evaluator_revision、模型配置和工作负载分层，按 experiment_id 聚合 attempt；同时报告样本数、失败率、取消率、方差和完整性覆盖，不能只展示平均分。",
+    "发布 Outcome 至少包含 selected、waived、committed、activated、rejected、discarded、rolled_back；回滚分析连接目标版本、来源版本、原因、触发指标和影响窗口，但不把回滚次数直接解释为版本质量。",
+    "作者复制、重生成、接受和人工修改是独立产品 Outcome，可连接相关 artifact_revision_id；它们可参与后续分析，但不能替代正式评估卷宗或受控候选实验。"
+  ],
+  "explanatory_limit": [
+    "该机制能证明哪次运行的哪个 Agent 或 Tool 产生了哪份准确修订，哪些修订进入了哪版证据卷宗，评估引用了哪些冻结证据，哪次候选实验和进化会话促成了哪个 git commit，以及生产何时激活或回滚到哪个版本。",
+    "它不能仅凭 produces、derived_from 或 published_as 边证明某个 Prompt、Skill、Memory 或代码改动导致了分数变化；多个共同变量、评估器偏差和样本选择仍需实验控制。",
+    "sha256 相同只能证明字节相同，不能证明语义等价、作者意图一致或内容质量；路径相同也不能证明是同一 revision。",
+    "compile_time_snapshot 只能证明卷宗编译时读到的内容，不能证明创作运行当时的内容；旧 Trace 缺少运行时 revision 时必须保留该限制。",
+    "OpenLineage、MLflow 和 LangSmith 的外部对象只能作为导出或对照视图；它们的 Run、Dataset、Artifact、Experiment、tag 或 alias 不能反向覆盖 Writer 自有不可变 ID 和状态机。"
+  ],
+  "writer_ui_impact": "在现有 Trace 详情旁增加聚焦式血缘视图，默认展示“当前修订 → 证据卷宗 → 评估卷宗 → 进化会话或候选实验 → 发布版本 → 激活或回滚”，节点显示状态、短哈希、版本、完整度和时间，并可回钻冻结内容。稿件页展示修订时间线和 review-revise 关系；发布页明确区分已提交、registry 已推进、executor 已激活和激活失败。不要默认渲染全库巨型图，也不新增通用 Artifact 管理台。",
+  "official_sources": [
+    "OpenLineage 官方对象模型：https://openlineage.io/docs/spec/object-model/ 。用于核对 Job、Run、Dataset 的稳定身份与运行输入输出关系。",
+    "OpenLineage 官方 Run Cycle：https://openlineage.io/docs/spec/run-cycle/ 。用于核对 START、RUNNING、COMPLETE、ABORT、FAIL 等运行事件和终态边界。",
+    "OpenLineage 官方 Facets：https://openlineage.io/docs/spec/facets/ 。用于核对 Run、Job、Dataset 的可扩展元数据，以及父运行、版本、模式和血缘扩展方式。",
+    "MLflow 官方 Tracking：https://mlflow.org/docs/latest/ml/tracking/ 。用于核对 Experiment、Run、参数、指标、标签、Artifact 和后端存储关系。",
+    "MLflow 官方 Artifact Stores：https://mlflow.org/docs/latest/ml/tracking/artifacts-stores/ 。用于核对运行元数据与大对象文件分离、Artifact URI 和存储边界。",
+    "MLflow 官方 Dataset Tracking：https://mlflow.org/docs/latest/ml/dataset/ 。用于核对 Run 输入数据集、数据集摘要和实验可复现性关系。",
+    "MLflow 官方 Model Registry：https://mlflow.org/docs/latest/ml/model-registry/ 。仅用于对照不可变版本与可移动别名、生产指针的区别，不把模型注册语义直接搬入 Writer。",
+    "LangSmith 官方 Evaluation Concepts：https://docs.langchain.com/langsmith/evaluation-concepts 。用于核对 Dataset、Example、Experiment、Run、Evaluator、Feedback 和比较实验的关系。",
+    "LangSmith 官方数据集管理：https://docs.langchain.com/langsmith/manage-datasets 。用于核对 Example、source run、数据集版本和版本标签。",
+    "LangSmith 官方离线评估：https://docs.langchain.com/langsmith/evaluate-llm-application 。用于核对固定数据集上运行目标、生成实验并记录逐例与汇总评估结果。",
+    "LangSmith 官方比较实验：https://docs.langchain.com/langsmith/compare-experiment-results 。用于核对共享参考数据集上的多实验比较与反馈关系。",
+    "Writer 当前系统真相源：docs/系统心智模型.md，以及 executor/app/domains/writing/agent.py、evolution/app/dossier/extractor.py、evolution/app/core/db.py、evolution/app/eval_agent/sealer.py、evolution/app/evolve/api.py、evolution/app/versioning/registry_repo.py、evolution/app/benchmark/repo.py。用于核对现有 revision 快照、两级卷宗、进化绑定、benchmark、发布和回滚链。",
+    "[不确定] 当前沙箱无法访问外网，以上官方页面的对象语义依据稳定官方入口与既有已核验资料交叉整理，但页面在 2025-07-28 至 2026-07-28 内的最近更新时间、重定向状态和当前补丁版本未能在线复核。"
+  ],
+  "standard_maturity": "OpenLineage 的 Job、Run、Dataset、运行周期和 Facet 已形成成熟公开规范与生态，适合做交换词汇；MLflow Tracking、Artifacts、Dataset Tracking 和 Registry 是成熟产品能力；LangSmith Datasets、Experiments、Feedback 和比较评估也是正式产品能力。三者共同证明运行、持久对象、固定输入版本、实验结果和生产指针应分层，但没有一个现成标准覆盖 Writer 的“稿件 revision → 两级不可变卷宗 → 进化会话 → harness 发布与回滚”全链，因此 Writer 内部契约必须自有且稳定。[不确定] 三者截至 2026-07-28 的具体当前版本号和个别页面状态未能在本次无外网沙箱中重新核验。",
+  "conflicts_with_writer": [
+    "OpenLineage 以数据处理 Job 和 Dataset 为中心，Dataset 通常由 namespace 与 name 标识；Writer 的稿件需要逻辑 Artifact、内容 revision、review-revise 和卷宗封存，不能只用路径式 Dataset 名称，也不能把每个 Agent Span 都升级成 Job。",
+    "MLflow 把 Artifact 归在 Run 下并常以文件路径或 URI浏览，Experiment 主要是 Run 分组；Writer 同一逻辑稿件跨多次 Trace 修订，必须有独立于 Run 的 artifact_id 和 revision 父链。MLflow 的 Model Registry 别名可移动，适合类比 production 指针，但不能作为历史发布身份。",
+    "LangSmith 的数据集版本主要按时间点和可移动 tag 读取，Experiment 绑定 reference dataset，Feedback 绑定 Run 或 Experiment；Writer 的正式证据必须绑定显式 dossier version、artifact revision 和 evaluator revision，不能用 latest、时间近似或项目名称重建历史。",
+    "三类工业方案都允许较自由的 metadata、tag 或 facet 扩展；Writer 的核心血缘字段不能只塞进无约束 JSON。稳定 ID、状态机、唯一约束、幂等键和完整性闸门必须进入本地 schema。",
+    "Writer 当前把 artifact snapshot 内容直接放进 trace，且捕获异常静默吞掉；工业模式强调运行元数据与 Artifact 存储分离、失败可观察。应保留用户写入成功优先，但必须显式降级和阻断不完整卷宗进入评估。",
+    "Writer 当前发布在 executor 通知失败时仍可能把进化 session 标为 published；工业产品中的注册版本或别名变化不等于生产实例已加载。Writer 必须额外记录激活回执，发布状态与部署状态分离。"
+  ],
+  "uncertain": [
+    "official_sources",
+    "standard_maturity"
+  ]
+}

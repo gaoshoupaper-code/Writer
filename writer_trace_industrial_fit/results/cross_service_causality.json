@@ -1,0 +1,136 @@
+{
+  "mechanism_name": "跨服务上下文与异步因果",
+  "primary_problem": "把一次 Writer 运行中可嵌套的同步调用、返回 202 后继续执行的异步摄入、失败重试，以及跨数小时或数天形成的证据卷宗、评估、进化和发布关系区分开，再以正确的边连接起来。目标不是制造一条无限长的 Trace，而是既能从 executor 的一次具体操作跳到 evolution 的直接后果，又能在遥测被采样、丢失或过期后仍靠稳定业务键复原整条业务血缘。",
+  "evidence_objects": [
+    "W3C Trace Context Level 1：2021-11-23 W3C Recommendation，当前稳定互操作基线；traceparent 只携带 TraceId、父 SpanId 和标志，tracestate 只承载厂商追踪状态。",
+    "W3C Trace Context Level 2：2024-03-28 Candidate Recommendation Draft，新增随机 TraceId 标志等能力，仍是工作草案；Writer 不依赖该新增标志才能成立。",
+    "OpenTelemetry Tracing API、SDK 与 Propagators API 1.59.0：2026-07-10 发布，主体状态为 Stable；SpanContext 不可变，一个 Span 最多一个父 Span，Link 可指向同 Trace 或不同 Trace 的 SpanContext。",
+    "OpenTelemetry Span Links：核心 Trace API 中为稳定能力；在 Span 创建时加入 Link 可参与头部采样，创建后补 Link 可能无法影响采样，SDK 默认 LinkCountLimit 为 128 且允许丢弃超限 Link。",
+    "OpenTelemetry Messaging Semantic Conventions 1.43.0：2026-07-03 发布，但 messaging spans 页面状态仍为 Development；其当前规则把 Link 作为生产者到消费者、批处理和已有 ambient context 场景的默认关联方式。",
+    "OTLP 1.11.0：Trace、Metric、Log 传输为 Stable，明确区分可重试、不可重试与 partial success，并承认队列、重试和确认边界仍可能造成丢失或重复。"
+  ],
+  "writer_classification": "Writer 核心",
+  "writer_problem_match": "Writer 当前已经有这条真实链路：executor 在本地记录 run/event/node，终态后 POST /api/ingestion/notify；evolution 返回 202 后异步按 since_seq 拉取并投影，通知失败再由扫描补齐。随后 runs.trace_id 生成带版本的 evidence_dossiers，evaluation_dossiers 永久绑定 source_dossier_id/source_dossier_version，evolve_sessions 永久绑定 bound_eval_dossier_id，registry.json 的版本再以 source_session、parent_version、git commit 和 rollback_log 接到发布。缺口不是再造一套工作流，而是现有同步 HTTP、后台任务、重试与这些持久对象之间没有统一且不混淆的因果语义；尤其现有业务字段 trace_id 容易与 OTel TraceId 同名混用。",
+  "adoption_decision": "改造后采用",
+  "minimal_writer_form": [
+    "保留现有 trace_id 作为 Writer 运行主键和持久血缘键；进入 OTel 属性时统一表达为 writer.run.id，OTel 自身 TraceId/SpanId 只用于一次有界执行的观测关联，不要求改库重命名。",
+    "executor 到 evolution 的同步 HTTP 段使用 W3C traceparent/tracestate 注入与提取：POST notify 的 client/server、evolution 拉 GET /internal/traces/{id} 的 client/server均按远程父子 Span 表达。tracestate 不放 Writer 业务数据。",
+    "evolution 接受 202 后启动的 _ingest_async 是新的有界执行：在创建处理 Span 时 Link 到通知的创建上下文，并携带 writer.run.id。后续网络拉取与本次投影作为它的子 Span；若批量处理多个 run，则每个输入一个 Link，避免伪造多父树。",
+    "每次异步重试创建新的 attempt Span，不复用 SpanId；同一任务的各 attempt 都 Link 到原始创建上下文，并用稳定 ingestion job/run ID、attempt 序号和固定关系值 retry_of 或 triggered_by 说明语义。幂等仍由业务键和事件 sequence 高水位保证，绝不由 OTel ID 保证。",
+    "跨阶段持久链只复用现有对象关系：writer run -> evidence dossier 版本 -> evaluation dossier -> bound evolve session -> registry version/source_session -> git commit/parent_version/rollback。只在对应操作 Span 上附这些不透明 ID 与版本，Span Link 用于导航加速，不新增通用 workflow 表或血缘图数据库。",
+    "只定义 Writer 实际需要的 Link 关系小集合：triggered_by（异步触发）、retry_of（重试）、resumed_from（HITL 续接）、derived_from（派生操作）；关系放在后果 Span 指向原因 Span 的 Link 属性上。消息语义可由 PRODUCER/CONSUMER SpanKind 推断时仍保留 Writer 业务关系，因为 OTel 尚无稳定的通用 Link 方向约定。"
+  ],
+  "explicit_non_goals": [
+    "不把创作、摄入、卷宗、评估、进化、发布合成一条跨天不结束的超级 Trace，也不让 Span 跨越人工等待期。",
+    "不以 OTel TraceId、SpanId 或 Link 替代 runs.trace_id、dossier_id、eval_attempt_id、eval_dossier_id、evolve session_id、harness version 和 git commit。",
+    "不为当前单 run 通知链引入 Kafka、通用事件总线、通用工作流引擎、OpenLineage 图或全局 correlation_id。",
+    "不照搬仍处于 Development 的 messaging span 全套 create/send/receive/process 建模；只映射 Writer 确实存在的 notify、后台 ingest、pull、project 与 retry。",
+    "不在 traceparent、tracestate、Baggage 或 Span 属性中复制稿件、提示词、完整工具输入输出、卷宗正文、评估冻结证据或用户身份信息。",
+    "不做可配置的任意 Link 关系本体、任意属性透传、任意后端兼容层；只保留 Writer 已确认的四类因果边。",
+    "不让遥测出口失败阻塞创作、封存或发布事务，也不把 Collector 的 WAL 当成 Writer 业务证据库。"
+  ],
+  "trace_boundary": [
+    "Trace：一个有界执行尝试。创作请求的一次连续执行、一次 evolution 摄入 attempt、一次卷宗编译、一次评估 attempt、一次进化 round/finalize、一次发布各自可以是独立 Trace；通过 Link 和业务键关联，而不是强行共享同一 TraceId。",
+    "Span：有开始和结束的实际操作。同步嵌套调用有且只有一个父 Span；远程同步调用通过传播的 SpanContext形成 client/server 父子关系；并行 subagent 可共享父 Span。",
+    "Event：Span 内一个有意义的时间点，例如任务入队、重试排期、HITL 暂停、部分接收、证据缺口发现。Event 不是可独立寻址的业务对象，也不能代替卷宗或发布记录。",
+    "长期 Workflow：由 Writer 持久业务对象组成的 DAG。HITL 等待时结束当前活动 Span，恢复时新建有界 Span/Trace，以 resumed_from Link 和同一个 writer.run.id/thread id 续接。",
+    "边界判据：调用方等待远端结果且只有一个直接原因时用父子；调用方不等待、后果可能晚于原因结束、存在多个输入、重试或已有其他 ambient parent 时用 Link；需要跨保留期审计时必须落业务外键。"
+  ],
+  "async_causality": [
+    "notify 只是触发提示：executor 的通知请求与 evolution 接收请求是同步父子；202 响应后 BackgroundTask 与请求生命周期解耦，新的 ingest Span 在创建时 Link 回通知上下文。",
+    "evolution 从 executor 拉 trace 内容是 ingest Span 的同步子调用；executor 的 GET server Span 继承远程父上下文，因此可在新的 ingest Trace 内看到实际跨服务往返。",
+    "重试不复用旧 Span，也不把前一次失败 attempt 当作下一次的同步父级。每个 attempt Link 到同一原始创建上下文，用 writer.run.id/ingestion job ID 聚合；必要时再用 retry_of 指向直接前驱。",
+    "同一消息被多个消费者处理或一个批次含多个 run 时，单个处理 Span只能有一个 parent，故对每个消息创建上下文分别加 Link；Link 属性保存对应 writer.run.id，超过 Link 上限时必须记录 dropped_links_count 与未覆盖清单。",
+    "缺少或无效 traceparent 时不拒绝业务：按 OTel Propagator 规则保留原 Context或开新 Trace，同时仍用 body 中 writer.run.id 拉取与幂等；将 propagation_missing 记为观测缺口。",
+    "可变且会重试的 carrier 在重新 Inject 前清理旧传播字段，避免把上一次 attempt 的 traceparent 混入新请求。"
+  ],
+  "agent_semantics": [
+    "Meta Agent 到同步委托的 Subagent 使用父子 Span；并行委托共享父 Span并保留现有 parallel_group_id。独立排队或跨进程执行的 Subagent attempt 改用新 Trace + triggered_by Link。",
+    "LLM 与 Tool 是有网络/执行耗时和独立失败语义的子 Span；Skill 是被加载并实际执行时的 Span或属性，纯选择结果可作为 Event；Middleware 只有在承担独立耗时、重试、权限或副作用时才建 Span，普通包装钩子不逐层制造噪声。",
+    "review-revise 循环中每轮/每次模型或工具调用都是当前阶段下的子 Span，round/revision 是低基数序号属性；内容影响仍靠 artifact revision/hash 和 evidence_ref 证明。",
+    "HITL awaiting_input 是当前执行 attempt 的终点或暂停事件；人工恢复创建新的活动段并以 resumed_from 关联，不保持一个占用资源且跨小时的 Span。",
+    "evolution 自观测的评估与进化 Agent继续使用自己的有界 Trace，但通过 eval_dossier_id、bound_eval_dossier_id 与 source trace 业务键回到来源；进化 Agent 不因此获得绕过卷宗直接读取原始 trace 的权限。"
+  ],
+  "artifact_lineage": [
+    "OTel Trace回答某次操作如何执行，Writer 业务血缘回答哪份不可变输入产生哪份不可变输出，两者不能合并为一个主键空间。",
+    "创作运行以现有 runs.trace_id 为锚；稿件/交付物在产出时记录 revision、内容哈希和来源 event/node；Span 只保存引用与哈希，不保存正文。",
+    "证据卷宗以 dossier_id、trace_id、version、compile_rule_version、provenance 和状态形成追加式版本；评估卷宗永久冻结 source_dossier_id/source_dossier_version、eval_attempt_id、findings/evidence_ref；进化会话永久冻结 bound_eval_dossier_id。",
+    "发布版本继续由 registry.json 的 version、parent_version、source_session、production 指针、git commit 映射和 rollback_log 形成权威谱系；发布 Span挂这些引用以便从运行观测跳转，Link 不是发布真源。",
+    "若源 Span因采样、过期或出口失败不可查，业务链仍可完整遍历；若业务外键缺失，即使 OTel Link 尚在也只能说明曾声明因果，不能补成可审计 Artifact 血缘。"
+  ],
+  "capture_timing": [
+    "Span 创建时：确定 parent 或 Links，并写入采样需要的稳定属性，包括 writer.run.id、任务/对象 ID、attempt、关系类型和 harness version；已知 Link 不延迟到 Span 结束后补。",
+    "跨服务发送前：从当前 Context Inject 到 HTTP/message carrier；接收入口先 Extract，再创建 server/consumer Span；解析失败不抛给业务。",
+    "执行中：只以 Event 记录重试排期、HITL、阶段切换、部分接收和关键错误；每次真实调用独立成 Span，不靠字符串日志重建层级。",
+    "业务对象终结时：在同一业务事务内先固化 ID、版本、内容哈希、状态和不可变绑定，再结束 Span并异步导出；避免出现遥测显示成功而卷宗/发布记录尚未提交。",
+    "失败或取消时：结束当前 attempt Span，记录可诊断错误类型和终态；后续 retry/resume 新建 Span。服务优雅停机时调用 ForceFlush，但超时仍以业务数据落盘成功为准。"
+  ],
+  "payload_policy": [
+    "traceparent/tracestate 仅用于追踪关联；遵守 W3C 要求，不放 PII、workspace 名称、稿件、用户输入或业务血缘 JSON。",
+    "Span/Link 属性只放不透明业务 ID、版本、枚举状态、计数、耗时和内容哈希。高基数 ID用于 Trace 检索，不进入按标签聚合的常规 Metrics。",
+    "完整稿件、提示词、LLM/Tool 载荷、证据卷宗、冻结证据和评估报告继续留在 Writer 受控存储；Span只存 artifact/evidence 引用。回钻沿用 owner_user_id 权限、访问审计与现有卷宗索引。",
+    "Baggage不是持久血缘：它不会自动成为 Span属性、无内建完整性校验且可能被自动传播到第三方。首期不使用；确需跨内部中间件读取时，仅允许白名单的不透明 writer.run.id，并在信任边界删除。",
+    "遥测保留期可短于业务卷宗；删除用户数据时按业务对象删除正文与受保护载荷，并同步清理可反查身份的遥测索引。内容哈希是否保留服从同一删除策略，不能借哈希规避删除。"
+  ],
+  "integrity_coverage": [
+    "明确区分 observed、missing、unknown、not_applicable 四种状态；没有 Span或 Link不能推断操作未发生，因为采样标志不保证最终记录，SDK/队列也允许丢弃。",
+    "每条 run 保留 executor 事件总数/最大 sequence 与 evolution ingested_seq，高水位出现间隙时标 missing 并触发补拉；重复 sequence 按 writer.run.id + sequence 幂等合并。",
+    "记录 propagation_missing、invalid_parent、orphan_async_span、unresolved_link、dropped_links_count、dropped_spans、export_failures 和 last_ingested_seq，作为卷宗 manifest/运行健康度的来源，而不是吞成空值。",
+    "Link 上限或批量裁剪时保存未覆盖的 writer.run.id 清单/数量到业务摄入记录；关键证据覆盖以 evidence dossier 的 completeness_status、契约矩阵和冻结引用为准，不以采样 Trace 的完整度冒充。",
+    "不适用例如单消息无 batch Link 应显式为 not_applicable；无法判断是没发生还是没观测到时为 unknown，禁止默认零。"
+  ],
+  "delivery_failure": [
+    "遵循 OTel 原则：遥测异常不得让创作或发布运行时抛出未处理异常。executor 先完成本地 trace/业务写入，notify 失败不回滚业务；但必须留下失败计数和可定位日志，不能完全静默。",
+    "沿用 Writer 已有的 notify + pull + scan 修复结构：notify 是低延迟提示，evolution 以 writer.run.id 拉取，since_seq 高水位增量补齐，扫描兜底；摄入写入按业务键和 sequence 幂等，允许重复通知与乱序到达。",
+    "OTLP 仅传遥测：对 429/502/503/504、Unavailable 等瞬时失败按规范指数退避并遵守 Retry-After；partial success 不重试整批，不可重试错误丢弃并计数，防止重复放大。",
+    "BatchSpanProcessor/Collector 队列满、重试超时、进程崩溃或磁盘故障都可能丢数据。只在确需提高观测可用性时给 Collector 发送队列启用 file_storage WAL；不引入 Kafka，也不把该 WAL升级为 Writer 证据真源。",
+    "背压只降低、延迟或丢弃遥测，不阻塞 Writer 主路径；关键业务证据仍由现有本地 WAL/SQLite/registry/git 保证。监控队列容量、失败发送、丢弃 Span/Link 与摄入延迟。"
+  ],
+  "metrics_scores_outcomes": [
+    "运行指标：上下文传播成功率、跨服务父子闭合率、异步 Link 解析率、orphan 数、notify 到 ingested 延迟、拉取次数、sequence 缺口、重试次数、队列利用率、丢弃 Span/Link 和出口失败数。",
+    "阶段指标：创作、摄入、卷宗编译、评估、进化 round/finalize、发布与回滚各自的耗时、成功/失败/取消；按低基数 service、operation、status、harness version 聚合。",
+    "Score 和 Outcome 不是 Span Status。Span Status只表示该操作执行是否出错；内容分数、人工判断、评估 findings、candidate uplift、发布/回滚结果继续存现有评估与版本对象，Span只挂对象 ID和摘要结果。",
+    "跨版本分析通过 writer.run.id -> 被测 harness version -> eval dossier/scores -> evolve session -> registry version 连接；Trace提供性能与失败解释线索，业务表提供可重算的样本集合与分数口径。",
+    "高基数 run/dossier/session ID只用于检索和 exemplars，不作为常规 Metric label，避免时序基数失控。"
+  ],
+  "explanatory_limit": [
+    "父子 Span能说明声明的同步调用层级与耗时；Link能说明后果 Span声明引用了某个 SpanContext，并支持异步、批量和多来源导航。",
+    "它们不能证明某段稿件内容确实受某提示、Skill或证据影响，不能证明评估结论正确，也不能替代 artifact hash、revision、frozen_evidence 和 evidence_ref。",
+    "Link没有通用稳定的方向/关系类型标准；messaging 场景可借 PRODUCER/CONSUMER 推断，但 Writer 自定义阶段仍需固定业务关系与持久外键。",
+    "采样标志只增加端到端记录可能性，不保证数据被保存；Link/Span可能因上限、队列、partial success、出口故障、保留期或后端能力缺失而不可见。",
+    "异步时间线受时钟偏差、乱序、重试和并发影响，时间先后本身不等于因果；因果方向由 parent/Link 与业务绑定共同给出。",
+    "如果代码没有在调度点捕获 Context，事后仅凭相似时间、相同用户或相同 workspace 不能可靠补 Link，应标 unknown。"
+  ],
+  "writer_ui_impact": [
+    "运行观测视图保留父子树，同时以虚线/箭头区分 Link，显示跨服务 hop、attempt、传播缺口和目标是否可解析；不要把 Link伪装成第二个 parent。",
+    "新增一条精简业务血缘导航：运行 -> 证据卷宗版本 -> 评估卷宗 -> 进化会话 -> 发布版本/commit/回滚，数据来自现有持久对象而非 Trace 后端。",
+    "详情页明确区分 Writer run ID 与 OTel TraceId，并可从业务对象跳到相关有界 Trace；当遥测缺失时显示未观测/已丢弃，业务血缘仍照常可用。"
+  ],
+  "official_sources": [
+    "W3C《Trace Context Level 1》Recommendation（2021-11-23，当前稳定基线）：https://www.w3.org/TR/trace-context/ 。规定 traceparent/tracestate 的传播、变更、隐私与安全；明确这些字段唯一用途是 Trace 关联。",
+    "W3C《Trace Context Level 2》Candidate Recommendation Draft（2024-03-28）：https://www.w3.org/TR/trace-context-2/ 。新增随机 TraceId 标志，但官方明确仍是 work in progress。",
+    "OpenTelemetry Specification 1.59.0 发布页（2026-07-10）：https://github.com/open-telemetry/opentelemetry-specification/releases/tag/v1.59.0 。用于锁定本次调研的当前规范版本。",
+    "OpenTelemetry Tracing API：https://opentelemetry.io/docs/specs/otel/trace/api/ 。状态 Stable；确认 SpanContext不可变、Span只有零或一个 parent、Link可跨 Trace、创建时 Link可参与采样。该文件当前主干于 2026-07-20仍有官方维护提交：https://github.com/open-telemetry/opentelemetry-specification/commit/114c96abe384a9d991362c97bfdb42acbc7c6892 。",
+    "OpenTelemetry Tracing SDK：https://opentelemetry.io/docs/specs/otel/trace/sdk/ 。状态 Stable except where otherwise specified；确认采样会造成缺口、默认 LinkCountLimit=128、批处理队列满会丢 Span、ForceFlush有超时边界。",
+    "OpenTelemetry Propagators API：https://opentelemetry.io/docs/specs/otel/context/api-propagators/ 。状态 Stable；规定 carrier 的 Inject/Extract、解析失败不抛异常，以及可变重试 carrier 注入前应清理旧字段。",
+    "OpenTelemetry Semantic Conventions 1.43.0 发布页（2026-07-03）：https://github.com/open-telemetry/semantic-conventions/releases/tag/v1.43.0 。",
+    "OpenTelemetry Messaging Spans：https://opentelemetry.io/docs/specs/semconv/messaging/messaging-spans/ 。页面状态 Development；明确消息创建上下文、批处理每消息 Link，以及 Link是 producer/consumer 关联的默认机制。当前主干在 2026-07-23完成 messaging v2 重构提交：https://github.com/open-telemetry/semantic-conventions/commit/aeae216e98eb137b5c4cb5dcd221e472b1dcf274 ，因此 Writer不固化其易变命名。",
+    "OpenTelemetry Traces 概念页的 Span Links：https://opentelemetry.io/docs/concepts/signals/traces/#span-links 。以异步排队后新 Trace关联前一 Trace的官方示例交叉验证 Link用途。",
+    "OpenTelemetry OTLP 1.11.0：https://opentelemetry.io/docs/specs/otlp/ 。Trace传输 Stable；规定 retryable/non-retryable、partial success、退避与背压。",
+    "OpenTelemetry Error Handling：https://opentelemetry.io/docs/specs/otel/error-handling/ 。规定遥测运行时错误不得泄漏为未处理异常，业务通常宁可丢遥测也不应被显著改变。",
+    "OpenTelemetry Collector Resiliency：https://opentelemetry.io/docs/collector/resiliency/ 。说明内存队列、file_storage WAL、重试和所有剩余丢失窗口，支持 Writer把业务证据与遥测投递分层。",
+    "OpenTelemetry Baggage：https://opentelemetry.io/docs/concepts/signals/baggage/ 。说明 Baggage不自动成为 Span属性、可能泄漏到第三方且无内建完整性校验，支持首期不把它作为业务血缘。",
+    "OpenTelemetry Semantic Conventions 官方议题 #596：https://github.com/open-telemetry/semantic-conventions/issues/596 。维护者明确通用 Link关系方向尚无标准；该议题是非规范性补充证据，不覆盖正式规范。"
+  ],
+  "standard_maturity": "截至 2026-07-28：W3C Trace Context Level 1 为 Recommendation，可直接作为传播基线；Level 2仍为 Candidate Recommendation Draft，只兼容其新增标志、不把它设为 Writer 前置条件。OpenTelemetry 1.59.0 的 Trace API、Trace SDK和 Propagators API主体 Stable，Span Links属于稳定核心数据模型；OTLP 1.11.0 对 Trace传输为 Stable。Messaging Semantic Conventions 1.43.0虽已发布，但 messaging spans 明示 Development，且 2026-07-23刚完成 v2重构；其“异步/批量默认用 Link”的结构性原则可采用，具体操作名、属性名和 Link方向推断仅做兼容适配。通用 Link关系类型仍未标准化。",
+  "conflicts_with_writer": [
+    "工业 Trace默认描述一次分布式请求/操作，而 Writer的创作到发布是跨阶段、可人工等待、可重编卷宗和可回滚的长期业务链。取舍：Trace有界化，长期连续性留给现有业务对象。",
+    "OTel允许采样、队列溢出与出口丢失，且其错误处理原则优先不影响业务；Writer的证据卷宗却要求可审计完整性。取舍：OTel只做操作观测和跨服务导航，现有本地事件、SQLite卷宗、registry和git继续做真源。",
+    "当前 Writer把 trace_id 用作 run业务主键，而 OTel也使用 TraceId。取舍：不做破坏性改库，但在接口、属性和 UI中显式命名 writer.run.id 与 otel.trace_id，禁止互换。",
+    "当前 notify 是每 run一次的 HTTP提示，evolution主动 pull并以 scan补漏；完整套用消息系统 create/send/receive/process 会增加无收益 Span。取舍：同步 HTTP保留父子，202后后台 ingest才用 Link。",
+    "Messaging conventions仍在 Development，通用 Link关系类型也未定。取舍：只采用稳定 Link数据模型和最小 Writer关系枚举，不把 semconv v2具体命名写进持久业务契约。",
+    "部分 Trace后端对 Link展示、跨 Trace检索或方向推断能力不同。取舍：Writer UI可展示 Link但业务血缘始终从本地对象关系生成，避免被观测后端能力锁定。",
+    "Baggage适合传播上下文却有泄漏与完整性风险。取舍：首期继续在已鉴权的请求体和数据库中传稳定业务 ID，不把 Baggage升级为隐式依赖。"
+  ],
+  "uncertain": []
+}

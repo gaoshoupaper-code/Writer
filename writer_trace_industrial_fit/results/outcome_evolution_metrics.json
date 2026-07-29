@@ -1,0 +1,167 @@
+{
+  "mechanism_name": "Outcome 评估与进化指标",
+  "primary_problem": "把创作 Trace 结束后才发生的复制、重生成、最终采用、人工编辑和评分，与评估卷宗、候选实验、发布激活及回滚结果连接起来，形成可复核的质量改善证据；同时保持运行事实、用户结果、评估分数、实验比较和发布结果各自独立，避免把所有信号追加回一条已结束 Trace 或压成一个无法解释的总分。",
+  "evidence_objects": [
+    "LangSmith Evaluation：当前官方模型明确区分离线评估与在线评估。离线评估针对 Dataset/Example，Experiment 保存某一应用版本在固定数据集上的输出、评估分和执行 Trace；在线评估针对生产 Run/Thread。Feedback 可由用户、人工标注者或自动 Evaluator 产生并挂到 Trace 或子 Run。该模型成熟，但主要目标仍是 Run/Experiment，不直接提供 Writer 所需的稿件 ArtifactRevision、证据卷宗和发布激活语义。",
+    "Langfuse Scores、Datasets 与 Experiments：当前 Score 可关联 Trace、Observation、Session 或 Experiment，带类型、来源、配置和评论；DatasetRunItem 把 DatasetItem 与 Trace 连接。2026-04 的 v4 重构把 Experiment 提升为独立且不可变的可比较执行快照，2026-06 Scores API v3 又把 score subject 改为显式判别对象并提供作者、来源和实验过滤。它证明 Score、实验和生产反馈应是独立对象，但 Writer 仍需增加 ArtifactRevision、卷宗、evaluator provenance 和发布状态机。",
+    "Phoenix Annotations、Evals、Datasets & Experiments：官方文档区分分类、连续和自由文本注释，记录 Human/LLM/Code annotator，并让生产注释进入数据集和实验；Dataset Evaluator 类似固定测试套件。Evaluator 本身通过 OpenTelemetry 单独追踪，保留输入、精确 judge Prompt、模型执行、最终分数和耗时，适合证明评估器也必须可解释和版本化。",
+    "Braintrust Datasets、Experiments 与 Online Scoring：Dataset 是可固定版本的测试集合；Experiment comparison 以 baseline 对齐相同 test case 并显示逐例 score delta、改善和回归；用户反馈支持 rating、correction、comment、metadata，官方建议多次反馈使用独立子记录而非覆盖；生产评分异步执行并显式保留采样、重试和未评分状态。它是成熟工业实现，但其自动化在线评分、通用 scorer 托管和 CI 门禁超出 Writer 当前核心。",
+    "W&B Weave Evaluations、Datasets 与 Feedback：Evaluation 把 Dataset、Scorer 和待测 Model/Function 固定成可重复配置，每次 evaluate 产生独立运行并支持多 trial；Dataset 发布后形成可引用版本；Feedback 是 Call 外部的独立对象，可记录 reaction、note 和结构化 human annotation。它再次验证评估配置、执行、分数和运行后反馈不应混为 Trace 内事件。"
+  ],
+  "writer_classification": "Writer 核心",
+  "writer_problem_match": [
+    "写作端 /screenplay/copy 与 /screenplay/regenerate 在创作完成后仍调用 TraceRecorder.append_event；此时 sequence 通常已清理，异常只记 signal_drop。当前请求仅带 trace_id 和 200 字 content_preview，没有 artifact_revision_id，因此既会丢失，也无法判断用户操作针对哪一版稿件。",
+    "写作流程目前没有统一持久化的最终采用版本、人工编辑前后 revision/diff 和人工评分。promote 层虽然预留从 user_edit 事件提取 reference_output，代码仍明确标为待 executor 埋点；桌面端只能让标注者手工粘贴终稿，不能还原真实用户结果链。",
+    "图像域已在 images 表内保存 agent_analysis、user_score、user_note 和 is_final，说明真实 Outcome 已出现；但它们内嵌在单一业务表，未关联生成 Trace、统一 ArtifactRevision、评估卷宗或 Outcome/Score 契约，写作与图像无法同口径分析。",
+    "新主链已有正确骨架：完整 Evidence Dossier 才可启动评估；evaluation_session 表示尝试，evaluation_dossier 是原子封存且绑定 source_dossier_id/version 的不可变交付物；finding 和 positive_pattern 必须带 evidence_ref；进化会话再永久绑定 sealed、complete 的评估卷宗。该链应保留。",
+    "当前评分契约已实质断裂：scoring.py 返回 groups/badcase/calibration/rubric_version，28 维取值为 1-5，0 表示无法判断；evaluation_scores 表注释仍写 0-1；promote/judge.py 和 benchmark/runner.py 仍读取旧 content.overall/content.scores，promote 阈值仍为 0.8/0.4。现状会把有效评分读成 0、空值或错误裁决，不能支撑可信进化。",
+    "benchmark_runs 已保存 case × harness_version × golden_revision，并关联 trace/eval/scores，是 Writer 离线实验的可用雏形；但当前评分读取错误，且未完整冻结 evaluator、judge model、Prompt、rubric、Skill 和 Middleware 版本，因此无法声称跨版本 uplift 可比。",
+    "publish_session 只校验 pending_review，发布时未带评估或实验决策；registry.json 的 v1-v6 均为 eval_score=null、eval_status=pending。notify_executor 失败后 session 仍可标 published；registry rollback 没有 API/桌面调用，discard 只是发布前丢弃工作区改动，不是生产回滚。",
+    "桌面端能显示 28 维和 uncalibrated，也能在进化审查页展示评估快照并发布或丢弃；但 Trace、数据集标注、评估、进化、版本分别散落，缺少围绕具体 ArtifactRevision 的 Outcome 时间线、matched uplift、评估器版本和发布后结果视图。"
+  ],
+  "adoption_decision": "改造后采用",
+  "minimal_writer_form": [
+    "只新增四类业务记录并复用现有 Trace、卷宗、benchmark 和 registry：OutcomeRecord 表达用户或人工在运行后的行为结果；ScoreRecord 表达一次有版本和证据的测量；ExperimentRun 收拢固定配置下的 baseline/candidate 配对尝试；ReleaseDecision/ReleaseOutcome 表达发布选择、实际激活、观察窗口和回滚。它们共享 trace_id、artifact_revision_id、dossier_id、experiment_id、release_id 等关联协议，但不是第二套 Trace 系统。",
+    "OutcomeRecord 最小字段为 outcome_id、outcome_type、target_artifact_revision_id、source_trace_id、actor_type/actor_id、source_surface、observed_at、recorded_at、value_ref、signal_polarity、signal_strength、idempotency_key 和 supersedes_outcome_id。复制、重生成、最终采用、人工编辑、人工评分、发布后人工结论分别使用不同 outcome_type，不把它们换算成一个隐式满意度。",
+    "ScoreRecord 最小字段为 score_id、subject_type/subject_id、metric_name、metric_version、value、value_type、scale_min/scale_max、direction、measurement_status、rubric_id/version、evaluator_type/id/version、judge_model/provider、judge_prompt_hash、evaluation_trace_id、evaluation_dossier_id、evidence_refs、scored_at。subject 至少支持 Trace、Span、ArtifactRevision 和 EvaluationDossier；Writer 正文质量分优先落到 ArtifactRevision 或评估卷宗，而不是只挂原始 Trace。",
+    "ExperimentRun 最小字段为 experiment_id、purpose、baseline_harness_version/commit、candidate_harness_version/commit、dataset_revision、case_slice、model_config_version、prompt/skill/middleware bundle hash、rubric_version、evaluator_version、judge_model_version、started_at、status 和 decision。每个 case × variant 是独立 attempt，关联其创作 Trace、ArtifactRevision、评估 Trace、评估卷宗、终态和 retry_of。",
+    "ReleaseDecision/ReleaseOutcome 最小字段为 release_id、source_experiment_id 或 waiver、source_eval_dossier_id、candidate_commit、registry_version、decider、decision/reason、committed_at、activated_at、activation_ack、observation_window、observed_sample_count、post_release_metrics_snapshot、rollback_to_version、rollback_reason 和 rolled_back_at。发布元数据、executor 实际激活和发布后质量是三个不同事实。",
+    "信号强度固定而不伪装成质量分：copy 是弱正向，regenerate 是弱负向，显式 final_adopt 是强正向，人工评分是直接但主观的 Score，human_edit 只表示发生了修改且需结合 diff 类型解释，edit distance 本身没有正负方向。图像 is_final 映射 final_adopt，user_score 映射人工 Score，保留来源域。",
+    "28 维评分继续使用 1-5 锚点，但把无法判断从数值 0 改为 value=null、measurement_status=unknown；不适用为 not_applicable，评估失败为 error。现有 raw 0 可兼容读取，却不得参与平均、badcase、promotion 或 uplift。uncalibrated 状态必须随每条相关 Score 和实验结果传播。",
+    "第一阶段只修复真实闭环：可靠采集运行后 Outcome、统一 Score 契约、冻结实验配置、形成配对 uplift、把发布与激活/回滚关联起来。不新建通用反馈中心、模型注册平台或在线实验编排器。"
+  ],
+  "explicit_non_goals": [
+    "不建设 LangSmith、Langfuse、Phoenix、Braintrust 或 Weave 式通用标注平台；Writer 不需要任意队列、任意 rubric builder、多租户 evaluator marketplace、动态 leaderboard 或跨项目 scorer 托管。",
+    "不引入第二套 Trace 存储。开发者 Trace 和运行后 Outcome/Score 使用同一关联与查询底座，但对象、页面、指标和保留策略分开；第三方观测平台只能做导出或对照，不能成为 Writer 真相源。",
+    "不把 copy、停留时长、regenerate、编辑距离、人工星级和 LLM judge 分数揉成单一 quality_score，也不先定义任意权重。各信号保留原始量纲、来源、强弱和覆盖率，等校准数据充分后再讨论组合。",
+    "不建设自动统计显著性平台、在线 A/B 分流、多臂老虎机、自动 Prompt 优化或大规模实验调度。Writer 第一阶段只做同 case、同数据集 revision、同 evaluator 契约的 matched comparison，并展示样本与缺失。",
+    "不让 uncalibrated LLM-as-judge 自动发布、自动回滚或自动收入 golden/growing；自动评分只用于定位和候选比较，正式发布继续由开发者或质量人员决策并留理由。",
+    "不记录每次键盘输入或把每个 autosave 当 Outcome。人工编辑在产生稳定 ArtifactRevision 时记录一次 diff；没有显式采用动作时不得把最后显示的稿件猜成最终采用版。",
+    "不无限保留所有生产反馈正文、编辑 diff 和 evaluator Prompt 副本。长期实验只保留被固定数据集、封存评估卷宗或发布决策引用的必要版本与受控内容，其余按内容治理保留类清理。"
+  ],
+  "trace_boundary": [
+    "一次创作请求仍是一条 Trace，Agent、Subagent、LLM、Tool 和同步 review-revise 留在其中。创作 Trace 在终态和摄入完整性确认后关闭，后续 copy、rating、adopt 或 edit 不重新打开，也不占用其 sequence。",
+    "证据卷宗编译、评估和进化分别创建新 Trace，继续遵守已确认边界。评估 Trace 记录评估 Agent、rubric Prompt、judge model、Tool 和封存动作；最终 ScoreRecord 和 EvaluationDossier 通过 source dossier、ArtifactRevision 和 Link 关联原始创作 Trace。",
+    "OutcomeRecord 是 Trace 之外的追加业务事实。反馈接口本身若被基础 APM 追踪，可有短 Span 并 Link 到 source_trace_id，但产品语义以 OutcomeRecord 为准，不为每次复制建立 Agent Trace。",
+    "ExperimentRun 是跨多条创作/评估 Trace 的持久聚合，不是一条覆盖整个矩阵的超长 Trace。每个 case × variant 的执行和对应评估各有明确 Trace，ExperimentRun 只冻结配置并收拢结果。",
+    "发布、激活、观察和回滚可跨数天，不放进进化 Trace。ReleaseDecision 和 append-only ReleaseOutcome/ReleaseEvent 组成长期 Workflow；进化 Trace 在候选制品和审查材料完成时终结。"
+  ],
+  "async_causality": [
+    "所有运行后记录使用稳定业务键而非 Trace sequence：OutcomeRecord 以 outcome_id/idempotency_key 去重，并同时保存 source_trace_id 与 target_artifact_revision_id；ScoreRecord 保存 evaluation_trace_id、被评目标和 evaluator bundle。晚到、乱序不会改变已结束 Trace。",
+    "regenerate 先为旧 revision 写 user_regenerate Outcome，新创作请求再建立新 Trace；新 Trace 保存 caused_by_outcome_id、source_trace_id 和可选 Span Link，从而同时回答用户拒绝了哪一版以及重生成产生了哪一版。",
+    "human_edit 由 from_revision_id 到新 ArtifactRevision 的 edits/supersedes 边表达；final_adopt 指向被采用的准确 revision。人工后来修改评分时追加新 Score/Outcome 并用 supersedes 指向旧记录，不覆盖审计历史。",
+    "评估重试使用稳定 logical_evaluation_id 和新的 eval_attempt_id/Trace，每个成功尝试最多封存一份评估卷宗；同一 rubric 下重评也产生新 ScoreRecord，旧分数不改写。",
+    "实验重试产生新的 attempt_id 和 retry_of，失败尝试保留。只有 dataset_revision、case_id、rubric/evaluator/judge model、任务切片和比较键完全一致的 baseline/candidate 才能组成 matched pair。",
+    "发布链以 release_id 连接 source experiment/evaluation、candidate commit、registry version、executor reload 请求和 activation ACK；rollback 追加新事件并链接 from/to release，不删除原版本或伪造同步父子 Span。"
+  ],
+  "agent_semantics": [
+    "创作 Agent 是 ArtifactRevision 的生产者；copy、regenerate、adopt、人工编辑和人工评分的 actor 是 user 或 quality_reviewer，不能标成创作 Agent 事件。human_edit 后的新 revision 明确 producer_type=human。",
+    "评估 Agent 是独立被观测对象。每次评估必须记录实际启用的 rubric、evaluator code、judge Prompt、judge model、Skill 激活、Middleware 有效干预和输入卷宗版本；Score 只引用该 provenance bundle，不从模型文字或当前代码版本倒推。",
+    "被测创作 Trace 的 Prompt、Skill、Middleware、模型和 harness 版本进入 ExperimentAttempt 的 tested_bundle；评估 Agent 自己的 Skill/Middleware 进入 evaluator_bundle，两组版本不能混为一个 agent_version。",
+    "Tool 或 Middleware 的运行指标可作为 Score 的输入证据，但不是 Outcome。比如 retry、cache hit、context compression 或 HITL 能解释为何结果不同，不能单独证明内容更好；分析时通过 Trace/Span Link 回钻机制介入。",
+    "HITL 选择、人工发布和回滚是 Decision/Outcome；LLM judge 给出的 28 维是 Score；进化 Agent 产生的候选代码和说明是 Artifact。三类事实使用不同类型，UI 不再用一个 status 或 score 混合展示。"
+  ],
+  "artifact_lineage": [
+    "核心链为 Creation Trace → ArtifactRevision → OutcomeRecord；ArtifactRevision → EvidenceDossierVersion → Evaluation Trace → EvaluationDossier + ScoreRecord；EvaluationDossier → Evolution Trace → candidate commit；candidate commit + ExperimentRun → ReleaseDecision → registry version → activation/rollback Outcome。",
+    "每个 copy、adopt、edit 和 rating 必须落到具体 ArtifactRevision。只知道 trace_id 的历史信号可保留为 target_resolution=trace_only，但不得进入 revision 级 uplift 或充当最终采用证据。",
+    "ScoreRecord 可落在 ArtifactRevision、Trace/Span 或 EvaluationDossier：正文质量分落 revision；流程可靠性落 Trace/Span；跨维度报告落 EvaluationDossier。finding 和 score 的 evidence_refs 继续指向封存证据，不复制成无来源数字。",
+    "数据集 case 保留 source_trace_id 的同时增加 source_artifact_revision_id 和 source_outcome_id；人工编辑终稿作为 reference ArtifactRevision 或不可变 reference revision，不再只向 reference.md 追加无法区分版本的文本。",
+    "ExperimentRun 永久固定 baseline/candidate bundle、dataset revision 和 evaluator bundle；逐例 attempt 关联输出 revision 与评估卷宗。发布版本引用被采纳 experiment_id；若人工豁免实验，记录 validation_status=waived、理由和决策者。",
+    "发布后 copy、regenerate、adopt、rating 和后续评估仍指向各自真实 ArtifactRevision，并由该 revision 的 producer Trace 解析实际 production registry version/commit，避免把当前 production 指针错误回填到历史内容。"
+  ],
+  "capture_timing": [
+    "生成完成时只终结创作 Trace 和输出 revision，不猜测用户 Outcome。前端展示哪个 revision 必须有稳定 revision_id，后续所有反馈请求携带该 ID。",
+    "copy 和 regenerate 在用户动作发生时立即写本地持久 Outcome/outbox；copy 可记录受控 selection_ref，regenerate 额外在下一次创作 Trace 建立后回填 caused_trace_id。用户动作本身不因观测失败而失败。",
+    "final_adopt 只在用户显式选定、定稿、导出或保存为最终版的产品动作上采集；如果产品尚无这种动作，应先补明确交互，不以最后生成、复制或长时间停留推断。",
+    "human_edit 不采集每个按键。在用户保存、显式定稿或一个可恢复编辑会话形成稳定 revision 时，生成新 ArtifactRevision，并记录 from/to revision、结构化 diff 摘要和受控完整 diff 引用。",
+    "人工评分和评论在提交时追加；修改评分产生新记录并 supersedes 旧记录。评分时冻结评分对象、rubric/version、reviewer 和当时可见 revision，不能随稿件后来编辑而漂移。",
+    "评估启动时冻结 Evidence Dossier、目标 ArtifactRevision、rubric、evaluator code、judge model/Prompt 和 agent bundle；每个维度完成时可写临时结果，但只有评估卷宗原子 sealed 时生成正式 ScoreRecord。",
+    "实验启动前冻结 baseline/candidate、dataset revision、case slice 和 evaluator bundle；所有 attempt 终结后再计算 matched delta。取消、错误、unknown 和缺失不得等到汇总时改写成 0。",
+    "发布请求、git/registry 提交、executor reload ACK、实际激活、观察窗口评审和回滚分别采集。ReleaseOutcome 的窗口在查询或评审时固定 start/end、样本数和过滤条件，不把不断变化的实时均值写成历史事实。"
+  ],
+  "payload_policy": [
+    "Outcome/Score 表只保存结构化语义和受控引用。稿件正文、完整编辑 diff、复制片段、人工评论、评估 Prompt/原始 judge 输出继续进入统一敏感内容存储；表内保存 content_ref、hash、范围、大小和策略标签，避免同一正文复制到 Trace、Outcome 和 Score 三份。",
+    "copy 的分析最小内容为 target revision、selection offset/hash 和可选受控 selection_ref；不再把 200 字 preview 当身份。human_edit 的新 revision 是内容真相，diff_ref 用于解释人工改了什么。",
+    "Score 保存数值、量纲、状态、evidence_refs 和 evaluator provenance；完整 judge reasoning 仅在确有校准/审计价值且通过敏感内容入口检查时保留。不得把用户文本、Prompt 或稿件片段放入 metric_name、tag 或高基数字段。",
+    "开发者和内部质量人员都可查看结构化 Outcome、Score、实验和发布结果；回钻完整 Prompt、稿件、Tool 内容、编辑 diff 或用户评论需内容权限和访问审计。列表默认显示摘要、版本、哈希和脱敏片段。",
+    "保留采用冷热分层：近期诊断保留可回钻内容；进入固定数据集、sealed 评估卷宗、被采纳实验或发布/回滚审计的必要 revision 与 evaluator bundle长期保留；普通生产反馈和未采用候选按内容保留策略到期。删除需引用检查、级联或 tombstone。",
+    "任何 Outcome 或评分载荷先执行与 Trace 相同的拒绝/脱敏入口策略；命中不可接受数据时拒绝该字段或整条敏感 payload，但尽可能保留 outcome_type、目标 revision、时间和 blocked_reason，使分析知道发生过治理阻断而看不到内容。"
+  ],
+  "integrity_coverage": [
+    "Trace 完整性与 Outcome 覆盖率分开。核心运行采集失败仍标 trace_incomplete，并禁止证据、评估和进化消费；用户没有反馈是正常 missing outcome，不把 Trace 降为不完整，也不当负反馈。",
+    "Outcome 完整性要求 outcome_id、类型、目标 revision、actor/source、observed_at 和幂等键可解析。已知反馈投递失败计 outcome_capture_gap；晚到记录计 late_arrival；分析同时展示 eligible_runs、runs_with_outcome 和 outcome_coverage。",
+    "Score 完整性要求被评目标、metric/version、量纲、measurement_status、rubric/evaluator/judge model 版本、evaluation trace/dossier 和适用 evidence_refs 可解析。unknown、not_applicable、error 和 missing 必须分开，任何一种都不得写成数值 0。",
+    "正式 EvaluationDossier 仍要求 seal_status=sealed、completeness_status=complete 且 finding/positive_pattern evidence_ref 全部可解析；其来源 Evidence Dossier 必须 ready 且来源 Trace 非 trace_incomplete。",
+    "ExperimentRun 分别报告 attempt_success_coverage、paired_case_coverage、score_coverage、artifact_resolution_coverage、evaluator_bundle_consistency 和 trace_integrity_coverage。存在 bundle 不一致的行只展示，不进入 uplift。",
+    "uplift 只对同 case、同 dataset revision、同任务切片、同 rubric/evaluator/judge model 和同评分量纲的 paired attempts 计算；同时报告 pair 数、改善/回归/持平数、均值/中位数 delta、错误和排除原因。",
+    "Release 完整性至少区分 decision_recorded、committed、registry_promoted、activation_acknowledged、observation_reviewed、rollback_requested 和 rollback_activated。registry production 指针与 executor ACK 不一致时标 deployment_diverged，不能显示发布成功。",
+    "uncalibrated 28 维可用于人工分析和收集校准样本，但 promotion_eligible=false；在与人工评分完成校准、版本冻结和阈值验证前，任何自动 promote/reject 结论均为不完整决策证据。"
+  ],
+  "delivery_failure": [
+    "copy、regenerate、adopt、rating 和 edit endpoint 先写本地 Outcome/outbox 再返回已接收，异步投递 evolution；同一 idempotency_key 至少一次重试且幂等。复制或编辑等用户主动作照常完成，观测失败通过 outcome_capture_gap/投递健康指标暴露。",
+    "Outcome 乱序按 observed_at、recorded_at 和对象 revision 链解释，不借用已结束 Trace 的 sequence。重复只合并同一 outcome_id；用户重复复制或多次评分是多个真实动作，不可按 trace_id+type 粗暴去重。",
+    "正式 Score 与 EvaluationDossier 在同一封存事务产生或通过可靠 outbox 衔接；封存失败不留下可消费的半份分数。评估 retry 是新 attempt/Trace，错误和耗尽重试保留为 measurement_status=error。",
+    "实验 attempt 独立终结并保留失败、取消、超时和 retry_of；汇总器只消费终态且可解析的 matched pair。部分成功不能把缺失 baseline/candidate 补 0，也不能用成功重试覆盖失败尝试。",
+    "发布采用可恢复状态机：registry 或 git 失败不推进；executor 通知失败停在 committed/registry_promoted 并重试；只有 ACK 指明实际 version/commit 后才 activated。回滚同样等待目标版本 ACK。",
+    "评分采样、内容治理阻断、访问删除和外部模型不可用都会产生可解释的未测量状态；分析查询必须返回 denominator 和 exclusion reasons，禁止静默少算后仍展示完整率 100%。",
+    "若 Trace 核心数据不完整，创作流程按已确认策略继续完成并标 trace_incomplete；证据编译、评估、实验候选和进化消费者在入口硬拒绝。晚到 Outcome 不能修复缺失的运行事实，只能作为独立结果保留。"
+  ],
+  "metrics_scores_outcomes": [
+    "产品 Outcome：按 artifact_kind、agent/harness version 和时间切片统计 copy、regenerate、final_adopt、human_edit、human_rating 的计数、去重用户数和覆盖率；各类独立展示。copy_rate 或 regenerate_rate 必须以有机会触发该动作的 eligible revision 为分母，缺反馈不算 0 分。",
+    "采用与编辑：final_adopt_rate 是主要强结果；human_edit 报告 edited_revision_rate、结构/内容 diff 类型、字符或节点变更比例和 edit-to-adopt 路径，但编辑量不直接判好坏。最终采用版本必须能回链原生成版本和人工修订。",
+    "评估 Score：展示 28 维原始 1-5、组级描述统计、unknown/not_applicable/error 数、rubric_version、calibration、evidence coverage 和 evaluator bundle；流程 reliability、成本、延迟单独作为运行指标，不能混入内容质量均分。",
+    "人工与自动一致性：按维度统计 human_score 覆盖、LLM judge 与人工评分的差异、排序一致性和 disagreement 样本，用于校准 rubric/阈值；样本不足时只列逐例差异，不制造校准系数。",
+    "候选 uplift：同 case 配对计算每维 delta、改善/回归/持平计数、均值与中位数、paired_case_coverage、attempt failure rate；再按任务类型和 agent/harness version 分层。只有 comparability_status=matched 的结果可称 uplift。",
+    "机制归因切片：通过 tested_bundle 和 Trace 回钻比较 Prompt、Skill、Middleware、模型或 harness 版本不同的候选，但一次实验尽量只改变明确变量。系统能展示相关改动与分数变化，不自动把多变量差异宣称为因果。",
+    "发布 Outcome：记录 selected/rejected/waived、committed、activated、activation_failed、observation_reviewed、rolled_back；观察窗口内展示 final_adopt/regenerate/human_rating、完整性和错误变化及样本数。rollback rate 仅是运维结果，必须结合原因和影响窗口解释。",
+    "进化闭环指标：从 finding → design change → candidate commit → matched experiment → release decision → post-release observation 建立可解析率；重点看 finding_resolution_coverage、candidate_improvement_rate、regression_count、release_activation_success 和 rollback_reason，而不是只看进化会话数量。"
+  ],
+  "explanatory_limit": [
+    "该机制能解释某一稿件 revision 由哪次创作产生，用户后来复制、拒绝、采用、编辑或评分了哪一版；哪份冻结证据和哪个 evaluator bundle产生了哪些 Score；哪个候选在固定 case 上改善或回归；最终哪个 commit 被决策、激活或回滚。",
+    "copy 是弱正向、regenerate 是弱负向，但都存在替代解释：用户可能复制局部错误作修改，也可能因探索多版本而重生成。没有显式 final_adopt 或人工评分时，系统只能报告行为事实，不能断言满意或质量。",
+    "人工评分是主观观察，不是绝对真值；评审者、rubric、可见上下文和时间不同会导致漂移。LLM-as-judge 即使保留 Prompt 和 reasoning 也可能偏置；uncalibrated 更不能驱动自动发布。",
+    "matched uplift 只说明在固定数据集和 evaluator 契约下候选分数相对变化，不保证真实生产创作质量同幅改善；数据集选择偏差、模型随机性和生产需求漂移仍存在。",
+    "同时改变 Prompt、Skill、Middleware、模型和代码时，Trace 能列出所有版本但不能分离每个变量贡献；要声称某机制导致改善，需单变量或明确设计的受控实验。",
+    "发布后评分变化和回滚与版本相关联，但仍可能受用户构成、流量、模型供应商变化、数据完整性或人工运营影响；ReleaseOutcome 应表述观察与决策理由，不承诺确定性因果。",
+    "被治理阻断、删除、未采样或 trace_incomplete 的内容形成不可观测边界；系统必须显示覆盖率和原因，不能从剩余样本补猜所有信息。"
+  ],
+  "writer_ui_impact": "运行 Trace 页继续回答一次 Agent 运行发生了什么，不把所有 Outcome 列塞回事件流。围绕 ArtifactRevision 增加一条简洁结果时间线，显示生成、复制、重生成到新 Trace、人工编辑、最终采用和评分；评估详情显示 28 维、量纲、unknown、calibration、rubric/evaluator/judge 版本和 evidence_ref；候选比较页只显示 matched baseline/candidate 的逐例 delta、覆盖率、失败和 bundle diff；版本页增加 ReleaseDecision、activation ACK、观察窗口与 rollback。开发者和质量人员看到同一结构化结果，敏感正文回钻仍受权限与审计控制，不建设通用仪表盘市场。",
+  "official_sources": [
+    "LangSmith 当前 Evaluation Concepts：https://docs.langchain.com/langsmith/evaluation-concepts 。核对离线 Dataset/Example/Experiment 与在线 Run/Thread 的目标边界，以及 Evaluator 输出 Feedback 的关系；访问核验日期 2026-07-28。",
+    "LangSmith 当前 Feedback Data Format：https://docs.langchain.com/langsmith/feedback-data-format 。核对 run_id、key、score、value、comment、correction 和 feedback_source；访问核验日期 2026-07-28。",
+    "LangSmith 当前 Attach User Feedback：https://docs.langchain.com/langsmith/attach-user-feedback 。核对反馈可关联根 Trace 或子 Run，以及异步创建语义；访问核验日期 2026-07-28。",
+    "LangSmith 当前 Compare Experiment Results：https://docs.langchain.com/langsmith/compare-experiment-results 。核对基于共同数据集的逐例改善/回归、输出 diff 和反馈列比较；访问核验日期 2026-07-28。",
+    "LangSmith 当前 Online Evaluations：https://docs.langchain.com/langsmith/online-evaluations 。核对生产 Run 过滤、采样、回填和评估日志；访问核验日期 2026-07-28。",
+    "Langfuse 当前 Scores Data Model：https://langfuse.com/docs/evaluation/scores/data-model 。核对 Score subject、类型、source、comment、idempotency 和不可变 ScoreConfig；访问核验日期 2026-07-28。",
+    "Langfuse 当前 Experiments Data Model：https://langfuse.com/docs/evaluation/experiments/data-model 。核对 DatasetItem、sourceTraceId、DatasetRun、DatasetRunItem、Trace 和 Score 的关系；访问核验日期 2026-07-28。",
+    "Langfuse 当前 User Feedback：https://langfuse.com/docs/observability/features/user-feedback 。核对显式反馈与 copy/retry/accept 等隐式行为的不同可信度；访问核验日期 2026-07-28。",
+    "Langfuse 当前 Datasets：https://langfuse.com/docs/evaluation/experiments/datasets 。核对生产 Trace 入数据集和按时间版本读取；访问核验日期 2026-07-28。",
+    "Langfuse 2026-04-13 Experiments as a First-Class Concept：https://langfuse.com/changelog/2026-04-13-experiments-rebuild 。核对 v4 中 Dataset 与不可变 Experiment 执行快照分离；当前文档另行交叉验证。",
+    "Langfuse 2026-06-10 Scores API v3：https://langfuse.com/changelog/2026-06-10-scores-v3-api 。核对 typed value、显式 subject、author/source/experiment 查询及 v2 废弃；当前 API 文档另行交叉验证。",
+    "Langfuse 2026-07-07 Experiment Public API and MCP：https://langfuse.com/changelog/2026-07-07-experiments-public-api-and-mcp 。核对实验和逐项结果的当前查询、导出与回钻能力；当前 API 文档另行交叉验证。",
+    "Phoenix 当前 Annotations Concepts：https://arize.com/docs/phoenix/tracing/concepts-tracing/annotations-concepts 。核对 categorical/continuous/freeform、Human/LLM/Code 来源及生产注释进入数据集；访问核验日期 2026-07-28。",
+    "Phoenix 当前 Datasets & Experiments Overview：https://arize.com/docs/phoenix/datasets-and-experiments/overview-datasets 。核对 Dataset、Task、Evaluator、Score 和固定测试套件关系；访问核验日期 2026-07-28。",
+    "Phoenix 当前 Evaluator Traces：https://arize.com/docs/phoenix/evaluation/llm-evals/evaluator-traces 。核对 evaluator 的 OTel Trace、精确 Prompt、模型执行、分数和耗时可见性；访问核验日期 2026-07-28。",
+    "Braintrust 当前 Datasets：https://braintrust.dev/docs/annotate/datasets/index 。核对可版本化、可固定到实验的数据集；访问核验日期 2026-07-28。",
+    "Braintrust 当前 Compare Experiments：https://braintrust.dev/docs/evaluate/compare-experiments 。核对 baseline、comparison key、逐例 delta、改善/回归、trial 和同 dataset 选择；访问核验日期 2026-07-28。",
+    "Braintrust 当前 Capture User Feedback：https://braintrust.dev/docs/instrument/user-feedback 。核对 rating、correction、comment、metadata，以及多次反馈追加而非覆盖；访问核验日期 2026-07-28。",
+    "Braintrust 当前 Score Production Traces：https://braintrust.dev/docs/evaluate/score-online 。核对异步在线评分、sampling、Trace/Span scope、重试、部分失败和未评分边界；访问核验日期 2026-07-28。",
+    "W&B Weave 当前 Evaluations：https://docs.wandb.ai/weave/guides/core-types/evaluations 。核对 Evaluation、Dataset、Scorer、Model/Function、独立 evaluation run 和多 trial；访问核验日期 2026-07-28。",
+    "W&B Weave 当前 Datasets：https://docs.wandb.ai/weave/guides/core-types/datasets 。核对 Dataset 发布、引用和版本化；访问核验日期 2026-07-28。",
+    "W&B Weave 当前 Feedback：https://docs.wandb.ai/weave/guides/tracking/feedback 。核对 Call 外部 feedback object、reaction、note、custom payload 和 human annotation；访问核验日期 2026-07-28。",
+    "Writer 当前实现：executor/app/routers/screenplay.py、executor/app/platform/core/db/__init__.py、evolution/app/eval_agent/scoring.py、evolution/app/eval_agent/rubrics/xianxia.py、evolution/app/eval_agent/sealer.py、evolution/app/promote/judge.py、evolution/app/promote/repo.py、evolution/app/promote/promote.py、evolution/app/benchmark/runner.py、evolution/app/evolve/api.py、evolution/app/versioning/registry_repo.py、evolution/harnesses/repo/registry.json 与 evolution/desktop。用于核对运行后信号丢失、图像反馈、卷宗封存、评分契约、benchmark、发布和 UI 现状。"
+  ],
+  "standard_maturity": "五个成熟平台已形成一致的产品级实践：反馈/注释是可独立追加的记录，离线实验固定数据集和评估配置，生产评分与离线评估分开，比较必须能对齐相同 case，评估器本身也需要可观测。LangSmith、Phoenix、Braintrust 和 Weave 的相关能力是正式当前功能；Langfuse v4 的 first-class Experiments、2026-06 Scores API v3 和 2026-07 Experiment API 仍在快速演进，但当前契约已有官方文档。尚无 vendor-neutral 标准统一定义 Agent Outcome、ArtifactRevision Score、Evaluator provenance、Experiment uplift 和 ReleaseOutcome 全链，因此 Writer 应自有最小稳定契约，只在 Trace/Span 关联层复用开放标准。",
+  "conflicts_with_writer": [
+    "LangSmith、Langfuse 和 Braintrust 允许把晚到反馈直接附加到 Trace/Run/Span；Writer 已确认 Trace 结束后不可重开，且当前 recorder sequence 会清理。取舍是保留 source_trace_id 关联，但把晚到事实写 OutcomeRecord/ScoreRecord，不再追加 trace jsonl。",
+    "工业平台常把 Score target 限于 Trace、Observation、Session 或 Experiment；Writer 的内容质量、人工采用和编辑必须针对准确 ArtifactRevision，评估报告又需绑定 EvaluationDossier。内部契约必须比外部平台多这两个 subject。",
+    "通用产品容许项目自由选择 0-1、0-100、类别或文本；Writer 当前 28 维已明确 1-5 且 0=无法判断，却有旧 0-1 schema 与阈值。先统一量纲和 unknown 语义是硬前置，不能靠 UI 适配掩盖。",
+    "Langfuse v4 允许无数据集实验并跨不同数据源比较，Braintrust 也支持自动选择基线；Writer 为保证可解释性只把相同 dataset revision、case、evaluator bundle 的配对结果称为 uplift，其他对比标 incompatible。",
+    "Braintrust/LangSmith 的在线评分自动化、采样、回填和 scorer 托管适合高流量工业平台；Writer 当前核心是创作、卷宗、评估、进化和发布闭环。第一阶段只保留独立评估 Trace、失败/覆盖语义和可选批处理，不建设常驻在线 evaluator 平台。",
+    "Braintrust 可在父 Span 聚合多条反馈，平台 UI 常显示均值；Writer 的人工评分和修订必须追加且可审计，聚合只在查询时计算，不能覆盖个人评分或把不同 rubric 混合平均。",
+    "工业平台可把实验分数直接接 CI/CD gate；Writer 的 rubric 明示 uncalibrated，且现有 scorer reader 已断裂。当前只能人工决策，先校准、修复契约并冻结 evaluator bundle 后才可能引入门禁。",
+    "Writer 图像反馈已直接内嵌 images 表，写作反馈却尝试追加 Trace；两者都不应被某一工业产品的数据模型牵引。统一 Outcome/Score 语义后保留各域制品表，使用 artifact_revision_id/source_trace_id 关联即可。",
+    "工业实验产品通常不负责 git registry、executor reload 和真实激活；Writer 不能把 experiment improved 或 registry production 指针等同于上线成功，必须保留 ReleaseDecision、activation ACK、观察和 rollback 的自有状态。"
+  ],
+  "uncertain": []
+}

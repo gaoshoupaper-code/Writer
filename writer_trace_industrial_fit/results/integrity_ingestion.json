@@ -1,0 +1,165 @@
+{
+  "mechanism_name": "完整性与可靠摄入",
+  "primary_problem": "在 executor 事件经过本地缓冲、完成通知、evolution 增量拉取、重复通知、乱序和失败重试后，仍能验证同一 Writer 运行是否收到且只解释了一份一致的事件事实；同时把传输结构完整性 Integrity 与任务证据覆盖 Coverage 分开，避免把“没有发现缺口”误写成“创作、卷宗、评估和发布证据已经完整”。",
+  "evidence_objects": [
+    {
+      "对象": "OpenTelemetry Collector",
+      "成熟度": "Collector 的发送队列、失败重试、批处理和 file_storage 持久队列是成熟的遥测韧性组件；官方明确队列满、重试窗口耗尽、进程或磁盘故障仍可丢数据，持久队列也不是业务恰好一次提交日志。",
+      "可核验边界": "可借鉴内存队列与持久队列分层、指数退避、背压指标和失败不阻断主业务；不能据此证明 Writer 事件无重复、无序号缺口、已见终态或契约覆盖完整。"
+    },
+    {
+      "对象": "OTLP",
+      "成熟度": "截至 2026-07-28，OTLP 1.11.0 的 Trace、Metric、Log 传输为稳定；协议区分成功、部分成功、可重试失败和不可重试失败，并要求客户端对瞬时失败退避。",
+      "可核验边界": "请求成功只确认该 OTLP 请求的接收结果；partial success 不应把整批盲目重试。协议不定义 Writer 的业务 sequence、连续前缀、终态清单、artifact 血缘或 Coverage 分母，因此只能作为可选遥测出口。"
+    },
+    {
+      "对象": "Langfuse ingestion",
+      "成熟度": "Langfuse 当前官方观测栈支持客户端自定义 trace/observation 标识、批量摄入、异步 SDK 缓冲以及 flush/shutdown，并提供原生 SDK 与 OpenTelemetry 摄入路径。",
+      "可核验边界": "[不确定] 当前公开文档未给出可供 Writer 依赖的端到端至少一次 SLA、跨批 sequence 缺口证明、终态清单或 Coverage 契约；历史 ingestion API 的事件 ID、逐项成功/错误响应与当前 OpenTelemetry 路径之间的精确去重语义也不应在未做版本锁定和集成测试前视为业务保证。"
+    },
+    {
+      "对象": "LangSmith ingestion",
+      "成熟度": "LangSmith Python SDK 当前正式版本为 0.10.10（2026-07-23）；官方 SDK 使用客户端 run UUID、trace_id、parent_run_id 与 dotted_order，支持 create/update、后台批量队列、重试和显式 flush，适合高吞吐观测摄入。",
+      "可核验边界": "[不确定] LangSmith 公共产品文档没有把服务端重复请求合并、创建与更新竞态、后台队列退出和 SaaS 持久化表述为 Writer 可审计的恰好一次契约；SDK 侧队列满或最终发送失败仍可能丢观测数据，因此只能作为兼容导出。"
+    }
+  ],
+  "writer_classification": "Writer 核心",
+  "writer_problem_match": "Writer 已有真实的可靠摄入骨架：executor 为每条事件生成 trace_id、event_id 和单调 sequence，先写本地 JSONL，终态 flush 后通知 evolution；evolution 返回 accepted 后后台按 ingested_seq 调用 since_seq 增量拉取，重复摄入时合并旧事件并重投影，通知失败由定时 scan 补漏。随后 runs 进入证据卷宗编译，只有 ready 卷宗才可评估，评估卷宗再被进化会话永久绑定并连接到 registry/git 发布。当前关键缺口是 ingested_seq 取已见最大 sequence 而非连续前缀、没有显式缺口与冲突记录、事件表缺少业务唯一约束和原子摄入收据、并发重复通知可能同时摄入；因此 completed 与 ready 之间还缺少可验证的 Integrity 闸门。",
+  "adoption_decision": "改造后采用",
+  "minimal_writer_form": [
+    "事件信封继续使用现有 trace_id，并强制每条事件具有稳定 event_id、从 1 单调递增的 sequence、schema_version、type、timestamp、status、payload 或 payload_ref+sha256；同一逻辑事件重试不得生成新 event_id。",
+    "executor 本地追加日志仍是跨服务摄入前的短期修复源。只有待写事件同步 flush 成功、sequence 固定后才写 terminal 事件与终态清单；清单至少包含 terminal_status、final_sequence、event_count、terminal_event_id 和事件序列摘要。观测写盘失败不打断创作，但必须把 delivery_status 标为 degraded/failed 并告警。",
+    "notify 保持低延迟提示而非事实载荷，允许至少一次发送和重复到达；evolution 仍主动 pull。首次与补拉均返回源端 run 摘要，使接收端能比较 final_sequence、event_count、终态和摘要，而不是只相信 HTTP 202。",
+    "evolution 以 trace_id+event_id 和 trace_id+sequence 建唯一约束并做幂等 upsert：同键同摘要视为重复成功；同键不同载荷视为 integrity_conflict，保留冲突事实并停止把该 run 提升为完整。",
+    "把 ingested_seq 改成 contiguous_seq，即从 1 开始无缺口的最大连续前缀；另存 max_seen_seq 与 missing_ranges。收到 1、2、4 时 contiguous_seq 只能是 2，下一次从 2 补拉，不能因 max=4 跳过 3。乱序事件可先暂存，补齐后再推进连续水位。",
+    "单次摄入在一个数据库事务中完成事件 upsert、连续前缀/缺口重算、run 状态更新、节点重投影版本和 ingestion receipt；同一 trace 使用进程内锁或数据库租约串行化，避免两个 BackgroundTask 互相 DELETE+INSERT。",
+    "Integrity 闸门仅在 run_start 存在、event_id/sequence 唯一、序号连续、声明数量相符、终态合法且清单摘要一致时为 verified；否则为 incomplete、conflict 或 unknown。只有 verified 的 executor trace 才允许证据卷宗进入 ready，失败或明确降级只能生成 partial/failed。",
+    "Coverage 继续由证据卷宗契约矩阵计算，不与 Integrity 合并。适用项分 covered、missing、unknown、not_applicable；not_applicable 必须带规则与理由，unknown 不能算 covered。报告 verified_coverage=covered/applicable_total 与 possible_coverage=(covered+unknown)/applicable_total 两个边界，并单列 missing/unknown 数量。"
+  ],
+  "explicit_non_goals": [
+    "不追求跨网络、跨数据库的恰好一次；采用可重试的至少一次投递加业务幂等，明确保留重复与未知窗口。",
+    "不引入 Kafka、Pulsar、通用 outbox 平台、分布式事务、全局事件总线或通用工作流引擎；Writer 当前 executor 本地日志、evolution pull 和 scan 足以承载修复窗口。",
+    "不把 Collector file_storage、Langfuse、LangSmith 或任何 SaaS 摄入队列升级为 Writer 稿件、证据卷宗、评估或发布真源。",
+    "不把 OTel SpanId、Langfuse observation ID 或 LangSmith run ID 替换现有 Writer trace_id、dossier_id、eval_attempt_id、eval_dossier_id、evolve session_id 和 git commit。",
+    "不为所有事件保存第二份完整大载荷；重复大正文继续使用受控引用、内容哈希和卷宗冻结，不因幂等需要复制稿件。",
+    "不把 completed 自动等同于完整、优质或可发布，也不以单一 Coverage 百分比掩盖 unknown、not_applicable 和 Integrity 失败。"
+  ],
+  "trace_boundary": [
+    "executor 用户生成 trace 从 run_start 开始，经 running/awaiting_input/resume，最终到 completed、failed 或 cancelled；awaiting_input 是可恢复中间态，不是终态。",
+    "evolution 自观测 trace 使用 running/completed/failed/cancelled/interrupted；interrupted 表示进程重启或心跳超时后的未知状态，必须由恢复或人工收敛，不可直接当成功、失败或完整终态。",
+    "Span/Node 配对完整性属于 trace 内部结构；Event 是可靠摄入和重建的最小事实单位。跨越摄入、卷宗、评估、进化、发布的长期链由业务对象 ID 与不可变版本连接，不靠一个无限长 trace。",
+    "终态清单是本次运行事件集合的封口证明，不是稿件内容质量证明；终态后允许追加用户复制/重生成等后置行为时，应使用独立 signal 流或提升 terminal_revision，不能悄悄改变已封口事件集合。"
+  ],
+  "async_causality": [
+    "executor complete/fail/cancel 与 evolution notify 是至少一次触发关系；HTTP 202 只表示任务已接收，不表示 trace 已完整入库。真正完成由 ingestion receipt 的 contiguous_seq、terminal_seen 和 integrity_state 表达。",
+    "重复 notify、scan 与手动补拉可以同时指向同一 trace，但都使用相同事件幂等键；接收端按 trace 串行化，attempt 只记录投递尝试，不复制业务事件。",
+    "重试拉取从 contiguous_seq 而非 max_seen_seq 继续；返回重叠窗口是允许的，接收端通过稳定键去重。若源端支持范围拉取，可优先请求 missing_ranges，仍保留重叠以处理边界竞态。",
+    "时间戳仅用于展示，因果与顺序以 sequence、parent/tool_call 关系和稳定业务外键为准；跨服务延迟、并发和时钟漂移不能用于判断丢失。",
+    "卷宗编译、评估和进化各自有独立幂等键：trace_id+compile_rule_version、eval_attempt_id、evolve session_id；上游重复投递不得重复创建下游不可变产物。"
+  ],
+  "agent_semantics": [
+    "Agent、Subagent、LLM、Tool、Skill、Middleware 和 HITL 的事件都服从同一事件信封与 sequence，不为每种类型建立独立投递协议。",
+    "Agent/Subagent、LLM 和 Tool 的 start 必须与 end/error/cancel/awaiting 配对；重试是新的 attempt span，但逻辑 operation_id 保持稳定，避免用最后一次成功覆盖之前失败。",
+    "Skill 只在实际加载/使用有可靠事件时计入 Coverage；Middleware 只在产生可验证业务效果时计入事实，单纯装配不等于覆盖。",
+    "HITL interrupt/awaiting 在 checkpoint 可恢复后记录，resume 仍在同一 executor trace 中推进 sequence；重复执行中断前副作用必须依赖工具业务幂等，而不是依赖摄入去重。",
+    "review-revise、并行 subagent 和 evaluation 子代理的结构完整性由配对、父子/dispatch 关系与 join 结果验证；是否满足写作契约仍由卷宗 Coverage 矩阵判断。"
+  ],
+  "artifact_lineage": [
+    "事件完整性链为 trace_id+sequence/event_id -> span/node/tool_call -> artifact logical path+revision+sha256；写文件成功事件只有在持久化并重新校验后才能声明产物 revision。",
+    "终态清单冻结事件集合边界；证据卷宗再以 dossier_id、trace_id、version、compile_rule_version、provenance 和 manifest 完整度冻结可评估事实。",
+    "评估尝试永久绑定 ready 的 source_dossier_id/source_dossier_version，成功后封存 evaluation_dossier；进化会话永久绑定 eval dossier，发布继续绑定 source_session、registry version、source_commit、parent_version 和回滚记录。",
+    "同一事件键载荷冲突、序号缺口、终态缺失或 artifact hash 不一致时，血缘可导航但不可标为 verified；后续对象必须保留 partial/unknown provenance，不能用重新编译掩盖源事实缺口。",
+    "OTLP、Langfuse 和 LangSmith 中的导出 ID 只作为外部观测回链引用，可删除或采样；Writer 业务血缘在第三方数据缺失时仍必须成立。"
+  ],
+  "capture_timing": [
+    "run_start 在 Agent 执行前落入本地追加日志；每个有副作用的模型/工具/产物事件在事实发生后分配唯一 sequence 并写缓冲，不能只靠结束时回忆重建。",
+    "append_event 可异步批量写盘，但终态前必须停止接收本 run 的新核心事件、drain 缓冲、fsync/等价持久化、核对连续 sequence，再写 terminal 事件和终态清单。",
+    "awaiting_input 在 checkpoint 可恢复后采集；resume 先记录恢复决定再继续运行。completed/failed/cancelled 只在所有在途核心 span 已收敛后采集。",
+    "evolution 每次摄入在事务提交时生成 receipt；缺口补齐或终态变化会生成新 receipt revision，但已接收原始事件不原地改写。",
+    "证据卷宗只能在源 trace 已见终态且 Integrity 已判定后编译；Integrity 未验证时可提前生成诊断性 partial，但不得进入 ready 或启动正式评估。"
+  ],
+  "payload_policy": [
+    "幂等键和清单只保存不透明 ID、序号、类型、状态、长度和 sha256；稿件、提示词、工具完整输入输出继续留在 Writer 受控存储，通过 payload_ref 回钻。",
+    "同键重复事件比较规范化信封与 payload hash；脱敏、截断和 reference_only 必须在哈希计算与验证规则中版本化，避免同一内容因处理顺序不同产生伪冲突。",
+    "凭据、Cookie、令牌、连接串和个人敏感信息在本地落盘及第三方导出前脱敏；第三方 exporter 默认关闭或按租户可禁用。",
+    "原始 trace 保留期至少覆盖 notify 失败、scan 和人工修复窗口；在 evolution receipt 已 verified 且超过修复期后才可清理。卷宗、评估卷宗和发布对象按各自治理周期保留。",
+    "访问原始载荷、冲突副本、缺口详情和完整稿件必须沿 owner/workspace 鉴权并审计；普通大盘只显示状态、计数和摘要。"
+  ],
+  "integrity_coverage": [
+    "Integrity 回答“这份事件流自身是否一致且封口”：至少校验 run_start、event_id 唯一、sequence 从 1 连续、同键载荷一致、声明 event_count/final_sequence 相符、span 配对、合法终态和终态摘要。结果使用 verified、incomplete、conflict、unknown；对无事件型对象才允许 not_applicable。",
+    "Coverage 回答“适用的创作与证据要求是否被观测和满足”：每个契约项使用 covered、missing、unknown、not_applicable。not_applicable 必须记录判定规则和理由；unknown 表示证据不足，不能折算为 covered 或 missing。",
+    "适用分母 applicable_total=covered+missing+unknown，not_applicable 排除。最低可验证覆盖率 verified_coverage=covered/applicable_total；可能覆盖上界 possible_coverage=(covered+unknown)/applicable_total，并同时展示四类计数。分母为 0 时覆盖率为 not_applicable，不显示 100%。",
+    "结构完整不等于语义覆盖：事件可以连续且终态正确，但因 Skill 未显式激活、产物未快照或契约项未执行而 Coverage 不完整；反之看到许多阶段事件也不能修复 sequence 缺口或载荷冲突。",
+    "当前 Writer 的 evidence dossier manifest 与 contract_coverage_matrix 应保留为 Coverage 真源，并新增 source_integrity 引用 ingestion receipt。ready 要求 Integrity verified、契约矩阵 complete 且无 coverage gaps；任一不满足只能 partial/failed。",
+    "完整性状态必须可回钻到 missing_ranges、duplicate_count、conflict_keys、terminal_manifest、receipt revision 和源端摘要；Coverage 必须回钻到 evidence_id、artifact revision 和判定规则。"
+  ],
+  "delivery_failure": [
+    "采用端到端可说明的至少一次尝试：executor 先持久化本地事件，再重复 notify/供 scan 拉取；evolution 成功事务提交后形成 receipt。HTTP 超时或确认丢失会造成重复，重复由业务幂等吸收，不宣称恰好一次。",
+    "通知失败、后台任务异常、拉取超时和 5xx 按指数退避并记录 attempt、next_retry_at、last_error；对 4xx、schema 不兼容和载荷冲突停止盲目重试，进入可见的 failed/conflict 状态。",
+    "背压时不得阻塞作者生成，但要优先保留 run、HITL、工具副作用、artifact hash、错误和 terminal 等核心事件；低价值 token 流与重复大载荷属于独立通道，可丢弃并记录 dropped_count。",
+    "队列满、写盘失败、flush 超时、源文件过早清理、executor 索引重启丢失和 evolution 数据库事务失败都必须有指标与日志；scan 只能修复源数据仍存在的缺口，不能把不可恢复丢失伪装成零事件。",
+    "OTLP partial success 不重试整批被拒绝数据；Collector/Langfuse/LangSmith 出口失败只影响兼容观测副本，不回滚 Writer 本地 trace、卷宗、评估或发布。",
+    "当前 evolution 按 max sequence 更新 ingested_seq 和 DELETE+INSERT 全量重投影的实现应收敛为连续水位、唯一约束、单事务与按 trace 串行；否则重复通知与乱序可能产生跳洞或竞态。"
+  ],
+  "metrics_scores_outcomes": [
+    "可靠摄入指标：notify 成功率、拉取成功率、端到端 ingest 延迟、contiguous_seq 与 max_seen_seq 差值、missing range 数量/年龄、重复率、冲突率、重试次数、队列利用率、丢弃事件数、终态未见时长和 receipt 未验证数量。",
+    "Integrity 指标按 verified/incomplete/conflict/unknown 计数；Coverage 同时报告 covered/missing/unknown/not_applicable 数量、verified_coverage 下界和 possible_coverage 上界，不只展示一个平均百分比。",
+    "执行 Outcome 仍分 completed/failed/cancelled/awaiting/interrupted；内容 Score 与评估 Outcome 只在评估卷宗封存，发布 Outcome 只在 registry/git/executor refresh 链终结。摄入成功不是质量分数。",
+    "跨版本分析只纳入 Integrity verified 且绑定明确 dossier/harness/model/evaluator 版本的样本；partial/unknown 可进入诊断统计，但不能静默混入正式基准分母。",
+    "告警优先级：载荷冲突、终态后事件突变、核心事件写盘失败为高；持续缺口、receipt 超时和扫描积压为中；第三方 exporter 丢弃为兼容层告警。"
+  ],
+  "explanatory_limit": [
+    "Integrity verified 能证明接收端拥有一份与源端终态清单一致、键唯一且序号连续的事件集合；不能证明未被 instrumentation 设计遗漏的行为，也不能证明稿件事实正确或质量优秀。",
+    "Coverage 能证明相对于已冻结适用分母，哪些契约项有证据、缺失、未知或不适用；不能证明被标 covered 的证据结论一定正确，仍需评估规则、冻结证据和人工判断。",
+    "至少一次加幂等能吸收重复请求，但不能保证副作用恰好一次；工具写文件、扣费、发布等副作用必须各自使用业务幂等和提交记录。",
+    "连续 sequence 只能发现编号流中的洞；如果生产端在分配 sequence 前就未采集某行为，序号仍可能连续，因此该问题属于 Coverage 或 capture_status，而非传输 Integrity。",
+    "终态清单能证明事件集合封口，但若终态前 flush 实际失败、摘要算法未版本化或源存储被篡改，仍需 delivery_status、算法版本和访问审计解释可信度。",
+    "OTLP、Langfuse 和 LangSmith 的成功响应、界面完整树或 flush 完成只覆盖各自客户端/服务边界，不能外推为 Writer 业务链已完整。"
+  ],
+  "writer_ui_impact": [
+    "运行详情增加轻量 Integrity 条：verified/incomplete/conflict/unknown、连续水位/源端终态序号、缺口区间、重复/冲突数和最后收据时间；缺口可触发补拉，不把空白显示为正常。",
+    "证据卷宗页把 source_integrity 与 contract Coverage 并列：Integrity 结构状态、covered/missing/unknown/not_applicable 四类计数，以及覆盖率下界/上界；只有满足 ready 闸门才显示可评估。",
+    "血缘视图继续展示 trace -> 证据卷宗版本 -> 评估卷宗 -> 进化会话 -> 发布版本；第三方 Langfuse/LangSmith/OTel 链接放诊断抽屉，不占据业务真源主链。"
+  ],
+  "official_sources": [
+    {
+      "来源": "OpenTelemetry OTLP 1.11.0 规范",
+      "地址": "https://opentelemetry.io/docs/specs/otlp/",
+      "用途": "确认稳定信号、成功/部分成功、可重试与不可重试错误、退避和背压边界。"
+    },
+    {
+      "来源": "OpenTelemetry Collector Resiliency 官方文档与 exporter helper 规范",
+      "地址": "https://opentelemetry.io/docs/collector/resiliency/ ; https://github.com/open-telemetry/opentelemetry-collector/blob/main/exporter/exporterhelper/README.md ; https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/extension/storage/filestorage",
+      "用途": "确认发送队列、retry_on_failure、file_storage 持久队列及仍存在的丢失窗口。"
+    },
+    {
+      "来源": "Langfuse 官方：OpenTelemetry、Trace ID/分布式追踪、SDK flush 与 ingestion API",
+      "地址": "https://langfuse.com/docs/observability/integrations/open-source/opentelemetry ; https://langfuse.com/docs/observability/features/trace-ids-and-distributed-tracing ; https://langfuse.com/docs/observability/sdk/python/advanced-usage ; https://api.reference.langfuse.com/#tag/ingestion",
+      "用途": "[不确定] 用于核对客户端 ID、异步批量/flush 和摄入响应；当前会话无法联网复核页面路径与最新服务端去重承诺。"
+    },
+    {
+      "来源": "LangSmith 官方：观测概念、分布式追踪、追踪数据配置与 Python SDK 0.10.10",
+      "地址": "https://docs.langchain.com/langsmith/observability-concepts ; https://docs.langchain.com/langsmith/distributed-tracing ; https://docs.langchain.com/langsmith/trace-with-langchain ; https://github.com/langchain-ai/langsmith-sdk/releases/tag/v0.10.10 ; https://github.com/langchain-ai/langsmith-sdk/blob/v0.10.10/python/langsmith/client.py",
+      "用途": "[不确定] 核对 run/trace 标识、后台批量、重试和 flush；公开资料未提供 Writer 所需的端到端 exactly-once、sequence gap 与 terminal manifest 契约。"
+    }
+  ],
+  "standard_maturity": [
+    "OpenTelemetry OTLP 1.11.0 的 Trace/Metric/Log 传输为稳定；Collector queue/retry/file_storage 是成熟运维能力，但可靠性仍受队列容量、存储和确认窗口约束，不是恰好一次。",
+    "LangSmith SDK 0.10.10 与 SaaS 观测摄入为成熟产品能力；其稳定 run ID、批量和 flush 可作为兼容对照，但服务端幂等、跨批完整性和业务终态保证不属于公开 Writer 契约。",
+    "[不确定] Langfuse 当前具体版本号及旧 ingestion API 与 OpenTelemetry 原生摄入路径的长期兼容状态未能在本会话联网复核；产品级批量观测能力成熟，但 Writer 不依赖其未公开的可靠性保证。",
+    "Writer 自有 trace_id、sequence、JSONL、since_seq、scan 和 dossier Coverage 已有可复用基础；需要补的是明确不变量与事务闸门，不需要更换基础设施。"
+  ],
+  "conflicts_with_writer": [
+    "工业遥测系统通常把“尽量送达且不影响应用”放在首位，允许采样、队列满丢弃和退出前未 flush；Writer 的卷宗、评估和进化输入不能接受这种隐式缺失，核心事件必须本地持久化并显式降级。",
+    "OTLP 不提供 Writer 业务 sequence、终态或 Coverage 分母；若直接把 Span 数量或 exporter success 当完整性，会让 ready 卷宗建立在不可验证假设上。",
+    "Langfuse/LangSmith 擅长可变 trace/run 观测与在线 feedback，Writer 的正式评估必须永久绑定 ready 证据卷宗并封存评估卷宗，不能从 SaaS 当前视图动态读取“最新 trace”。",
+    "当前 Writer 用最大 sequence 作为 ingested_seq，遇到乱序或中间缺口会越过未收到事件；必须改为连续前缀和 missing_ranges，不能照搬只关心最终展示的观测平台策略。",
+    "当前重复摄入通过删除 runs 后全量重写实现，缺少同键冲突检测和单事务串行保证；可靠幂等应保留一致重复、暴露不一致重复，而不是用最后写入覆盖事实。",
+    "为追求工业通用性引入消息中间件、全局 outbox 或恰好一次协议会扩大运维与一致性边界；Writer 当前只需让已有本地日志+pull+scan 链可证明、可修复、可降级。"
+  ],
+  "uncertain": [
+    "evidence_objects",
+    "official_sources",
+    "standard_maturity"
+  ]
+}

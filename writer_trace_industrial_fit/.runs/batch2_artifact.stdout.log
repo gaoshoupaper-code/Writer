@@ -1,0 +1,5 @@
+调研结果已写入 [artifact_lineage.json](D:/Desktop/Writer/writer_trace_industrial_fit/results/artifact_lineage.json)。
+
+验证脚本通过：字段覆盖率 `100%（22/22）`。因沙箱外网受限，`official_sources` 和 `standard_maturity` 已按要求标注 `[不确定]`。仅修改了指定 JSON 文件。
+
+本次更新了 docs/ 下：无需更新。

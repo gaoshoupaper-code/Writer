@@ -1,0 +1,195 @@
+{
+  "mechanism_name": "成熟 Agent 工程横向案例的最小可迁移观测机制",
+  "primary_problem": "用 Claude Code、Cursor、Hermes Agent、OpenClaw 和当前可验证的 Codex 运行环境校验 Writer 的 Trace 边界：哪些事实必须在 DeepAgent/Harness 和业务服务内部产生，哪些只是产品会话、Hook、诊断或外部 OTLP 投影；避免把成熟产品的通用平台能力、临时工作区或闭源内部实现误当成 Writer 的领域契约。",
+  "evidence_objects": [
+    {
+      "对象": "Claude Code",
+      "当前成熟度": "Session、Skills、Subagents、Hooks、Permissions 和 Checkpointing 为当前公开能力；OpenTelemetry monitoring/traces 明确为 beta，详细 Hook Span 还有额外 beta/组织限制。",
+      "可验证事实": [
+        "OTel 以一条用户 Prompt 为 claude_code.interaction 根边界，LLM、Tool、Hook 为嵌套操作，Agent 子任务嵌在父 Tool 下；Subagent 使用独立上下文且可恢复历史。",
+        "Session 连续写本地 JSONL 并可 resume/branch，但官方明确该 JSONL 是内部格式，可随版本变化；默认清理期为 30 天。",
+        "SKILL.md 可按相关性或显式命令加载，正文在实际使用时才进入上下文；Hook 生命周期覆盖 Tool 前后、失败、Subagent 起止、权限请求和压缩；Permission 是独立强制层。",
+        "Prompt、回复和 Tool 详情默认不导出；开启的 raw API body 仍会 redaction extended thinking。Checkpoint 只是局部、短期恢复，Bash/Subagent/外部修改并不保证可回滚。"
+      ],
+      "Writer 结论": "采纳有界运行、同步层级、显式生命周期和内容默认不外发的原则；不把 Claude JSONL、Checkpoint、Team、调度器或 beta OTel 字段作为 Writer 真相源。"
+    },
+    {
+      "对象": "Cursor",
+      "当前成熟度": "Agents Window 在 Cursor 3 公开 GA；Hooks 是 version: 1 的公开接口；其它能力依赖具体产品版本、Cloud Agent 和权限配置。",
+      "可验证事实": [
+        "Subagent 具备独立干净上下文、前台/后台执行与可恢复 agent ID；Cloud Agent 在独立 VM/branch 中运行并可异步通知结果。",
+        "Skills 支持自动发现或手动调用，Rules/AGENTS.md 作为持久上下文；Hooks 可在 Tool、Subagent、Shell、MCP、文件、压缩和 Stop 节点观察、修改或阻断，且存在明确配置优先级与 fail-open/fail-closed 行为。",
+        "afterAgentThought Hook 能提供完整 thinking 文本；这证明某些产品可暴露模型思维文本，但不构成 Writer 应采集它的理由。",
+        "Evals 是独立 harness/run，评分由外部 harness 完成；Analytics 另记录建议接受、PR 创建/合并等后续结果；Cloud 工作区、transcript、截图和工具调用都可能是临时或仅在 available 时存在。"
+      ],
+      "Writer 结论": "采纳显式 parent/root、异步新 Trace、有效 Hook 结果、人工批准/拒绝和运行后 Outcome 分离；禁止接入 CoT，禁止用临时 worktree/transcript 代替 ArtifactRevision，也不复制 Cloud VM、企业 Hook 分发或通用权限控制面。"
+    },
+    {
+      "对象": "Hermes Agent v2026.7.20",
+      "当前成熟度": "开源项目及官方文档可验证，当前 release 为 v2026.7.20；公开资料未给出可替代业务血缘的稳定 OTLP/Trace 域模型。",
+      "可验证事实": [
+        "README 公开支持隔离 Subagent、并行委派、会话检索、轨迹生成/压缩和跨会话记忆；这些说明运行、长期记忆与训练轨迹是不同对象。",
+        "Skills 采用渐进披露：skills_list 只列元数据，skill_view 才加载全文或引用文件；Skill 位于可变目录，Agent 可以修改或删除它，且技能可以由用户、Hub 或 Agent 创建。",
+        "安全文档把危险命令审批、文件写入、容器隔离、MCP 凭据过滤、上下文文件扫描和跨会话隔离拆成独立层；审批有 smart/manual/off 模式、超时和强制拒绝底线。",
+        "CLI 支持 retry、undo、context compress、stop 等操作，但这些是会话控制能力，不是对永久制品版本、业务发布或评估因果的承诺。"
+      ],
+      "Writer 结论": "Skill 必须在解析/激活时记录版本或内容 hash，审批/阻断必须记录请求、决定和生效结果；不引入自动 Skill 自我演化、技能市场、完整终端隔离或会话命令集。"
+    },
+    {
+      "对象": "OpenClaw v2026.7.1",
+      "当前成熟度": "开源项目、Gateway 文档和 diagnostics-otel 插件为当前公开能力；其诊断导出是 opt-in，采样和 Collector 行为决定外部副本的覆盖。",
+      "可验证事实": [
+        "Gateway 通过 diagnostics-otel 订阅进程内 diagnostics，并把模型运行、消息流、会话、队列和 exec 等事件导出为 OTLP metrics、traces、logs；Span 覆盖 model call、harness lifecycle、Skill、Tool、exec、webhook、context assembly 和 tool loop。",
+        "原始 Prompt、回复、Tool 输入输出、system prompt、skill 路径和 session key 默认不导出；内容采集逐类显式开启，且内容走可信 listener-only 通道。输入 traceparent 由 OpenClaw 自己的可信 model-call 上下文生成，调用方传入的 traceparent 会被替换以防伪造祖先关系。",
+        "root Trace 可按 sampleRate 丢弃，logs/metrics/traces 可独立开启；本地 JSONL 日志可带 traceId/spanId/parentSpanId，但日志滚动和 24 小时清理不是长期业务档案。",
+        "对 Claude CLI 和 Codex app-server 的调用，OpenClaw 只形成一个 synthetic turn-level model-call Span；文档明确它不代表底层 HTTP 请求、隐藏重试、Tool 工作或内部阶段。"
+      ],
+      "Writer 结论": "可采纳源端默认无正文、字段级显式授权、可信上下文传播和外部 CLI/网关只能记录其可见 turn 的边界；不把 OpenClaw plugin、OTLP 后端、session dashboard 或其 Agent runtime 纳入 Writer 核心。"
+    },
+    {
+      "对象": "Codex",
+      "当前成熟度": "本会话可直接观察到 Skills、AGENTS.md 指令和子代理协作等宿主能力；官方 Codex manual helper 在 2026-07-28 访问 developers.openai.com 时返回 HTTP 403，当前没有官方文档 MCP，因此不把无法复核的产品内部实现当证据。",
+      "可验证事实": [
+        "当前环境可见 Skill 加载、项目 AGENTS.md 约束、受控 shell/tool 调用和协作子代理，但这些仅证明当前运行环境提供相应接口。",
+        "没有可访问的一手资料证明 Codex 内部 Trace schema、Hook 顺序、保留期、exactly-once 投递、制品血缘、评估实验或发布回滚因果，因此它们均不从会话行为推断。"
+      ],
+      "Writer 结论": "只把当前可观察到的 Skill/指令/协作边界作为交叉验证，不采用任何未经官方资料验证的 Codex Trace 细节；后续获得官方资料后再单独重新验收。"
+    }
+  ],
+  "writer_classification": "Writer 核心",
+  "writer_problem_match": [
+    "executor 的创作 Agent 需要在 DeepAgent/Harness 内记录根运行、同步 Subagent/LLM/Tool、实际 Skill 激活和 Middleware 有效干预，而不能从模型网关、会话 transcript 或 Agent 名称倒推。",
+    "evolution 的证据编译、评估和进化需要各自建立有界 Trace，并通过来源 Trace、ArtifactRevision、EvidenceDossierVersion、EvaluationDossier、Experiment 和 ReleaseVersion 形成跨流程因果链。",
+    "当前 contracts/trace/__init__.py 的 JSONL 事件、executor recorder 和 evolution 摄入适合成为迁移起点，但现有 agent_name 聚合、mutable workspace Artifact 读取和缺少显式 Skill/Middleware/Span Link 语义，无法满足上述边界。",
+    "开发者和内部质量人员需要既能看单次运行与干预事实，也能追到稿件、卷宗、评分、候选版本和发布结果；产品会话、Cloud PR 或诊断 UI 只能提供旁证。"
+  ],
+  "adoption_decision": "改造后采用",
+  "minimal_writer_form": [
+    "以 Writer 内部版本化 Trace Contract 为唯一真源：一次创作请求一条根 Trace；证据编译、评估、进化各自新建根 Trace；同步 Tool/Subagent 是当前 Trace 的子 Span；异步工作只通过 SpanLink、source_trace_id 和业务对象外键关联。",
+    "在 Skill loader 成功解析并决定激活时写 SkillActivation：skill_id、来源、manifest/version、content_hash、自动或手动触发、触发位置、作用 Span、开始/结束/失败。可用目录清单不等于实际激活。",
+    "在 Harness 装配时固定 MiddlewareAssembly（有序 name、version、config_hash、启用状态）；只有实际修改、阻断、路由、重试、缓存命中、压缩、HITL、短路或故障降级时写 Intervention，并保存 before/after 的 PayloadObject 引用、决定来源和结果。",
+    "将允许的完整 Prompt、稿件和 Tool 语义写入 PayloadObject；所有稿件、卷宗、评分结果和候选配置在产生时冻结为不可变 ArtifactRevision 或相应版本对象。历史详情不得重新读取 mutable workspace。",
+    "把人工批准/拒绝、终止、复制、重新生成、最终采用、编辑差异、人工评分、评估分数、实验 uplift、发布/回滚写成后续 Outcome/Score/Release 事实，而不是向已结束 Trace 追加伪 Span。",
+    "内部 recorder 先持久化 canonical 事件；OTLP/OpenInference 或外部平台只从 PayloadGate 后异步、单向投影低敏结构和 external_refs。"
+  ],
+  "explicit_non_goals": [
+    "不引入 Claude Code Agent Teams、Session branch/resume、Checkpoint、Cursor Cloud VM/worktree/PR、Hermes 自我生成 Skill/技能市场、OpenClaw Gateway/插件运行时或 Codex 未公开 Trace 作为 Writer 功能。",
+    "不建立通用 Hook 脚本市场、企业级多层策略分发、命令 allowlist、沙箱平台、外部 webhook 编排、跨产品 Skill 目录兼容或远程桌面控制面。",
+    "不保存 Cursor afterAgentThought、Claude extended thinking、模型 chain-of-thought 或任何仅为产品调试暴露的内部推理文本。",
+    "不把 session transcript、JSONL、临时 worktree、PR、截图、视频、CLI turn、供应商调用树或外部 dashboard 当作 Trace、ArtifactRevision、EvidenceDossier、Evaluation 或 Release 的主键或唯一事实。",
+    "不因案例有 OTel、日志或训练轨迹就建设多厂商 SDK、任意 dashboard、全量历史导入、双向同步、exactly-once 外部导出或长期无限制内容留存。"
+  ],
+  "trace_boundary": [
+    "成熟案例共同支持有界用户运行：Claude Code 的一条 user prompt、Cursor 的 Agent/Subagent run、Hermes 的会话 turn、OpenClaw 的 harness/run/model call 都不是跨整个产品生命周期的一条无限 Trace。Writer 应坚持一次创作请求一条根 Trace。",
+    "同步 DeepAgent 子代理、LLM、Tool 和运行内 Hook/Middleware 归于同一根 Trace；后台 Cloud Agent、Webhook、证据编译、评估、进化、HITL resume 和发布在自身开始时创建新的 Trace。",
+    "Trace 是运行事实，ArtifactRevision/EvidenceDossier/Evaluation/Experiment/Release 是长期领域对象。产品 Session、checkpoint、worktree 或诊断日志不能折叠为任一领域对象。",
+    "OpenClaw 对外部 Claude/Codex 只看见一个 opaque turn，直接说明外部包装层无法还原 DeepAgent 内部拓扑；Writer 必须以自己的运行时采集为准。"
+  ],
+  "async_causality": [
+    "异步目标 Trace 在创建时记录 source_trace_id、triggered_by、input ArtifactRevision、来源卷宗/评估/实验 ID 和 idempotency key；同时保留 SpanLink，但不伪造 remote parent-child。",
+    "同步可信服务调用可传播 W3C traceparent；像 OpenClaw 一样由 Writer 生成可信上下文，不接受不受信调用方的 traceparent/baggage 作为业务祖先，也不在 header 传播正文、密钥或可反查的敏感业务 ID。",
+    "异步投递、Webhook、后台子任务、HITL 恢复和 exporter 重试都应有 received/accepted/started/finished/failed 状态与稳定事件 ID；投递重试不会重复产生业务运行或吞没来源关系。",
+    "Cursor Cloud webhook 与 Hermes/OpenClaw 会话恢复只能证明异步运行需要显式关联和重试状态，不能替代 Writer 对证据、评估、进化和发布的业务因果账本。"
+  ],
+  "agent_semantics": [
+    "Agent 根 Span：记录服务、workload、purpose、agent role、effective configuration/version、输入制品引用、终态和根原因；Subagent Span 记录 parent/root、agent type、委派输入/输出制品引用和终态。",
+    "LLM Span 记录请求发起/可见结束、模型配置、usage、成本、逻辑 attempt 和 PayloadObject 引用；Tool Span 仅在真实 handler 执行时记录，模型提出 tool call 不等于 Tool 成功。",
+    "SkillActivation 与 MiddlewareAssembly/Intervention 是一等事件，而不是从 read_file、agent_name 或日志字符串推测。正式记录的介入包括修改、阻断、路由、重试、缓存、压缩、HITL、短路及其效果；no-op 不进入干预指标。",
+    "HITL 是独立请求/决定/恢复事实，必须记录 policy/version、请求对象、批准/拒绝/超时和实际执行结果；审批机制本身不等价于安全或质量成功。",
+    "Claude/Cursor/Hermes/OpenClaw 都说明 Hook、权限、Skill 和 Tool 是不同生命周期点；没有一个产品提供可直接复用的 Writer 统一语义，因此内部契约必须明确而不依赖 vendor 命名。"
+  ],
+  "artifact_lineage": [
+    "创作输出、证据卷宗输入/输出、评估输入/输出、候选配置和发布结果在产生时形成不可变 revision；Trace 仅引用 revision ID、content hash 和 PayloadObject ID。",
+    "DAG 主链为 Trace -> ArtifactRevision -> EvidenceDossierVersion -> EvaluationDossier/ScoreRecord -> EvolutionSession/Experiment -> ReleaseVersion/rollback，并允许复制、重新生成、人工编辑和最终采用作为带时间的边。",
+    "Claude Checkpoint 明确不是版本控制替代，Cursor worktree/Cloud artifact 可清理，Hermes Skill 可被 agent 修改，OpenClaw 日志会滚动；这些产品事实支持 Writer 不能依赖 mutable filesystem 或临时 session 保存历史证据。",
+    "外部 ID、provider response、OTel trace/span、webhook run 与 dashboard URL 只能作为 external_refs；删除或 retention 到期不影响内部 DAG，反之亦然。"
+  ],
+  "capture_timing": [
+    "根 Trace 与 immutable input ArtifactRevision 在请求接受时建立；MiddlewareAssembly 在 DeepAgent/Harness 完成装配时记录；SkillActivation 在匹配、读取并决定激活时记录，而非事后从文件访问猜测。",
+    "LLM 在请求出站前固定 effective input 引用和 logical_call_id，在流完成、取消或失败时结束；Tool 在真实 handler 进入/退出时记录；Intervention 在实际改变、阻断或决定发生的原子点记录。",
+    "ArtifactRevision 在写入成功、卷宗编译输出、评估结果落盘和候选配置冻结时创建；人工行为、评分、采用、发布或回滚发生时创建独立 Outcome/Score/Trace。",
+    "OTLP/exporter 只读取已封口 canonical 事件并异步投影。外部晚到或采样数据不重新打开 Writer Trace，不覆盖原始状态或完整性。"
+  ],
+  "payload_policy": [
+    "内部完整载荷遵守已冻结策略：保存分析所需完整 Prompt、稿件和 Tool 语义内容，但入口硬拒绝 secret、Authorization、Cookie、环境变量、CoT、embedding、二进制和媒体正文；拒绝/遮盖决策本身留审计。",
+    "PayloadObject 保存加密内容、类型、hash、访问策略、生命周期、来源 Span 和 redaction 结果；Trace 热索引只放结构、摘要、大小、hash 和引用。授权查看、搜索、导出必须形成访问审计。",
+    "OpenClaw、Claude Code 的默认 no-body 导出和 Cursor 可暴露 afterAgentThought 共同说明：正文采集须显式、字段级、来源端受控；不以外部 exporter 开关或 Hook 是否可见决定 Writer 允许采什么。",
+    "外部兼容导出固定 no-body allowlist，仅含低敏状态、耗时、token/cost 摘要、模型、错误类别、mapping version 和 opaque correlation ID；完整正文仅在 Writer 内部按 90 天默认生命周期保存，数据集/实验快照按明确选择封存。"
+  ],
+  "integrity_coverage": [
+    "完整性按内部 event sequence、必需根/终态、父子关系、来源链接、关键版本与制品引用、PayloadObject 可解析性计算；缺任一关键事实为 integrity_incomplete，证据、评估和进化不得消费。",
+    "coverage 单独表达可选 token/cost、外部 ID、网络指标、OTLP 接收、导出、采样、截断和 retention 状态。0、unknown 和 not_applicable 互不等价。",
+    "Cursor 可用时才有的 Cloud transcript/tool 调用、OpenClaw root sampling、Claude beta OTel、临时 worktree/JSONL 及未公开 Codex 内部过程只能导致 external/diagnostic coverage partial 或 unknown，绝不把内部 Trace 补成 complete。",
+    "历史 JSONL Trace 只能迁移可证明字段；未能恢复的 parent、Tool 参数、Skill 激活和制品 revision 标为 legacy/unknown，不用默认名称、路径或 Agent 名称填补。"
+  ],
+  "delivery_failure": [
+    "创作端 recorder 以本地持久缓冲、稳定 event_id、至少一次投递和接收端幂等为准；远端采集失败不阻断创作，但根 Trace 标记 trace_incomplete，并记录缺口、最后错误和 dropped 数。",
+    "证据编译、评估和进化在发现来源 integrity_incomplete 时必须拒绝消费；这是 Writer 的领域闸门，不把 Claude/ Cursor/ Hermes/ OpenClaw 的会话恢复或日志成功当作替代。",
+    "同一运行可有业务 retry_of 和运输/export retry 两类重试：前者产生明确逻辑 attempt/Link，后者保持相同 canonical identity 并去重；乱序、重复、背压和永久失败均显式计数。",
+    "外部 OTLP、网关或诊断插件失败 fail-open；其队列/采样/Collector 失败只影响兼容副本。模型主路径或真实 Tool 失败则按自身 Span 失败与终态处理，不被观测错误掩盖。"
+  ],
+  "metrics_scores_outcomes": [
+    "公共运行指标包括完成/失败/取消、耗时、错误/重试、Token、成本、Span 数/深度、完整性、coverage、版本和载荷治理。每项指标带 workload、公式版本、来源与缺失语义。",
+    "创作 Profile 加 Skill/Tool/Subagent/HITL/Intervention、ArtifactRevision、复制/重生成/采用、人工编辑差异和质量信号；证据编译、评估、进化各自保留专属 Profile，不混进一个排行榜。",
+    "Cursor 的 Evals 与 Analytics、Claude skill-creator 的 benchmark/A-B、Hermes trajectory 都支持把运行、评分和后续结果分开，但它们不提供 Writer 所需完整 release/rollback 因果；Writer 自己保存 rubric/evaluator/model/version、sample、uplift、置信度、最终采用与发布结果。",
+    "弱 Outcome（复制、重生成、编辑量）只作相关信号；人工评分、版本化评估和最终采用更强。采样/unknown/legacy 数据不得静默进入进化门禁或归因结论。"
+  ],
+  "explanatory_limit": [
+    "该机制能解释：一次 Writer 运行做了什么、哪个 Agent/Skill/Middleware/HITL 真实介入、有效输入输出制品及版本为何、后续评估和发布结果如何关联。",
+    "它不能证明模型内部推理、CoT、外部模型请求的隐藏 retry、第三方平台未接收的事件、临时工作区以外的副作用，或仅由时间相邻推断的业务因果。",
+    "Claude beta OTel、Cursor Hook/transcript、Hermes 会话/轨迹、OpenClaw diagnostics 和当前 Codex 宿主行为均可辅助诊断，但不能自动发现 Writer 的证据卷宗、ArtifactRevision、Middleware 有效修改或发布血缘。",
+    "没有公开案例可证明完整的 stable vendor-neutral Skill revision、Middleware 全局顺序、Payload revision、quality uplift 和 release rollback 统一模型；这不是缺陷要由产品猜补，而是 Writer 必须自定义并版本化的契约边界。"
+  ],
+  "writer_ui_impact": [
+    "运行观测工作台显示单次根 Trace 的调用树、时间线、完整性、coverage、版本快照、SkillActivation、MiddlewareAssembly/Intervention、HITL 和按需 PayloadObject；不混入长周期评估或发布统计。",
+    "血缘 DAG 显示创作 Trace 到 ArtifactRevision、卷宗、评估、实验、Release/rollback 的可导航关系及失败/不完整节点；不以 session transcript、PR 或临时 worktree 填图。",
+    "分析工作台按创作、证据、评估、进化和观测管道分别呈现 Profile、版本切片、Outcome/Score 与数据质量；外部 OTLP/产品 Trace 仅显示 coverage、external_ref 和受控外链。",
+    "权限界面只需支持完整载荷查看/搜索/导出审计和必要的人工 Score；不重建产品 Teams、Cloud Agent、沙箱、命令权限或通用 dashboard。"
+  ],
+  "official_sources": [
+    {
+      "来源": "Claude Code Monitoring、Sessions、Subagents、Skills、Hooks、Permissions、Checkpointing",
+      "地址": "https://code.claude.com/docs/en/monitoring ; https://code.claude.com/docs/en/sessions ; https://code.claude.com/docs/en/sub-agents ; https://code.claude.com/docs/en/skills ; https://code.claude.com/docs/en/hooks ; https://code.claude.com/docs/en/permissions ; https://code.claude.com/docs/en/checkpointing",
+      "用途": "确认 user-prompt 根边界、运行内层级、可变 JSONL、Skill 加载、Hook/Permission 生命周期、默认内容导出和 checkpoint 局限。"
+    },
+    {
+      "来源": "Cursor Subagents、Skills、Rules、Hooks、Run Modes、Cloud Agent、Evals、Analytics、Worktrees、Webhooks",
+      "地址": "https://cursor.com/docs/subagents ; https://cursor.com/docs/skills ; https://cursor.com/docs/rules ; https://cursor.com/docs/hooks ; https://cursor.com/docs/agent/security/run-modes ; https://cursor.com/docs/cloud-agent ; https://cursor.com/docs/evals ; https://cursor.com/docs/account/teams/analytics ; https://cursor.com/docs/configuration/worktrees ; https://cursor.com/docs/cloud-agent/api/webhooks",
+      "用途": "确认 Subagent/异步边界、Skill/Rule、Hook 可观察与阻断、afterAgentThought、独立 eval run、采用结果和临时 Cloud 制品局限。"
+    },
+    {
+      "来源": "Hermes Agent README、Skills System、Security、最新 release",
+      "地址": "https://github.com/NousResearch/hermes-agent ; https://hermes-agent.nousresearch.com/docs/user-guide/features/skills ; https://hermes-agent.nousresearch.com/docs/user-guide/security ; https://github.com/NousResearch/hermes-agent/releases/tag/v2026.7.20",
+      "用途": "确认隔离 Subagent、轨迹/会话区分、渐进披露与可变 Skill、审批/阻断/会话控制边界。"
+    },
+    {
+      "来源": "OpenClaw Gateway OpenTelemetry export、Logging、Skills、最新 release",
+      "地址": "https://docs.openclaw.ai/gateway/opentelemetry ; https://docs.openclaw.ai/logging ; https://docs.openclaw.ai/tools/skills ; https://github.com/openclaw/openclaw/releases/tag/v2026.7.1",
+      "用途": "确认进程内诊断到 OTLP 的单向导出、默认 no-body、可信 traceparent、采样、外部 Claude/Codex CLI 的 synthetic turn 限制和日志留存边界。"
+    },
+    {
+      "来源": "Codex 官方 manual helper 的本次访问结果与当前受控运行环境",
+      "地址": "C:/Users/h2640/.codex/skills/.system/openai-docs/scripts/fetch-codex-manual.mjs ; https://developers.openai.com/codex/codex-manual.md",
+      "用途": "2026-07-28 helper 对官方 URL 返回 HTTP 403；仅据此和当前会话可见 Skills/AGENTS/subagent 接口界定可验证边界，不断言未公开运行时实现。"
+    },
+    {
+      "来源": "Writer 当前实现与既有核心研究结论",
+      "地址": "contracts/trace/__init__.py ; executor/app/platform/trace/recorder.py ; evolution/app/trace/recorder.py ; evolution/app/core/db.py ; writer_trace_industrial_fit/results/deepagent_topology.json ; writer_trace_industrial_fit/results/skill_activation.json ; writer_trace_industrial_fit/results/middleware_intervention.json ; writer_trace_industrial_fit/results/artifact_lineage.json",
+      "用途": "将产品案例限制在机制校验，避免把外部产品能力误写成 Writer 当前架构或取代已冻结的内部真相源。"
+    }
+  ],
+  "standard_maturity": [
+    "Claude Code 的 OTel Trace 是 beta，不能作为 Writer 内部字段或保留/投递承诺；其 Hook、Skill、Subagent 和权限生命周期可作为成熟设计证据。",
+    "Cursor、Hermes 和 OpenClaw 的公开能力随版本、Cloud/本地部署、配置、采样和插件启用变化；它们验证原则而不是提供可复制的统一 contract。",
+    "OpenClaw 的 OTLP 诊断导出与可信 context propagation 已具备工程可用性，但根采样、内容开关和 Collector retention 意味着它天然是 best-effort 观测副本。",
+    "Codex 的本次官方文档访问受阻，故没有将其未复核的 Trace/Hook/留存主张提升为证据；这是一项明确的证据边界而非待用默认值。"
+  ],
+  "conflicts_with_writer": [
+    "成熟编程 Agent 以会话、仓库、终端权限和 Cloud 任务为中心；Writer 以创作、证据卷宗、评估、进化和发布为中心。取舍是复用有界运行和有效干预原则，不复制通用 IDE/CLI 控制面。",
+    "产品 Hook 或 OTel 常按调试需要暴露 transcript、thinking、Tool body 或 session；Writer 必须坚持 PayloadGate、硬排除 CoT/秘密和授权审计，即使外部系统能够提供更多内容。",
+    "产品 session、checkpoint、worktree、日志和 dashboard 多为可变、短期或采样副本；Writer 的 ArtifactRevision 和长期 DAG 必须独立持久化，不能依赖工作区重读。",
+    "产品的异步 Cloud task、Webhook、resume 和 retry 能启发显式关联，但没有提供 Writer 所需的卷宗、评估、实验、候选提升与发布/回滚全链；因果对象必须由 Writer 自己定义。",
+    "接入五个产品的 SDK、session 格式、权限系统或 dashboard 会引入与当前 DeepAgent/Harness 架构无关的多运行时复杂度；第一阶段只保留内部契约、W3C trace context 和可替换单向 adapter。"
+  ],
+  "uncertain": []
+}

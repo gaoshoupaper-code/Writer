@@ -1,0 +1,172 @@
+{
+  "mechanism_name": "OTel GenAI 与 OTLP 出口适配边界",
+  "primary_problem": "在不改变 Writer 自有 Trace、制品血缘和证据卷宗真相源的前提下，把可安全公开的运行结构投影成 OpenTelemetry Trace 并经 OTLP 输出，使外部 APM 能看懂服务、Agent、LLM、Tool、父子关系和基础耗用；同时隔离 GenAI 语义约定仍在快速演进、OTLP 投递并非端到端可靠、外部后端会采样或截断以及大载荷不可直接外发等风险。",
+  "evidence_objects": [
+    "OpenTelemetry Specification 1.59.0（2026-07-10）：Trace API/SDK、Instrumentation Scope 和 Telemetry Schemas 属于稳定基础；OTel TraceId 固定为 16 字节、SpanId 固定为 8 字节，Span 原生承载 attributes、events、links 和 dropped counts。",
+    "OTLP Specification 1.11.0（2026-07-21）：Trace、Metric、Log 传输为 Stable，定义 gRPC/HTTP、部分成功、可重试与不可重试错误及背压；规范明确确认只覆盖相邻 client/server，排除多跳端到端投递保证。",
+    "OpenTelemetry Semantic Conventions 1.43.0（2026-07-03）：主仓库的 GenAI 页面已停止维护并迁往独立 semantic-conventions-genai 仓库。",
+    "OpenTelemetry GenAI Semantic Conventions 独立仓库（核对到 2026-07-25 提交 64cfaa6）：Agent、模型、Tool、评估事件和 GenAI 指标整体仍为 Development；仓库尚无独立发布版本，README 的 Schema URL 仍为 TODO。",
+    "GenAI 内容采集规范：system instructions、input messages、output messages 和 Tool 参数/结果均为 Opt-In 或敏感大字段；官方默认不采集，生产建议外部受控存储后只记引用，但通用引用格式和 streaming chunks 仍为 TODO。",
+    "Writer 当前共享契约 contracts/trace/__init__.py：TraceLogEvent 已定义 run、LLM、Tool、用户反馈、父子 run、token usage、上下文锚点和 skill_name；executor 与 evolution 各有自有 recorder，evolution 保存 runs、event_payloads、nodes、卷宗和评估血缘；当前依赖清单中没有 OpenTelemetry/OTLP 依赖。"
+  ],
+  "writer_classification": "兼容适配",
+  "writer_problem_match": "Writer 的创作 Agent 位于 executor，证据编译、评估和进化位于 evolution，分别生成有界 Trace，并以来源 Trace、稿件 revision、证据卷宗版本、评估卷宗和发布版本构成长链。现有自有事件契约能够保存完整语义内容并支撑下游闸门，但外部平台无法按通用协议接收；反过来，OTel GenAI 又没有 Skill、Middleware 有效干预、卷宗版本、Integrity/Coverage 和发布 Outcome 语义。真正需要的是一个单向、版本化、可关闭的出口适配器，而不是把现有 recorder 替换成 OTel 模型，也不是再建设第二套业务 Trace。",
+  "adoption_decision": "改造后采用",
+  "minimal_writer_form": [
+    "唯一内部真相源仍是 Writer Canonical Trace Contract：运行信封、事件序列、Span/Node、Span Link、PayloadObject 引用、SkillActivation、MiddlewareIntervention、ArtifactRevision、Integrity/Coverage 和 Outcome 均先按 Writer 语义形成；外部 OTel 数据永远是可重建、可丢弃的兼容投影。",
+    "增加一个共享 WriterOtelAdapter，而不是在四类 Agent 各写一套埋点。所有 recorder/执行钩子调用同一规范化生命周期接口；适配器在生命周期发生时创建和结束 OTel Span，并交给标准 SDK/BatchSpanProcessor/OTLP Exporter。禁止通过事后解析日志文本猜 Agent、Skill 或 Middleware。",
+    "适配器采用两个固定 Profile：otel-core-v1 只用稳定的 Resource、InstrumentationScope、Trace/Span/Event/Link/Status；otel-genai-dev-64cfaa6 仅增加经审核的 GenAI 严格子集。内部事件 schema_version、export_mapping_version、目标 semconv 提交/版本都随导出记录，GenAI 变更只改适配器和金丝雀查询，不改 Writer 内部字段。",
+    "Resource 最小集合为 service.name（writer-executor 或 writer-evolution）、service.version、deployment.environment.name；InstrumentationScope 使用 writer.trace.otel-adapter 及适配器版本。GenAI 独立仓库没有可用 Schema URL，第一阶段不得伪填；只有 Writer 发布不可变、可取回的自有 schema 后才设置自有 schema_url。",
+    "ID 空间分离：OTel SDK 生成合法 OTel TraceId/SpanId，Writer trace_id、event_id、run_id、dossier_id 和 artifact revision 以 writer.* 属性或受控引用保留。运行开始时把 otel_trace_id 与根 span_id 回写到兼容映射记录，禁止截断 UUID、复用 callback run_id 或把 trace- 前缀字符串直接冒充 OTLP ID。",
+    "最小结构映射：Writer 有界运行根节点映射 INTERNAL root Span；同进程 Agent/Subagent 映射 invoke_agent INTERNAL；LLM 映射 inference CLIENT（同进程模型才 INTERNAL）；Tool 映射 execute_tool INTERNAL；同步 HTTP 仍由标准 HTTP CLIENT/SERVER instrumentation 表达；异步来源由 OTel Link 表达。普通 Writer Event 只有在表示重试、HITL、阶段切换或有效干预等时间点时才投影成 Span Event。",
+    "GenAI 字段只输出确定且有分析价值的子集：gen_ai.operation.name、provider.name、request.model、response.model、response.id、finish_reasons、usage.input_tokens、usage.output_tokens、request.stream、response.time_to_first_chunk、agent.name、agent.version、tool.name 和 tool.call.id；未知字段不补默认值，动态多模型 Agent 不在 Agent Span 上伪填 request.model。",
+    "Skill、Middleware、HITL、上下文压缩、缓存、路由、制品、卷宗、Integrity 和 Outcome 没有合适的稳定 GenAI 语义，保留为低数量的 writer.skill.*、writer.middleware.*、writer.hitl.*、writer.artifact.* 和 writer.trace.* 自有属性/事件。Skill 不伪装成 Tool，Middleware 不为每层 wrapper 都创建 Span，只有有效干预才投影。",
+    "生产 OTLP 只输出受控元数据、状态、计数、版本、hash 和 payload_ref；完整 Prompt、稿件、Tool 参数/结果仍保存在 PayloadGate 后的 Writer PayloadObject 中。适配器不得设置 gen_ai.system_instructions、gen_ai.input.messages、gen_ai.output.messages、gen_ai.tool.call.arguments 或 gen_ai.tool.call.result。",
+    "建立小型映射清单与 golden fixtures：每类 Agent 各一条成功、失败、HITL、异步 Link、Skill 激活和 Middleware 干预样例；校验 OTel ID 长度、parent/link、状态、敏感字段禁入、映射版本和未知字段行为。升级 GenAI 版本必须先做字段 diff 与双读验证，不在生产长期 dual emit。"
+  ],
+  "explicit_non_goals": [
+    "不以 OTel TraceId、SpanId、Resource、Schema URL 或外部平台 observation ID 替换 Writer trace_id、event sequence、PayloadObject、卷宗、评估、实验和发布外键。",
+    "不建设一套 OTel Trace 和一套 Writer Trace 的双业务真相；OTLP 只有单向 exporter，不实现从任意 OTLP 后端回灌或重建 Writer 卷宗。",
+    "不追求 OTel GenAI 全字段覆盖、所有 provider 专属约定、MCP 全套约定、通用自动埋点市场或任意自定义字段映射器。",
+    "不把完整 Prompt、稿件、CoT、embedding、媒体正文、Tool 参数/结果、秘密或 PII 放入 OTLP attributes、events、logs、Baggage、traceparent 或 tracestate。",
+    "不把 Skill 当作 execute_tool，不把 Middleware wrapper 当作 Agent/Tool，不用 span 名称或 read_file 调用事后猜测 Skill 激活和有效干预。",
+    "不依赖 Collector schema transform 自动吸收 GenAI breaking change；OTel 规范当前对依赖 schema transformation 维持 moratorium，而 GenAI 独立仓库尚无 Schema URL。",
+    "不长期双发多个 GenAI 主版本，不为尚未发生的后端迁移预建转换 DSL、通用遥测网关、Kafka、全局 outbox 或永久重放队列。",
+    "第一阶段不直接创建 gen_ai.* Metric instruments，也不把 gen_ai.evaluation.result 作为 Writer Score/Outcome 真源；这些 Development 语义不足以表达冻结卷宗、评估版本和长期 uplift。",
+    "不让 OTLP exporter、Collector 或外部平台故障阻塞创作、卷宗封存、评估、进化和发布，也不因 OTLP 成功就把 trace_incomplete 改成完整。"
+  ],
+  "trace_boundary": [
+    "Writer Trace 边界保持已冻结决策：一次创作请求一个 Writer Trace；证据编译、评估和进化分别新建 Writer Trace；同步 Tool/Subagent 位于当前 Trace；异步阶段用来源 Trace、制品、卷宗和 Span Link 关联。OTel 适配器不得合并这些 Trace。",
+    "连续执行段可一对一形成 OTel Trace，Writer 根运行形成 root Span，Agent/LLM/Tool 是其子 Span。若同一个 Writer 创作 trace_id 经 HITL 跨进程或长时间恢复，结束旧活动 Span，恢复段可新建 OTel Trace 并用 resumed_from Link 与同一 writer.trace.id 关联；Writer 仍只有一条业务 Trace。",
+    "Span 只表示有开始和结束的操作；LLM Span 从请求发起到响应流完全接收、报错或取消，自动透明重试属于同一逻辑模型调用。Writer 可观测到的显式 retry attempt 另以自有子 Span/Event 表达，不能用最后一次成功覆盖前序失败。",
+    "Event 仅表示所属 Span 中的时间点，不承担可独立寻址的制品、Skill 激活记录、Middleware 干预记录或 Outcome；这些事实在 Writer 内部先有稳定 ID，再把摘要投影到 Event。",
+    "长期创作到发布链始终由 Writer 业务对象 DAG 表达。OTel Trace 过期、采样或删除后，trace -> artifact revision -> evidence dossier version -> evaluation dossier -> evolution session -> release version 仍可完整遍历。"
+  ],
+  "async_causality": [
+    "同步 executor/evolution HTTP 调用按 W3C traceparent 提取和注入，形成 CLIENT/SERVER 父子；异步 notify、后台 ingest、重试、HITL 恢复和派生评估在创建后果 Span 时使用 Link，不伪造成同步父子。",
+    "Link 由 Writer 已冻结的 triggered_by、retry_of、resumed_from、derived_from 小集合投影；关系类型和稳定业务 ID放在 Link attributes。OTel Link 只有在源 OTel SpanContext 已可靠保存时创建，缺失时保留业务血缘并标 unresolved_link，禁止伪造 SpanId。",
+    "每次可见的重试 attempt 使用新 SpanId；同一逻辑操作保留稳定 writer.operation.id 和 attempt 序号。OTLP 或 SDK 自动重试属于遥测投递行为，不得混入 Agent/LLM 业务重试次数。",
+    "Baggage 第一阶段关闭。writer.trace.id、用户 ID、稿件名和卷宗 ID不靠 Baggage 跨边界传播；HTTP body/header 中已有的受控业务键继续作为幂等与血缘依据，traceparent 只传播 OTel 上下文。",
+    "事后补导出只能投影已持久化的 parent/link 和时间数据；若运行时没有保存 OTel SpanContext，不得声称恢复了原始分布式因果。此时新建 backfill Trace，携带 writer.trace.id、mapping_version 和 causality_status=partial。"
+  ],
+  "agent_semantics": [
+    "主 Agent 和同进程 Subagent：仅在能够可靠界定一次 invoke 时映射为 gen_ai.operation.name=invoke_agent、SpanKind=INTERNAL，并输出 agent.name/agent.version；gen_ai.agent.id 只允许稳定的托管 Agent 资源 ID，Writer 的临时实例、session 或 callback run_id 不填。",
+    "LLM：映射为 GenAI inference Span；输出实际已知的 provider、请求/响应 model、response id、finish reason、stream、TTFC 和 token usage。网关代理场景的 provider.name 只表达 instrumentation 所知 provider，不能冒充真实最终上游。",
+    "Tool：可靠配对的 tool_start/end/error 映射 execute_tool INTERNAL，输出 tool.name、tool.call.id 和低基数 error.type；参数与结果只输出 PayloadObject ref/hash。若已有 HTTP、数据库或 MCP instrumentation 完整覆盖实际远程调用，避免重复创建同义网络 Span。",
+    "Skill：GenAI semconv 没有 Skill 生命周期。Writer 继续显式记录 available/read/activated/completed/failed、版本、内容 hash 和触发位置；OTel 仅把 activated/completed/failed 摘要作为 writer.skill.activation Event 或有实际耗时的自有 Span。",
+    "Middleware：GenAI semconv 没有有序装配和有效干预模型。装配清单放 root Span 的引用/hash；修改、阻断、路由、重试、缓存命中、上下文压缩、HITL、短路等实际介入按 writer.middleware.intervention Event/Span 投影，未生效 wrapper 不产生噪声。",
+    "HITL：等待发生时结束当前活动段并记录 writer.hitl.awaiting；恢复时新 Span/Trace Link 回原执行段。OTel Span 状态不表示人工决定质量，人工编辑、评分和采用仍写 OutcomeRecord/ScoreRecord。",
+    "评估 Agent 和进化 Agent各有自己的 Writer/OTel Trace；第一阶段不采用 Development 的 gen_ai.evaluation.result 作为跨 Trace 事实，因为它只提供 metric name、value/label、explanation 和 response id，不能冻结 evidence dossier、evaluator version、attempt 与发布因果。"
+  ],
+  "artifact_lineage": [
+    "OTLP Span 只保存 writer.trace.id、artifact.id、artifact.revision、content_hash、payload_ref、dossier.id/version、eval_dossier.id、experiment.id、release.version 等不透明引用；不可变制品和对象绑定仍落 Writer 数据库/受控对象存储。",
+    "根运行、LLM 和 Tool Span结束时挂接本次真实读取/产生的制品引用，不能从运行结束后的 mutable workspace 反推历史内容。一个 Span可关联多个输入/输出，但业务血缘方向和角色仍由 Writer ArtifactEdge 保存。",
+    "OTel trace_id/span_id 作为外部诊断回链写入 Writer export mapping，便于进化端跳转外部 APM；它们不是 lineage key，采样或删除不会破坏卷宗编译、评估和发布。",
+    "ScoreRecord、ExperimentRun、ReleaseOutcome 和复制/重生成/采用/人工编辑差异发生在 Trace 结束后，继续独立追加并通过 Writer ID关联；首期不把它们反写旧 Span，也不依赖外部平台可变 annotation。"
+  ],
+  "capture_timing": [
+    "运行开始前：PayloadGate 先形成允许进入 Trace 的策略决定；创建 Writer trace_id 和 OTel Context，记录 service/harness/agent/prompt/skill/middleware manifest 版本及 export_mapping_version。影响采样和 Link 的属性必须在 OTel Span 创建时提供。",
+    "Agent、LLM、Tool 开始：在同一个规范化生命周期钩子中先形成 Writer start 事实，再由适配器创建 OTel Span；确定 parent/Links、operation name、model/tool/agent 身份和输入 payload_ref。不得等结束后从文本或 Node label 猜拓扑。",
+    "运行中：首个流式 chunk 到达时记录 TTFC；Skill 实际激活、Middleware 有效介入、重试排期、缓存命中、HITL 和上下文压缩在事实发生点记录；普通 token chunk 不逐条建 Span/Event。",
+    "操作结束：响应完全接收或报错/取消后补 response model/id、finish reason、usage、输出 artifact/payload 引用和 error.type，再结束 Span；任何未知字段保持缺失并在 mapping coverage 中记 unknown。",
+    "Writer Trace 终结：先完成内部事件 flush、Integrity 判定和 trace_incomplete 闸门，再异步 ForceFlush OTel（有界超时）。内部采集失败标 trace_incomplete 并阻止证据、评估和进化消费；仅 OTLP 出口失败只标 otel_export_degraded，不污染内部完整性。",
+    "Trace 后复制、重生成、最终采用、人工编辑、评分、实验和发布在行为发生时写独立 Outcome/Score/Experiment/Release 对象；不重新打开已结束 Span。"
+  ],
+  "payload_policy": [
+    "秘密、凭据、Cookie、连接串、不可接受 PII、CoT/extended thinking 正文、embedding 向量和媒体正文在最靠近源头的 PayloadGate 阻断；被阻断内容既不进入 Writer Trace，也不进入 OTel。只允许记录 policy_reason、类型、字节数和不可逆审计标识。",
+    "完整 Prompt、稿件和 Tool 语义内容按已冻结策略保留在 Writer PayloadObject：正文与事件信封分离、0-30 天热存储、31-90 天冷存储、90 天后删除或按合法保留例外处理；访问走开发者/质量人员权限和审计。",
+    "生产 OTLP 一律 reference-only：只输出 payload_ref、sha256、revision、mime/category、size、redaction_policy_version 和 capture_status。即使 GenAI semconv 把 messages、instructions、tool arguments/result 定义为 Opt-In，也不启用这些字段。",
+    "禁止把 payload_ref 设计为无需鉴权的公网 URL；外部平台只看到不可解析的不透明 ID。进化端用户回钻时由 Writer API再次鉴权并记录访问审计。",
+    "OTLP 元数据保留期可短于 Writer 90 天内容周期；删除正文时同步删除可反查敏感内容的索引和外部标签。hash 也受删除政策约束，不能以去重为由永久保留。"
+  ],
+  "integrity_coverage": [
+    "分别计算 internal_integrity 与 external_export_status。只有前者的 verified/incomplete/conflict/unknown 决定卷宗、评估和进化消费；外部状态使用 not_configured/complete/partial/dropped/failed，绝不把外部 complete 当内部完整证明。",
+    "为每个 mapping_version 维护支持矩阵：run、agent、llm、tool、skill、middleware、HITL、link、artifact_ref 各标 mapped、writer_only、unknown、not_applicable；不支持的 Writer 事实显式计数，不静默丢弃。",
+    "采集并回写 dropped_attributes_count、dropped_events_count、dropped_links_count、payload_blocked_count、mapping_unknown_count、serialization_error_count 和 exporter_drop_count。OTLP 后端看不到这些事实时，Writer 自观测页仍应可见。",
+    "OTel Span 缺失不能证明 Agent/Skill/Tool 未发生，因为 sampling、SDK 限额、队列、partial success 和后端保留都会造成缺口；是否发生以 Writer 事件与 Integrity/Coverage 为准。",
+    "映射正确性由 golden fixtures 和 Collector 测试接收器验证：结构、ID、父子/Link、状态、时间、字段类型、敏感字段负面断言和版本属性全部通过后，才允许某 mapping_version 进入生产。"
+  ],
+  "delivery_failure": [
+    "采用标准 OTel SDK 的 BatchSpanProcessor 和 OTLP Exporter；Collector 可作为部署层的队列/重试缓冲，但不是 Writer 必选业务组件。第一阶段不自研 OTLP protobuf、发送队列或重试协议。",
+    "按 OTLP 1.11.0 处理响应：partial_success 已接受部分数据，客户端不得重试整批；Unavailable、DeadlineExceeded 等可重试错误按指数退避/RetryInfo；InvalidArgument 等不可重试错误丢弃并计数；RESOURCE_EXHAUSTED 仅在服务端给出可恢复信号时重试。",
+    "OTLP acknowledgment 只证明当前 client/server 对接受情况，不证明 Collector 到最终后端的多跳送达。Writer 页面必须把 configured、queued、exported、partial、dropped、failed 与 unknown 分开，不显示虚假的端到端 delivered。",
+    "出口失败、队列满、进程退出 flush 超时、后端 4xx 和序列化失败不抛回 Agent 主流程；记录 otel_export_degraded、最后错误类别和丢弃数。Writer 核心 Trace 已完整时，创作和下游流程继续。",
+    "Writer 核心 recorder 写盘失败、事件序号缺口或 PayloadObject 丢失仍标 trace_incomplete，创作可返回结果，但证据、评估和进化不得消费；外部 OTel 成功不能修复该状态。",
+    "不承诺 OTLP 恰好一次或 Span 去重。短暂重试可能产生重复，外部分析按 OTel trace/span ID 和 mapping_version 聚合；不为兼容副本建设无限期 outbox/backfill。只有明确诊断需求才从内部真相源发起有标记、限范围的 backfill。"
+  ],
+  "metrics_scores_outcomes": [
+    "第一阶段仅输出 Trace；LLM token、duration、TTFC、Tool duration 作为 Span 属性/时长供外部诊断，Writer 自有指标 Profile仍是创作、证据、评估和进化分析真源。这样避免直接绑定全部仍为 Development 的 gen_ai.client.*、invoke_agent、workflow 和 execute_tool Metric 名称。",
+    "必须新增的适配器运行指标只有低基数健康度：exported_spans、dropped_spans、partial_success、export_failures、queue_utilization、serialization_failures、mapping_unknown 和 payload_blocked，按 service、environment、mapping_version 和 error.type 聚合，不带 trace_id。",
+    "Score、人工评分、评估分数、复制、重生成、采用、编辑距离、候选 uplift、发布和回滚继续使用 ScoreRecord、OutcomeRecord、ExperimentRun、ReleaseOutcome，并绑定 artifact/dossier/evaluator/harness/model 版本；不塞入 Span attributes 或 gen_ai.evaluation.result 代替。",
+    "当 GenAI metrics 形成稳定版本且 Writer 确实需要跨后端可移植大盘时，再只评估 token usage、client operation duration、TTFC 和 execute_tool duration 四类；不得因为标准提供了更多指标就复制 Writer 的七维质量体系。"
+  ],
+  "explanatory_limit": [
+    "外部 OTel Trace 能解释某个已导出执行段由哪个服务和版本运行、Agent/LLM/Tool 的父子或 Link、调用耗时、状态、模型、token、基础错误以及关联的 Writer 制品引用。",
+    "它不能独立解释完整 Prompt/稿件/Tool 内容、Skill 的完整激活生命周期、Middleware 有序装配与所有有效干预、卷宗 Coverage、评估冻结证据、人工编辑和发布 Outcome；这些必须回到 Writer 内部模型。",
+    "OTLP success 不能证明端到端送达，外部 Trace 树完整也不能证明 instrumentation 没有漏采；sampling 或 retention 后的空白是 unknown，不是未发生。",
+    "gen_ai.provider.name 是 instrumentation 的最佳认知，经过 LiteLLM/Portkey 等代理时可能不同于最终上游；request.model 也不能证明实际响应模型，必须在可用时同时看 response.model。",
+    "Trace、版本和 Outcome 的相关性只能支持因果候选解释，不能证明某个 Skill、Middleware 或模型版本导致质量改善；正式结论仍需绑定版本的对照实验、评估和发布结果。",
+    "Development 的 GenAI 字段可能重命名、改变要求级别或被移除；mapping_version 只能说明当时采用的投影规则，不能把外部字段稳定性外推为 Writer 内部长期契约。"
+  ],
+  "writer_ui_impact": [
+    "进化端不新增一套 OTel Trace 页面。运行观测详情只增加“外部观测”诊断区：OTel trace link、service、mapping_version、export_status、dropped counts 和最后错误；主树、载荷、Skill/Middleware、Integrity 与血缘仍读 Writer。",
+    "运行列表可筛 otel_export_degraded，但不得与 trace_incomplete 合并；前者是兼容出口问题，后者会阻断卷宗/评估/进化。",
+    "映射详情用小型对照表显示 Writer 事实是 mapped、writer_only 还是 unknown，帮助开发者判断外部平台为何缺字段；质量人员默认无需看到 OTLP 传输细节。"
+  ],
+  "official_sources": [
+    {
+      "来源": "OpenTelemetry Specification 1.59.0 与 Instrumentation Scope/Telemetry Schemas/Versioning",
+      "地址": "https://github.com/open-telemetry/opentelemetry-specification/releases/tag/v1.59.0 ; https://opentelemetry.io/docs/specs/otel/common/instrumentation-scope/ ; https://opentelemetry.io/docs/specs/otel/schemas/ ; https://opentelemetry.io/docs/specs/otel/versioning-and-stability/",
+      "用途": "确认 2026-07-10 当前核心版本、稳定 Trace/Scope/Schema 能力、Development 允许 breaking change，以及当前不得长期依赖 Development 和不得依赖 schema transform 稳定性的警告。"
+    },
+    {
+      "来源": "OTLP Specification 1.11.0 与 opentelemetry-proto 1.11.0",
+      "地址": "https://opentelemetry.io/docs/specs/otlp/ ; https://github.com/open-telemetry/opentelemetry-proto/tree/v1.11.0/opentelemetry/proto/trace/v1/trace.proto",
+      "用途": "确认 2026-07-21 当前 OTLP Trace 稳定状态、ID/Span/Event/Link 数据结构、相邻节点确认边界、partial success、重试、背压和 dropped counts。"
+    },
+    {
+      "来源": "OpenTelemetry Semantic Conventions 1.43.0 GenAI 迁移页",
+      "地址": "https://opentelemetry.io/docs/specs/semconv/gen-ai/ ; https://github.com/open-telemetry/semantic-conventions/releases/tag/v1.43.0",
+      "用途": "确认 2026-07-03 主 semconv 当前版本及 GenAI 页面已迁出、不再在主仓库维护。"
+    },
+    {
+      "来源": "OpenTelemetry GenAI Semantic Conventions 独立仓库，固定提交 64cfaa612a1af8472b2f063374fbe3c9e6cea2ab",
+      "地址": "https://github.com/open-telemetry/semantic-conventions-genai/tree/64cfaa612a1af8472b2f063374fbe3c9e6cea2ab ; https://github.com/open-telemetry/semantic-conventions-genai/blob/64cfaa612a1af8472b2f063374fbe3c9e6cea2ab/docs/gen-ai/README.md ; https://github.com/open-telemetry/semantic-conventions-genai/blob/64cfaa612a1af8472b2f063374fbe3c9e6cea2ab/README.md",
+      "用途": "确认 2026-07-25 当前 Agent/模型/Tool/事件/指标整体为 Development、仓库只有 Unreleased changelog，且 Schema URL 为 TODO。"
+    },
+    {
+      "来源": "GenAI Span、Agent Span、Event 与 Metric 当前规范",
+      "地址": "https://github.com/open-telemetry/semantic-conventions-genai/blob/64cfaa612a1af8472b2f063374fbe3c9e6cea2ab/docs/gen-ai/gen-ai-spans.md ; https://github.com/open-telemetry/semantic-conventions-genai/blob/64cfaa612a1af8472b2f063374fbe3c9e6cea2ab/docs/gen-ai/gen-ai-agent-spans.md ; https://github.com/open-telemetry/semantic-conventions-genai/blob/64cfaa612a1af8472b2f063374fbe3c9e6cea2ab/docs/gen-ai/gen-ai-events.md ; https://github.com/open-telemetry/semantic-conventions-genai/blob/64cfaa612a1af8472b2f063374fbe3c9e6cea2ab/docs/gen-ai/gen-ai-metrics.md",
+      "用途": "核对 invoke_agent、inference、execute_tool、输入输出 Opt-In、生产引用建议、动态模型规则、evaluation result 和当前指标命名。"
+    },
+    {
+      "来源": "Semantic Convention Version Selection 1.43.0",
+      "地址": "https://github.com/open-telemetry/semantic-conventions/blob/v1.43.0/docs/configuration/version-selection.md",
+      "用途": "确认版本选择和 dual_emit 配置本身仍为 Development；支持迁移思路，但不应成为 Writer 第一阶段的通用配置系统。"
+    },
+    {
+      "来源": "Writer 当前共享 Trace 契约与 recorder/数据库实现",
+      "地址": "contracts/trace/__init__.py ; executor/app/platform/trace/recorder.py ; evolution/app/trace/recorder.py ; evolution/app/core/db.py",
+      "用途": "核对 Writer 现有 trace_id、event sequence、Agent/LLM/Tool/Skill 字段、双服务 recorder、event_payloads/nodes 以及卷宗/评估持久关系，避免用工业标准臆造项目现状。"
+    }
+  ],
+  "standard_maturity": [
+    "OpenTelemetry Specification 1.59.0 的 Trace API/SDK、Instrumentation Scope 与 Telemetry Schemas 为 Stable；OTLP 1.11.0 的 Trace/Metric/Log 为 Stable，Profiles 仍为 Development。",
+    "OpenTelemetry GenAI 独立仓库截至 2026-07-25 的总文档、Agent spans、模型 spans、Tool span、events 和 metrics 全部为 Development；仓库尚无独立 release，CHANGELOG 只有 Unreleased。",
+    "GenAI 仓库依赖 core semantic-conventions 1.43.0，但自身 README 的 Schema URL 仍为 TODO；输入输出外部引用的统一格式和 streaming chunks 也仍为 TODO。",
+    "Telemetry Schemas 机制虽 Stable，OpenTelemetry 1.59.0 的稳定性文档明确写有依赖 schema transformations 的 moratorium；因此 Writer 只能用自有 mapping_version 隔离，不能假定 Collector 自动迁移会兜底。",
+    "Semantic convention version selection/experimental/dual_emit 文档为 Development；Writer 第一阶段固定单一映射 Profile 比暴露通用版本选择更稳妥。",
+    "Writer 当前没有 OTel SDK/OTLP 依赖，属于尚未接入状态；现有自有 recorder 与共享契约已经是可复用基础，不需要推倒重建。"
+  ],
+  "conflicts_with_writer": [
+    "工业通用 OTel 鼓励低侵入、采样和尽力投递，Writer 的证据编译却要求可验证完整性。取舍是内部 Writer Trace 必须完整并有消费闸门，OTLP 永远是可降级兼容副本。",
+    "GenAI 默认不采集敏感大内容、生产建议存外部引用，但引用标准尚未定义；Writer 又要求保留完整 Prompt、稿件和 Tool 语义。取舍是使用 Writer PayloadObject 作为受控正文真源，OTLP 固定 reference-only。",
+    "GenAI Agent/Tool/LLM 语义没有 Skill、Middleware 有序装配与有效干预、Artifact revision、Integrity/Coverage 和发布 Outcome。取舍是保留精简的 writer.* 扩展，不为标准兼容牺牲 Writer 的核心解释能力。",
+    "GenAI inference 以逻辑模型调用覆盖透明自动重试，而 Writer 需要解释 Middleware 触发的每次显式 retry attempt。取舍是外层 GenAI Span 表示逻辑调用，Writer 自有 attempt Span/Event 保存可见重试，二者不互相覆盖。",
+    "GenAI evaluation.result 倾向挂在被评估操作 Span或 response id 上，Writer 评估是独立 Trace并永久绑定 ready 证据卷宗版本。取舍是继续使用 ScoreRecord/EvaluationDossier，仅把外部事件作为未来可选摘要。",
+    "GenAI 的 provider.name 在网关代理时只代表 instrumentation 所知 provider，不能回答最终模型路由；Writer 必须另外记录路由 Middleware 的 before/after、决策版本和实际 response.model。",
+    "把 Development 字段直接做进数据库或桌面查询会让标准改名侵入内部契约；取舍是查询只依赖 Writer 字段，外部 GenAI 名称集中在版本化 adapter。",
+    "工业平台常提供多版本 dual emit、schema translation 和任意 exporter 组合，但 Writer 当前只需要一个严格 OTLP 出口。第一阶段固定映射、单一 exporter 接口和少量自有属性，避免为工业适配性引入与创作闭环无关的复杂度。"
+  ],
+  "uncertain": []
+}

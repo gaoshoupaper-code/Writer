@@ -1,0 +1,133 @@
+{
+  "mechanism_name": "完整语义载荷治理",
+  "primary_problem": "在保留 Prompt、稿件、Tool 参数与结果等调试和进化所需完整语义的同时，保证秘密、模型内部思维链、embedding 和媒体正文永远不进入 Trace；把结构事件与大载荷分离，建立可验证的采集准入、90 天冷热保留、按需审计访问和跨 Trace/制品/卷宗/评估/进化对象的级联删除，使“完整保存”不再等于无限复制生产内容。",
+  "evidence_objects": [
+    "Langfuse Masking：当前官方文档要求在应用或 exporter 侧、数据离开应用前转换 Trace/Observation 的 input、output、metadata 和 OpenTelemetry span attributes；其推荐 hook 同步、确定且快速，异常会丢弃 batch 或 span。它证明敏感控制必须在发送前完成，不能只靠 UI 遮盖，但通用正则样例不能代替 Writer 的字段级准入。",
+    "Langfuse Data Retention：当前官方能力按项目配置 Trace、Observation、Score 和媒体资产的保留天数并周期删除，且明确删除独立于外部引用，可能留下指向不存在 Trace 的 dataset item。它证明保留和删除是必要控制，也暴露了 Writer 必须额外处理业务血缘与派生对象引用，不能直接照搬按时间删行。",
+    "LangSmith Sensitive Data 与 Secret Redaction：当前官方 SDK 支持在发送前隐藏或变换 input、output、metadata，按函数处理载荷，或用 anonymizer 清理 API key、token 和凭据；文档同时提示 JSON 序列化、嵌套深度和复杂正则会带来性能成本。它支持源端治理和分载荷策略，不支持“抓取所有内容后再在后端清洗”。",
+    "LangSmith TTL：当前自托管能力为 Trace 配置短期/长期保留并执行后台清理，也说明大规模 DELETE 会影响存储性能、备份和非当前对象仍需独立生命周期。Writer 只借鉴冷热与异步清理，不引入 ClickHouse TTL 平台。",
+    "Writer 当前实现：executor 对 LLM input 完整保留，只为 write_file/edit_file 保留 Tool args，其余 Tool 参数删除；evolution 的旧 loader 又无条件删除全部 tool_args。event_payloads 把整条 input/output JSON 内联进 SQLite，Trace 详情按需返回完整正文，但没有统一敏感准入、载荷对象、访问审计和保留期。"
+  ],
+  "writer_classification": "Writer 核心",
+  "writer_problem_match": [
+    "评估和进化需要知道模型实际看到的 Prompt/上下文、Tool 实际收到的参数、最终 Tool 结果和每个稿件 revision；当前只保存 write/edit 正文、删除其他 Tool 参数，导致 read_file 路径、委派任务、检索条件、HITL 编辑和 Middleware 修改等关键语义不可解释。",
+    "executor 与 evolution 使用两套不一致的 sanitize：执行端保留交付工具 args，evolution loader 全部删除；同一 Trace 在不同服务中可见内容不同，现有重复读指标甚至会在参数缺失时把“未知”算成零。",
+    "LLM input/output 和 Tool 结果可能包含 Authorization、Cookie、API key、环境变量、用户隐私、provider reasoning/thinking 字段、base64 媒体或 embedding。当前递归清理主要删 Tool call 参数，没有明确的 forbidden 类型与 fail-closed 规则，无法兑现“阻止不可接受数据进入 Trace”。",
+    "当前 JSONL、SQLite event_payloads、context 投影、workspace 当前文件和卷宗冻结都可能保存同一正文；大 Trace 已在代码注释中出现数十 MB 量级。没有载荷引用和冷热分层时，完整采集会让生产内容无限增长并拖慢摄入、重建和桌面端。",
+    "当前 evolution 删除 Trace 只显式删除证据卷宗并依赖 runs 外键删除 nodes/events，代码还注明评估卷宗、纠错裁决和未发布进化记录待后续处理；executor 原 JSONL、摘要、Artifact 内容和发布/实验引用也没有一个可执行删除计划。",
+    "开发者和内部质量人员都需要按需查看正文，但列表与聚合不需要正文。当前事件懒加载只解决传输体积，没有记录谁在何时查看、导出或复制了哪份敏感载荷，也无法区分到期、策略阻断、权限不足和采集丢失。"
+  ],
+  "adoption_decision": "改造后采用",
+  "minimal_writer_form": [
+    "建立版本化 PayloadPolicy，固定四类处理结果：forbidden 永不入 Trace；semantic_full 保存清洗后的完整 Prompt、消息、稿件、Tool 参数/结果和人工编辑语义；reference_only 只保存媒体、外部文件和受管制制品的引用/hash/元数据；structural 仅保存事件、版本、计数、状态、reason_code 和关系。策略按 payload_kind 而不是任意用户配置匹配。",
+    "在 executor/evolution 的统一 Trace 契约层提供单一 PayloadGate。事实产生方先构造 typed payload，再由 Gate 做字段 allowlist、禁止类型剥离、秘密检测和规范化；只有 Gate 返回 accepted 才写 PayloadObject。任何 UI、摄入端或第三方 exporter 都只能读取已经通过 Gate 的对象，不能接触原始未治理副本。",
+    "PayloadObject 最小字段为 payload_id、schema_version、payload_kind、classification、capture_status、content_ref、sha256、byte_length、media_type、producer_trace_id/span_id/event_id、artifact_revision_id、policy_version、redaction_manifest、storage_tier、created_at、expires_at 和 deletion_subjects。结构 Event 只持有 payload_ref/hash/size，不复制正文。",
+    "semantic_full 的 Writer 固定子类包括 effective_model_input、visible_model_output、effective_tool_args、visible_tool_result、middleware_before/after、hitl_request/decision、draft_revision_content、human_edit_patch 和 evaluation_evidence。Tool 参数在 Middleware/HITL 完成修改、即将调用 handler 时固定；原始与修改后语义通过干预的两个 payload_ref 关联。",
+    "forbidden 固定包括 API key/token/password/cookie/authorization、完整环境变量、私钥、数据库连接凭据、provider reasoning/thinking/analysis 或其他不可验证 CoT、embedding/vector 数组、音视频/图片 base64 与二进制正文、未允许的原始 HTTP headers/body。命中时删除实际值，只记录 payload_kind、blocked_by_policy、reason_code 和 policy_version；秘密本身不做 hash。",
+    "完整语义默认保留 90 天：0-30 天为热载荷，31-90 天为冷载荷，90 天后删除 content_ref 并保留允许长期存在的结构事件、hash、版本、Integrity、Score/Outcome 和血缘。EvidenceDossierVersion、EvaluationDossier、固定 dataset case、被采纳 Experiment 和 ReleaseVersion 是独立受控制品，按其生命周期保留，不通过延长所有来源 Trace 正文来保留。",
+    "访问控制只实现 Writer 需要的两类内部角色和作用域：开发者与质量人员可在授权 workspace/用户范围按需 reveal；默认列表、时间线、DAG 和指标只显示摘要。每次 reveal、download/export 和管理员删除写 append-only PayloadAccessAudit，包含 actor、purpose、payload_id、trace/artifact、时间和结果。",
+    "删除以 DeletionPlan 为单位从 trace/workspace/user/artifact 等 subject 解析全部 PayloadObject、ArtifactRevision、卷宗冻结片段、评估证据、未发布实验和缓存副本，在一个可重试状态机中 tombstone、撤销访问、物理清理并验证无悬空引用；允许长期保留的结构血缘改为 deleted_payload tombstone，不保留正文。",
+    "第一阶段不迁移历史正文来伪造完整性。旧 JSONL/DB 事件标 legacy_unclassified；新 schema 上线后只有通过 Gate 且 payload refs 可解析的 Trace 才能满足相应 Coverage，并进入证据、评估和进化。"
+  ],
+  "explicit_non_goals": [
+    "不建设通用 DLP、隐私分类器平台、数据驻留编排、法律保全、客户自带密钥、字段级加密服务或任意策略 DSL；Writer 采用封闭 payload_kind 与固定禁止词类，底层磁盘/对象存储加密复用部署基础设施。",
+    "不承诺正则可以识别所有秘密和 PII，也不把后端 masking 当准入。已知结构字段优先 allowlist/denylist，未知复杂对象 fail closed；正则只作为最后一道补充检测。",
+    "不保存或恢复模型 CoT，不把 reasoning token 数误认为 reasoning 正文；只保留用户可见输出、模型返回的标准 usage、明确允许的摘要和机制决策 reason_code。",
+    "不把每个流式 token、autosave、临时内存状态、embedding、媒体字节、依赖包或完整 HTTP 报文做成 PayloadObject。只保存能够解释 Agent 选择、制品生产、评估证据和进化结果的稳定语义边界。",
+    "不把完整载荷再复制到 event_payloads、nodes、context、指标索引和 Lineage 节点。搜索第一阶段只索引安全结构字段和显式摘要，不建设生产正文全文检索。",
+    "不无限延长被某个 Trace、dataset 或实验引用的所有内容。需要长期复查的制品必须显式晋升为卷宗、数据集 revision 或发布证据，并拥有独立保留依据；普通运行正文仍按 90 天清理。",
+    "不让第三方 LangSmith/Langfuse/Phoenix 或通用对象存储成为 Writer 的权限、删除或证据真相源。将来导出时必须经过同一 PayloadGate，并接受 Writer 删除与保留约束。"
+  ],
+  "trace_boundary": [
+    "PayloadObject 不是 Trace/Span/Event，不创建第二棵调用树。一次创作、证据编译、评估或进化 Trace 仍只记录运行结构；载荷作为不可变受控对象由一个或多个 Event/ArtifactRevision 引用。",
+    "同一 Trace 中同步 Agent/Subagent/LLM/Tool 的 payload 继承 producer span；异步下游只读取来源 payload 或 ArtifactRevision 的稳定引用，不复制到新 Trace。下游自己的输入快照可产生新的 payload_id，并通过 derived_from 建立显式关系。",
+    "HITL 等待不保持开放载荷或 Span：interrupt 前固定 request payload，resume 时产生 decision payload；edit 的前后 Tool 参数是两个对象并由 intervention/outcome 关联。",
+    "Trace 封口后不再追加复制、重生成、人工编辑或评分正文。运行后行为写 Outcome/Score，若产生稳定人工修订则创建 ArtifactRevision 和受控 payload，再关联来源 Trace。"
+  ],
+  "async_causality": [
+    "payload_id 和 sha256 在来源服务成功持久化后才进入事件；跨服务传输只发送引用、hash、policy/schema 和短安全摘要。evolution 拉取后验证引用可解析和 hash 一致，不重新清洗一份不同语义的副本。",
+    "异步卷宗、评估和进化通过 source_trace_id、artifact_revision_id、dossier/evaluation/experiment ID 获取固定内容；每次消费记录 consumed_payload_id/revision 和 policy snapshot，避免以后读取 mutable workspace 或已变化的 Tool 结果。",
+    "同内容在同一作用域可引用同一不可变对象，但不跨用户/workspace 公开去重身份，避免 hash 或 content address 暴露内容相等性。重试投递沿用 payload_id；业务重跑或内容变化产生新 payload_id。",
+    "删除、到期和冷迁移都是异步状态机事件。引用方看到 expired/deleting/deleted 时停止消费并显示明确状态，不回退到当前文件、事件预览或其他副本。"
+  ],
+  "agent_semantics": [
+    "Agent/Workflow payload 固定显式任务输入、委派说明、上下文策略和最终交付引用；Subagent 只接收它实际获得的上下文，不复制根 Agent 全部历史作为自己的独立正文。",
+    "LLM 的 effective_model_input 在所有 Skill、Memory、Middleware、上下文压缩和提示组装完成后、调用 provider 前采集；visible_model_output 在 provider 返回并去除禁止字段后采集。provider 原始响应、reasoning/thinking 和未知附加字段不进入 Trace。",
+    "Tool 的 effective_tool_args 在 PathGuard、HITL edit、参数 Middleware 等最终生效后、handler 前采集；visible_tool_result 在底层工具和 wrapper 最终转换后采集。blocked/cache_hit/short_circuited 工具分别引用被阻断输入、缓存结果或合成结果，不能伪装成实际执行输出。",
+    "Skill 记录激活/version/hash/触发位置，SKILL.md 正文作为受控配置制品按版本引用，不在每条运行事件重复全文；Middleware 栈记录实现/config hash，只有实际修改前后语义才引用 payload。",
+    "ArtifactRevision 表达需要跨运行复查的稳定交付物；普通消息和临时上下文是 PayloadObject。两者可以共享 content_ref 技术存储，但身份、保留、删除和业务语义不同。"
+  ],
+  "artifact_lineage": [
+    "write_file/edit_file 成功后回读真实字节、计算 hash 并创建 ArtifactRevision；该 revision 的 content_ref 指向受控内容。Tool args 中的拟写正文只是执行输入，不能替代写盘后的 ArtifactRevision，也不能因写入失败产生成功制品。",
+    "EvidenceDossierVersion manifest 固定 consumed artifact/payload refs、hash、policy version 和 capture status；只接受来源 Trace integrity verified 且必需语义载荷 accepted/available。预览、过期或 policy-blocked 不能被编译器当完整证据。",
+    "EvaluationDossier 冻结本次实际引用的 evidence payload 和 Score/rubric/evaluator version；CandidateExperiment 固定 baseline/candidate revision；ReleaseVersion 固定被选候选与发布证据。它们不复制整个来源 Trace，只保留必要受控制品。",
+    "级联删除先从血缘图解析受影响对象，再按对象政策删除正文或留下 tombstone。被删除来源导致卷宗/实验不可再审计时必须显式 invalidated/deleted_source，不能保留一份无人知晓的冻结正文继续显示 complete。"
+  ],
+  "capture_timing": [
+    "请求进入时只记录安全结构身份；用户 Prompt 在 schema 校验、禁止字段剥离和秘密扫描后产生 payload。Gate 必须在 jsonl、日志、队列、SQLite 或 exporter 之前，不能先写原始内容再异步打码。",
+    "LLM：最终消息列表和 system prompt 在实际 provider 调用前固定；响应在可见内容与 usage 解析完成、reasoning/未知 provider 字段剥离后固定。流式片段不逐 token 保存，只在可恢复边界或最终响应合并后采集。",
+    "Tool：最终参数在所有干预完成且即将执行时固定；Tool 结果在 handler/wrapper 完成、错误分类或短路结果确定后固定。重试每个 attempt 有自己的输入/结果引用，logical operation 另有最终 disposition。",
+    "上下文压缩：压缩前后消息集合分别保存引用和计数，summary 作为允许的语义载荷；被删除的内部 CoT 不因压缩而重新进入 Trace。HITL request/decision 按 interrupt/resume 事实点采集。",
+    "Artifact：成功写盘、回读和 hash 后创建 revision；人工编辑在用户形成稳定保存版本时创建 human ArtifactRevision 和 diff payload，不采集每次按键或 autosave。",
+    "Trace 终止前验证所有结构关键 payload_ref 的 capture_status、hash 和可解析性；必需载荷 blocked/missing/conflict 时创作仍可结束，但 Trace 标 trace_incomplete，下游闸门拒绝。",
+    "冷热迁移在第 30 天后异步执行并校验内容 hash；第 90 天到期先撤销读取、写 tombstone，再物理删除和验证派生副本。访问审计在 reveal/export 决策时同步写入，不在事后从 HTTP 日志猜测。"
+  ],
+  "payload_policy": [
+    "结构事件长期可保留的字段限定为身份、时间、状态、版本/hash、类型、大小、计数、reason_code、Integrity/Coverage、关系和安全摘要。任何可能还原秘密、正文、CoT、embedding 或媒体的字段不能因为叫 metadata 就自动长期保存。",
+    "semantic_full 清洗后保存完整 Prompt、可见消息、稿件、Tool 参数/结果、人工编辑和评估证据 90 天；热层支持近期诊断，冷层支持近期对照但按需读取。过期后 content_ref 不可恢复，hash 只用于一致性和 revision 身份。",
+    "secrets/credentials 不替换为可关联 hash；只写 redaction category 和计数。CoT/reasoning 整字段删除，不生成摘要；需要解释机制时由 Agent/Middleware 显式 reason_code 或用户可见总结承担。",
+    "媒体正文和 embedding 不入 Trace；保存 asset/vector collection 的稳定引用、内容 hash、模型/维度/媒体类型、尺寸和访问策略。若评估必须使用媒体，由受控 Artifact/asset 存储提供，不从 Trace JSON 恢复。",
+    "所有 payload 带 policy_version 和 redaction_manifest；manifest 只列规则、字段路径和动作，不包含被删除值。策略升级不重写历史 accepted 内容，查询按其当时 policy 显示并可将旧版本标 policy_legacy。",
+    "权限不足、到期、策略阻断、采集失败和对象丢失分别使用 access_denied、expired、blocked_by_policy、capture_failed、missing；UI 和 API 不用 null/空对象统一表达。"
+  ],
+  "integrity_coverage": [
+    "Payload Integrity 校验 payload_id 唯一、content_ref 可解析、sha256/size/media_type 一致、producer 关系存在、policy/schema 可识别、capture_status 合法和没有 forbidden 字段。任一结构必需条件失败使该 payload conflict/incomplete。",
+    "Trace Coverage 按 workload schema 声明哪些 payload_kind required、optional 或 not_applicable。创作至少覆盖用户需求、有效模型输入、可见输出和承诺 ArtifactRevision；Tool 语义是否必需按实际调用与工具类别判断，不把未调用 Tool 算 missing。",
+    "blocked_by_policy 证明 Gate 正常阻止了数据，但若被阻止内容同时是下游必需语义，Trace 仍为 trace_incomplete；安全成功与分析完整是两个轴，不能为了下游消费而放行 forbidden 内容。",
+    "expired 是按政策发生的后续状态，不倒改运行时 Integrity；但需要全文的重新编译/评估必须拒绝并显示 payload_expired。长期结构分析可继续使用允许保留的 hash、版本、Outcome 和血缘。",
+    "Coverage 分开报告 model_input、model_output、tool_args、tool_result、artifact_revision、middleware_diff、hitl、human_edit 和 evaluation_evidence；unknown、missing、blocked、expired、not_applicable 分别计数，不压成单一百分比。",
+    "访问与删除完整性另有 audit_write_success、deletion_plan_resolution、physical_purge、dangling_ref 四项状态；删除 API 返回 accepted 不等于级联完成。"
+  ],
+  "delivery_failure": [
+    "PayloadGate 在进程内同步且有确定性时限，不调用网络和 Agent Tool；只将 accepted 的规范化对象交给本地持久缓冲。Gate 异常时 fail closed：不写原始载荷，记录安全的 capture_failed，业务创作继续但 Trace 标不完整。",
+    "PayloadObject 先可靠持久化再让结构 Event 引用；若无法原子完成，Event 使用 pending ref 且终态前必须收敛为 available/failed。不能出现事件已摄入而 content_ref 从未存在却仍显示 complete。",
+    "跨服务采用至少一次投递、稳定 payload_id/event_id 和 hash 幂等；同 ID 同 hash 重复成功，同 ID 不同 hash 是 integrity_conflict。evolution 不再执行会改变语义的第二套 sanitize，只做契约验证。",
+    "冷热迁移和删除队列可以重试，但每步保持状态、attempt、错误和最后成功 hash。对象存储或 DB 故障不静默吞掉；积压只影响观测内容，超过窗口或阻塞终态时触发告警和 trace_incomplete。",
+    "读取失败按 access denied、expired、missing、corrupt、backend unavailable 返回，调用方不得回退到 mutable workspace、预览字段或另一个未治理副本。证据、评估和进化服务端再次执行可消费性闸门。"
+  ],
+  "metrics_scores_outcomes": [
+    "载荷治理指标只衡量采集与安全：各 payload_kind accepted/blocked/failed/missing、forbidden category 命中、required payload coverage、dangling refs、hash conflict、热/冷字节、过期/删除积压和 reveal/export 审计量；不把遮盖次数当质量指标。",
+    "容量按 workload、payload_kind、storage_tier 和保留年龄统计，不按正文、用户 Prompt 或高基数 payload_id 做时序 label。单 Trace 体积异常可回钻，但不建立通用存储计费平台。",
+    "Score/Outcome 长期保留的是结构值、版本、目标和证据引用；其自由文本、人工备注、编辑 patch 和 evaluator Prompt 仍受载荷政策。证据过期后 Score 标 evidence_payload_expired，不删除原始数值也不声称仍可复核。",
+    "进化实验比较只纳入 payload coverage 满足其实验契约的 attempt；缺输入、Tool 语义或 artifact content 时标不可比较，不用零分填补。90 天后需要长期重跑的样本必须已晋升到版本化 dataset/dossier。",
+    "分析页展示因载荷政策、过期和权限而排除的样本数；不能只展示剩余样本的漂亮结果。"
+  ],
+  "explanatory_limit": [
+    "该机制能让开发者和质量人员看到模型实际可见的输入输出、Tool 最终参数与结果、Middleware/HITL 修改前后语义和准确 ArtifactRevision，同时解释某个内容为何被阻止、遮盖、过期或删除。",
+    "它不能恢复未采集、已过期或 forbidden 的原始内容，不能提供模型内部 CoT，也不能从 reason_code 推导 provider 的隐藏决策。安全策略宁可让 Trace 不完整，也不能为了可解释性保存不可接受数据。",
+    "hash 能证明同一已知内容的一致性，不能证明内容质量、意图或秘密值；低熵秘密不保存 hash。预览和摘要不能替代完整语义 Coverage。",
+    "访问审计证明谁通过 Writer 接口请求过载荷，不证明用户没有在外部系统复制内容；部署层磁盘、备份和对象存储加密/生命周期必须独立正确配置。",
+    "Langfuse/LangSmith 的 masking、retention 和 TTL 是成熟产品证据，但其项目级策略、外部 exporter 和存储实现不构成 Writer 内部规范。Writer 的 typed Gate、90 天规则和业务级联才是可消费真相。"
+  ],
+  "writer_ui_impact": "Trace 列表和详情默认只读结构投影，顶部同时显示 payload coverage、policy_version 和 retained_until。节点抽屉对每个输入输出显示 full/masked/blocked/expired/missing/access_denied，用户主动展开完整语义时执行权限检查并写审计；禁止字段永远没有 reveal 入口。Artifact 区只展示本次 revision，不读取当前 workspace 冒充历史。血缘节点显示内容可用性和删除/到期影响，分析页报告被政策或缺失排除的样本。提供一个面向管理员的固定保留/删除状态页即可，不建设通用隐私控制台。",
+  "official_sources": [
+    "Langfuse 官方 Masking（当前文档，2026-07-28 核验）：https://langfuse.com/docs/observability/features/masking.md 。明确在数据离开应用前清理 input、output、metadata 和 OTel span attributes；推荐 export-stage hook，并说明 hook 异常会丢 batch/span、慢处理会造成队列背压。",
+    "Langfuse 官方 Data Retention（当前文档，2026-07-28 核验）：https://langfuse.com/docs/administration/data-retention.md 。当前按项目保留 Trace、Observation、Score 和媒体，周期删除且不可恢复；引用不阻止删除，dataset 可能留下指向不存在 Trace 的引用，正好说明 Writer 需要业务级联与 tombstone。",
+    "LangSmith 官方 Sensitive Data（当前文档，2026-07-28 核验）：https://docs.langchain.com/langsmith/mask-inputs-outputs.md 。提供发送前 hide/transform input、output、metadata、函数级 processor、anonymizer 和批处理，并提示 JSON 序列化、复杂正则与嵌套深度的性能/覆盖边界。",
+    "LangSmith 官方 Secret Redaction（当前文档，2026-07-28 核验）：https://docs.langchain.com/langsmith/redact-secrets.md 。明确 API key、token、credential 应在到达后端前由 SDK anonymizer 清理，并给出结构键与高熵模式；Writer 将正则降为补充检测，主要依赖 typed allowlist。",
+    "LangSmith 官方 Data Storage and Privacy（当前文档，2026-07-28 核验）：https://docs.langchain.com/langsmith/data-storage-and-privacy.md 。说明 Trace 数据、输入输出与区域/存储/加密属于敏感数据治理问题；Writer 仅采纳与内部完整内容查看直接相关的最小控制。",
+    "LangSmith 官方 Self-hosted TTL（当前文档，2026-07-28 核验）：https://docs.langchain.com/langsmith/self-host-ttl.md 。提供短期/长期 Trace 保留与后台清理，并说明大规模 DELETE、ClickHouse mutation 和备份会影响真实清理；Writer 借鉴异步清理和验证，不引入其存储栈。",
+    "OpenTelemetry Collector Contrib 官方 Redaction Processor（当前 main，2026-07-28 核验）：https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/redactionprocessor 。证明 exporter 管道可按允许/阻止键和摘要处理属性；该处理器只作为将来 OTLP 导出的第二道防线，不替代 Writer 源端 PayloadGate。",
+    "OpenTelemetry Security 官方文档（当前文档，2026-07-28 核验）：https://opentelemetry.io/docs/security/ 。强调遥测本身可能包含敏感信息且 Collector/exporter 必须安全配置；Writer 不把 OTel 属性当可存放完整生产正文的默认容器。"
+  ],
+  "standard_maturity": "发送前 masking/redaction、按保留期清理、冷热/TTL、访问控制与审计均是成熟工业能力；但产品行为差异明显，Langfuse 甚至明确按时间删除可能留下断引用，且 OTel 没有 Agent Prompt/稿件/Tool 语义的统一保留与级联标准。Writer 的安全控制采用成熟原则，typed payload 分类、CoT/embedding/media 禁止项、90 天规则和 Artifact-Dossier-Evaluation 级联属于项目专用契约。",
+  "conflicts_with_writer": [
+    "工业平台常默认把任意 input/output/metadata 送入后端后再 masking；Writer 已确认秘密和 CoT 不能进入 Trace，因此必须在 jsonl/SQLite/队列/exporter 之前准入，后端遮盖只能作为防御层。",
+    "Langfuse 项目级 retention 会不顾 dataset 引用删除 Trace；Writer 的证据卷宗、评估卷宗、实验和发布形成强业务血缘，必须先生成 DeletionPlan、处理派生内容并留下 tombstone，不能只执行时间 SQL。",
+    "LangSmith/Langfuse 提供任意回调、规则和多种保留配置，适合平台客户；Writer 只需要封闭 payload_kind、固定 forbidden 类和 30/90 天两层，避免建设策略 DSL 和多租户管理面。",
+    "通用观测平台倾向在 Span 内联完整输入输出；Writer 的长篇稿件和累积消息会形成数十 MB Trace，必须把结构 Event、PayloadObject 和 ArtifactRevision 分离，并按需读取。",
+    "当前 Writer 为控制体积删除非 write/edit Tool args，又在 evolution 再删一次，直接损失调用语义；正确做法不是全量 JSON 直存，而是对每种 Tool 采集其允许的完整有效参数和结果到受控载荷。",
+    "工业安全能力如 CMK、区域驻留、法律保全和企业 SCIM 并非 Writer Trace 架构机制；除非未来业务提出独立要求，本次不为这些能力增加接口或数据库抽象。"
+  ],
+  "uncertain": []
+}

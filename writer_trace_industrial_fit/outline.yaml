@@ -1,0 +1,75 @@
+topic: Writer Trace 观测机制的架构适配性与工业适配性
+scope:
+  time_range: 2025-07-28 至 2026-07-28，并以当前官方文档为准
+  principle: 以 Writer 创作、证据卷宗、评估、进化和发布闭环为中心；工业产品仅作为机制证据来源
+  output_goal: 区分 Writer 核心机制、兼容适配机制和不采用机制，形成专而精的需求依据
+items:
+  - name: 跨服务上下文与异步因果
+    category: Writer 核心机制
+    relevance: 核心
+    description: 研究同步父子 Span、异步 Span Link 与稳定业务血缘如何共同还原 executor 到 evolution 的因果链。
+    evidence_objects: [W3C Trace Context, OpenTelemetry Traces, OpenTelemetry Span Links]
+  - name: DeepAgent 执行拓扑
+    category: Writer 核心机制
+    relevance: 核心
+    description: 研究 Agent、Subagent、LLM、Tool、HITL 和 Workflow 在 DeepAgents/LangGraph 中可被可靠观测的生命周期边界。
+    evidence_objects: [DeepAgents, LangGraph, LangSmith DeepAgents Tracing, OpenAI Agents SDK]
+  - name: Skill 显式激活语义
+    category: Writer 核心机制
+    relevance: 核心
+    description: 研究如何区分可用、读取、激活、完成和失败，并记录版本与内容 hash，而不是从 read_file 事后猜测。
+    evidence_objects: [DeepAgents Skills, Claude Code Skills, Codex Skills]
+  - name: Middleware 有效干预语义
+    category: Writer 核心机制
+    relevance: 核心
+    description: 研究 Middleware 装配顺序及修改、阻断、重试、缓存、压缩、HITL、短路等有效介入的最小观测模型。
+    evidence_objects: [DeepAgents Middleware, LangChain Agent Middleware, OpenAI Agents Guardrails]
+  - name: Artifact 与进化血缘
+    category: Writer 核心机制
+    relevance: 核心
+    description: 研究 Trace、稿件 revision、证据卷宗、评估卷宗、候选实验和发布回滚之间的持久对象关系。
+    evidence_objects: [OpenLineage, MLflow Tracking and Artifacts, LangSmith Datasets and Experiments]
+  - name: 完整性与可靠摄入
+    category: Writer 核心机制
+    relevance: 核心
+    description: 研究至少一次投递、幂等、序号缺口、终态、Integrity 与 Coverage 的可验证边界。
+    evidence_objects: [OpenTelemetry Collector, OTLP, Langfuse ingestion, LangSmith ingestion]
+  - name: 完整载荷治理
+    category: Writer 核心机制
+    relevance: 核心
+    description: 研究 Prompt、稿件和 Tool 语义载荷的冷热分离、敏感排除、访问审计、保留与级联删除。
+    evidence_objects: [Langfuse masking and retention, LangSmith data retention, OpenTelemetry Collector processors]
+  - name: Outcome 评估与进化指标
+    category: Writer 核心机制
+    relevance: 核心
+    description: 研究运行后 Outcome、人工 Score、在线和离线评估、版本 uplift 与发布回滚如何关联 Trace 和 Artifact。
+    evidence_objects: [LangSmith Evaluation, Langfuse Scores and Datasets, Phoenix Evals, Braintrust, W&B Weave]
+  - name: 专用运行血缘分析界面
+    category: Writer 核心机制
+    relevance: 核心
+    description: 研究运行观测、血缘 DAG 和分工作负载分析三类视图的职责边界，避免通用监控页混算。
+    evidence_objects: [LangSmith Trace View, Langfuse Trace View, Phoenix Traces, Datadog LLM Observability]
+  - name: OTel GenAI 与 OTLP 边界适配
+    category: 兼容适配机制
+    relevance: 相关
+    description: 只研究 Writer 内部契约到 OTel GenAI/OTLP 的最小稳定映射及标准演进隔离，不追求字段全覆盖。
+    evidence_objects: [OpenTelemetry GenAI Semantic Conventions, OTLP]
+  - name: OpenInference ATIF 与 OpenLineage 交换适配
+    category: 兼容适配机制
+    relevance: 相关
+    description: 研究轨迹交换和血缘标准中可复用的语义，并明确第一阶段不实现的兼容功能。
+    evidence_objects: [OpenInference, ATIF, OpenLineage]
+  - name: 网关 APM 与外部观测平台边界
+    category: 非核心工业能力
+    relevance: 背景
+    description: 识别 LiteLLM、AI Gateway、Langfuse、通用 APM 能看到与看不到的信息，防止把外部平台当成 Writer 核心。
+    evidence_objects: [LiteLLM, Portkey, Helicone, Kong AI Gateway, Bedrock AgentCore, Datadog, Grafana]
+  - name: 成熟 Agent 工程横向案例
+    category: 机制验证案例
+    relevance: 背景
+    description: 只采纳有官方资料或可验证行为的机制，用于校验 Writer 的边界和遗漏，不推测闭源内部实现。
+    evidence_objects: [Claude Code, Codex, Cursor, Hermes, OpenClaw]
+execution:
+  batch_size: 3
+  items_per_agent: 1
+  output_dir: ./results

@@ -1,0 +1,102 @@
+field_categories:
+  - category: 基本定位
+    fields:
+      - name: mechanism_name
+        description: 机制名称
+        detail_level: 极简
+        required: true
+      - name: primary_problem
+        description: 该机制实际解决的问题
+        detail_level: 简要
+        required: true
+      - name: evidence_objects
+        description: 提供证据的标准、框架或产品及其当前成熟度
+        detail_level: 详细
+        required: true
+  - category: Writer 架构适配性
+    fields:
+      - name: writer_classification
+        description: Writer 核心、兼容适配或不采用
+        detail_level: 极简
+        required: true
+      - name: writer_problem_match
+        description: 对应 Writer 哪个真实问题、服务和工作负载
+        detail_level: 详细
+        required: true
+      - name: adoption_decision
+        description: 直接采用、改造后采用、仅保留兼容或不采用
+        detail_level: 极简
+        required: true
+      - name: minimal_writer_form
+        description: 满足 Writer 目标所需的最小机制形态
+        detail_level: 详细
+        required: true
+      - name: explicit_non_goals
+        description: 不应带入 Writer 的工业通用能力和预留式复杂度
+        detail_level: 详细
+        required: true
+  - category: 运行与因果语义
+    fields:
+      - name: trace_boundary
+        description: Trace、Span、Event 和长期 Workflow 的边界
+        detail_level: 详细
+        required: true
+      - name: async_causality
+        description: 跨服务、异步任务、重试和 Link 的关联方式
+        detail_level: 详细
+        required: true
+      - name: agent_semantics
+        description: Agent、Subagent、LLM、Tool、Skill、Middleware 和 HITL 覆盖情况
+        detail_level: 详细
+        required: true
+      - name: artifact_lineage
+        description: Trace 与稿件、卷宗、评估、实验和发布的关系
+        detail_level: 详细
+        required: true
+  - category: 数据与治理
+    fields:
+      - name: capture_timing
+        description: 各类事实应在何时采集和终结
+        detail_level: 详细
+        required: true
+      - name: payload_policy
+        description: 完整载荷、引用、脱敏、访问审计、保留和删除策略
+        detail_level: 详细
+        required: true
+      - name: integrity_coverage
+        description: 完整性、覆盖率、未知和不适用的表达方式
+        detail_level: 详细
+        required: true
+      - name: delivery_failure
+        description: 投递、幂等、乱序、丢失、背压和观测故障行为
+        detail_level: 详细
+        required: true
+  - category: 分析与进化
+    fields:
+      - name: metrics_scores_outcomes
+        description: 指标、Score、Outcome、评估和跨版本分析能力
+        detail_level: 详细
+        required: true
+      - name: explanatory_limit
+        description: 能解释什么、不能证明什么，以及不可观测边界
+        detail_level: 详细
+        required: true
+      - name: writer_ui_impact
+        description: 对运行观测、血缘视图和分析视图的必要影响
+        detail_level: 简要
+        required: true
+  - category: 工业证据
+    fields:
+      - name: official_sources
+        description: 最近 12 个月或当前官方一手来源
+        detail_level: 详细
+        required: true
+      - name: standard_maturity
+        description: 标准或产品能力的稳定、开发中、预览、废弃状态
+        detail_level: 简要
+        required: true
+      - name: conflicts_with_writer
+        description: 工业模式与 Writer 已确认需求的冲突及取舍
+        detail_level: 详细
+        required: true
+uncertain: []

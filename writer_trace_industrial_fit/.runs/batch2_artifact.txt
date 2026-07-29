@@ -1,0 +1,36 @@
+## 任务
+调研以下 item，输出结构化 JSON 到 D:\Desktop\Writer\writer_trace_industrial_fit\results\artifact_lineage.json
+
+name: Artifact 与进化血缘
+category: Writer 核心机制
+relevance: 核心
+description: 研究 Trace、稿件 revision、证据卷宗、评估卷宗、候选实验和发布回滚之间的持久对象关系。
+evidence_objects: [OpenLineage, MLflow Tracking and Artifacts, LangSmith Datasets and Experiments]
+
+## 字段定义
+读取 D:\Desktop\Writer\writer_trace_industrial_fit\fields.yaml 获取所有字段定义
+
+## 搜索策略
+调研前先根据调研对象性质，读取对应的搜索策略模块（本 skill 的 references/ 目录下）：
+- 通用信息/产品对比 -> C:\Users\h2640\.agents\skills\deep-research\references\general-web.md
+- 学术论文/算法原理 -> C:\Users\h2640\.agents\skills\deep-research\references\academic-papers.md
+- 中文社区/国内方案 -> C:\Users\h2640\.agents\skills\deep-research\references\chinese-tech.md
+- bug/issue/版本问题 -> C:\Users\h2640\.agents\skills\deep-research\references\github-debug.md
+- 编程问答/API用法 -> C:\Users\h2640\.agents\skills\deep-research\references\stackoverflow.md
+按模块指引的搜索源和查询策略做 WebSearch。时间范围为 2025-07-28 至 2026-07-28，并以当前官方文档为准。
+
+## 输出要求
+1. 按 fields.yaml 定义的字段输出 JSON
+2. 不确定的字段值标注 [不确定]
+3. JSON 末尾添加 uncertain 数组，列出所有不确定的字段名
+4. 所有字段值必须使用中文输出（调研过程可用英文，但最终 JSON 值为中文）
+5. 只修改指定 JSON 文件，不修改项目代码、需求文档或其他调研结果
+6. 以 Writer 现有 executor/evolution、创作到证据卷宗到评估到进化到发布架构为判断中心；机制必须归类为 Writer 核心、兼容适配或不采用，不能为了工业通用性增加机制
+
+## 输出路径
+D:\Desktop\Writer\writer_trace_industrial_fit\results\artifact_lineage.json
+
+## 验证
+完成 JSON 输出后，运行验证脚本确保字段完整覆盖：
+python C:\Users\h2640\.agents\skills\deep-research\scripts\validate_json.py -f D:\Desktop\Writer\writer_trace_industrial_fit\fields.yaml -j D:\Desktop\Writer\writer_trace_industrial_fit\results\artifact_lineage.json
+验证通过后才算完成任务。

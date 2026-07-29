@@ -1,0 +1,113 @@
+{
+  "mechanism_name": "Skill 显式激活与版本化生命周期",
+  "primary_problem": "把 Skill 从“系统提示词里可见、模型可能读取过的文件”提升为 Writer 可审计的一等运行事实，明确区分可用、内容读取、开始生效、正常完成、执行失败、中断、取消和终态未知，并固定本次执行实际使用的 harness 版本与内容哈希。",
+  "evidence_objects": [
+    "DeepAgents Skills：当前官方文档和 SkillsMiddleware 源码明确采用 Discovery、Read、Execute 三级渐进披露；启动时装载名称与描述，调用时由模型通过通用 read_file 读取 SKILL.md，官方排障也以 SKILL.md 的 read_file 轨迹为线索。它证明渐进披露已经成熟可用，也证明默认实现没有独立的 Skill 完成或失败生命周期。",
+    "Agent Skills 规范：当前规范定义 SKILL.md、名称、描述、可选 metadata 和渐进披露；metadata.version 只是任意扩展示例，不是规范化版本契约，规范也没有定义激活事件、终态、内容哈希或追踪字段。",
+    "Claude Code Skills：当前官方文档同时支持用户 /skill-name 显式调用与模型自动调用，定义内容进入上下文后的持久生命周期、调用权限、当轮工具权限和 Skill 作用域 hooks；官方 hook 事件表没有 SkillStart 或 SkillEnd，因而不能把通用 Stop、工具成功或内容驻留直接解释成 Skill 完成。",
+    "Codex Skills：OpenAI 当前官方开源实现把用户结构化选择或 $skill 提及记为 Explicit，把读取 SKILL.md 或运行 Skill 脚本识别为 Implicit，并记录 codex.skill.injected 的 ok/error；SkillMetadata 和 SkillInvocation 事件未携带内容哈希、Skill 版本或业务完成结果。2026-07-15 至 2026-07-24 的官方提交显示这套目录刷新与调用分析仍在快速演进。"
+  ],
+  "writer_classification": "Writer 核心",
+  "writer_problem_match": [
+    "executor 在运行时动态装配 harness，meta agent 与 storybuilding、detail-outline、writing 等 subagent 各自挂载不同 Skill；当前 TraceMiddleware 可靠记录 LLM 与 Tool 的开始、结束和错误，但 SDK SkillsMiddleware 位于默认执行栈，Skill 使用只能从 read_file 路径事后推测。",
+    "同一 SKILL.md 可能因排障、预览、缓存、重复读取或普通文件访问而被 read_file 读取；反过来，内容进入上下文后可能跨多个模型与工具调用持续生效。将 read_file 等同激活会产生假阳性，将一次工具结束等同完成会产生错误终态。",
+    "evolution 的证据卷宗、评估卷宗、候选实验和 harness 发布需要回答“哪一个 agent 在哪次创作中实际采用了哪一版 Skill”；只有名称或路径无法支撑跨版本 Outcome 比较、回滚解释和发布审计。"
+  ],
+  "adoption_decision": "改造后采用",
+  "minimal_writer_form": [
+    "保留 DeepAgents 与 Agent Skills 的目录、frontmatter、优先级解析和渐进披露，不 fork SDK；在 Writer 的平台隔离层手工装配 SkillsMiddleware，并把默认“用 read_file 读取 Skill”提示替换为 Writer 专用的显式激活入口。",
+    "装配完成后生成一次有效 Skill 目录快照。每个条目至少含 skill_id、name、agent_scope、source_path、harness_version、definition_sha256、可用或加载失败状态；后来源覆盖前来源后只记录最终有效定义，同时保留被覆盖或解析失败诊断。",
+    "提供唯一的 activate_skill 入口，由受控加载器读取已解析条目、校验发现时哈希、返回准确 SKILL.md 内容，并原子地产生 skill_read 与 skill_activated 事实。普通 read_file 读取 Skill 路径只算文件访问，绝不升级为激活。",
+    "每次激活生成 activation_id，挂到当前 agent 或 subagent run_id 下；父工作单元正常闭合时写 completed，未处理异常写 failed，HITL、用户停止和额度强停分别写 interrupted 或 cancelled，进程丢失或缺终态写 unknown，禁止把这些状态互相折叠。",
+    "事件只进入 executor 现有 append-only trace 与摄入链；证据卷宗冻结事件引用、版本和哈希，评估与进化复用现有卷宗关系，不新增独立 Skill 数据平台。"
+  ],
+  "explicit_non_goals": [
+    "不建设 Skill 市场、在线安装器、远程运行时拉取、多租户共享目录、用户自编辑平台或通用插件系统；Writer 的创作 Skill 继续随 harness 版本发布。",
+    "不照搬 Claude Code 的动态上下文注入、按 Skill 切模型、后台 fork、复杂权限前置或会话永久驻留，也不照搬 Codex 的产品分析上报；这些能力与 Writer 的固定创作闭环无直接需求。",
+    "不为所有 supporting files 预建全包 Merkle 树，不把每次普通文件读取都升级为 Skill 事件；第一阶段只固定 SKILL.md 定义哈希，并对实际读取的 supporting file 记录内容引用和哈希。",
+    "不声称 Skill 导致了稿件质量、失败或分数变化；机制只证明何时、何处、哪一版 Skill 处于有效作用域。",
+    "不新增跨服务长事务、分布式锁或通用 OTel Skill 标准；生命周期先是 Writer 内部契约，外部标准映射另行适配。"
+  ],
+  "trace_boundary": [
+    "一次 executor 创作请求仍是一条 Trace；meta agent、subagent 和 review-revise 工作单元仍是 Span。Skill 可用目录是 agent 装配 Span 上的 catalog_snapshot Event，不为每个未使用 Skill 创建空 Span。",
+    "一次实际激活是当前 agent 或 subagent Span 的子 Span，activation_id 是其稳定标识；skill_read 是该激活 Span 内的 Event，completed、failed、interrupted、cancelled 或 unknown 是该 Span 的唯一终态。",
+    "Skill 内容进入上下文后可能跨多个 LLM 与 Tool Span 生效，这些调用通过 active_activation_ids 关联，而不是把所有调用强行改成 Skill Span 的直接子节点。",
+    "证据卷宗编译、评估、进化实验和发布是跨时间的独立 Workflow 与独立 Trace；它们通过 trace_id、dossier_id、artifact_revision_id、activation_id 和 harness_version 建立业务血缘，不维持一个数天不结束的分布式 Trace。"
+  ],
+  "async_causality": [
+    "activation_id 在当前 agent/subagent 上下文中显式传播到后续 LLM、Tool、ArtifactSnapshot 和 review 事件；并行 subagent 各自持有独立激活集合，禁止用线程局部变量或“最近一次读取”关联。",
+    "重试使用稳定 logical_activation_id 与递增 attempt，并为每次尝试创建新的 activation_id；retry_of 指向上一次尝试，避免把一次失败和一次成功合并成同一个终态，也避免指标重复计数。",
+    "executor 到 evolution 继续采用事件 event_id 幂等与 sequence 排序；重复投递不重复生成激活，乱序到达时按 sequence 重建。evolution 只能消费 executor 已产生的显式 Skill 事实，不能根据 read_file 事件二次推导。",
+    "评估和进化启动时以 Link 语义关联来源卷宗及 activation_id，不建立错误的父子 Span；发布记录 Link 到被采纳候选实验、来源评估卷宗和新 harness_version。"
+  ],
+  "agent_semantics": [
+    "Agent 与 Subagent 提供 Skill 激活的父作用域；LLM 和 Tool 是作用域内的执行证据；Skill 是被显式选中并注入的指令定义；Middleware 负责目录快照、激活原子性、上下文传播和终态收敛；HITL 是控制流终止或暂停原因，不是 Skill 失败。",
+    "Skill available 仅表示对指定 agent 有效且通过解析；skill_read 仅表示准确内容已由专用加载器取得；skill_activated 表示内容已进入该 agent 的有效上下文；completed 仅表示激活作用域正常闭合，不表示指令被完全遵守或稿件质量良好。",
+    "普通 read_file、查看 supporting file、脚本执行或名称出现在 Prompt 中都不是激活证据。若为了兼容保留 DeepAgents 默认读取路径，只能标记 observed_read，不能填充 skill_activated。",
+    "同一 agent 可组合多个 Skill，每个 Skill 有独立 activation_id；active_activation_ids 是集合，不能假设单 Skill 独占。"
+  ],
+  "artifact_lineage": [
+    "ArtifactSnapshot 在成功写盘时记录 active_activation_ids、skill definition_sha256、harness_version 和产生该 revision 的 tool event_id，形成“激活到稿件 revision”的可验证多对多关系。",
+    "证据卷宗 manifest 冻结目录快照、所有激活终态、关键 supporting file 引用和覆盖率；facts 层可汇总每个 agent 实际使用的 Skill 版本，semantic 层只能做解释性归纳，不能改写底层事实。",
+    "评估卷宗把 Score、finding 和 Outcome 绑定到 artifact_revision_id 与来源 activation_ids；候选实验记录变更前后 definition_sha256，发布 registry 记录最终 harness_version、来源实验和回滚指针。",
+    "Skill 自身不是稿件 Artifact，路径也不是稳定血缘键；稳定键是 skill_id 加 definition_sha256，版本键是 harness_version，激活键是 activation_id。"
+  ],
+  "capture_timing": [
+    "装配阶段：在 DeepAgents 完成来源扫描、覆盖优先级解析和 frontmatter 校验后立即记录 catalog_snapshot；加载失败同步记录 unavailable 及原因，避免未出现的 Skill 被误解为未使用。",
+    "读取阶段：activate_skill 成功取得准确字节后计算并校验 definition_sha256，再写 skill_read；发现时哈希与读取时哈希不一致则拒绝激活并写 failed，避免装配到执行之间内容漂移。",
+    "激活阶段：Skill 内容成功注入 agent 上下文、下一次模型调用之前写 skill_activated；不得在模型只表达“准备使用”时提前记录。",
+    "终结阶段：父 agent/subagent 工作单元正常返回时写 completed；异常冒泡时写 failed；GraphInterrupt、用户停止、额度强停分别收敛为 interrupted 或 cancelled；Trace 结束仍无终态的激活由收敛器写 unknown。",
+    "产物阶段：每次成功 ArtifactSnapshot 采集当时 active_activation_ids；证据卷宗编译时只冻结既有事实，不补造或更改 Skill 生命周期。"
+  ],
+  "payload_policy": [
+    "热 Trace 只保存 skill_id、名称、版本、SHA-256、作用域、调用方式、状态、时间、父运行标识和内容对象引用，不在每条事件重复保存完整 SKILL.md。",
+    "SKILL.md 准确字节以内容寻址对象保存一次，或由不可变 harness git commit 加 SHA-256 重建；实际读取的 supporting file 也只保存哈希与受控引用。Prompt 中渲染后的动态内容不引入第一阶段，避免出现第二套 render_hash。",
+    "Skill 内容按 harness 源码权限访问；可能含路径、连接信息或示例密钥时在入卷宗前执行现有敏感字段排除，查看完整内容进入访问审计。删除 harness 版本时先检查被卷宗和发布谱系引用，保留审计所需冷存档或执行受控级联删除。",
+    "哈希用于完整性和同内容识别，不用于隐藏低熵秘密；任何秘密仍必须在写入 Trace 前排除。"
+  ],
+  "integrity_coverage": [
+    "每个 agent run 声明 skills_applicable 为 true、false 或 unknown；false 时目录和激活覆盖率为不适用，禁止用空数组冒充完整。",
+    "完整 agent run 至少需要一个 catalog_snapshot；每个 skill_activated 必须有同 activation_id 的 skill_read、definition_sha256 和且仅一个终态；每个关联 ArtifactSnapshot 引用的 activation_id 必须可解析。",
+    "覆盖率分别报告 catalog_coverage、activation_terminal_coverage、artifact_link_coverage 和 hash_coverage，不合并成一个百分比；缺事件标记 incomplete 或 unknown，不推断为“未激活”或“成功”。",
+    "加载失败、被覆盖、无权限和内容过大属于 available 层诊断；激活后失败属于运行层终态。两层不能互相替代。"
+  ],
+  "delivery_failure": [
+    "Skill 事件复用 executor 本地 append-only recorder，携带全局唯一 event_id 与单 Trace 递增 sequence；摄入采用至少一次投递和 event_id 幂等，重复事件不重复计数。",
+    "乱序由 sequence 重排，发现缺口时标记 Trace 与证据卷宗 partial；在缺失 skill_read 或终态时，评估可以查看稿件但不得做按 Skill 版本归因。",
+    "catalog_snapshot、skill_activated 和终态是小体积关键事件，进入优先队列；观测背压不得阻断用户创作，但本地持久化失败必须显式降低 integrity 状态，不能静默丢弃。",
+    "进程崩溃或网络断开后由终态收敛器把悬空激活标为 unknown，并保留最后 sequence；禁止自动补 completed。重试发送沿用原 event_id，重试执行则使用新的 activation_id 与 attempt。"
+  ],
+  "metrics_scores_outcomes": [
+    "运行指标：按 skill_id、definition_sha256、harness_version、agent_name 和 workload 统计可用数、显式激活率、读取失败率、完成率、失败率、中断率、取消率、unknown 率、激活时长和重试次数。",
+    "Score 与 Outcome 不写进 Skill 激活 Span，而由评估卷宗绑定 artifact_revision_id 和 activation_ids；同一 Artifact 受多个 Skill 共同作用时保留多对多关系，不拆成伪精确的单 Skill 分数。",
+    "跨版本 uplift 只在相同数据集、模型、agent 角色、评估器版本和工作负载分层下比较 definition_sha256 或 harness_version；样本不足显示 unknown，不做全局排行榜。",
+    "发布判断同时看质量 Outcome、完整性覆盖和失败行为；完成率高不等于质量好，质量提升也不能掩盖大量 unknown 或内容漂移。"
+  ],
+  "explanatory_limit": [
+    "该机制能证明某个 Skill 在某个 agent 运行中是否可用、准确内容是否被读取、何时进入有效上下文、以何种终态闭合，以及它与哪些稿件 revision、卷宗和发布版本相关。",
+    "它不能证明模型逐条遵守了 Skill，不能证明某个 Tool 调用由 Skill 单独导致，也不能从相关性证明 Skill 导致质量提升或失败；模型、Prompt、Middleware、记忆、输入和其他 Skill 都是共同变量。",
+    "completed 只表示激活作用域正常收尾，failed 只表示该作用域以错误闭合，不是对 Skill 设计质量的判决；interrupted、cancelled 和 unknown 必须单列。",
+    "未经过 activate_skill 的 read_file 只能说明文件访问；旧 Trace 缺少显式事件时统一标记 legacy_unknown，不回填猜测性激活。"
+  ],
+  "writer_ui_impact": "在现有 Trace 树的 agent/subagent 节点下增加 Skill 激活子节点，展示调用方式、状态、harness 版本、短哈希、attempt 和加载失败原因；目录快照默认折叠。血缘视图可从 Skill 激活跳到稿件 revision、证据卷宗、评估卷宗、候选实验和发布版本。分析页只增加按 agent、工作负载和版本的激活/终态/Outcome 分层，不建设通用 Skill 管理台。",
+  "official_sources": [
+    "LangChain DeepAgents 官方 Skills 文档（当前页，2026-07-28 核验）：https://docs.langchain.com/oss/python/deepagents/skills 。证实 Discovery、Read、Execute 三级语义、SkillsMiddleware 默认通过 read_file 读取 SKILL.md，以及官方排障依赖 LangSmith 中的读取轨迹。",
+    "LangChain DeepAgents 官方源码（当前 main，2026-07-28 核验）：https://github.com/langchain-ai/deepagents/blob/main/libs/deepagents/deepagents/middleware/skills.py 。证实 before_agent 只装载 metadata、默认系统提示要求通用 read_file、加载错误进入诊断，未定义 Skill 激活终态。官方仓库 2026-07-27 仍有活跃提交。",
+    "Agent Skills 官方规范（当前页，2026-07-28 核验）：https://agentskills.io/specification 。证实 name、description、任意 metadata 与三级渐进披露；版本只是 metadata 示例，不是标准字段，也没有运行生命周期契约。",
+    "Anthropic Claude Code 官方 Skills 文档（当前页，2026-07-28 核验）：https://code.claude.com/docs/en/skills 。证实 /skill-name 与自动调用、disable-model-invocation、内容在会话中的生命周期、当轮权限和 Skill 作用域 hooks。",
+    "Anthropic Claude Code 官方 Hooks 文档（当前页，2026-07-28 核验）：https://code.claude.com/docs/en/hooks 。证实会话、当轮、工具、subagent、任务和 Stop/StopFailure 事件清单；当前清单没有 SkillStart 或 SkillEnd，Skill 内 hooks 只是组件 active 期间生效。",
+    "OpenAI Codex 官方 Skills 文档入口（当前入口，2026-07-28 核验）：https://developers.openai.com/codex/skills 。官方仓库 docs/skills.md 直接指向该页。",
+    "OpenAI Codex 官方源码快照（2026-07-24 提交）：https://github.com/openai/codex/blob/0d2a0aa76ba8cabb468501a04d050834ec2ef80d/codex-rs/core-skills/src/injection.rs 。证实结构化选择与 $skill 显式注入、InvocationType::Explicit、内容加载 ok/error 指标。",
+    "OpenAI Codex 官方源码快照（2026-07-24 快照）：https://github.com/openai/codex/blob/0d2a0aa76ba8cabb468501a04d050834ec2ef80d/codex-rs/core-skills/src/invocation_utils.rs 。证实通过读取 SKILL.md 或运行 scripts 识别隐式调用，这种兼容分析仍是路径检测而非业务终态。",
+    "OpenAI Codex 官方 SkillMetadata 源码（当前 main，2026-07-28 核验）：https://github.com/openai/codex/blob/main/codex-rs/skills/src/model.rs 。当前元数据含名称、描述、路径、scope、插件与策略，但没有内容哈希、Skill 版本或完成状态。"
+  ],
+  "standard_maturity": "Agent Skills 已形成公开的跨产品文件格式和渐进披露规范，但运行激活、终态、版本和哈希仍未标准化。DeepAgents Skills 与 Claude Code Skills 均有当前官方文档和生产级功能说明；Claude 多项行为带明确最低版本，显示仍在演进。Codex 已有官方文档入口、开源目录模型、显式/隐式调用分析和注入指标，但 2026 年 7 月仍连续调整目录刷新与调用分析。结论是“格式成熟、产品实现可用、跨产品生命周期契约缺失”，Writer 必须拥有自己的稳定内部语义。",
+  "conflicts_with_writer": [
+    "DeepAgents 把调用落实为通用 read_file，官方排障也围绕读取轨迹；Writer 要做评估和发布因果审计，不能把文件读取猜成激活，因此只复用发现与渐进披露，替换激活边界。",
+    "Claude Code 的 Skill 内容可在会话余下阶段持续存在，并支持模型、权限、后台 subagent 与动态上下文等通用交互能力；Writer 的 Skill 应绑定明确 agent/subagent 工作单元和 harness 版本，不能采用会话级模糊作用域。",
+    "Codex 的 Explicit/Implicit 分型和注入 ok/error 值得借鉴，但其 implicit 路径检测仍会把读取或脚本运行当调用，注入成功也不等于业务完成；Writer 只把它作为兼容观测，不作为核心真相。",
+    "Agent Skills 允许任意 metadata.version，但没有唯一性、比较规则或内容绑定；Writer 必须以发布系统的 harness_version 为版本真相，以 SHA-256 固定实际内容，不能信任可选自报版本。",
+    "工业工具主要面向通用编码会话，而 Writer 的真实闭环是创作、ArtifactSnapshot、证据卷宗、评估卷宗、进化实验和 harness 发布；任何不能进入这条血缘链的 Skill 指标都不应成为核心机制。"
+  ],
+  "uncertain": []
+}

@@ -1,0 +1,5 @@
+已完成并写入 [integrity_ingestion.json](D:/Desktop/Writer/writer_trace_industrial_fit/results/integrity_ingestion.json)。
+
+验证结果：JSON 语法有效，`fields.yaml` 的 22/22 个字段全部覆盖，验证脚本通过。Langfuse/LangSmith 未公开的服务端可靠性边界已标注 `[不确定]` 并列入 `uncertain`。
+
+本次 docs/ 下无需更新。
