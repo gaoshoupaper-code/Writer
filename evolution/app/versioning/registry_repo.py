@@ -113,22 +113,26 @@ def get_production_version_number() -> int | None:
 
 
 def get_version_commit(version: int) -> str | None:
-    """取某版本对应的 git commit hash。
+    """取某版本对应的不可变 git commit hash（FR-005 / CON-004 / DEC-006）。
 
-    registry 不存 commit hash（自引用问题），通过 git log 顺序映射：
-    version N = git log 倒序第 N 个 commit。
+    优先读 registry entry 的显式 commit_hash 绑定（C1 修复 EVD-007）。
+    仅当旧版本无显式绑定且无法迁移时，才回退到 git log 推导（已标记不可执行）。
     """
-    from app.core import git_ops
-
     v = get_version(version)
     if v is None:
         return None
-    # git log 倒序（最新在前），version 1 = 最早的 commit
-    log = git_ops.log_oneline()
-    commits = [line.split()[0] for line in log if line.strip()]
-    # version 编号从 1 开始，commit 倒序后最老的在最后
-    if 1 <= version <= len(commits):
-        return commits[len(commits) - version]
+
+    # 优先：显式绑定的 commit_hash（C1 新增，不可变源码身份）。
+    explicit_commit = v.get("commit_hash")
+    if explicit_commit:
+        return explicit_commit
+
+    # 无显式绑定的旧版本：不可执行（DEC-006 / EDGE-005）。
+    # 不再用 git log 序号猜测——线上已证明此映射失真（EVD-007: v6→错误 commit）。
+    # 调用方应检查 v.get("executable") == False 并提示迁移或重跑。
+    logger.warning(
+        "版本 v%s 无显式 commit 绑定，不可执行（需迁移或重跑）", version
+    )
     return None
 
 
@@ -154,16 +158,15 @@ def publish_version(
     操作：
       1. 读 registry
       2. 新版本号 = max + 1，parent = 当前 production
-      3. append 新版本条目（不含 commit hash——自引用问题见下方说明）
+      3. append 新版本条目（commit_hash 留空，待 commit 后回填——见 bind_version_commit）
       4. production 指针移到新版本
 
-    commit hash 不在 registry 记录：registry 和源码在同一个 git commit 里，
-    记录"自身所在 commit 的 hash"是自引用（git 计算时 registry 内容还没填 hash）。
-    version↔commit 映射通过 git log 顺序推导（第 N 次 publish 的 commit = version N），
-    需要精确 hash 时调 git_ops（current_commit / show_file 等）。
+    commit_hash 不在此处写入：registry 和源码在同一个 git commit 里，记录"自身
+    所在 commit 的 hash"是自引用。调用方在 commit_and_push 后调
+    bind_version_commit(version, commit_hash) 回填不可变绑定（C1 / FR-005）。
 
     调用方负责在调本函数后，把 registry 变更和源码改动放在同一个 git commit 里
-    （单 commit 原子性：git_ops.commit_and_push）。
+    （单 commit 原子性：git_ops.commit_and_push），然后回填 commit_hash。
 
     Args:
         change_summary: 本版改了什么
@@ -185,12 +188,36 @@ def publish_version(
         "eval_status": eval_status,
         "created_at": _now(),
         "source_session": source_session,
+        "commit_hash": None,       # C1: 待 commit_and_push 后回填
+        "executable": True,        # 有显式绑定后才真正可执行
     }
     data["versions"].append(entry)
     data["production"] = next_v
     _write(data)
-    logger.info("发布 production v%s", next_v)
+    logger.info("发布 production v%s（待回填 commit 绑定）", next_v)
     return entry
+
+
+def bind_version_commit(version: int, commit_hash: str) -> dict[str, Any] | None:
+    """回填版本到不可变 commit 的显式绑定（C1 / FR-005 / CON-004）。
+
+    publish_version 在 git commit 前调用（自引用问题），无法写入 commit_hash。
+    调用方在 commit_and_push 后调本方法回填，使版本可执行。
+    已绑定的版本不可改写（CON-004 不可变性）。
+    """
+    data = _read()
+    for v in data["versions"]:
+        if v["version"] == version:
+            if v.get("commit_hash"):
+                logger.warning("版本 v%s 已绑定 commit %s，拒绝改写", version, v["commit_hash"])
+                return dict(v)
+            v["commit_hash"] = commit_hash
+            v["executable"] = True
+            _write(data)
+            logger.info("版本 v%s 绑定 commit %s", version, commit_hash)
+            return dict(v)
+    logger.warning("bind_version_commit: v%s 不存在", version)
+    return None
 
 
 def rollback(to_version: int, *, reason: str | None = None) -> dict[str, Any]:
@@ -261,6 +288,7 @@ __all__ = [
     "get_production_version_number",
     "get_version_commit",
     "publish_version",
+    "bind_version_commit",
     "rollback",
     "update_version_meta",
     "STATUS_PRODUCTION",

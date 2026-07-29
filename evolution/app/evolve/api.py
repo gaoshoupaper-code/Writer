@@ -743,6 +743,8 @@ def publish_session(session_id: str, request: Request) -> dict[str, Any]:
         # 2. git commit + push（registry 变更 + 源码改动 → 同一个 commit，原子）
         commit_msg = f"进化发版 v{entry['version']}: session={session_id}"
         source_commit = git_ops.commit_and_push(commit_msg)
+        # C1 / FR-005: commit 后回填不可变 commit 绑定，使版本可执行。
+        registry_repo.bind_version_commit(entry["version"], source_commit)
         candidate_id = f"harness-version-{entry['version']}"
         append_release_event(
             release_id=release_id,

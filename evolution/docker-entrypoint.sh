@@ -54,6 +54,37 @@ if [ ! -d "$REPO_DIR" ]; then
   fi
 fi
 
+# 1b-升级. 受控系统中间件升级（C3 / FR-004 / EVD-007）：
+#     repo/ 已存在时，把镜像 seed 中新增的承重系统文件（middleware/）合并进来。
+#     只合并 seed 有但 repo 没有的文件（新增），不覆盖用户进化改动过的同名文件
+#     （冲突时记录到升级日志，不静默覆盖——EDGE-006 / RSK-003）。
+#     这样 ArtifactSnapshotMiddleware 等镜像新增的承重中间件能进入活跃 Harness。
+if [ -d "$SEED_REPO/middleware" ] && [ -d "$REPO_DIR/middleware" ]; then
+  echo "[entrypoint] 受控系统中间件升级：检查 seed 新增的承重文件..."
+  UPGRADE_LOG="/app/evolution/harnesses/.system_upgrade.log"
+  echo "[upgrade $(date -u +%FT%TZ)] 开始系统中间件升级" > "$UPGRADE_LOG" || true
+  conflicts=0; added=0
+  for seed_file in "$SEED_REPO"/middleware/*.py; do
+    [ -f "$seed_file" ] || continue
+    fname=$(basename "$seed_file")
+    target="$REPO_DIR/middleware/$fname"
+    if [ ! -f "$target" ]; then
+      # 新增文件：合并进来（镜像带来的承重系统中间件）。
+      cp "$seed_file" "$target"
+      echo "  + 新增 $fname" >> "$UPGRADE_LOG"
+      added=$((added + 1))
+    else
+      # 已存在：比较内容，不同则记录冲突（不覆盖用户改动）。
+      if ! cmp -s "$seed_file" "$target"; then
+        echo "  ! 冲突 $fname（用户有改动，保留现状）" >> "$UPGRADE_LOG"
+        conflicts=$((conflicts + 1))
+      fi
+    fi
+  done
+  echo "[upgrade] 完成: 新增 $added 个, 冲突 $conflicts 个（保留现状）" >> "$UPGRADE_LOG"
+  echo "[entrypoint] 系统中间件升级完成: 新增 $added, 冲突 $conflicts（详见 $UPGRADE_LOG）"
+fi
+
 # 1c. git 仓库初始化（repo/ 有 .git 则跳过，无则 init + 首次 commit + push）
 echo "[entrypoint] 初始化 harness 独立 git 仓库..."
 cd /app/evolution && python -c "
