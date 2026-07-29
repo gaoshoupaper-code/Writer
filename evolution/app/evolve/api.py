@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -61,6 +62,9 @@ class EvolveStartRequest(BaseModel):
     """进化启动请求（阶段 D：按评估卷宗启动，永久绑定）。"""
 
     eval_dossier_id: str  # 必填：要进化的评估卷宗 id（须为 sealed 完整态）
+    # CON-010 / DEC-012 / AC-015：来源评估运行已取消的 sealed 卷宗，必须由授权用户
+    # 显式确认才能人工提交。系统永不自动调度取消来源卷宗。
+    confirmed_cancel_origin: bool = False
 
 
 class EvolveStartResponse(BaseModel):
@@ -82,7 +86,9 @@ async def evolve_start(
     阶段 D（2026-07-27）：按评估卷宗启动，永久绑定（需求 §42）。
     进化 Agent 只读评估卷宗（结论 + 引用的冻结证据），不读原始 trace / 完整证据卷宗。
     """
-    eval_dossier = _resolve_eval_dossier(req.eval_dossier_id)
+    eval_dossier = _resolve_eval_dossier(
+        req.eval_dossier_id, confirmed_cancel_origin=req.confirmed_cancel_origin
+    )
     active = _find_active_session()
     if active:
         raise HTTPException(
@@ -116,7 +122,9 @@ async def evolve_start_converse(req: EvolveStartRequest) -> EvolveStartResponse:
     阶段 D：按评估卷宗启动，永久绑定。内部走 inspect round（探查 + Agent 开场白），
     跑完后 status 自动转 conversing，等用户在对话区发消息（POST /messages）。
     """
-    eval_dossier = _resolve_eval_dossier(req.eval_dossier_id)
+    eval_dossier = _resolve_eval_dossier(
+        req.eval_dossier_id, confirmed_cancel_origin=req.confirmed_cancel_origin
+    )
     active = _find_active_session()
     if active:
         raise HTTPException(
@@ -212,14 +220,20 @@ def _find_active_session() -> dict[str, Any] | None:
     return None
 
 
-def _resolve_eval_dossier(eval_dossier_id: str) -> dict[str, Any]:
+def _resolve_eval_dossier(
+    eval_dossier_id: str, *, confirmed_cancel_origin: bool = False,
+    _skip_cancel_check: bool = False,
+) -> dict[str, Any]:
     """校验评估卷宗存在 + 已封存（sealed）+ 完整（需求 §42 进化输入边界）。
 
     阶段 D：进化只接受已封存的评估卷宗。旧链路（按 trace_id 查评估）废弃。
+    CON-010 / DEC-012 / AC-015：来源评估运行已取消的 sealed 卷宗，必须由授权用户
+    显式确认（confirmed_cancel_origin=True）才能人工提交。
+    _skip_cancel_check 仅用于会话恢复路径（启动时已检查过，恢复无需重复确认）。
     Returns:
         评估卷宗 dict（含 findings/frozen_evidence/scores/report_md）。
     Raises:
-        HTTPException: 卷宗不存在 / 未封存 / 不完整。
+        HTTPException: 卷宗不存在 / 未封存 / 不完整 / 取消来源未确认。
     """
     try:
         row = require_sealed_evaluation_dossier(eval_dossier_id)
@@ -232,6 +246,41 @@ def _resolve_eval_dossier(eval_dossier_id: str) -> dict[str, Any]:
                 "missing_fields": list(exc.missing_fields),
             },
         ) from exc
+
+    # CON-010 / AC-015：检测评估来源 trace 是否 cancelled。
+    # 会话恢复路径（_skip_cancel_check）启动时已检查过，跳过。
+    if not _skip_cancel_check:
+        evaluation_trace_id = row.get("evaluation_trace_id")
+        if evaluation_trace_id:
+            eval_run = db.query_one(
+                "SELECT status FROM runs WHERE trace_id=?", (evaluation_trace_id,)
+            )
+            if eval_run and eval_run.get("status") == "cancelled":
+                if not confirmed_cancel_origin:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "message": (
+                                f"评估卷宗 {eval_dossier_id} 的来源评估运行已取消（cancelled）。"
+                                "取消来源的卷宗必须由您确认了解其来源已取消、可能影响进化结论"
+                                "后才能人工提交。"
+                            ),
+                            "cancel_origin_confirmation_required": True,
+                            "source_trace_id": evaluation_trace_id,
+                            "source_status": "cancelled",
+                        },
+                    )
+                db.execute(
+                    """INSERT INTO cancel_origin_submissions
+                       (source_trace_id, source_status, dossier_id, target_downstream,
+                        submitted_by, confirmed_at)
+                       VALUES (?, 'cancelled', ?, 'evolution', 'api', ?)""",
+                    (evaluation_trace_id, eval_dossier_id, datetime.now(UTC).isoformat()),
+                )
+                logger.info(
+                    "取消来源评估卷宗 %s 经人工确认进入进化: source_trace=%s",
+                    eval_dossier_id, evaluation_trace_id,
+                )
 
     import json as _json
     dossier: dict[str, Any] = dict(row)
@@ -991,7 +1040,7 @@ def _rebuild_ctx_from_db(session_id: str) -> EvolveContext | None:
     bound_eval_dossier_id = session.get("bound_eval_dossier_id")
     if bound_eval_dossier_id:
         try:
-            eval_dossier = _resolve_eval_dossier(bound_eval_dossier_id)
+            eval_dossier = _resolve_eval_dossier(bound_eval_dossier_id, _skip_cancel_check=True)
             ctx.eval_dossier = eval_dossier
             ctx.eval_dossier_id = bound_eval_dossier_id
             ctx.trace_id_self = session.get("self_trace_id") or ""

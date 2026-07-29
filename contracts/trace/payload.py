@@ -23,10 +23,17 @@ class PayloadRejected(ValueError):
     """载荷含有 Writer 明确禁止进入 Trace 的内容。"""
 
 
-_FORBIDDEN_KEY_PARTS = (
+# 内部推理字段（DEC-001 / FR-001）：模型私密推理不属于业务证据，定向剥离而非整包拒绝。
+# 命中这些键时删除该键值对并继续规范化剩余结构，保证业务正文 100% 保留。
+_INTERNAL_REASONING_KEY_PARTS = (
+    "chain_of_thought", "cot", "reasoning", "thinking",
+)
+
+# 敏感凭据/配置字段（CON-002）：值或结构可能泄露认证材料，必须 fail-closed 整包拒绝。
+# 不得因"删字段后尽量保存"弱化安全边界——与内部推理采用不同策略。
+_SECRET_KEY_PARTS = (
     "authorization", "cookie", "secret", "password", "api_key", "apikey",
     "access_token", "refresh_token", "environment", "env", "embedding",
-    "chain_of_thought", "cot", "reasoning", "thinking",
 )
 _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
@@ -43,42 +50,73 @@ _STRUCTURAL_SECRET_ASSIGNMENT = re.compile(
 class PreparedPayload:
     canonical_json: bytes
     content_hash: str
+    # 定向剥离了哪些内部推理键（去重后的原始键名集合，不含值）。
+    # 不含私密原文，仅作为 recorder 的诊断元数据——用于证明"业务正文保留，
+    # 推理已剥离"，而非把剥离当降级（DEC-001 / FR-001）。
+    stripped_reasoning_keys: tuple[str, ...] = ()
 
 
 class PayloadGate:
     """固定白名单的载荷检查器。
 
-    未知复杂对象和禁止字段一律拒绝整个语义载荷，而不是尝试猜测如何保留它。这避免
-    ``Authorization``、CoT 或 embedding 在任意嵌套位置漏网。
+    内部推理字段（reasoning/CoT/thinking）定向剥离后保留业务正文（DEC-001）；
+    敏感凭据、密钥、未知复杂对象仍一律整包拒绝，避免在任意嵌套位置漏网（CON-002）。
+    两者风险性质不同，必须采用不同策略。
     """
 
     def prepare(self, value: Any) -> PreparedPayload:
-        normalized = self._normalize(value)
+        normalized, stripped = self._normalize(value)
         encoded = json.dumps(
             normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
-        return PreparedPayload(encoded, hashlib.sha256(encoded).hexdigest())
+        # 剥离后去重并稳定排序，保证同一输入的 strip_report 确定。
+        unique_stripped = tuple(sorted(set(stripped))) if stripped else ()
+        return PreparedPayload(
+            encoded,
+            hashlib.sha256(encoded).hexdigest(),
+            unique_stripped,
+        )
 
-    def _normalize(self, value: Any) -> Any:
+    def _normalize(self, value: Any) -> tuple[Any, list[str]]:
+        """规范化载荷，返回 (规范化值, 被剥离的内部推理键列表)。
+
+        - 内部推理键：删除并继续规范化剩余结构（业务正文保留）。
+        - 敏感凭据键 / 密钥模式 / 二进制 / 不支持类型：raise PayloadRejected（fail-closed）。
+        - 剥离推理后剩余结构仍会递归检测密钥（EDGE-001：先剥离 reasoning，
+          剩余命中密钥规则后必须拒绝该语义载荷）。
+        """
         if value is None or isinstance(value, bool | int | float):
-            return value
+            return value, []
         if isinstance(value, str):
             if any(pattern.search(value) for pattern in _SECRET_PATTERNS):
                 raise PayloadRejected("secret-like value")
-            return value
+            return value, []
         if isinstance(value, bytes | bytearray | memoryview):
             raise PayloadRejected("binary payload")
         if isinstance(value, list | tuple):
-            return [self._normalize(item) for item in value]
+            stripped_all: list[str] = []
+            items: list[Any] = []
+            for item in value:
+                normalized_item, stripped = self._normalize(item)
+                items.append(normalized_item)
+                stripped_all.extend(stripped)
+            return items, stripped_all
         if isinstance(value, dict):
             normalized: dict[str, Any] = {}
+            stripped_keys: list[str] = []
             for key, item in value.items():
                 key_text = str(key)
                 lowered = key_text.lower().replace("-", "_")
-                if any(part in lowered for part in _FORBIDDEN_KEY_PARTS):
+                if any(part in lowered for part in _INTERNAL_REASONING_KEY_PARTS):
+                    # 定向剥离：跳过该键值对，记录键名（不含值）供诊断。
+                    stripped_keys.append(key_text)
+                    continue
+                if any(part in lowered for part in _SECRET_KEY_PARTS):
                     raise PayloadRejected(f"forbidden field: {key_text}")
-                normalized[key_text] = self._normalize(item)
-            return normalized
+                normalized_child, stripped_child = self._normalize(item)
+                normalized[key_text] = normalized_child
+                stripped_keys.extend(stripped_child)
+            return normalized, stripped_keys
         raise PayloadRejected(f"unsupported payload type: {type(value).__name__}")
 
 

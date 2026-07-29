@@ -245,6 +245,163 @@ def get_trace(trace_id: str) -> TraceDetailLite:
     )
 
 
+class IntegrityCheck(BaseModel):
+    """单个完整性检查项：具体失败检查 + 影响阶段 + 恢复动作（FR-003 / AC-004）。
+
+    取代"Trace 数据不完整：不完整"这类同义反复——每项必须说清缺了什么、影响哪个
+    下游、用户能做什么，不得只给一个标签或比例。
+    """
+
+    check: str             # 失败检查名（如 "payload_missing"/"manifest_capture_degraded"）
+    stage: str             # 影响阶段（如 "采集"/"摄入"/"完整性校验"）
+    impact: str            # 对下游的影响（如 "证据卷宗无法编纂为 ready"）
+    recovery: str          # 可执行恢复动作（如 "重跑该测试生成新 Trace"）
+
+
+class IntegrityDiagnosis(BaseModel):
+    """Trace 完整性结构化诊断（FR-003 / AC-004 / DEC-006）。
+
+    verified 的 Trace 也会返回（空 missing_checks），让前端用同一套渲染逻辑。
+    """
+
+    trace_id: str
+    integrity_status: str           # verified / incomplete / conflict / legacy
+    recoverable: bool               # 正文是否可恢复（历史丢失=false，重跑可恢复=true）
+    missing_checks: list[IntegrityCheck]
+    affected_downstreams: list[str]  # 受影响的下游（evaluation/evolution/evidence_compile）
+
+
+def _compute_integrity_diagnosis(trace_id: str) -> IntegrityDiagnosis:
+    """根据 runs + trace_receipts 推导结构化完整性诊断。
+
+    数据源：
+      - runs.integrity_status：权威完整性标签
+      - trace_receipts：manifest_status / manifest_json（含 capture_degraded）/
+        missing_ranges_json（序列缺口）
+    诊断规则（FR-003）：每个非 verified 状态必须给出具体失败检查、影响和恢复动作。
+    """
+    run_row = db.query_one("SELECT * FROM runs WHERE trace_id = ?", (trace_id,))
+    if run_row is None:
+        raise HTTPException(status_code=404, detail="Trace not found")
+
+    integrity = run_row.get("integrity_status") or "legacy"
+    schema_version = int(run_row.get("schema_version") or 1)
+
+    # legacy / schema_version<2：旧版 Trace，无法套用 V2 完整性结论（DEC-006）。
+    if integrity == "legacy" or schema_version < 2:
+        return IntegrityDiagnosis(
+            trace_id=trace_id,
+            integrity_status="legacy",
+            recoverable=True,
+            missing_checks=[
+                IntegrityCheck(
+                    check="legacy_trace_unverified",
+                    stage="完整性校验",
+                    impact="该 Trace 由旧版系统生成，未经过 V2 完整性校验，不能作为下游证据基线",
+                    recovery="重新运行该任务以生成 V2 Trace，再编纂证据卷宗",
+                )
+            ],
+            affected_downstreams=["evidence_compile", "evaluation", "evolution"],
+        )
+
+    if integrity == "verified":
+        return IntegrityDiagnosis(
+            trace_id=trace_id,
+            integrity_status="verified",
+            recoverable=True,
+            missing_checks=[],
+            affected_downstreams=[],
+        )
+
+    # incomplete / conflict：从 receipt 提取具体缺口（AC-004）。
+    receipt = db.query_one(
+        "SELECT manifest_json, manifest_status, missing_ranges_json FROM trace_receipts WHERE trace_id=?",
+        (trace_id,),
+    )
+    checks: list[IntegrityCheck] = []
+    capture_degraded = False
+    missing_ranges: list[Any] = []
+
+    if receipt is not None:
+        missing_ranges = json.loads(receipt.get("missing_ranges_json") or "[]")
+        manifest_raw = receipt.get("manifest_json")
+        if manifest_raw:
+            try:
+                manifest = json.loads(manifest_raw)
+                capture_degraded = bool(manifest.get("capture_degraded"))
+            except (json.JSONDecodeError, TypeError):
+                checks.append(
+                    IntegrityCheck(
+                        check="manifest_unparseable",
+                        stage="完整性校验",
+                        impact="终态清单无法解析，无法证明事件序列未被篡改",
+                        recovery="重新运行该任务以生成有效清单",
+                    )
+                )
+        if receipt.get("manifest_status") in (None, "", "missing"):
+            checks.append(
+                IntegrityCheck(
+                    check="manifest_missing",
+                    stage="终态收尾",
+                    impact="缺少终态清单，无法证明 Trace 数据完整",
+                    recovery="重新运行该任务以生成完整终态",
+                )
+            )
+
+    if missing_ranges:
+        checks.append(
+            IntegrityCheck(
+                check="event_sequence_gap",
+                stage="摄入",
+                impact=f"事件序列存在 {len(missing_ranges)} 处缺口，调用链可能断裂",
+                recovery="重新运行该任务，或等待摄入补全后刷新",
+            )
+        )
+
+    if capture_degraded:
+        # 采集降级：payload 被安全闸门拒绝（密钥/二进制）或写盘失败。
+        # 注意：reasoning 剥离不再触发 degraded（DEC-001），此处仅指真实数据丢失。
+        checks.append(
+            IntegrityCheck(
+                check="payload_capture_degraded",
+                stage="采集",
+                impact="部分 LLM 正文或工具载荷因安全策略或写盘失败被丢弃，业务证据不完整",
+                recovery="重新运行该任务；若反复出现请检查载荷是否含密钥类内容",
+            )
+        )
+
+    if not checks:
+        # integrity 非 verified 但无具体缺口证据：给出兜底诊断，不返回空同义反复。
+        checks.append(
+            IntegrityCheck(
+                check="integrity_unverified",
+                stage="完整性校验",
+                impact=f"完整性状态为 {integrity}，但缺少具体缺口证据",
+                recovery="重新运行该任务以生成可验证的完整 Trace",
+            )
+        )
+
+    # 历史正文永久丢失不可补造（DEC-006）：capture_degraded 导致的丢失不可原地恢复，
+    # 只能重跑生成新 Trace。recoverable=True 表示"可通过重跑恢复"，而非"可原地修复"。
+    return IntegrityDiagnosis(
+        trace_id=trace_id,
+        integrity_status=integrity,
+        recoverable=True,
+        missing_checks=checks,
+        affected_downstreams=["evidence_compile", "evaluation", "evolution"],
+    )
+
+
+@router.get("/traces/{trace_id}/integrity", response_model=IntegrityDiagnosis)
+def get_trace_integrity(trace_id: str) -> IntegrityDiagnosis:
+    """Trace 完整性结构化诊断（FR-003 / AC-004）。
+
+    返回具体失败检查、影响阶段、受影响下游和可执行恢复动作，取代前端
+    "Trace 数据不完整：不完整"这类同义反复文案。verified Trace 返回空 missing_checks。
+    """
+    return _compute_integrity_diagnosis(trace_id)
+
+
 @router.get("/traces/{trace_id}/events", response_model=list[TraceLogEvent])
 def get_trace_events(
     request: Request,

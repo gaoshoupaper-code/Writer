@@ -33,8 +33,10 @@ _JSON_COLUMNS = {
 
 # 终态：编译已结束（成功/降级/失败）。superseded 是被新版本替代的只读终态。
 _TERMINAL_STATUSES = {"ready", "partial", "failed", "superseded"}
-# 可消费：下游 Agent 可以读的状态。
-_CONSUMABLE_STATUSES = {"ready", "partial"}
+# 可消费：只有完整 ready 卷宗可进入任何下游（CON-007 / DEC-007）。
+# partial 不在此列——降级卷宗只能诊断或重跑，不得消费。此规则覆盖既有文档中
+# 允许 partial 降级消费的冲突条款（.claude/md/20260726_214821_trace证据管线.md）。
+_CONSUMABLE_STATUSES = {"ready"}
 
 
 class DossierImmutableError(Exception):
@@ -231,18 +233,18 @@ def get_current_dossier(trace_id: str) -> dict[str, Any] | None:
 
 
 def get_consumable_dossier(trace_id: str) -> dict[str, Any] | None:
-    """查某 trace 最近一条可消费的证据卷宗（ready/partial）。
+    """查某 trace 最近一条可消费的证据卷宗（仅 ready，CON-007）。
 
-    供进化闸门强前置校验用。优先取 is_current 的；无则取最新终态可消费的。
+    供进化闸门强前置校验用。优先取 is_current 的；无则取最新 ready。
     """
     # 先试当前推荐版本
     current = get_current_dossier(trace_id)
     if current and current["status"] in _CONSUMABLE_STATUSES:
         return current
-    # 退而取最新 ready/partial
+    # 退而取最新 ready
     row = db.query_one(
         """SELECT * FROM evidence_dossiers
-           WHERE trace_id = ? AND status IN ('ready','partial')
+           WHERE trace_id = ? AND status IN ('ready')
            ORDER BY version DESC LIMIT 1""",
         (trace_id,),
     )
@@ -277,14 +279,15 @@ def get_active_compiling(trace_id: str, compile_rule_version: str) -> dict[str, 
 def get_consumable_by_rule(
     trace_id: str, compile_rule_version: str
 ) -> dict[str, Any] | None:
-    """查某 trace + 编译规则版本下最近一条可消费的卷宗。
+    """查某 trace + 编译规则版本下最近一条可消费的卷宗（仅 ready，CON-007）。
 
-    供 start 端点做幂等：已有同规则版本的 ready/partial 则直接返回，不重复编译。
+    供 start 端点做幂等：已有同规则版本的 ready 则直接返回，不重复编译。
+    partial 不算可消费——降级卷宗需重新编纂为 ready。
     """
     row = db.query_one(
         """SELECT * FROM evidence_dossiers
            WHERE trace_id = ? AND compile_rule_version = ?
-             AND status IN ('ready','partial')
+             AND status IN ('ready')
            ORDER BY version DESC LIMIT 1""",
         (trace_id, compile_rule_version),
     )

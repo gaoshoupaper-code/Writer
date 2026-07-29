@@ -10,9 +10,11 @@ import { Badge } from "@/components/ui/badge";
 import {
   getTraceEvents,
   getTraceContext,
+  getTraceIntegrity,
   stopActiveSession,
   resolveTrace,
 } from "@/lib/api";
+import type { IntegrityDiagnosis } from "@/lib/api";
 import type { TraceNode, TraceRunSummary, TraceContextSegment, TraceLogEvent } from "@/lib/types";
 
 /**
@@ -46,6 +48,10 @@ export default function TraceDetailPage() {
   const [stopping, setStopping] = useState(false);
   const [resolving, setResolving] = useState<"failed" | "completed" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+
+  // ── 完整性结构化诊断（FR-003 / AC-004）：非 verified 时拉取具体缺口 ──
+  const [integrityDiagnosis, setIntegrityDiagnosis] = useState<IntegrityDiagnosis | null>(null);
+  const [integrityLoading, setIntegrityLoading] = useState(false);
 
   const activeRun: TraceRunSummary | null = detail?.run ?? null;
   const nodes = detail?.nodes ?? [];
@@ -108,6 +114,37 @@ export default function TraceDetailPage() {
 
     return () => { ignore = true; };
   }, [drawerNode, traceId]);
+
+  // 完整性诊断：仅当 run.integrity_status 非 verified 且 trace 终态时拉取一次。
+  // 终态前 integrity 通常还是 incomplete（运行中），拉诊断意义不大且浪费请求。
+  useEffect(() => {
+    const status = activeRun?.integrity_status;
+    const isTerminal = activeRun?.status
+      ? !["running", "awaiting_input"].includes(activeRun.status)
+      : false;
+    if (!traceId || !status || status === "verified" || !isTerminal) {
+      setIntegrityDiagnosis(null);
+      return;
+    }
+    let ignore = false;
+    setIntegrityLoading(true);
+    (async () => {
+      try {
+        const diag = await getTraceIntegrity(traceId);
+        if (!ignore) {
+          setIntegrityDiagnosis(diag);
+          setIntegrityLoading(false);
+        }
+      } catch {
+        if (!ignore) {
+          // 诊断加载失败：保留状态标签但不阻断页面（EDGE-007 失败不得伪装成无缺口）。
+          setIntegrityDiagnosis(null);
+          setIntegrityLoading(false);
+        }
+      }
+    })();
+    return () => { ignore = true; };
+  }, [traceId, activeRun?.integrity_status, activeRun?.status]);
 
   // 抽屉内 LLM 输入消息（从懒加载的 events 找 start 事件的 input.messages）
   const drawerInputMessages = useMemo(() => {
@@ -313,7 +350,34 @@ export default function TraceDetailPage() {
         )}
         {run.integrity_status && run.integrity_status !== "verified" && (
           <div className={`integrity-hint integrity-${run.integrity_status}`}>
-            Trace 数据不完整：{integrityLabel(run.integrity_status)}。下游证据、评估和进化流程不可消费。
+            {integrityLoading ? (
+              <span>正在分析完整性缺口…</span>
+            ) : integrityDiagnosis && integrityDiagnosis.missing_checks.length > 0 ? (
+              <div className="integrity-diagnosis">
+                <div className="integrity-diagnosis-summary">
+                  Trace 完整性：{integrityLabel(run.integrity_status)}。
+                  {integrityDiagnosis.affected_downstreams.length > 0 && (
+                    <>受影响下游：{integrityDiagnosis.affected_downstreams.map(downstreamLabel).join("、")}。</>
+                  )}
+                </div>
+                <ul className="integrity-check-list">
+                  {integrityDiagnosis.missing_checks.map((check) => (
+                    <li key={check.check} className="integrity-check-item">
+                      <span className="integrity-check-stage">{check.stage}</span>
+                      <span className="integrity-check-impact">{check.impact}</span>
+                      <span className="integrity-check-recovery">恢复：{check.recovery}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <span>
+                Trace 完整性：{integrityLabel(run.integrity_status)}，下游证据、评估和进化流程不可消费。
+                {run.integrity_status === "legacy"
+                  ? " 该 Trace 由旧版系统生成，建议重新运行生成 V2 Trace。"
+                  : " 诊断信息暂时不可用，请稍后刷新或重新运行该任务。"}
+              </span>
+            )}
           </div>
         )}
       </header>
@@ -456,6 +520,13 @@ function integrityLabel(status: string): string {
   if (status === "incomplete") return "不完整";
   if (status === "conflict") return "冲突";
   return "旧版未验证";
+}
+
+function downstreamLabel(downstream: string): string {
+  if (downstream === "evidence_compile") return "证据卷宗编纂";
+  if (downstream === "evaluation") return "评估";
+  if (downstream === "evolution") return "进化";
+  return downstream;
 }
 
 function workloadLabel(workload: string | null | undefined): string {

@@ -996,6 +996,18 @@ def _init_trace_v2_tables(conn: sqlite3.Connection) -> None:
                 received_at TEXT NOT NULL,
                 UNIQUE(trace_id, conflict_key, received_hash)
             );
+            -- CON-010 / DEC-012 / AC-015：取消来源 ready 卷宗人工确认审计。
+            -- 记录每一次"来源运行已取消的 ready 卷宗经人工确认进入下游"的操作，
+            -- 保留操作者、确认时间、取消来源、目标下游，证明非自动调度。
+            CREATE TABLE IF NOT EXISTS cancel_origin_submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_trace_id TEXT NOT NULL,
+                source_status TEXT NOT NULL,
+                dossier_id TEXT NOT NULL,
+                target_downstream TEXT NOT NULL,   -- evaluation | evolution
+                submitted_by TEXT NOT NULL,
+                confirmed_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS payload_objects (
                 payload_id TEXT PRIMARY KEY,
                 content_hash TEXT NOT NULL,

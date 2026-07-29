@@ -501,6 +501,26 @@ export async function resolveTrace(
   });
 }
 
+/** Trace 完整性结构化诊断（FR-003 / AC-004）：具体缺口 + 影响下游 + 恢复动作。 */
+export interface IntegrityCheck {
+  check: string;       // 失败检查名
+  stage: string;       // 影响阶段
+  impact: string;      // 对下游的影响
+  recovery: string;    // 可执行恢复动作
+}
+
+export interface IntegrityDiagnosis {
+  trace_id: string;
+  integrity_status: string;          // verified / incomplete / conflict / legacy
+  recoverable: boolean;              // 是否可通过重跑恢复
+  missing_checks: IntegrityCheck[];
+  affected_downstreams: string[];    // 受影响下游
+}
+
+export async function getTraceIntegrity(traceId: string): Promise<IntegrityDiagnosis> {
+  return evoJson<IntegrityDiagnosis>(`/api/traces/${traceId}/integrity`, { method: "GET" });
+}
+
 /**
  * 按 session_type 分发停止调用（trace 详情页停止按钮用）。
  *
@@ -592,14 +612,19 @@ export interface ConsumableDossierSummary {
   finished_at: string | null;
 }
 
-/** 启动评估（阶段 C：按证据卷宗启动，须 ready 完整卷宗） */
+/** 启动评估（阶段 C：按证据卷宗启动，须 ready 完整卷宗）。
+ * CON-010/AC-015：来源运行已取消的 ready 卷宗，须 confirmedCancelOrigin=true 才能人工提交。 */
 export async function startEval(
   dossierId: string,
+  confirmedCancelOrigin = false,
 ): Promise<{ eval_id: string; trace_id: string; dossier_id: string; status: string }> {
   return evoJson(`/api/eval-agent/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ dossier_id: dossierId }),
+    body: JSON.stringify({
+      dossier_id: dossierId,
+      confirmed_cancel_origin: confirmedCancelOrigin,
+    }),
   });
 }
 

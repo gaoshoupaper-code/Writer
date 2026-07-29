@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import app.core.db as db
@@ -53,6 +54,9 @@ class EvalStartRequest(BaseModel):
     """评估启动请求（阶段 C：按证据卷宗启动）。"""
 
     dossier_id: str  # 必填：要评估的证据卷宗 id（须为完整态 ready）
+    # CON-010 / DEC-012 / AC-015：来源运行已取消的 ready 卷宗，必须由授权用户
+    # 在看到醒目取消来源标识后显式确认才能人工提交。系统永不自动调度取消来源卷宗。
+    confirmed_cancel_origin: bool = False
 
 
 class EvalStartResponse(BaseModel):
@@ -101,7 +105,7 @@ async def eval_start(
 
     # 2. 防自观测：卷宗来源 trace 不能是进化端自观测 trace（需求 §44）。
     run_row = db.query_one(
-        "SELECT run_purpose FROM runs WHERE trace_id = ?", (trace_id,)
+        "SELECT run_purpose, status FROM runs WHERE trace_id = ?", (trace_id,)
     )
     run_purpose = (run_row or {}).get("run_purpose") or "user_generation"
     if run_purpose in ("evolution_eval", "evolution_evolve"):
@@ -111,6 +115,38 @@ async def eval_start(
                 f"证据卷宗 {req.dossier_id} 来源 trace 是进化端自观测"
                 f"（run_purpose={run_purpose}），不能评估。"
             ),
+        )
+
+    # CON-010 / DEC-012 / AC-015：来源运行已取消的 ready 卷宗不得自动进入评估。
+    # 只有授权用户看到醒目取消来源标识后显式确认（confirmed_cancel_origin=True）
+    # 才可人工提交。系统永不自动调度取消来源卷宗。
+    source_status = (run_row or {}).get("status")
+    if source_status == "cancelled":
+        if not req.confirmed_cancel_origin:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        f"证据卷宗 {req.dossier_id} 的来源运行已取消（cancelled）。"
+                        "取消来源的卷宗可能是有价值的失败样本，但必须由您确认了解"
+                        "其来源已取消、可能影响评估结论后才能人工提交。"
+                    ),
+                    "cancel_origin_confirmation_required": True,
+                    "source_trace_id": trace_id,
+                    "source_status": "cancelled",
+                },
+            )
+        # 接受取消来源：记录审计（操作者/时间/取消来源/目标下游）。
+        db.execute(
+            """INSERT INTO cancel_origin_submissions
+               (source_trace_id, source_status, dossier_id, target_downstream,
+                submitted_by, confirmed_at)
+               VALUES (?, 'cancelled', ?, 'evaluation', 'api', ?)""",
+            (trace_id, req.dossier_id, datetime.now(UTC).isoformat()),
+        )
+        logger.info(
+            "取消来源卷宗 %s 经人工确认进入评估: source_trace=%s",
+            req.dossier_id, trace_id,
         )
 
     recorder = get_recorder()

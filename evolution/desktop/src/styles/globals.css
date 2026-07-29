@@ -10065,6 +10065,14 @@ html[data-theme="dark"] {
 .lineage-jump-button:hover { border-color: var(--teal); color: var(--teal); }
 .integrity-hint { margin-top: 8px; padding: 8px 12px; border-left: 3px solid var(--gold); background: color-mix(in srgb, var(--gold) 8%, transparent); color: var(--gold); font-size: 12px; }
 .integrity-hint.integrity-conflict { border-left-color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); color: var(--danger); }
+.integrity-diagnosis { display: flex; flex-direction: column; gap: 6px; }
+.integrity-diagnosis-summary { font-weight: 600; }
+.integrity-check-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.integrity-check-item { display: grid; grid-template-columns: auto 1fr; grid-template-areas: "stage impact" "stage recovery"; gap: 2px 8px; align-items: start; padding: 4px 0; border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+.integrity-check-item:first-child { border-top: none; }
+.integrity-check-stage { grid-area: stage; font-weight: 600; white-space: nowrap; opacity: 0.85; }
+.integrity-check-impact { grid-area: impact; }
+.integrity-check-recovery { grid-area: recovery; opacity: 0.8; }
 .integrity-text.integrity-verified { color: var(--completed); }
 .integrity-text.integrity-incomplete,
 .integrity-text.integrity-legacy { color: var(--awaiting); }
