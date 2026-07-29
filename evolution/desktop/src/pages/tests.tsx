@@ -113,7 +113,7 @@ export default function TestsPage() {
   async function handleStop(testId: string) {
     try {
       await stopTest(testId);
-      toast.success("已停止");
+      toast.success("已请求取消，正在收敛…");
       refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "停止失败");
@@ -241,8 +241,14 @@ export default function TestsPage() {
                     {t.status === "failed" && (
                       <button className="action-link" onClick={() => handleRetry(t.test_id)}>重试</button>
                     )}
-                    {(t.status === "pending" || t.status === "running") && (
-                      <button className="action-link warn" onClick={() => handleStop(t.test_id)}>停止</button>
+                    {(t.status === "pending" || t.status === "running" || t.status === "cancelling") && (
+                      <button
+                        className="action-link warn"
+                        disabled={t.status === "cancelling"}
+                        onClick={() => t.status !== "cancelling" && handleStop(t.test_id)}
+                      >
+                        {t.status === "cancelling" ? "取消中…" : "停止"}
+                      </button>
                     )}
                     {t.status === "failed" && (
                       <button className="action-link warn" onClick={() => handleStop(t.test_id)}>强制停止</button>
@@ -264,7 +270,8 @@ export default function TestsPage() {
 
 function testStatusLabel(s: string): string {
   const map: Record<string, string> = {
-    pending: "待执行", running: "运行中", done: "完成", failed: "失败", cancelled: "已取消",
+    pending: "待执行", running: "运行中", done: "完成", failed: "失败",
+    cancelled: "已取消", cancelling: "取消中", cancel_timeout: "取消超时",
   };
   return map[s] ?? s;
 }

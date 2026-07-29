@@ -406,9 +406,7 @@ export default function TraceDetailPage() {
         </div>
         <div className="summary-item">
           <label>完整性</label>
-          <span className={`integrity-text integrity-${run.integrity_status || "legacy"}`}>
-            {integrityLabel(run.integrity_status || "legacy")}
-          </span>
+          <StatusBadge status={run.integrity_status || "legacy"} />
         </div>
         <div className="summary-item">
           <label>Coverage</label>
@@ -496,12 +494,16 @@ function StatusBadge({ status }: { status: string }) {
     : status === "failed" ? "failed"
     : status === "interrupted" ? "interrupted"
     : status === "cancelled" ? "cancelled"
+    : status === "cancelling" ? "cancelled"
+    : status === "cancel_timeout" ? "failed"
     : "running";
   const label =
     status === "completed" ? "完成"
     : status === "failed" ? "失败"
     : status === "interrupted" ? "已中断"
     : status === "cancelled" ? "已取消"
+    : status === "cancelling" ? "取消中"
+    : status === "cancel_timeout" ? "取消超时"
     : status === "awaiting_input" ? "等待输入"
     : "运行中";
   return <Badge variant={variant as any}>{label}</Badge>;
