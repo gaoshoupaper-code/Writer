@@ -337,22 +337,24 @@ async def ab_run(req: ABRunRequest, background_tasks: BackgroundTasks) -> ABRunR
 
 
 def _execute_ab(task_id: str, req: "ABRunRequest") -> None:
-    """后台执行 A/B 生成（同步阻塞跑完，写结果到 _ab_tasks）。"""
-    # 取消标志（ab_run 端点创建，run_ab_generation 在 super-step 边界检查）
+    """后台执行 A/B 生成（隔离子进程，写结果到 _ab_tasks）。
+
+    FR-006 / NFR-001：run_ab_generation 在独立子进程跑，取消时可在十秒内强杀，
+    不受长 LLM / 长工具的 C 层阻塞影响。子进程内独立构建 recorder，trace 写到
+    共享 workspace，通过 Queue 回传 trace_id。
+    """
     task_state = _ab_tasks.get(task_id) or {}
-    cancel_event = task_state.get("cancel_event")
     # source_root：快照版本按 source_commit checkout；working 包用 harnesses/current
     checked_out: Path | None = None
+    worker = None
     try:
-        from app.routers.ab_endpoint import run_ab_generation
         from app.platform.core.settings import get_settings as _get_writer_settings
-        from app.routers.context import get_trace_recorder
+        from app.platform.isolation import IsolatedGenerationWorker
 
         writer_settings = _get_writer_settings()
-        trace_recorder = get_trace_recorder()
         if req.source_commit:
             # 快照版本：clone bare repo + checkout 指定 commit 到临时目录
-            from app.platform.agent.git_sync import checkout_commit, cleanup_checkout
+            from app.platform.agent.git_sync import checkout_commit
 
             source_root = checkout_commit(req.source_commit)
             checked_out = source_root
@@ -364,36 +366,56 @@ def _execute_ab(task_id: str, req: "ABRunRequest") -> None:
                 # 回退：从 evolution 工作目录找
                 source_root = Path(__file__).resolve().parents[3] / "evolution" / "harnesses" / "current"
 
-        trace_id = run_ab_generation(
+        workspace_root = Path(writer_settings.workspace_root).resolve()
+        worker = IsolatedGenerationWorker(
             source_root=source_root,
             demand_md=req.demand_md,
-            trace_recorder=trace_recorder,
-            writer_settings=writer_settings,
-            on_trace_created=lambda tid: _ab_tasks.update(
-                {task_id: {"status": "running", "trace_ids": [tid], "error": None,
-                           "cancel_event": cancel_event}}
-            ),
-            cancel_event=cancel_event,
+            workspace_root=workspace_root,
         )
-        # run_ab_generation 在 cancelled 时已调 cancel_run 收尾；这里区分终态
-        if cancel_event.is_set():
-            _ab_tasks[task_id] = {
-                "status": "cancelled", "trace_ids": [trace_id], "error": None,
-                "cancel_event": cancel_event,
-            }
-            logger.info("候选执行任务被停止: task=%s trace=%s", task_id, trace_id)
-        else:
-            _ab_tasks[task_id] = {"status": "done", "trace_ids": [trace_id], "error": None,
-                                  "cancel_event": cancel_event}
-            logger.info("候选执行任务完成: task=%s trace=%s", task_id, trace_id)
+        # 登记 worker 到 task 表（ab_stop 用它做硬终止）。
+        _ab_tasks[task_id]["worker"] = worker
+        worker.start()
+
+        # 阻塞等子进程回传 trace_id（running 期间就能拿到）。
+        trace_id = worker.wait_for_trace_id(timeout=300)
+        if trace_id:
+            _ab_tasks[task_id]["trace_ids"] = [trace_id]
+
+        # 阻塞等子进程自然结束（非取消场景）。取消由 ab_stop 的后台收敛线程处理。
+        # 用循环 + is_alive 检查，让取消收敛能更新状态。
+        while worker.is_alive():
+            import time
+            time.sleep(0.5)
+            # 若已被 ab_stop 标记 cancelling，说明取消收敛正在进行——本循环让路，
+            # 不再尝试覆盖终态（避免与取消收敛线程竞争，CON-003 单调性）。
+            if _ab_tasks.get(task_id, {}).get("status") == "cancelling":
+                logger.info("task %s 已进入取消收敛，_execute_ab 退出等待", task_id)
+                return
+
+        # 收集终态（遵循单调终态规则，CON-003：不覆盖取消收敛已设的终态）。
+        from contracts.cancel_state import can_transition_to
+
+        worker._drain_queue()
+        result = getattr(worker, "_last_result", None)
+        current = _ab_tasks.get(task_id, {}).get("status")
+        if result is not None and can_transition_to(current, result.status):
+            _ab_tasks[task_id]["status"] = result.status
+            if result.trace_id:
+                _ab_tasks[task_id]["trace_ids"] = [result.trace_id]
+            if result.error:
+                _ab_tasks[task_id]["error"] = result.error
+            if result.status == "failed":
+                _notify_evolution_task_failed(task_id, result.error or "")
+        logger.info(
+            "候选执行任务结束: task=%s status=%s",
+            task_id, _ab_tasks[task_id].get("status"),
+        )
     except BaseException as exc:
         logger.exception("候选执行任务失败: task=%s", task_id)
-        # 保留 on_trace_created 回调已回填的 trace_id（assemble 抛异常但 trace 已创建的
-        # 场景——evolution 端能据此关联 trace 详情；粗暴清空会让 trace 永远查不到）。
         prior_trace_ids = (_ab_tasks.get(task_id) or {}).get("trace_ids", [])
-        _ab_tasks[task_id] = {"status": "failed", "trace_ids": prior_trace_ids,
-                              "error": str(exc), "cancel_event": cancel_event}
-        # 失败兜底通知 evolution（trace 可能尚未创建，ingest 链路收不到）
+        _ab_tasks[task_id]["status"] = "failed"
+        _ab_tasks[task_id]["trace_ids"] = prior_trace_ids
+        _ab_tasks[task_id]["error"] = str(exc)
         _notify_evolution_task_failed(task_id, str(exc))
     finally:
         if checked_out is not None:
@@ -461,30 +483,64 @@ def ab_status(task_id: str) -> dict[str, Any]:
 
 @router.post("/ab/stop/{task_id}")
 def ab_stop(task_id: str) -> dict[str, Any]:
-    """请求停止运行中的候选执行任务（边界停）。
+    """请求停止运行中的候选执行任务（十秒硬终止，FR-006 / NFR-001 / DEC-002）。
 
-    set 取消标志 → _execute_ab 在下一个 super-step 边界中断 → trace 收尾 cancelled。
-    不会立即中断（需等当前 LLM/节点周期结束），响应快但停止有数秒延迟。
+    立即标记 cancelling 并返回（DEC-002 立即反馈），后台线程在 10 秒时限内
+    通过子进程隔离 + 强杀收敛到 cancelled（NFR-001 P100 ≤ 10.0s）。
 
     - task 不存在 → 404
-    - task 已终态（done/failed/cancelled）→ 409，无需停止
-    - task running → set 标志，返回 accepted
+    - task 已终态（done/failed/cancelled/cancel_timeout）→ 409，幂等返回当前状态
+    - task running/cancelling → 标 cancelling，后台硬终止，返回 cancelling
     """
+    from contracts.cancel_state import HARD_STOP_DEADLINE_SECONDS, is_terminal
+
     task = _ab_tasks.get(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"task not found: {task_id}")
-    if task.get("status") != "running":
+    current_status = task.get("status")
+    if is_terminal(current_status):
+        # 幂等：已终态返回当前进度（EDGE-003 重复取消）。
         raise HTTPException(
             status_code=409,
-            detail=f"task {task_id} 已终态（{task.get('status')}），无需停止",
+            detail=f"task {task_id} 已终态（{current_status}），无需停止",
         )
-    cancel_event = task.get("cancel_event")
-    if cancel_event is None:
-        # 老任务无取消标志（兼容）：无法停止
-        raise HTTPException(status_code=409, detail=f"task {task_id} 不支持停止")
-    cancel_event.set()
-    logger.info("候选执行任务收到停止请求: task=%s", task_id)
-    return {"status": "accepted", "task_id": task_id}
+
+    # 立即标记 cancelling（DEC-002：用户提交后当前帧可见）。
+    _ab_tasks[task_id]["status"] = "cancelling"
+    logger.info("候选执行任务进入取消中: task=%s", task_id)
+
+    # 后台线程做硬终止收敛（不阻塞 HTTP 响应）。
+    worker = task.get("worker")
+    if worker is not None:
+        import threading
+
+        def _converge_cancel() -> None:
+            try:
+                result = worker.stop_and_collect(
+                    deadline=HARD_STOP_DEADLINE_SECONDS
+                )
+                _ab_tasks[task_id]["status"] = result.status
+                if result.trace_id:
+                    _ab_tasks[task_id]["trace_ids"] = [result.trace_id]
+                if result.error:
+                    _ab_tasks[task_id]["error"] = result.error
+                logger.info(
+                    "候选执行任务取消收敛完成: task=%s status=%s",
+                    task_id, result.status,
+                )
+            except Exception:
+                logger.exception("取消收敛异常: task=%s", task_id)
+                _ab_tasks[task_id]["status"] = "cancel_timeout"
+
+        threading.Thread(target=_converge_cancel, daemon=True).start()
+    else:
+        # 无 worker（兼容老任务或 worker 未就绪）：回退协作式取消。
+        cancel_event = task.get("cancel_event")
+        if cancel_event is not None:
+            cancel_event.set()
+        _ab_tasks[task_id]["status"] = "cancelled"
+
+    return {"status": "cancelling", "task_id": task_id}
 
 
 # 内存任务表（进程级。生产可换 Redis/DB）
