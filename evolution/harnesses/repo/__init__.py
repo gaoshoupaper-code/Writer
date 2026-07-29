@@ -227,6 +227,16 @@ def _make_intervention_callback(ctx: RuntimeContext, agent_name: str):
     return _callback
 
 
+def _retry_runner_for(ctx: RuntimeContext):
+    """从 ctx 构造模型重试运行器（FR-003/EVD-006 可观测）。
+
+    writer_retry_runner_factory 是 RuntimeContext 声明字段（默认 None）；None 时返回 None，
+    TraceMiddleware 走原"只看外边界"行为（向后兼容）。meta 与各子代理装配共用此构造。
+    """
+    factory = ctx.writer_retry_runner_factory
+    return factory() if factory is not None else None
+
+
 def assemble(ctx: RuntimeContext):
     """装配完整创作 Agent（meta + 4 个 subagent）。
 
@@ -276,7 +286,10 @@ def assemble(ctx: RuntimeContext):
     #   → WriteResultInspector（在串行化内、ErrorRecovery 内，转抛 WriteFailedError）
     #   → GoalMiddleware（最内层）
     meta_middleware = [
-        ErrorRecoveryMiddleware(intervention_callback=_make_intervention_callback(ctx, "meta-agent")),
+        ErrorRecoveryMiddleware(
+            intervention_callback=_make_intervention_callback(ctx, "meta-agent"),
+            tool_replay_policy=ctx.tool_replay_policy,  # CON-005 task 防重放
+        ),
         MetaReadOnlyMiddleware(intervention_callback=_make_intervention_callback(ctx, "meta-agent")),
         ReadCacheMiddleware(intervention_callback=_make_intervention_callback(ctx, "meta-agent")),
         FilesystemPathGuardMiddleware(
@@ -293,9 +306,11 @@ def assemble(ctx: RuntimeContext):
     meta_skills = _skill_abs_paths("meta")
 
     # TraceMiddleware 挂载（T2：类由 ctx 注入，包内实例化）
+    # FR-003/EVD-006：写作路径注入重试运行器时，TraceMiddleware 用它包裹模型调用，
+    # 让传输层 attempt/退避在 Trace 可见。运行器由领域层提供（平台层不 import domains）。
     if ctx.trace_recorder is not None and ctx.trace_id and ctx.trace_middleware_cls:
         meta_middleware.insert(1, ctx.trace_middleware_cls(
-            ctx.trace_recorder, ctx.trace_id, "meta-agent",
+            ctx.trace_recorder, ctx.trace_id, "meta-agent", retry_runner=_retry_runner_for(ctx),
         ))
 
     # CreditsMiddleware 挂载（AD2/AD6：积分制，类由 ctx 注入，包内实例化）
@@ -335,7 +350,10 @@ def assemble(ctx: RuntimeContext):
     def middleware_factory(agent_name: str) -> list:
         intervention_callback = _make_intervention_callback(ctx, agent_name)
         mw = [
-            ErrorRecoveryMiddleware(intervention_callback=intervention_callback),
+            ErrorRecoveryMiddleware(
+                intervention_callback=intervention_callback,
+                tool_replay_policy=ctx.tool_replay_policy,  # CON-005 task 防重放
+            ),
             ReadCacheMiddleware(intervention_callback=intervention_callback),
             FilesystemPathGuardMiddleware(
                 workspace_path,
@@ -348,7 +366,7 @@ def assemble(ctx: RuntimeContext):
         ]
         if ctx.trace_recorder is not None and ctx.trace_id and ctx.trace_middleware_cls:
             mw.insert(1, ctx.trace_middleware_cls(
-                ctx.trace_recorder, ctx.trace_id, agent_name,
+                ctx.trace_recorder, ctx.trace_id, agent_name, retry_runner=_retry_runner_for(ctx),
             ))
         # CreditsMiddleware 挂载到创作类子代理（AD6），不挂 interview（访谈免费）。
         if (

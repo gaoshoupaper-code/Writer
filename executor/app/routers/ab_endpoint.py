@@ -143,6 +143,10 @@ def run_ab_generation(
     from contracts.runtime_context import RuntimeContext
     from app.domains.writing.models import build_writer_model
     from app.platform.agent.middleware import TraceMiddleware
+    # CON-005/FR-003（trace 可见性根治）：复用生产路径的平台级安全边界注入。
+    # A/B + 单次测试是 EVD-003 的实际复现入口，必须与生产路径同施加 task 防重放 +
+    # 模型重试可观测，否则该入口仍会出现约 18 分钟等待与整任务重放。
+    from app.domains.writing.agent import _build_tool_replay_policy, _make_retry_runner_factory
     from app.schemas.screenplay import ThreadSummary
     from datetime import UTC, datetime
 
@@ -209,6 +213,10 @@ def run_ab_generation(
             styles=None,  # A/B 用裸 prompt
             trace_recorder=trace_recorder,
             trace_middleware_cls=TraceMiddleware,
+            # CON-005/FR-003：与生产路径同注入 task 防重放 + 模型重试可观测边界，
+            # 覆盖单次测试/A·B（EVD-003 实际复现入口）。
+            tool_replay_policy=_build_tool_replay_policy(trace_recorder, trace_id),
+            writer_retry_runner_factory=_make_retry_runner_factory(),
         )
 
         # 5. assemble（单参数契约，与生产路径 agent.py 一致）

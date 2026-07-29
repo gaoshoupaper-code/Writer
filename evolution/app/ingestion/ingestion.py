@@ -83,22 +83,63 @@ def _fetch_trace_content(
         run_summary = data.get("run", {}) or {}
         run = TraceRunSummary.model_validate(run_summary)
         payload_values: dict[str, object] = {}
-        for payload_id in {
+        payload_ids = {
             ref.payload_id for event in events for ref in event.payload_refs.values()
-        }:
-            payload_response = httpx.get(
-                f"{settings.executor_url}/internal/traces/{trace_id}/payloads/{payload_id}",
-                timeout=_FETCH_TIMEOUT,
-                headers=headers,
+        }
+        # NFR-003/RSK-005：payload 并发拉取（原串行逐个 30s，长 trace 会把单轮 refresh
+        # 拖到分钟级，表现为页面"卡住"）。并发上限有界，避免打爆 executor。
+        if payload_ids:
+            payload_values = _fetch_payloads_concurrent(
+                settings.executor_url, trace_id, payload_ids, headers,
             )
-            if payload_response.status_code == 200:
-                payload_values[payload_id] = payload_response.json()
-            else:
-                logger.warning("拉取 trace %s payload %s 失败: %s", trace_id, payload_id, payload_response.status_code)
         return events, run, payload_values
     except Exception as exc:
         logger.warning("拉取 trace %s 失败：%s", exc)
         return None
+
+
+# payload 并发拉取上限（NFR-003：有界并发，避免单轮 refresh 打爆 executor）。
+_PAYLOAD_CONCURRENCY = 8
+
+
+def _fetch_payloads_concurrent(
+    executor_url: str,
+    trace_id: str,
+    payload_ids: set[str],
+    headers: dict[str, str] | None,
+) -> dict[str, object]:
+    """并发拉取一批 payload（NFR-003/RSK-005）。
+
+    原实现逐个串行，每个最长 30s；含多个 payload 的长 trace 会让单轮 refresh 拖到
+    分钟级，表现为详情页"卡住不动"。改为线程池并发（上限有界），单个失败不阻塞其余，
+    只记 warning。行为与串行等价（payload_values 内容一致），仅缩短墙钟时间。
+    """
+    import httpx
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results: dict[str, object] = {}
+    if not payload_ids:
+        return results
+
+    def _one(pid: str) -> tuple[str, object | None]:
+        url = f"{executor_url}/internal/traces/{trace_id}/payloads/{pid}"
+        try:
+            r = httpx.get(url, timeout=_FETCH_TIMEOUT, headers=headers)
+        except Exception as exc:  # noqa: BLE001 —— 单个 payload 失败不阻塞其余
+            logger.warning("拉取 trace %s payload %s 异常: %s", trace_id, pid, exc)
+            return pid, None
+        if r.status_code == 200:
+            return pid, r.json()
+        logger.warning("拉取 trace %s payload %s 失败: %s", trace_id, pid, r.status_code)
+        return pid, None
+
+    with ThreadPoolExecutor(max_workers=_PAYLOAD_CONCURRENCY) as pool:
+        futures = [pool.submit(_one, pid) for pid in payload_ids]
+        for fut in as_completed(futures):
+            pid, value = fut.result()
+            if value is not None:
+                results[pid] = value
+    return results
 
 
 def _load_prior_events(trace_id: str) -> tuple[list, int]:

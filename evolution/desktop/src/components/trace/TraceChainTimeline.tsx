@@ -3,6 +3,35 @@ import type { TraceNode, TraceRunSummary } from "@/lib/types";
 import { ChainIcon } from "./ChainNodeIcon";
 
 /**
+ * useRunningDuration —— 运行中节点的客户端动态计时（FR-001/EVD-008）。
+ *
+ * 后端对未闭合节点只给 started_at、duration_ms 为空。旧实现因此把运行节点显示成
+ * 空白耗时，让"健康的长调用"和"卡死"看起来一样。本 hook 用 started_at 在客户端
+ * 每秒推算已运行时长，让用户始终看到"正在等待返回·已用时 X"（EDGE-001）。
+ * 节点闭合（duration_ms 非 null 或 status 非 running）后停止计时，回退到后端耗时。
+ */
+function useRunningDuration(node: TraceNode): number | null {
+  const [elapsed, setElapsed] = useState<number | null>(null);
+  useEffect(() => {
+    // 仅运行中且有 started_at 的节点需要客户端计时。
+    if (node.duration_ms != null || node.status !== "running" || !node.started_at) {
+      setElapsed(null);
+      return;
+    }
+    const startedMs = Date.parse(node.started_at);
+    if (Number.isNaN(startedMs)) {
+      setElapsed(null);
+      return;
+    }
+    const tick = () => setElapsed(Date.now() - startedMs);
+    tick(); // 立即给一个初值，不等 1s。
+    const timer = setInterval(tick, 1000); // NFR-001：本地计时每秒至少更新一次。
+    return () => clearInterval(timer);
+  }, [node.duration_ms, node.status, node.started_at]);
+  return elapsed;
+}
+
+/**
  * 链路时间线 — 显示 trace 执行节点的时间线视图。
  * - Agent 节点可折叠/展开其子节点
  * - 每个节点显示 SVG 图标 + 名称 + chain_summary + 耗时 + 状态
@@ -35,6 +64,45 @@ type RenderItem =
 export function TraceChainTimeline({ nodes, activeRun, activeNodeId, onSelectNode, onJumpToChart, highlightedNodeId, onClearHighlight }: TraceChainTimelineProps) {
   const [collapsedAgents, setCollapsedAgents] = useState<Set<string>>(new Set());
   const nodeRowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+
+  // ── AC-002 自动跟随：用户停在底部时新节点到达自动滚动；手动上滚查看历史不强行拉回 ──
+  const nodesScrollRef = useRef<HTMLDivElement>(null);
+  const atBottomRef = useRef(true);
+  const prevNodeCountRef = useRef(0);
+  const [hasNewNodes, setHasNewNodes] = useState(false);
+
+  const handleNodesScroll = useCallback(() => {
+    const el = nodesScrollRef.current;
+    if (!el) return;
+    // 距底部 < 40px 视为"在底部跟随"（容忍抖动）。
+    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    if (atBottomRef.current) setHasNewNodes(false);
+  }, []);
+
+  // 新节点到达时：若用户在底部则平滑跟随；否则显示"有新节点"提示（不强行打断历史阅读）。
+  useEffect(() => {
+    const el = nodesScrollRef.current;
+    if (!el) return;
+    const count = nodes.length;
+    if (count > prevNodeCountRef.current && prevNodeCountRef.current > 0) {
+      if (atBottomRef.current) {
+        requestAnimationFrame(() => {
+          el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+        });
+      } else {
+        setHasNewNodes(true);
+      }
+    }
+    prevNodeCountRef.current = count;
+  }, [nodes.length]);
+
+  const jumpToLatest = useCallback(() => {
+    const el = nodesScrollRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    atBottomRef.current = true;
+    setHasNewNodes(false);
+  }, []);
 
   // ── 高亮效果：从图检测跳转过来时，展开父 agent、滚动到目标位置并高亮 ──
   useEffect(() => {
@@ -185,7 +253,7 @@ export function TraceChainTimeline({ nodes, activeRun, activeNodeId, onSelectNod
       </div>
 
       {/* 节点列表 */}
-      <div className="trace-chain-nodes">
+      <div className="trace-chain-nodes" ref={nodesScrollRef} onScroll={handleNodesScroll}>
         {chainNodes.length === 0 ? (
           <p className="status-copy">暂无执行节点。</p>
         ) : null}
@@ -238,6 +306,12 @@ export function TraceChainTimeline({ nodes, activeRun, activeNodeId, onSelectNod
           );
         })}
       </div>
+      {/* AC-002：用户向上查看历史时有新节点到达，提供"回到最新"入口（不强行打断阅读）。 */}
+      {hasNewNodes && (
+        <button type="button" className="chain-new-nodes-pill" onClick={jumpToLatest}>
+          ↓ 有新节点，回到最新
+        </button>
+      )}
     </div>
   );
 }
@@ -319,6 +393,10 @@ const ChainNodeRow = forwardRef<HTMLDivElement, {
   // 仅 LLM 节点可跳转到图检测
   const canJumpToChart = node.kind === "llm" && loopIndex != null && onJumpToChart;
 
+  // FR-001/EVD-008：运行中节点用 started_at 客户端计时，不再显示空白耗时。
+  const runningElapsed = useRunningDuration(node);
+  const displayDuration = node.duration_ms != null ? node.duration_ms : runningElapsed;
+
   // depth-based 缩进：depth=1 → 28px，depth=2（evaluation）→ 56px
   const indent = node.depth && node.depth > 0 ? 28 * node.depth : 0;
 
@@ -343,7 +421,11 @@ const ChainNodeRow = forwardRef<HTMLDivElement, {
               {isCollapsed ? `${childCount} ▸` : "▾"}
             </span>
           ) : null}
-          <span className={`chain-node-duration ${durationColorClass(node.duration_ms)}`}>{node.duration_ms != null ? formatDuration(node.duration_ms) : ""}</span>
+          <span className={`chain-node-duration ${durationColorClass(displayDuration)}`}>
+            {displayDuration != null
+              ? `${formatDuration(displayDuration)}${node.duration_ms == null && node.status === "running" ? " ⋯" : ""}`
+              : ""}
+          </span>
           <span className={`chain-node-status-dot ${node.status}`} />
         </div>
         {node.chain_summary ? (

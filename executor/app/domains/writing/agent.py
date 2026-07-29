@@ -35,6 +35,134 @@ from app.schemas.screenplay import (
 logger = logging.getLogger("writer.meta_agent")
 
 
+def _safe_version(pkg: str) -> str | None:
+    """读取已安装包版本，缺失时返回 None（CON-003：Trace 快照可追溯 SDK 版本）。"""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        return version(pkg)
+    except PackageNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _build_tool_replay_policy(trace_recorder, trace_id: str | None):
+    """构建带 Trace 观测回调的 TaskReplayPolicy（CON-005 平台级 task 防重放）。
+
+    命中防重放（task 被通用恢复重试）时，写一条 middleware_intervention 事件，
+    让"已阻止整任务重放"在 Trace 时间线可见（FR-003 可观测）。
+    """
+    from app.domains.writing.task_replay_policy import TaskReplayPolicy
+
+    recorder = trace_recorder
+    tid = trace_id
+
+    def _on_blocked(tool_name: str, policy_version: str, exc: BaseException) -> None:
+        if recorder is None or not tid:
+            return
+        record_intervention = getattr(recorder, "record_intervention", None)
+        if not callable(record_intervention):
+            return
+        try:
+            record_intervention(
+                tid,
+                "meta-agent",
+                action="blocked_task_replay",
+                hook="wrap_tool_call",
+                affected_fields=["control_flow"],
+                reason=f"{type(exc).__name__}:{tool_name}",
+            )
+        except Exception:  # noqa: BLE001 —— 观测失败不得阻断执行
+            logger.debug("task 防重放 intervention 记录失败", exc_info=True)
+
+    return TaskReplayPolicy(on_replay_blocked=_on_blocked)
+
+
+def _make_retry_runner_factory():
+    """构造模型重试运行器工厂（FR-003/EVD-006 可观测）。
+
+    返回一个工厂，harness assemble 把它传给 TraceMiddleware。TraceMiddleware
+    调用 ``runner(invoke_async, on_attempt, on_backoff)`` 执行带预算的模型调用。
+    重试实现（WriterRetryController）定义在本领域层，平台层只消费工厂、不 import，
+    保持 platform 不依赖 domains 的分层铁律。
+    """
+
+    def _factory():
+        from app.domains.writing.retry import MAX_TRANSMIT_ATTEMPTS, RetryBudget, WriterRetryController
+
+        async def _runner(invoke_async, on_attempt, on_backoff):
+            budget = RetryBudget(
+                max_attempts=MAX_TRANSMIT_ATTEMPTS,
+                backoff_seconds=1.0,
+                on_attempt_complete=lambda outcome: (
+                    None if outcome.success
+                    else on_attempt(outcome.attempt_number, MAX_TRANSMIT_ATTEMPTS, outcome.error_class or "unknown")
+                ),
+                on_backoff=lambda _aid, attempt, delay: on_backoff(attempt, attempt + 1, delay),
+            )
+            # 把 invoke 包一层：跟踪本次 attempt 是否已收到任意响应增量；若已收到增量
+            # 后抛错，给异常打 _writer_partial_response 标记，让控制器按 DEC-006 禁止重放。
+            tracked = _track_partial_response(invoke_async)
+            return await WriterRetryController(budget).acall(tracked.invoke, is_partial=tracked.is_partial)
+
+        return _runner
+
+    return _factory
+
+
+def _track_partial_response(invoke_async):
+    """包装 invoke，检测"已收到响应增量后中断"的部分响应（DEC-006/EDGE-005）。
+
+    invoke 返回完整响应对象；若返回成功即视为本次 attempt 收到了完整响应（非部分）。
+    真正的部分响应（流式过程中已产出 chunk 后断流）会以异常抛出——此时无法在不侵入
+    LangChain 流式内部的前提下可靠捕获 chunk 计数，故采用保守启发：若异常携带的
+    response body / api response 已含 choices 或 usage 字段，视为已部分到达，禁止重放。
+    宁可对不确定的情况保守判为部分响应（不重放），也不冒险重复副作用/计费（RSK-002/006）。
+    """
+    seen_increment = False
+
+    async def _wrapped():
+        nonlocal seen_increment
+        result = await invoke_async()
+        # 成功返回 = 收到了完整响应（非部分失败）。
+        seen_increment = True
+        return result
+
+    def _is_partial(exc: BaseException) -> bool:
+        if seen_increment:
+            return False  # 成功返回过的不在此讨论
+        # 检查异常是否携带已部分到达的响应体（openai 流式错误常带 response）。
+        response = getattr(exc, "response", None)
+        if response is not None:
+            try:
+                body = None
+                if hasattr(response, "json"):
+                    try:
+                        body = response.json()
+                    except Exception:  # noqa: BLE001
+                        body = None
+                if body is None:
+                    text = getattr(response, "text", None)
+                    if isinstance(text, str) and text:
+                        import json as _json
+                        try:
+                            body = _json.loads(text)
+                        except Exception:  # noqa: BLE001
+                            body = None
+                if isinstance(body, dict) and ("choices" in body or "usage" in body):
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
+    from types import SimpleNamespace
+
+    return SimpleNamespace(invoke=_wrapped, is_partial=_is_partial)
+
+    return _factory
+
+
 def _get_memory_recall_cls():
     """从 harness 包动态加载 MemoryRecallMiddleware 类。
 
@@ -264,6 +392,15 @@ class MetaAgentService(BaseAgentService):
                         or getattr(model, "model", None)
                         or model.__class__.__name__
                     ),
+                    # CON-003：把决定重试/超时行为的关键配置冻结进 Trace 快照，
+                    # 证明行为不依赖第三方默认值、可随镜像重建复核（RSK-004）。
+                    "writer_retry": {
+                        "sdk_max_retries": getattr(model, "max_retries", None),
+                        "transmit_max_attempts": 2,  # WriterRetryController 预算（DEC-003）
+                        "request_timeout_s": getattr(model, "request_timeout", None),
+                        "openai_version": _safe_version("openai"),
+                        "langchain_openai_version": _safe_version("langchain_openai"),
+                    },
                 })
             except Exception as exc:
                 self.trace_recorder._mark_capture_degraded(
@@ -306,6 +443,12 @@ class MetaAgentService(BaseAgentService):
             trace_middleware_cls=TraceMiddleware,  # T2：类由执行端注入，包内实例化
             credits_service=credits_service,  # AD2：积分制服务，None 不计费
             credits_middleware_cls=CreditsMiddleware,  # AD6：类由执行端注入，包内实例化
+            # CON-005/FR-003：注入平台级 task 防重放边界。harness 的 ErrorRecovery
+            # 在重试前查 should_retry；task（子 Agent 委派）恒为 False，不得重放。
+            tool_replay_policy=_build_tool_replay_policy(self.trace_recorder, trace_id),
+            # FR-003/EVD-006：开启模型传输层重试可观测——TraceMiddleware 用
+            # 领域层注入的 retry_runner 包裹模型调用，attempt/退避写 Trace 事件。
+            writer_retry_runner_factory=_make_retry_runner_factory(),
             # NWM 记忆系统：per-workspace backend（workspace_id 定位 memory.db）。
             # pool 未初始化或配置缺失时返回 None → writing 走 ContextAssembler 全量注入。
             memory_backend=get_memory_backend(f"{owner_id}_{workspace_path.name}"),
