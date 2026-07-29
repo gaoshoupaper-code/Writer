@@ -14,7 +14,12 @@
 // （点开 LLM 节点看 input/output 时走 /events?event_ids= 接口）。
 
 import { useEffect, useRef, useState } from "react";
-import { getTraceDetail, getActiveSession, type ActiveSession } from "@/lib/api";
+import {
+  getTraceDetail,
+  refreshExecutorTrace,
+  getActiveSession,
+  type ActiveSession,
+} from "@/lib/api";
 import type { TraceDetailLite } from "@/lib/types";
 
 /** 终态集合：进入这些状态后停止轮询。 */
@@ -67,7 +72,20 @@ export function useTracePolling(traceId: string | null): TracePollingState {
 
     const poll = async () => {
       try {
-        const next = await getTraceDetail(traceId);
+        const current = detailRef.current;
+        let next: TraceDetailLite;
+        if (current?.run.service === "executor" && !TERMINAL_STATUSES.has(current.run.status)) {
+          next = await refreshExecutorTrace(traceId);
+        } else {
+          try {
+            next = await getTraceDetail(traceId);
+          } catch (loadError) {
+            // 单次测试先拿到 trace_id、后完成首次摄入。首个 404 立即按需同步，
+            // 避免把正常的跨服务时序窗口呈现成“Trace not found”。
+            if (current !== null) throw loadError;
+            next = await refreshExecutorTrace(traceId);
+          }
+        }
         if (ignore) return;
 
         setDetail(next);

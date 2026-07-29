@@ -444,7 +444,15 @@ export async function getUserCache(): Promise<UserCacheItem[]> {
 }
 
 export async function getTraceDetail(traceId: string): Promise<TraceDetailLite> {
-  return evoJson<TraceDetailLite>(`/api/traces/${traceId}`, { method: "GET" });
+  return evoJson<TraceDetailLite>(`/api/traces/${encodeURIComponent(traceId)}`, { method: "GET" });
+}
+
+/** 按需从 executor 增量同步运行中 trace，并返回最新详情。 */
+export async function refreshExecutorTrace(traceId: string): Promise<TraceDetailLite> {
+  return evoJson<TraceDetailLite>(
+    `/api/traces/${encodeURIComponent(traceId)}/refresh`,
+    { method: "POST" },
+  );
 }
 
 /**

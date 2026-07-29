@@ -132,33 +132,46 @@ async def _ingest_async(trace_id: str, traceparent: str | None = None) -> None:
     - 旧 LLM-judge：已解除（不再对单条 trace 实时评估）
     - 新双层评估：仅终态触发（completed/cancelled/failed），awaiting_input/running 跳过
     """
-    prior_events, since_seq = await asyncio.to_thread(_load_prior_events, trace_id)
-    fetched = await asyncio.to_thread(_fetch_trace_content, trace_id, since_seq, traceparent)
+    await asyncio.to_thread(ingest_trace_now, trace_id, traceparent)
+
+
+def ingest_trace_now(trace_id: str, traceparent: str | None = None) -> str | None:
+    """立即从 executor 增量拉取并摄入一条 trace。
+
+    终态通知和详情页按需刷新共用这条同步路径，避免两套摄入逻辑在高水位、
+    状态同步和手动测试终态上产生分歧。调用方应在线程池或同步 FastAPI 路由中执行。
+    """
+    prior_events, since_seq = _load_prior_events(trace_id)
+    fetched = _fetch_trace_content(trace_id, since_seq, traceparent)
     if fetched is None:
-        return
+        return None
     events, run_summary, payload_values = fetched
     # 增量场景：本次无新事件（since_seq 已是最新）。
     # 仍可能是状态变迁通知（如 awaiting_input→running，resume 不产生事件只改 index），
     # 故不直接 return：用执行端 run 摘要的 status 覆盖本地，保持状态最终一致。
     if since_seq > 0 and not events:
-        await asyncio.to_thread(_sync_status_only, trace_id, traceparent)
-        return
-    tid = await asyncio.to_thread(
-        importer.ingest_events,
-        events, run_summary.workspace_id, None, prior_events, run_summary.status,
-        run_summary, payload_values,
+        _sync_status_only(trace_id, traceparent)
+        return trace_id
+    tid = importer.ingest_events(
+        events,
+        run_summary.workspace_id,
+        prior_events=prior_events,
+        run_status_hint=run_summary.status,
+        run_summary_hint=run_summary,
+        payload_values=payload_values,
     )
     if tid is None:
-        return
+        return None
     # 评估已从摄入链路解耦（决策 S6）：不再摄入时自动评估，
     # 评估统一由 eval_agent 手动触发（POST /eval-agent/start）。
     # 手动测试状态同步：按 trace_id 同步 manual_tests 终态（D-Q3）
     run_row = db.query_one("SELECT status FROM runs WHERE trace_id=?", (tid,))
     if run_row:
-        await asyncio.to_thread(_sync_manual_test_status, tid, run_row["status"])
+        _sync_manual_test_status(tid, run_row["status"])
         if run_row["status"] in {"completed", "failed", "cancelled", "interrupted"}:
             from app.trace.otlp import schedule_otlp_export
             schedule_otlp_export(tid)
+    return tid
 
 
 def _sync_status_only(trace_id: str, traceparent: str | None = None) -> None:

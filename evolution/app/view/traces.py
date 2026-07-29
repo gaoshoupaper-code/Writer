@@ -240,6 +240,28 @@ def get_trace(trace_id: str) -> TraceDetailLite:
     detail = load_trace_structure(trace_id)
     if detail is None:
         raise HTTPException(status_code=404, detail="Trace not found")
+    return _to_trace_detail_lite(detail)
+
+
+@router.post("/traces/{trace_id}/refresh", response_model=TraceDetailLite)
+def refresh_executor_trace(trace_id: str, request: Request) -> TraceDetailLite:
+    """按需增量同步 executor trace，并返回最新轻量详情。
+
+    executor 的运行中 trace 默认不持续摄入；只有用户打开详情页时才调用本端点，
+    因此既能实时查看单次测试，又不会让所有后台 trace 产生高频同步开销。
+    """
+    from app.ingestion.ingestion import ingest_trace_now
+
+    traceparent = request.headers.get("traceparent")
+    if ingest_trace_now(trace_id, traceparent) is None:
+        raise HTTPException(status_code=404, detail="Trace 尚未可从 executor 读取")
+    detail = load_trace_structure(trace_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Trace 同步后仍不可用")
+    return _to_trace_detail_lite(detail)
+
+
+def _to_trace_detail_lite(detail: TraceDetail) -> TraceDetailLite:
     return TraceDetailLite(
         run=detail.run, nodes=detail.nodes, todos=detail.todos,
     )
