@@ -280,25 +280,30 @@ def _mark_test_failed_by_task(task_id: str, error: str) -> None:
 
 
 def _sync_manual_test_status(trace_id: str, run_status: str) -> None:
-    """trace 摄入完成后，按 trace_id 同步关联的手动测试记录状态（D-Q3）。
+    """trace 摄入完成后，按 trace_id 同步关联的手动测试记录状态（D-Q3, FR-007）。
 
-    completed → done；failed/cancelled → failed。
-    running/awaiting_input 是中间态，不触发终态判定——manual_tests 的 done/failed
-    应只由 trace 终态驱动，运行中摄入（如兜底扫描拉到运行中 trace）不应误标。
+    completed → done；failed → failed；cancelled → cancelled（CON-003: 取消不是失败）。
+    running/awaiting_input 是中间态，不触发终态判定。
+    终态单调（CON-003）：已终态的记录不被迟到摄入覆写。
     """
     try:
         from app.tests import repo as test_repo
+        from contracts.cancel_state import is_terminal
 
         row = test_repo.find_by_trace_id(trace_id)
         if not row:
             return  # 非 manual_test 触发的 trace，跳过
-        if row["status"] in ("done", "failed"):
-            return  # 已终结，不重复更新
+        # 单调终态保护（CON-003）：已终态的记录不重复更新。
+        if is_terminal(row["status"]):
+            return
         if run_status in ("running", "awaiting_input"):
             return  # 中间态：测试记录保持 running，等终态再判定
         if run_status == "completed":
             test_repo.mark_done(row["test_id"], trace_id)
-        elif run_status in ("failed", "cancelled"):
+        elif run_status == "failed":
             test_repo.mark_failed(row["test_id"], f"trace {run_status}", trace_id=trace_id)
+        elif run_status == "cancelled":
+            # CON-003: 用户取消不得被映射为 failed（EVD-006 根因修复）。
+            test_repo.mark_cancelled(row["test_id"], trace_id=trace_id)
     except Exception:
         logger.exception("同步手动测试状态失败 trace=%s", trace_id)

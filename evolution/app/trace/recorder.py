@@ -804,15 +804,12 @@ class EvolutionTraceRecorder:
     # ── 崩溃恢复（D8 R1 / 稳定性重构：interrupted 不再强标 failed）──
 
     def recover_pending(self) -> int:
-        """进程重启后扫描 evolution 自观测 running trace，标为 interrupted。
+        """进程重启后扫描 evolution 自观测 running trace，标为 interrupted 或 cancelled。
 
-        设计修正（2026-07-20 实施反馈）：原版无差别扫描所有 status='running'，
-        会误标 executor 跑的 trace（run_purpose='user_generation'）。但 evolution
-        重启只影响 evolution 自己的 recorder——executor 的 trace 生命周期归 executor 管，
-        evolution 重启不影响它。executor 权威状态通过兜底摄入同步。
+        设计修正（2026-07-20 实施反馈）：只标 evolution 自观测 trace，不碰 executor trace。
 
-        所以只标 evolution 自观测 trace（run_purpose=evolution_eval/evolution_evolve），
-        不碰 executor trace。
+        B4（FR-007 / EDGE-009）：若关联 session 已处于 cancelling（用户重启前已提交
+        停止），则收敛为 cancelled（取消意图已持久化），否则标 interrupted。
 
         Returns: 恢复的 trace 数量。
         """
@@ -824,29 +821,51 @@ class EvolutionTraceRecorder:
         count = 0
         for row in rows:
             trace_id = row["trace_id"]
-            logger.warning("崩溃恢复：trace %s 标记为 interrupted（待用户收敛）", trace_id)
-            # 不调 _finalize_run——那会清内存活跃态 + 投影 nodes + 写终态事件，
-            # 对 interrupted 不合适（trace 数据已完整，只需 UPDATE runs）。
-            # 直接 UPDATE：status=interrupted + interrupted_reason=process_restart。
+            # B4：检查关联 session 是否已 cancelling（用户重启前已提交停止）。
+            if self._check_session_cancelling(trace_id) == "cancelled":
+                logger.info("崩溃恢复：trace %s 关联 session 已 cancelling，收敛为 cancelled", trace_id)
+                final_status = "cancelled"
+                final_reason = None
+                final_error = _CANCEL_REASON_MESSAGES.get("user_stop", "user stop")
+            else:
+                logger.warning("崩溃恢复：trace %s 标记为 interrupted（待用户收敛）", trace_id)
+                final_status = "interrupted"
+                final_reason = "process_restart"
+                final_error = _CANCEL_REASON_MESSAGES["crash_recovery"]
             try:
                 db.execute(
                     """UPDATE runs
-                       SET status='interrupted',
-                           interrupted_reason='process_restart',
+                       SET status=?,
+                           interrupted_reason=?,
                            ended_at=?,
                            error=?
                        WHERE trace_id=?""",
-                    (
-                        self._now(),
-                        _CANCEL_REASON_MESSAGES["crash_recovery"],
-                        trace_id,
-                    ),
+                    (final_status, final_reason, self._now(), final_error, trace_id),
                 )
                 count += 1
             except Exception:
                 logger.exception("崩溃恢复失败 trace=%s", trace_id)
-            # 不 _cleanup_run_state：重启后内存本就是空的，无需清理。
         return count
+
+    def _check_session_cancelling(self, trace_id: str) -> str | None:
+        """检查 trace 关联的 eval/evolve session 是否处于 cancelling（B4）。
+
+        返回 'cancelled' 表示应收敛为 cancelled，None 表示无 cancelling session。
+        """
+        try:
+            for table, col in (
+                ("evaluation_sessions", "self_trace_id"),
+                ("evolve_sessions", "self_trace_id"),
+            ):
+                row = db.query_one(
+                    f"SELECT status FROM {table} WHERE {col}=? LIMIT 1",
+                    (trace_id,),
+                )
+                if row and row.get("status") == "cancelling":
+                    return "cancelled"
+        except Exception:
+            pass
+        return None
 
     # ── 写盘解耦（drain + flush）──
 

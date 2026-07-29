@@ -10078,6 +10078,13 @@ html[data-theme="dark"] {
 .integrity-text.integrity-legacy { color: var(--awaiting); }
 .integrity-text.integrity-conflict { color: var(--danger); }
 
+/* StopController 统一停止反馈组件（FR-008 / AC-008） */
+.stop-controller { display: inline-flex; align-items: center; gap: 8px; }
+.stop-error { color: var(--danger, #e74c3c); font-size: 11px; }
+.stop-warning { color: var(--warning, #f39c12); font-size: 11px; }
+.stop-button:disabled { opacity: 0.6; cursor: not-allowed; }
+.stop-button[data-status="cancelling"] { color: var(--warning, #f39c12); }
+
 .shell-nav { overflow-y: auto; }
 .shell-brand-icon,
 .shell-nav-icon { flex: 0 0 auto; }

@@ -510,58 +510,61 @@ def _try_load_eval_snapshot(eval_ref: str | None) -> dict[str, Any] | None:
 
 @router.post("/evolve/sessions/{session_id}/stop")
 def stop_session(session_id: str) -> dict[str, Any]:
-    """手动停止运行中的进化 session。
+    """手动停止运行中的进化 session（FR-006 / NFR-001 / DEC-002）。
 
-    双路收敛，避免状态分裂（session 表 cancelled 但 runs 表 running）：
-      1. task.cancel()：让 Agent 在下一个 await 点抛 CancelledError，
-         run_evolve_session 的 except 分支会调 recorder.cancel_run 正常收尾。
-      2. recorder.cancel_run(trace_id_self)：强制收敛——即便 Agent 卡在
-         无 await 的底层（同步阻塞/吞 CancelledError 的循环）导致 task.cancel
-         无效，也能立即把 runs.status 推进到 cancelled 并清内存活跃集合。
-         幂等：trace 已被路径 1 收敛时 no-op。
+    立即标记 cancelling 并返回（DEC-002），后台 asyncio task 在 10 秒时限内
+    收敛到 cancelled。
 
     已知边界：Agent 若停在改源码中途，harnesses/current/ 下可能留脏文件，
     本端点不清理（由用户手动 stash / 重置）。
     """
+    from contracts.cancel_state import HARD_STOP_DEADLINE_SECONDS, is_terminal
+
     session = ev_db.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"session {session_id} 不存在")
-    # 可停止的状态：running / conversing / finalizing（pending_review 走 publish/discard）。
-    # Phase 1（状态机骨架）：统一标 cancelled，与原 running 单体行为一致。
-    # Phase 3（对话式 API 改造）会按决策 L 细化——conversing 的 stop 只取消当前输出
-    # task、不推进 status，会话保留可继续输入。
+    current = session.get("status")
+    if is_terminal(current):
+        raise HTTPException(
+            status_code=409,
+            detail=f"session 状态为 {current}，已终态，无需停止",
+        )
+    # 可停止的非终态：running / conversing / finalizing（pending_review 走 publish/discard）。
     stoppable = {STATUS_RUNNING, STATUS_CONVERSING, STATUS_FINALIZING}
-    if session.get("status") not in stoppable:
+    if current not in stoppable:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"session 状态为 {session.get('status')}，"
-                f"只有 running/conversing/finalizing 可停止"
-            ),
+            detail=f"session 状态为 {current}，只有 running/conversing/finalizing 可停止",
         )
 
+    # 立即标记 cancelling（DEC-002）。
+    ev_db.update_session(session_id, status="cancelling")
+
+    # 后台 asyncio task 做 10 秒硬终止收敛。
     task = _running_tasks.get(session_id)
+    asyncio.create_task(_converge_evolve_cancel(session_id, task))
+    return {"status": "cancelling", "session_id": session_id}
+
+
+async def _converge_evolve_cancel(session_id: str, task: asyncio.Task | None) -> None:
+    """进化取消收敛：task.cancel → 等 10s → recorder 强制收敛 → 标 cancelled。"""
+    recorder = get_recorder()
+    trace_id_self = recorder.get_trace_id_by_session(session_id) if recorder else None
+
     if task is not None and not task.done():
         task.cancel()
-        logger.info("进化 session %s 已请求取消（task.cancel）", session_id)
-    else:
-        # 竞态：task 已结束或不在注册表（进程重启后）。仍标 cancelled 对齐状态。
-        logger.warning(
-            "进化 session %s 未找到活跃 task，仅标记 cancelled", session_id
-        )
 
-    # 强制收敛 recorder trace 状态：即便 task.cancel 无效，runs.status 也立即收敛。
-    # 必须在 task.cancel 之后调——若 Agent 真在 await 点退出，run_evolve_session 的
-    # except 分支会再次调 cancel_run，幂等保护兜底。
-    recorder = get_recorder()
-    if recorder is not None:
-        trace_id_self = recorder.get_trace_id_by_session(session_id)
-        if trace_id_self:
-            recorder.cancel_run(trace_id_self, reason="user_stop")
-            logger.info("进化 session %s trace %s 已强制收敛 cancelled", session_id, trace_id_self)
+    if task is not None:
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=HARD_STOP_DEADLINE_SECONDS)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            pass
+
+    if recorder and trace_id_self:
+        recorder.cancel_run(trace_id_self, reason="user_stop")
 
     ev_db.update_session(session_id, status="cancelled")
-    return {"status": "cancelled", "session_id": session_id}
+    logger.info("进化 session %s 取消收敛完成", session_id)
 
 
 # ── SSE 实时流 ──────────────────────────────────────────────

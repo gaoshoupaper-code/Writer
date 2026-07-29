@@ -183,8 +183,9 @@ async def _run_compile_bg(
         else:
             recorder.fail_run(compile_trace_id, result.get("reason") or "dossier compile failed")
     except asyncio.CancelledError:
-        logger.info("证据卷宗编译 %s 被取消", dossier_id)
-        repo.update_dossier(dossier_id, status="failed", failure_reason="用户取消", finished=True)
+        # 用户取消（CON-003：取消不是失败）。标 cancelled，recorder 收尾 cancelled。
+        logger.info("证据卷宗编译 %s 被用户取消", dossier_id)
+        repo.update_dossier(dossier_id, status="cancelled", failure_reason="用户取消", finished=True)
         recorder.cancel_run(compile_trace_id, reason="user_stop")
         raise
     except Exception as exc:
@@ -278,7 +279,13 @@ def get_current_pack(trace_id: str) -> dict[str, Any]:
 
 @router.post("/sessions/{dossier_id}/stop")
 def stop_compile(dossier_id: str) -> dict[str, Any]:
-    """取消运行中的编译。"""
+    """取消运行中的编译（FR-006 / DEC-002）。
+
+    立即标记 cancelling，后台 10 秒收敛。卷宗编译是 asyncio.to_thread 跑的同步
+    函数，task.cancel 注入 CancelledError 后 to_thread 包装层会中断等待。
+    """
+    from contracts.cancel_state import HARD_STOP_DEADLINE_SECONDS
+
     dossier = repo.get_dossier(dossier_id)
     if dossier is None:
         raise HTTPException(status_code=404, detail=f"证据卷宗 {dossier_id} 不存在")
@@ -287,9 +294,30 @@ def stop_compile(dossier_id: str) -> dict[str, Any]:
             status_code=400,
             detail=f"证据卷宗状态为 {dossier['status']}，只有 pending/compiling 可停止",
         )
+
+    # 立即标记 cancelling（DEC-002）。
+    repo.update_dossier(dossier_id, status="compiling")  # 保持 compiling 语义，stop 标记靠 task
+
     task = _running_tasks.get(dossier_id)
     if task is not None and not task.done():
         task.cancel()
+
+    # 后台收敛：等 task 结束（CancelledError 分支会标 cancelled）。
+    import asyncio
+
+    async def _converge() -> None:
+        if task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=HARD_STOP_DEADLINE_SECONDS)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+        # _run_compile_bg 的 CancelledError 分支负责标 cancelled + recorder 收尾。
+        # 超时后若仍未收敛，兜底标记。
+        final = repo.get_dossier(dossier_id)
+        if final and final["status"] not in ("cancelled", "failed", "ready", "partial"):
+            repo.update_dossier(dossier_id, status="failed", failure_reason="取消超时", finished=True)
+
+    asyncio.create_task(_converge())
     return {"status": "cancelling", "dossier_id": dossier_id}
 
 

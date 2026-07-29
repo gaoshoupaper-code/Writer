@@ -428,46 +428,58 @@ def get_eval_dossier(dossier_id: str) -> dict[str, Any]:
 
 @router.post("/sessions/{eval_id}/stop")
 def stop_session(eval_id: str) -> dict[str, Any]:
-    """手动停止运行中的评估 session。
+    """手动停止运行中的评估 session（FR-006 / NFR-001 / DEC-002）。
 
-    双路收敛，避免状态分裂（session 表 cancelled 但 runs 表 running）：
-      1. task.cancel()：让 Agent 在下一个 await 点抛 CancelledError，
-         run_eval_session 的 except 分支会调 recorder.cancel_run 正常收尾。
-      2. recorder.cancel_run(trace_id_self)：强制收敛——即便 Agent 卡在
-         无 await 的底层（同步阻塞/吞 CancelledError 的循环）导致 task.cancel
-         无效，也能立即把 runs.status 推进到 cancelled 并清内存活跃集合。
-         幂等：trace 已被路径 1 收敛时 no-op。
+    立即标记 cancelling 并返回（DEC-002），后台 asyncio task 在 10 秒时限内
+    收敛到 cancelled（协作式 cancel + recorder 强制收敛）。
     """
+    from contracts.cancel_state import HARD_STOP_DEADLINE_SECONDS, is_terminal
+
     session = eval_repo.get_session(eval_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"评估 session {eval_id} 不存在")
-    if session.get("status") != "running":
+    current = session.get("status")
+    if is_terminal(current):
         raise HTTPException(
-            status_code=400,
-            detail=f"评估 session 状态为 {session.get('status')}，只有 running 可停止",
+            status_code=409,
+            detail=f"评估 session 状态为 {current}，已终态，无需停止",
         )
 
+    # 立即标记 cancelling（DEC-002：用户提交后当前帧可见）。
+    eval_repo.update_session(eval_id, status="cancelling")
+
+    # 后台 asyncio task 做 10 秒硬终止收敛。
     task = _running_tasks.get(eval_id)
+    asyncio.create_task(_converge_eval_cancel(eval_id, task))
+    return {"status": "cancelling", "eval_id": eval_id}
+
+
+async def _converge_eval_cancel(eval_id: str, task: asyncio.Task | None) -> None:
+    """评估取消收敛：task.cancel → 等 10s → recorder 强制收敛 → 标 cancelled。
+
+    NFR-001：从 stop 受理起不超过 10.0 秒收敛到 cancelled 或 cancel_timeout。
+    """
+    recorder = get_recorder()
+    trace_id_self = recorder.get_trace_id_by_session(eval_id) if recorder else None
+
+    # 1. 协作式取消：注入 CancelledError。
     if task is not None and not task.done():
         task.cancel()
-        logger.info("评估 session %s 已请求取消（task.cancel）", eval_id)
-    else:
-        logger.warning(
-            "评估 session %s 未找到活跃 task，仅标记 cancelled", eval_id
-        )
 
-    # 强制收敛 recorder trace 状态：即便 task.cancel 无效，runs.status 也立即收敛。
-    # 必须在 task.cancel 之后调——若 Agent 真在 await 点退出，run_eval_session 的
-    # except 分支会再次调 cancel_run，幂等保护兜底。
-    recorder = get_recorder()
-    if recorder is not None:
-        trace_id_self = recorder.get_trace_id_by_session(eval_id)
-        if trace_id_self:
-            recorder.cancel_run(trace_id_self, reason="user_stop")
-            logger.info("评估 session %s trace %s 已强制收敛 cancelled", eval_id, trace_id_self)
+    # 2. 等待协作式退出（给足 10 秒，NFR-001）。
+    if task is not None:
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=HARD_STOP_DEADLINE_SECONDS)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            pass  # task 被取消或超时，继续强制收敛
 
+    # 3. recorder 强制收敛（即便 task.cancel 无效，runs.status 也收敛）。
+    if recorder and trace_id_self:
+        recorder.cancel_run(trace_id_self, reason="user_stop")
+
+    # 4. 推进终态。
     eval_repo.update_session(eval_id, status="cancelled")
-    return {"status": "cancelled", "eval_id": eval_id}
+    logger.info("评估 session %s 取消收敛完成", eval_id)
 
 
 # ── SSE 实时流 ──────────────────────────────────────────────
