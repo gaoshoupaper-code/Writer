@@ -92,6 +92,11 @@ class TraceRecorder:
         # 完成后才来拉取，那时活跃态已清，需靠此索引反查 workspace）。
         # 进程重启后丢失——退化为 scan 端点列表扫描兜底。
         self._trace_workspace: dict[str, str] = {}
+        # FR-001 磁盘发现的负缓存（trace_id → 确认不存在的到期时间）。
+        # 避免前端轮询期间对同一不存在的 trace_id 反复扫盘（glob 全临时目录）。
+        # 命中正例会立即回填 _trace_workspace，所以这里只缓存短期负命中。
+        self._disk_miss_until: dict[str, float] = {}
+        self._disk_miss_ttl: float = 5.0  # 秒：跨进程登记通常 < 5s 完成
         # anchor 计数器：为每条事件分配稳定 anchor_id（T1）。
         # 格式 anchor-{trace_seq}-{global_counter}，写进 jsonl 后永久稳定。
         self._anchor_counter: int = 0
@@ -128,6 +133,7 @@ class TraceRecorder:
         run_purpose: str = "user_generation",
         *,
         traceparent: str | None = None,
+        external_refs_extra: Mapping[str, str] | None = None,
     ) -> TraceRunHandle:
         trace_id = f"trace-{uuid4().hex}"
         started_at = datetime.now(UTC)
@@ -146,6 +152,17 @@ class TraceRecorder:
         self._run_endpoints[trace_id] = endpoint
         self._trace_workspace[trace_id] = thread.workspace_path
 
+        # FR-004 / CON-003：external_refs 以 W3C 字段为底，叠加调用方提供的业务关联
+        # opaque ID（如单次测试的 test_id / task_id）。w3c_*/traceparent 是 recorder
+        # 管理的命名空间，调用方不得覆写（否则破坏 W3C trace 树完整性）；在边界过滤，
+        # 让 CON-003 的最小化由服务端强制而非仅靠调用方自律。
+        refs = dict(w3c_context.external_refs)
+        if external_refs_extra:
+            refs.update(
+                {k: v for k, v in external_refs_extra.items()
+                 if not k.startswith("w3c_") and k != "traceparent"}
+            )
+
         summary = TraceRunSummary(
             trace_id=trace_id,
             workspace_id=thread.workspace_id,
@@ -162,7 +179,7 @@ class TraceRecorder:
             purpose=run_purpose,
             integrity_status="incomplete",
             coverage={"payload": "known", "token": "unknown", "cost": "unknown"},
-            external_refs=w3c_context.external_refs,
+            external_refs=refs,
         )
         self._run_metadata[trace_id] = {"run_summary": summary.model_dump(mode="json")}
         try:
@@ -817,26 +834,66 @@ class TraceRecorder:
     def read_run(self, thread: ThreadSummary, trace_id: str) -> TraceDetail | None:
         return self._read_run_detail(thread, trace_id)
 
+    def _load_run_index_entry(self, workspace_path: str, trace_id: str) -> dict[str, Any] | None:
+        """读 workspace/traces/index.json，返回指定 trace_id 的 run 条目（None=缺失/不可读）。
+
+        register_external_run / find_run_by_trace_id / 磁盘发现共用此读取路径，
+        避免 open+json.load 的样板重复。TOCTOU 安全：直接 open，异常即视为缺失。
+        """
+        index_path = Path(workspace_path) / "traces" / "index.json"
+        try:
+            with index_path.open("r", encoding="utf-8") as f:
+                runs = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+        if not isinstance(runs, dict):
+            return None
+        return runs.get(trace_id)
+
+    def register_external_run(self, trace_id: str, workspace_path: str) -> bool:
+        """登记一个由本进程之外创建的 trace（隔离子进程 A/B 测试，FR-001）。
+
+        隔离子进程自建独立 TraceRecorder 写盘，但只经 IPC 回传 trace_id；
+        主进程若不登记，find_run_by_trace_id 会在主 recorder 内存索引查无，
+        导致 GET /internal/traces/{trace_id} 稳定 404（EVD-002/003 根因）。
+
+        本方法仅登记 trace_id → workspace_path 映射并就地读取 index.json 还原
+        run summary，不重放 create_run（不污染状态机/事件/锁）。幂等：重复登记
+        同一 trace_id 只刷新 workspace 指向，按 trace_id 隔离（CON-004）。
+
+        返回 True 表示登记成功（index.json 存在且可解析）；False 表示该
+        workspace 下没有该 trace 的 index，调用方可稍后重试（吸收跨进程竞态）。
+        """
+        if self._load_run_index_entry(workspace_path, trace_id) is None:
+            return False
+        # 登记即可：find_run_by_trace_id / read_trace_events 都基于此索引定位。
+        self._trace_workspace[trace_id] = workspace_path
+        return True
+
     def find_run_by_trace_id(self, trace_id: str) -> TraceRunSummary | None:
         """按 trace_id 反查 run summary（不依赖 thread，Phase 3 evolution 拉取用）。
 
         先查内存 _trace_workspace 索引拿 workspace_path，再从该 workspace 的
-        index.json 读 run summary。进程重启后索引丢失则返回 None（由 scan 兜底）。
+        index.json 读 run summary。内存索引丢失时（进程重启 / 隔离子进程产物未登记）
+        退化为 _discover_workspace_on_disk 磁盘兜底，避免同一 trace_id 永久 404。
 
         返回 TraceRunSummary（含相对 workspace 的 path 字段，可拼出 jsonl 全路径）。
         """
         ws_path = self._trace_workspace.get(trace_id)
         if ws_path is None:
-            return None
-        index_path = Path(ws_path) / "traces" / "index.json"
-        if not index_path.exists():
-            return None
-        try:
-            with index_path.open("r", encoding="utf-8") as f:
-                runs = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            return None
-        run_data = runs.get(trace_id) if isinstance(runs, dict) else None
+            # 负缓存：近期已确认磁盘上没有该 trace_id，跳过昂贵的全临时目录扫描，
+            # 避免前端轮询期间对同一不存在的 trace_id 反复 glob（TTL 内跨进程登记
+            # 通常已完成，到期后再扫一次兜底竞态）。
+            miss_until = self._disk_miss_until.get(trace_id)
+            if miss_until is not None and time.monotonic() < miss_until:
+                return None
+            # 磁盘发现兜底（FR-001）：扫 A/B workspace 临时根下 index.json，
+            # 命中后回填内存索引，防止跨进程竞态/重启导致的永久不可读。
+            ws_path = self._discover_workspace_on_disk(trace_id)
+            if ws_path is None:
+                self._disk_miss_until[trace_id] = time.monotonic() + self._disk_miss_ttl
+                return None
+        run_data = self._load_run_index_entry(ws_path, trace_id)
         if run_data is None:
             return None
         return TraceRunSummary.model_validate(run_data)
@@ -874,6 +931,24 @@ class TraceRecorder:
             raise KeyError(f"Payload {payload_id} is not referenced by trace {trace_id}")
         trace_path = Path(ws_path) / run.path
         return ContentAddressedPayloadStore(trace_path.parent.parent / "payloads").get(payload_id)
+
+    def _discover_workspace_on_disk(self, trace_id: str) -> str | None:
+        """磁盘发现兜底（FR-001 / RSK-005）：内存索引缺失时按 trace_id 扫盘定位。
+
+        覆盖两类场景：(1) 进程重启导致 _trace_workspace 丢失；(2) 隔离子进程产物
+        在 register_external_run 登记前被查询（跨进程竞态）。只扫系统临时目录下
+        的 ab_ws_* 前缀 workspace（A/B 测试临时根，见 ab_endpoint.prepare_ab_workspace），
+        范围受限、只读，命中后回填内存索引，不串读其他 trace（CON-004 并发隔离）。
+        """
+        import glob
+        import tempfile
+
+        tmp_root = tempfile.gettempdir()
+        for ws in glob.glob(str(Path(tmp_root) / "ab_ws_*")):
+            if self._load_run_index_entry(ws, trace_id) is not None:
+                self._trace_workspace[trace_id] = ws
+                return ws
+        return None
 
     def list_recent_runs(self, since_iso: str = "") -> list[dict[str, Any]]:
         """列出近期完成的 trace（Phase 3 evolution scan 兜底用）。

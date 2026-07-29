@@ -35,7 +35,7 @@ export default function TraceDetailPage() {
   const navigate = useNavigate();
   const { isSuperAdmin } = useOutletContext<{ isSuperAdmin: boolean }>();
 
-  const { detail, isLive, activeSession, loading, error } = useTracePolling(traceId ?? null);
+  const { detail, isLive, activeSession, loading, error, availability } = useTracePolling(traceId ?? null);
 
   // ── 页面壳状态 ──
   const [activeTab, setActiveTab] = useState<"trace" | "chart" | "artifacts">("trace");
@@ -262,6 +262,23 @@ export default function TraceDetailPage() {
 
   if (loading) {
     return <div className="page-loading">加载 trace…</div>;
+  }
+
+  // FR-003：准备态（跨进程/摄入竞态，自动刷新）与不可用态（断链旧记录），
+  // 不呈现原始 not found。available 态走下面的正常渲染分支。
+  if (!detail && (availability === "preparing" || availability === "unavailable")) {
+    return (
+      <div className="trace-detail-page">
+        <header className="trace-detail-header">
+          <button className="back-button" onClick={() => navigate(-1)}>← 返回</button>
+        </header>
+        {availability === "preparing" ? (
+          <div className="trace-detail-empty">Trace 准备中…</div>
+        ) : (
+          <div className="trace-detail-empty">Trace 不可用，可重跑</div>
+        )}
+      </div>
+    );
   }
 
   if (error && !detail) {

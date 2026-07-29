@@ -1030,6 +1030,9 @@ export interface ManualTest {
   retry_of: string | null;
   origin_layer: string | null;
   created_at: string;
+  // FR-003 / DEC-003：对象 trace 可用性语义（后端加法字段，旧客户端忽略不影响测试状态）。
+  // available=可查看 / preparing=Trace 准备中 / unavailable=Trace 不可用，可重跑 / none=无 trace_id
+  trace_availability?: "available" | "preparing" | "unavailable" | "none";
 }
 
 export interface TestAgentOption {

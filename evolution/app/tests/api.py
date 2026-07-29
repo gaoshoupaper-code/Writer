@@ -27,6 +27,7 @@ from app.core.settings import settings
 from app.common import evalset
 from app.versioning.registry_repo import list_versions as list_snapshots
 from app.tests import repo as test_repo
+from contracts.trace.w3c import create_trace_context
 
 logger = logging.getLogger("evolution.tests.api")
 
@@ -206,7 +207,12 @@ def _validate_version(version_type: str, version_id: int | None) -> dict[str, An
 
 
 def _trigger_executor(
-    *, demand_md: str, version_type: str, snapshot: dict[str, Any] | None
+    *,
+    demand_md: str,
+    version_type: str,
+    snapshot: dict[str, Any] | None,
+    test_id: str,
+    traceparent: str | None = None,
 ) -> str:
     """调 executor /internal/ab/run，返回 task_id。
 
@@ -216,6 +222,10 @@ def _trigger_executor(
 
     去 DB 重构后版本 = git commit，"配置"即源码本身，不再需要序列化的 config_json
     （与 benchmark/runner.py._trigger_executor 对齐）。
+
+    FR-004 / DEC-005：透传 evolution 侧 test_id 与 W3C traceparent 到 executor，
+    使对象 trace 继承发起链路上游 context、并在 external_refs 持久化 test_id/task_id，
+    供跨服务追溯。缺失/非法 traceparent 由 executor 自行生成有效 context。
     """
     if version_type == "working":
         source_commit = None
@@ -228,7 +238,10 @@ def _trigger_executor(
         "demand_md": demand_md,
         "baseline": version_type == "working",
         "source_commit": source_commit,
+        "test_id": test_id,
     }
+    if traceparent:
+        payload["traceparent"] = traceparent
 
     resp = httpx.post(_executor_url("/internal/ab/run"), json=payload, timeout=_EXEC_TIMEOUT)
     resp.raise_for_status()
@@ -260,8 +273,16 @@ def _start_test_internal(
     # 读 demand_md + 调 executor
     try:
         demand_md = evalset.load_case_demand(case_id)
+        # FR-004：为本次单次测试建立 W3C 根 context（单次测试是用户交互发起，
+        # 无更上游），作为 executor 对象 trace 的 traceparent 透传下去，使跨服务
+        # trace 树从这条测试可追溯。create_trace_context() 无参时生成有效新 context。
+        traceparent = create_trace_context().traceparent
         task_id = _trigger_executor(
-            demand_md=demand_md, version_type=version_type, snapshot=snapshot
+            demand_md=demand_md,
+            version_type=version_type,
+            snapshot=snapshot,
+            test_id=test_id,
+            traceparent=traceparent,
         )
         test_repo.mark_running(test_id, task_id)
         # 后台轮询 executor task 状态，回填 trace_id + 驱动终态（与 ingest 链路互为兜底）
@@ -298,7 +319,9 @@ def start_test(req: StartTestRequest) -> StartTestResponse:
 # ── 列表 / 详情 / 重试 ────────────────────────────────────────
 
 
-def _row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
+def _row_to_dict(
+    row: dict[str, Any], ingested_trace_ids: set[str] | None = None
+) -> dict[str, Any]:
     return {
         "test_id": row["test_id"],
         "case_id": row["case_id"],
@@ -311,7 +334,71 @@ def _row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
         "retry_of": row["retry_of"],
         "origin_layer": row.get("origin_layer"),
         "created_at": row["created_at"],
+        # FR-003 / DEC-003：对象 trace 的可用性语义。前端据此区分
+        # "可查看" / "Trace 准备中" / "Trace 不可用，可重跑"，不暴露原始 not found。
+        # 加法兼容：旧客户端忽略此字段不影响测试状态查询。
+        "trace_availability": _trace_availability(row, ingested_trace_ids),
     }
+
+
+# 单次测试终态集合（manual_tests.status）。
+# 注意：与 contracts.cancel_state.TERMINAL_STATES 词汇不同——单次测试无
+# completed/interrupted（那是 runs/executor 侧状态），这里只覆盖 manual_tests 状态机。
+_TEST_TERMINAL = {"done", "failed", "cancelled", "cancel_timeout"}
+
+
+def _trace_availability(
+    row: dict[str, Any], ingested_trace_ids: set[str] | None = None
+) -> str:
+    """判定单次测试对象 trace 的可用性（FR-003 / EDGE-001/003/004）。
+
+    - available：对象 trace 已在 evolution runs 表摄入，可查看。
+    - preparing：已回填 trace_id 但尚未首次摄入，且测试未终态。吸收正常跨进程/
+                 摄入竞态（EDGE-001/004），不暴露原始 not found，前端继续刷新。
+    - unavailable：终态且有 trace_id，但 runs 表查无 → 断链旧记录（DEC-002 不迁移），
+                   隐藏查看并显示"Trace 不可用，可重跑"（DEC-003）。
+    - none：无 trace_id（trace 尚未创建），无查看入口。
+
+    ingested_trace_ids：列表场景下由调用方一次性批量查询注入（避免 N+1）；
+                        None 时单条回退到逐条查询（详情场景）。
+
+    临时故障（executor/evolution 5xx）由 refresh 端点的准备态吸收，不在此固化为
+    unavailable——只有"终态 + 权威来源确定查无"才判 unavailable。
+    """
+    trace_id = row.get("trace_id")
+    if not trace_id:
+        return "none"
+    if ingested_trace_ids is not None:
+        is_ingested = trace_id in ingested_trace_ids
+    else:
+        # 详情场景：逐条查 evolution 权威 runs 表。
+        is_ingested = (
+            db.query_one("SELECT 1 FROM runs WHERE trace_id=? LIMIT 1", (trace_id,))
+            is not None
+        )
+    if is_ingested:
+        return "available"
+    if row.get("status") in _TEST_TERMINAL:
+        # 终态且 runs 查无：断链旧记录，不可恢复（DEC-002/003）。
+        return "unavailable"
+    # 未终态且尚未首次摄入：正常准备窗口（EDGE-001），保持可恢复准备态。
+    return "preparing"
+
+
+def _batch_ingested_trace_ids(rows: list[dict[str, Any]]) -> set[str]:
+    """一次性查询本页所有 trace_id 在 runs 表的摄入情况（避免列表 N+1）。
+
+    返回已摄入的 trace_id 集合；无 trace_id 或空列表时返回空集。
+    """
+    trace_ids = [r["trace_id"] for r in rows if r.get("trace_id")]
+    if not trace_ids:
+        return set()
+    placeholders = ",".join("?" * len(trace_ids))
+    ingested_rows = db.query_all(
+        f"SELECT trace_id FROM runs WHERE trace_id IN ({placeholders})",
+        tuple(trace_ids),
+    )
+    return {r["trace_id"] for r in ingested_rows}
 
 
 @router.get("")
@@ -322,8 +409,10 @@ def list_tests(
 ) -> dict[str, Any]:
     """测试记录列表（状态过滤 + created_at 倒序分页）。"""
     rows, total = test_repo.list_tests(status=status, page=page, page_size=page_size)
+    # 一次性批量查 runs 摄入情况，避免逐行 N+1（列表自动刷新，是热路径）。
+    ingested = _batch_ingested_trace_ids(rows)
     return {
-        "tests": [_row_to_dict(r) for r in rows],
+        "tests": [_row_to_dict(r, ingested) for r in rows],
         "total": total,
         "page": page,
         "page_size": page_size,

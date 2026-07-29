@@ -115,6 +115,9 @@ def run_ab_generation(
     writer_settings,
     on_trace_created=None,
     cancel_event: threading.Event | None = None,
+    traceparent: str | None = None,
+    test_id: str | None = None,
+    task_id: str | None = None,
 ) -> str:
     """跑一次候选生成（同步，非 SSE），返回 trace_id。
 
@@ -124,10 +127,15 @@ def run_ab_generation(
         demand_md: 预置 demand.md 内容
         trace_recorder: TraceRecorder 实例
         writer_settings: writer settings（构建 model 用）
-        on_trace_created: 可选回调，trace 创建后立即调用（传 trace_id），
-                          供调用方在 running 期间就能拿到 trace_id 做实时展示。
+        on_trace_created: 可选回调，trace 创建后立即调用（传 trace_id, workspace_path），
+                          供调用方在 running 期间就能拿到 trace_id 做实时展示，
+                          并把 workspace_path 登记进主进程 recorder（FR-001 跨进程发现）。
         cancel_event: 可选取消标志；set() 后在下一个 super-step 边界中断生成，
                       trace 收尾为 cancelled（user_stop）。None = 不可取消（原行为）。
+        traceparent: 可选 W3C traceparent（FR-004）。继承 evolution 发起链路的上游 context；
+                     缺失/非法时由 create_run 生成有效新 context，不阻断运行。
+        test_id: 可选 evolution 单次测试 ID（FR-004）。写入 external_refs 供跨服务追溯。
+        task_id: 可选 executor 任务 ID（FR-004）。写入 external_refs 供跨服务追溯。
 
     Returns:
         trace_id
@@ -155,15 +163,28 @@ def run_ab_generation(
     )
 
     # 3. 创建 trace run
+    # FR-004：透传 W3C traceparent（继承 evolution 发起链路）与 test_id/task_id 业务关联，
+    # 写入 external_refs 供跨服务追溯；缺失/非法 traceparent 时 create_run 自行生成有效 context。
+    extra_refs: dict[str, str] = {}
+    if test_id:
+        extra_refs["test_id"] = test_id
+    if task_id:
+        extra_refs["task_id"] = task_id
     trace = trace_recorder.create_run(
-        thread, "screenplay.ab_run", run_purpose="evolution"
+        thread,
+        "screenplay.ab_run",
+        run_purpose="evolution",
+        traceparent=traceparent,
+        external_refs_extra=extra_refs or None,
     )
     trace_id = trace.trace_id
 
-    # trace 已创建，立即通知调用方（供 running 期间实时展示）
+    # trace 已创建，立即通知调用方（供 running 期间实时展示）。
+    # 回传 workspace_path：主进程据此登记进主 recorder，让 /internal/traces/{id}
+    # 能查到子进程产物（FR-001 跨进程发现根因修复）。
     if on_trace_created:
         try:
-            on_trace_created(trace_id)
+            on_trace_created(trace_id, str(workspace_path))
         except Exception:
             pass
 

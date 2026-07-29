@@ -38,6 +38,15 @@ type TracePollingState = {
   activeSession: ActiveSession | null;
   loading: boolean;
   error: string | null;
+  /**
+   * FR-003：trace 详情的可用性语义（与列表 trace_availability 对齐）。
+   * - available：详情已加载，可正常展示。
+   * - preparing：已回填 trace_id 但 executor 尚未可读，吸收跨进程/摄入竞态窗口，
+   *   不暴露原始 not found，自动继续刷新（EDGE-001/004）。
+   * - unavailable：终态且权威来源确定不可读，显示"Trace 不可用，可重跑"（DEC-003）。
+   * - loading：首次加载中，尚无结论。
+   */
+  availability: "available" | "preparing" | "unavailable" | "loading";
 };
 
 export function useTracePolling(traceId: string | null): TracePollingState {
@@ -46,6 +55,9 @@ export function useTracePolling(traceId: string | null): TracePollingState {
   const [activeSession, setActiveSession] = useState<ActiveSession | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [availability, setAvailability] = useState<
+    "available" | "preparing" | "unavailable" | "loading"
+  >("loading");
 
   // 保持最新 detail 的引用，避免闭包旧值（轮询回调读最新状态判断是否继续）。
   const detailRef = useRef<TraceDetailLite | null>(null);
@@ -56,6 +68,7 @@ export function useTracePolling(traceId: string | null): TracePollingState {
       detailRef.current = null;
       setLoading(false);
       setIsLive(false);
+      setAvailability("loading");
       return;
     }
 
@@ -92,6 +105,7 @@ export function useTracePolling(traceId: string | null): TracePollingState {
         detailRef.current = next;
         setError(null);
         setLoading(false);
+        setAvailability("available");
 
         const status = next.run.status;
         if (TERMINAL_STATUSES.has(status)) {
@@ -118,10 +132,22 @@ export function useTracePolling(traceId: string | null): TracePollingState {
         // 首次加载失败才显示 error（detail 还是 null 时）；后续失败保留旧 detail。
         const msg = err instanceof Error ? err.message : "trace 查询失败";
         if (detailRef.current === null) {
-          setError(msg);
+          // FR-003：区分 preparing / unavailable，不把跨进程竞态或断链旧记录
+          // 呈现为原始 not found（EDGE-001/003/004）。后端 refresh 端点用不同 detail
+          // 文案区分这两类：executor 尚不可读=准备态（可恢复）；同步后仍不可用=断链。
+          if (msg.includes("尚未可从 executor 读取")) {
+            setAvailability("preparing");
+            setError(null);
+          } else if (msg.includes("同步后仍不可用")) {
+            setAvailability("unavailable");
+            setError(null);
+          } else {
+            setError(msg);
+          }
           setLoading(false);
         }
         // 退避后继续轮询（可能是临时网络问题，下个 tick 恢复）。
+        // preparing 态也继续刷新——吸收竞态窗口，依赖恢复后自动转可查看。
         timer = setTimeout(poll, ERROR_BACKOFF_MS);
       }
     };
@@ -131,13 +157,14 @@ export function useTracePolling(traceId: string | null): TracePollingState {
     setError(null);
     setDetail(null);
     detailRef.current = null;
+    setAvailability("loading");
     poll();
 
     return stop;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [traceId]);
 
-  return { detail, isLive, activeSession, loading, error };
+  return { detail, isLive, activeSession, loading, error, availability };
 }
 
 // 向后兼容别名：旧调用方 useTraceStream(...) 仍可用，等价于 useTracePolling。

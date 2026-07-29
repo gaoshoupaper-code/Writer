@@ -35,6 +35,8 @@ class WorkerResult:
     trace_id: str | None = None
     status: str = "unknown"       # done / failed / cancelled
     error: str | None = None
+    # FR-001：子进程 trace 的 workspace 落盘路径，主进程据此登记进主 recorder。
+    workspace_path: str | None = None
 
 
 def _worker_main(
@@ -43,6 +45,9 @@ def _worker_main(
     workspace_root_str: str,
     cancel_event: Any,
     result_queue: Any,
+    traceparent: str | None,
+    test_id: str | None,
+    task_id: str | None,
 ) -> None:
     """子进程入口：构建独立 recorder + 跑 run_ab_generation。
 
@@ -65,10 +70,18 @@ def _worker_main(
         # （append_event 的 _drain_active() 返回 False 时同步写，兼容测试/直接调用）。
         # 这样保证 trace 事件即时落盘，即使子进程被强杀也不丢已写事件。
 
-        def _on_trace_created(tid: str) -> None:
-            # trace 创建后立即回传，让父进程在 running 期间就能拿到 trace_id。
+        # 捕获 workspace_path：既经 trace_id 消息即时回传，也带入终态 WorkerResult，
+        # 这样即使父进程先消费到 result 消息（result 在 trace_id 之后入队但被先 drain），
+        # 也能拿到 workspace_path 完成主进程登记（FR-001 边界加固，EDGE-001 竞态）。
+        captured: dict[str, str | None] = {"workspace_path": None}
+
+        def _on_trace_created(tid: str, workspace_path: str) -> None:
+            captured["workspace_path"] = workspace_path
+            # trace 创建后立即回传 trace_id + workspace_path，让父进程在 running
+            # 期间就能拿到 trace_id，并把 workspace_path 登记进主 recorder
+            # （FR-001 跨进程发现根因修复）。
             try:
-                result_queue.put_nowait(("trace_id", tid))
+                result_queue.put_nowait(("trace_id", tid, workspace_path))
             except Exception:
                 pass
 
@@ -79,16 +92,21 @@ def _worker_main(
             writer_settings=writer_settings,
             on_trace_created=_on_trace_created,
             cancel_event=cancel_event,
+            traceparent=traceparent,
+            test_id=test_id,
+            task_id=task_id,
         )
 
-        # 判定终态（与 _execute_ab 逻辑一致）。
+        # 判定终态（与 _execute_ab 逻辑一致）。终态也带 workspace_path。
         if cancel_event.is_set():
             result_queue.put_nowait(("result", WorkerResult(
                 trace_id=trace_id, status="cancelled",
+                workspace_path=captured["workspace_path"],
             )))
         else:
             result_queue.put_nowait(("result", WorkerResult(
                 trace_id=trace_id, status="done",
+                workspace_path=captured["workspace_path"],
             )))
     except BaseException as exc:
         logger.exception("隔离子进程执行失败")
@@ -113,22 +131,42 @@ class IsolatedGenerationWorker:
         source_root: Path,
         demand_md: str,
         workspace_root: Path,
+        *,
+        traceparent: str | None = None,
+        test_id: str | None = None,
+        task_id: str | None = None,
     ) -> None:
         self._source_root = source_root
         self._demand_md = demand_md
         self._workspace_root = workspace_root
+        # FR-004：透传给子进程的 W3C context 与业务关联 ID。
+        self._traceparent = traceparent
+        self._test_id = test_id
+        self._task_id = task_id
         # multiprocessing 原语（跨进程安全）。
         ctx = mp.get_context("spawn")  # spawn 最干净，不继承父进程状态
         self._cancel_event = ctx.Event()
         self._result_queue: mp.Queue = ctx.Queue()
         self._process: mp.Process | None = None
         self._trace_id: str | None = None
+        # FR-001：子进程 trace 的 workspace 路径（trace_id 回传时一并取得）。
+        self._workspace_path: str | None = None
         self._lock = threading.Lock()
 
     @property
     def trace_id(self) -> str | None:
         with self._lock:
             return self._trace_id
+
+    @property
+    def workspace_path(self) -> str | None:
+        """子进程 trace 的 workspace 落盘路径（trace_id 回传时一并取得）。
+
+        供主进程登记进主 recorder，让 /internal/traces/{trace_id} 能查到子进程产物
+        （FR-001 跨进程发现根因修复）。在 trace_id 回传前为 None。
+        """
+        with self._lock:
+            return self._workspace_path
 
     def start(self) -> None:
         """启动子进程。"""
@@ -142,6 +180,9 @@ class IsolatedGenerationWorker:
                 str(self._workspace_root),
                 self._cancel_event,
                 self._result_queue,
+                self._traceparent,
+                self._test_id,
+                self._task_id,
             ),
             daemon=True,  # 父进程退出时子进程也退出，防孤儿
         )
@@ -162,18 +203,29 @@ class IsolatedGenerationWorker:
                 self._drain_queue()
                 break
             try:
-                kind, value = self._result_queue.get(timeout=0.5)
+                msg = self._result_queue.get(timeout=0.5)
             except queue_mod.Empty:
                 continue
+            kind = msg[0]
             if kind == "trace_id":
+                # FR-001：trace_id 与 workspace_path 一并回传。
+                # msg = ("trace_id", trace_id, workspace_path)
+                tid = msg[1]
+                ws_path = msg[2] if len(msg) > 2 else None
                 with self._lock:
-                    self._trace_id = value
-                return value
+                    self._trace_id = tid
+                    if ws_path:
+                        self._workspace_path = ws_path
+                return tid
             if kind == "result":
                 # 子进程可能在回传 trace_id 前就结束（失败）——记录终态。
+                value = msg[1]
                 with self._lock:
                     if value.trace_id:
                         self._trace_id = value.trace_id
+                    # FR-001 边界加固：result 也可能携带 workspace_path。
+                    if value.workspace_path:
+                        self._workspace_path = value.workspace_path
                     self._last_result = value
                 return value.trace_id
         return self.trace_id
@@ -225,17 +277,28 @@ class IsolatedGenerationWorker:
 
         while True:
             try:
-                kind, value = self._result_queue.get_nowait()
+                msg = self._result_queue.get_nowait()
             except queue_mod.Empty:
                 break
+            kind = msg[0]
             if kind == "trace_id":
+                # FR-001：trace_id 与 workspace_path 一并回传。
+                tid = msg[1]
+                ws_path = msg[2] if len(msg) > 2 else None
                 with self._lock:
                     if self._trace_id is None:
-                        self._trace_id = value
+                        self._trace_id = tid
+                    if ws_path:
+                        self._workspace_path = ws_path
             elif kind == "result":
+                value = msg[1]
                 with self._lock:
                     if value.trace_id and not self._trace_id:
                         self._trace_id = value.trace_id
+                    # FR-001 边界加固：result 也可能携带 workspace_path（父进程先消费
+                    # 到 result 时用于主进程登记）。
+                    if value.workspace_path and not self._workspace_path:
+                        self._workspace_path = value.workspace_path
                     self._last_result = value
 
     def is_alive(self) -> bool:

@@ -235,8 +235,15 @@ export default function TestsPage() {
                   <td><span className={`session-status ${t.status}`}>{testStatusLabel(t.status)}</span></td>
                   <td>{t.created_at.slice(0, 19).replace("T", " ")}</td>
                   <td className="test-actions">
-                    {t.trace_id && (
+                    {/* FR-003：按 trace_availability 区分可查看 / 准备中 / 不可用，不暴露原始 not found */}
+                    {t.trace_availability === "available" && t.trace_id && (
                       <button className="action-link" onClick={() => navigate(`/traces/${t.trace_id}`)}>查看</button>
+                    )}
+                    {t.trace_availability === "preparing" && (
+                      <span className="action-hint">Trace 准备中</span>
+                    )}
+                    {t.trace_availability === "unavailable" && (
+                      <span className="action-hint warn">Trace 不可用，可重跑</span>
                     )}
                     {t.status === "failed" && (
                       <button className="action-link" onClick={() => handleRetry(t.test_id)}>重试</button>

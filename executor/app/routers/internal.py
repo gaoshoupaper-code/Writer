@@ -290,11 +290,18 @@ class ABRunRequest(BaseModel):
     - baseline / config：遗留字段（去 DB 重构后不再驱动装配——
       候选/工作版本都走 assemble(ctx) 单参数契约，版本差异由 source_root 决定）。
       保留只为 HTTP 契约向后兼容，内部已忽略。
+    - traceparent：可选 W3C traceparent（FR-004/DEC-005）。继承 evolution 发起链路
+      的上游 context，透传到隔离子进程 trace。缺失时 executor 自行生成有效 context。
+      兼容未传字段的既有调用方（普通创作 trace 行为不变）。
+    - test_id：可选 evolution 单次测试 ID（FR-004）。opaque ID，写入 trace external_refs
+      供跨服务追溯。仅允许非敏感 opaque ID，禁止正文/凭证（CON-003）。
     """
     config: dict | None = None  # 遗留字段，内部已忽略（保留向后兼容）
     demand_md: str = ""  # 预置 demand.md 内容（interview 直通）
     baseline: bool = True  # 遗留字段，内部已忽略（保留向后兼容）
     source_commit: str | None = None  # 快照版本 git commit；None=working 包（harnesses/repo）
+    traceparent: str | None = None  # FR-004：W3C traceparent，继承上游 context
+    test_id: str | None = None  # FR-004：evolution 单次测试 ID，写入 external_refs
 
 
 class ABRunResponse(BaseModel):
@@ -371,6 +378,9 @@ def _execute_ab(task_id: str, req: "ABRunRequest") -> None:
             source_root=source_root,
             demand_md=req.demand_md,
             workspace_root=workspace_root,
+            traceparent=req.traceparent,
+            test_id=req.test_id,
+            task_id=task_id,
         )
         # 登记 worker 到 task 表（ab_stop 用它做硬终止）。
         _ab_tasks[task_id]["worker"] = worker
@@ -380,6 +390,13 @@ def _execute_ab(task_id: str, req: "ABRunRequest") -> None:
         trace_id = worker.wait_for_trace_id(timeout=300)
         if trace_id:
             _ab_tasks[task_id]["trace_ids"] = [trace_id]
+            # FR-001 根因修复：把子进程 trace 的 workspace_path 登记进主 recorder，
+            # 否则 GET /internal/traces/{trace_id} 会在主进程内存索引查无 → 稳定 404
+            # （EVD-002/003）。子进程产物已落盘，主进程只需拿到定位信息即可读取。
+            ws_path = worker.workspace_path
+            if ws_path:
+                main_recorder = get_trace_recorder()
+                main_recorder.register_external_run(trace_id, ws_path)
 
         # 阻塞等子进程自然结束（非取消场景）。取消由 ab_stop 的后台收敛线程处理。
         # 用循环 + is_alive 检查，让取消收敛能更新状态。
