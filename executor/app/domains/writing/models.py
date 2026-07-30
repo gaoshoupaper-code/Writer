@@ -86,6 +86,11 @@ def build_writer_model(
         api_key=effective_key,
         base_url=effective_base,
         request_timeout=120,
+        # CON-003/DEC-003：显式关闭 SDK 内部隐藏重试。重试预算由 WriterRetryController
+        # 统一持有（最多 2 次传输尝试），行为不再随 openai/langchain-openai 默认值漂移。
+        # 线上 18 分钟等待的根因之一正是此处未显式设置，SDK 默认 max_retries=2 与
+        # 外层 task 重放相乘（EVD-004/005）。
+        max_retries=0,
         # AD5：deepseek 也开启 stream_usage——流式模式下需要 usage 做积分计费（D3）。
         # ChatOpenAI 的 stream_usage=True 会传 stream_options={"include_usage": true}，
         # deepseek 兼容 OpenAI 协议会返回 usage。

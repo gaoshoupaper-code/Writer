@@ -64,6 +64,21 @@ class WriterModelTest(unittest.TestCase):
         self.assertEqual(model.model_name, "gpt-4o-mini")
         self.assertIsNone(model.extra_body)
 
+    def test_build_writer_model_disables_sdk_retries_explicitly(self) -> None:
+        # CON-003/DEC-003：SDK 内部重试必须显式关闭，重试预算由 WriterRetryController 统一持有。
+        # 线上 18 分钟等待的根因之一是此处未显式设置，导致 SDK 默认 max_retries 与外层相乘。
+        model = build_writer_model(
+            SimpleNamespace(
+                writer_model="openai:gpt-4o-mini",
+                writer_temperature=None,
+                writer_top_p=None,
+                openai_api_key="test-key",
+                openai_base_url="https://api.openai.com/v1",
+            )
+        )
+        self.assertEqual(model.max_retries, 0)
+        self.assertEqual(model.request_timeout, 120)
+
 
 class DeepSeekThinkingModelTest(unittest.TestCase):
     def test_sidecar_saves_reasoning_by_tool_call_id(self) -> None:

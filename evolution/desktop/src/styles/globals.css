@@ -6529,6 +6529,60 @@ html[data-theme="dark"] {
   50% { opacity: 0.3; }
 }
 
+/* FR-002/EDGE-003：陈旧标识——同步失败保留旧快照但明确区分（不伪装成实时）。 */
+.stale-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 12px;
+  color: var(--warning, #d97706);
+  padding: 6px 12px;
+  background: rgba(217, 119, 6, 0.12);
+  border-radius: 6px;
+  align-self: flex-start;
+}
+
+/* DEC-004：常驻刷新按钮——用户可主动验证数据新鲜度，不需先等页面判定故障。 */
+.refresh-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted-foreground, #94a3b8);
+  padding: 6px 10px;
+  background: transparent;
+  border: 1px solid var(--border, #2a3142);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.refresh-button:hover:not(:disabled) {
+  color: var(--foreground, #e5e7eb);
+  border-color: var(--teal, #3a9a7e);
+}
+
+.refresh-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.refresh-button .spin {
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* FR-001：最后成功同步时间——数据新鲜度的可见锚点。 */
+.last-synced {
+  font-size: 11px;
+  color: var(--muted-foreground, #94a3b8);
+  align-self: flex-start;
+  padding: 6px 0;
+}
+
 .log-stream {
   background: var(--surface, #141821);
   border: 1px solid var(--border, #2a3142);
@@ -8673,6 +8727,7 @@ html[data-theme="dark"] {
   flex-direction: column;
   min-height: 480px;
   overflow: hidden;
+  position: relative; /* AC-002：新节点浮动 pill 的定位锚点 */
 }
 
 /* status summary bar */
@@ -8736,6 +8791,28 @@ html[data-theme="dark"] {
   display: flex;
   flex-direction: column;
   gap: 3px;
+}
+
+/* AC-002：用户向上查看历史时有新节点到达的"回到最新"浮动入口。 */
+.chain-new-nodes-pill {
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  font-size: 12px;
+  color: var(--bg, #0f1320);
+  background: var(--teal, #3a9a7e);
+  border: none;
+  border-radius: 999px;
+  padding: 6px 14px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  animation: pulse 1.8s ease-in-out infinite;
+}
+
+.chain-new-nodes-pill:hover {
+  filter: brightness(1.1);
 }
 
 /* parallel group */

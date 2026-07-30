@@ -38,6 +38,10 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
 
     通过 DeepAgents 的 AgentMiddleware 接口拦截工具调用，
     在调用失败时自动重试，耗尽后注入错误恢复建议。
+
+    task 防重放（CON-005/FR-003/DEC-003）：``task`` 工具运行整个子 Agent，重放会重复
+    副作用与计费并制造约 18 分钟乘法等待。注入的 ``tool_replay_policy`` 在重试前判定；
+    命中 task 时恒为"不可重试"，错误交回 Meta Agent 用新逻辑任务身份显式重新委派。
     """
 
     def __init__(
@@ -46,15 +50,27 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
         max_retries: int = 2,
         retry_delay: float = 0.5,
         intervention_callback: Callable[..., None] | None = None,
+        tool_replay_policy: Any | None = None,
     ) -> None:
         """
         Args:
             max_retries: 最大重试次数（不含首次调用），默认 2 次
             retry_delay: 重试基础延迟（秒），异步模式下按 attempt+1 递增
+            tool_replay_policy: 平台注入的 task 防重放策略（CON-005）。非 None 时，
+                每次重试前调用 should_retry(tool_name, exc)；返回 False 的工具不重试。
         """
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.intervention_callback = intervention_callback
+        self.tool_replay_policy = tool_replay_policy
+
+    def _can_retry(self, request: Any, exc: BaseException) -> bool:
+        """平台 task 防重放判定：task 工具不得被通用恢复重放（CON-005）。"""
+        if self.tool_replay_policy is None:
+            return True
+        tool_call = getattr(request, "tool_call", {})
+        tool_name = _mapping_value(tool_call, "name")
+        return bool(self.tool_replay_policy.should_retry(tool_name, exc))
 
     # ------------------------------------------------------------------
     # 工具调用拦截（同步 / 异步）
@@ -72,9 +88,12 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
                 if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)) or type(exc).__name__ == "GraphInterrupt":
                     raise
                 last_exc = exc
-                if attempt < self.max_retries:
+                # task 防重放：命中不可重试工具立即短路，交回 Meta Agent（CON-005）。
+                if attempt < self.max_retries and self._can_retry(request, exc):
                     self._emit_intervention("retry", exc)
-        # 所有重试都失败，返回包含恢复建议的错误消息
+                    continue
+                break
+        # 所有重试都失败（或被防重放短路），返回包含恢复建议的错误消息
         self._emit_intervention("short_circuit", last_exc)
         return self._tool_error_message(request, last_exc)
 
@@ -88,10 +107,12 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
                 if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)) or type(exc).__name__ == "GraphInterrupt":
                     raise
                 last_exc = exc
-                # 非最后一次重试前等待，延迟按尝试次数递增（0.5s → 1.0s → 1.5s ...）
-                if attempt < self.max_retries:
+                # task 防重放：命中不可重试工具立即短路，交回 Meta Agent（CON-005）。
+                if attempt < self.max_retries and self._can_retry(request, exc):
                     self._emit_intervention("retry", exc)
                     await asyncio.sleep(self.retry_delay * (attempt + 1))
+                    continue
+                break
         self._emit_intervention("short_circuit", last_exc)
         return self._tool_error_message(request, last_exc)
 

@@ -74,6 +74,11 @@ class RuntimeContext:
         memory_recall_middleware_cls: MemoryRecallMiddleware 类（harness 定义，ctx 传入，包内实例化）。
             与 memory_backend 配合，复用 T2 注入模式（实例 + 类双注入）。
             group_id 在包内 assemble 时从 owner_id + workspace_path 算出（请求级）。
+        tool_replay_policy: TaskReplayPolicy 实例（CON-005/FR-003 平台级 task 防重放边界）。
+            执行端注入；harness 包的 ErrorRecoveryMiddleware 在决定重试前调用其
+            ``should_retry(tool_name, exc)``。``task``（子 Agent 委派）恒返回 False，
+            通用错误恢复不得重放整个子 Agent。None 时按各 harness 既有行为（向后兼容，
+            旧 snapshot 不消费本字段）。类型用 object 避免 contracts 硬依赖执行端模块。
     """
 
     # 请求级（每次 assemble 新建）
@@ -95,6 +100,14 @@ class RuntimeContext:
     memory_recall_middleware_cls: object | None = None  # MemoryRecallMiddleware 类
     # 证据采集（第二期，2026-07）：callback 模式，None 时不采集
     artifact_snapshot_callback: object | None = None  # Callable[[dict], None]，写盘成功后冻结产物快照
+    # CON-005/FR-003（trace 可见性根治，2026-07）：平台级 task 防重放边界，None 向后兼容。
+    tool_replay_policy: object | None = None  # TaskReplayPolicy 实例，执行端注入
+    # FR-003/EVD-006（trace 可见性根治，2026-07）：模型重试运行器工厂（领域层注入）。
+    # 非 None 时 harness assemble 把它传给 TraceMiddleware，让模型传输层重试预算与 attempt
+    # 可观测。工厂签名：``factory() -> Callable[[invoke_async, on_attempt, on_backoff], Awaitable]``。
+    # 定义在领域层（app.domains.writing.retry），平台层 TraceMiddleware 只调用、不 import，
+    # 保持 platform 不依赖 domains 的分层铁律。
+    writer_retry_runner_factory: object | None = None
 
 
 __all__ = ["RuntimeContext"]

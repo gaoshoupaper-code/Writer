@@ -49,16 +49,31 @@ class TraceMiddleware(AgentMiddleware):
     在调用前后插入追踪事件记录。同时提供同步和异步两套接口。
     """
 
-    def __init__(self, recorder: TraceRecorder, trace_id: str, agent_name: str) -> None:
+    def __init__(
+        self,
+        recorder: TraceRecorder,
+        trace_id: str,
+        agent_name: str,
+        *,
+        retry_runner: Callable[..., Any] | None = None,
+    ) -> None:
         """
         Args:
             recorder:   追踪记录器，负责将事件持久化到本地存储
             trace_id:   当前追踪会话的唯一标识
             agent_name: 当前代理名称（如 "meta-agent"、"outline" 等）
+            retry_runner: 模型传输层重试运行器（领域层注入，保持平台层不依赖 domains）。
+                非 None 时，``awrap_model_call`` 用它包一层 handler：单次逻辑调用最多
+                2 次传输尝试，每次 attempt 失败/退避写 middleware_intervention 事件，
+                让 SDK 内部重试不再"开始后长时间没结果"地不可见（EVD-006 / FR-003）。
+                签名：``retry_runner(invoke_async, on_attempt, on_backoff) -> awaitable``。
+                平台层只提供观测回调（record_attempt_failed/record_backoff），不 import
+                领域层重试实现（分层铁律：platform 不依赖 domains）。
         """
         self.recorder = recorder
         self.trace_id = trace_id
         self.agent_name = agent_name
+        self.retry_runner = retry_runner
 
     # ------------------------------------------------------------------
     # 模型调用拦截（同步 / 异步）
@@ -77,12 +92,7 @@ class TraceMiddleware(AgentMiddleware):
         except BaseException as exc:
             # GraphInterrupt 是 HITL（ask_user）的正常控制流，不是错误——
             # 直接放行，不记录 llm_error，避免监测面板误报。
-            if isinstance(exc, GraphInterrupt):
-                self.recorder.record_hitl(
-                    self.trace_id, self.agent_name, phase="model", state="requested"
-                )
-            else:
-                self._record_model_error(request, started, exc)
+            self._finalize_model_exception(request, started, exc)
             raise
         self._record_model_end(request, response, started)
         return response
@@ -92,21 +102,92 @@ class TraceMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
-        """拦截异步模型调用：记录开始 → 执行 → 记录完成/错误。"""
+        """拦截异步模型调用：记录开始 → 执行 → 记录完成/错误。
+
+        注入了 retry_runner（写作路径）时，handler 经领域层重试运行器包一层：
+        单次逻辑调用最多 2 次传输尝试，每次失败/退避写 attempt 事件，让 SDK 内部
+        重试不再"开始后长时间没结果"地不可见（EVD-006 / FR-003 可观测）。
+        """
+        if self.retry_runner is not None:
+            return await self._awrap_model_call_with_retry(request, handler)
         started = time.perf_counter()
         self._record_model_start(request)
         try:
             response = await handler(request)
         except BaseException as exc:
-            if isinstance(exc, GraphInterrupt):
-                self.recorder.record_hitl(
-                    self.trace_id, self.agent_name, phase="model", state="requested"
-                )
-            else:
-                self._record_model_error(request, started, exc)
+            self._finalize_model_exception(request, started, exc)
             raise
         self._record_model_end(request, response, started)
         return response
+
+    async def _awrap_model_call_with_retry(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        """带重试的模型调用：llm_start 一次 → runner 多次 attempt → end/error。
+
+        平台层只提供观测回调（record_attempt_failed/record_backoff），重试实现由
+        领域层注入的 retry_runner 提供——保持 platform 不 import domains（分层铁律）。
+        """
+        started = time.perf_counter()
+        self._record_model_start(request)
+
+        async def _invoke() -> ModelResponse:
+            return await handler(request)
+
+        try:
+            response = await self.retry_runner(_invoke, self.record_attempt_failed, self.record_backoff)
+        except BaseException as exc:
+            # 预算用尽/不可重试：写最终 llm_error（duration 覆盖全部 attempt）。
+            self._finalize_model_exception(request, started, exc)
+            raise
+        self._record_model_end(request, response, started)
+        return response
+
+    def _finalize_model_exception(self, request: ModelRequest, started: float, exc: BaseException) -> None:
+        """模型调用异常的统一收尾：GraphInterrupt 记 HITL，其余记 llm_error。
+
+        三个模型调用路径（sync/async/async+retry）共享此分支，避免 copy-paste 漂移。
+        """
+        if isinstance(exc, GraphInterrupt):
+            self.recorder.record_hitl(
+                self.trace_id, self.agent_name, phase="model", state="requested"
+            )
+        else:
+            self._record_model_error(request, started, exc)
+
+
+    # ------------------------------------------------------------------
+    # 平台层重试观测回调（供领域层 retry_runner 在 attempt 失败/退避时调用）
+    # ------------------------------------------------------------------
+
+    def _emit_attempt_event(self, action: str, reason: str) -> None:
+        """attempt 事件的共享落点：record_intervention + 观测失败吞掉（不影响重试主流程）。"""
+        try:
+            self.recorder.record_intervention(
+                self.trace_id, self.agent_name,
+                action=action,
+                hook="awrap_model_call",
+                affected_fields=["control_flow"],
+                reason=reason,
+            )
+        except Exception:  # noqa: BLE001 —— 观测失败不得影响重试主流程
+            pass
+
+    def record_attempt_failed(self, attempt_number: int, max_attempts: int, error_class: str) -> None:
+        """单次传输 attempt 失败：写一条 intervention 让"第 N 次尝试失败"可见（EDGE-002）。"""
+        self._emit_attempt_event(
+            "model_attempt_failed",
+            f"attempt {attempt_number}/{max_attempts}:{error_class}",
+        )
+
+    def record_backoff(self, attempt: int, next_attempt: int, delay: float) -> None:
+        """attempt 间退避：写一条 intervention 让"等待重试"可见。"""
+        self._emit_attempt_event(
+            "model_attempt_backoff",
+            f"attempt {attempt} → {next_attempt}, backoff {delay}s",
+        )
 
     # ------------------------------------------------------------------
     # 工具调用拦截（同步 / 异步）

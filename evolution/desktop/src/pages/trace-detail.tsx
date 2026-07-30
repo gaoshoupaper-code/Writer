@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useNavigate, useOutletContext } from "react-router-dom";
-import { GitFork } from "lucide-react";
+import { GitFork, RefreshCw } from "lucide-react";
 import { useTracePolling } from "@/hooks/useTraceStream";
 import { TraceChainTimeline } from "@/components/trace/TraceChainTimeline";
 import { TraceChainDrawer } from "@/components/trace/TraceChainDrawer";
@@ -35,7 +35,10 @@ export default function TraceDetailPage() {
   const navigate = useNavigate();
   const { isSuperAdmin } = useOutletContext<{ isSuperAdmin: boolean }>();
 
-  const { detail, isLive, activeSession, loading, error, availability } = useTracePolling(traceId ?? null);
+  const {
+    detail, isLive, isStale, lastSyncedAt, refresh, refreshing,
+    activeSession, loading, error, availability,
+  } = useTracePolling(traceId ?? null);
 
   // ── 页面壳状态 ──
   const [activeTab, setActiveTab] = useState<"trace" | "chart" | "artifacts">("trace");
@@ -331,8 +334,28 @@ export default function TraceDetailPage() {
           >
             <GitFork size={14} />血缘
           </button>
-          {isLive && (
+          {isLive && !isStale && (
             <span className="streaming-badge"><span className="pulse" /> 实时</span>
+          )}
+          {isStale && (
+            // FR-002/EDGE-003：同步失败保留旧快照但明确标陈旧，不伪装成实时。
+            <span className="stale-badge" title={error ?? undefined}>陈旧</span>
+          )}
+          {/* DEC-004：常驻刷新按钮 + 最后成功同步时间。进行中防重复并发（AC-004）。 */}
+          <button
+            type="button"
+            className="refresh-button"
+            disabled={refreshing || loading}
+            onClick={refresh}
+            title={refreshing ? "同步中…" : "立即刷新拉取最新 Trace"}
+          >
+            <RefreshCw size={14} className={refreshing ? "spin" : undefined} />
+            {refreshing ? "同步中" : "刷新"}
+          </button>
+          {lastSyncedAt && (
+            <span className="last-synced" title="最后成功同步时间">
+              同步于 {new Date(lastSyncedAt).toLocaleTimeString("zh-CN", { hour12: false })}
+            </span>
           )}
           {/* trace 稳定性重构：running/cancelling 时显示停止按钮；interrupted 时显示收敛按钮。
               FR-006：cancelling 时按钮显示"取消中…"（受理后立即可见），允许重复点击幂等重试。 */}
