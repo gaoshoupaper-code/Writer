@@ -143,6 +143,8 @@ def run_ab_generation(
     from contracts.runtime_context import RuntimeContext
     from app.domains.writing.models import build_writer_model
     from app.platform.agent.middleware import TraceMiddleware
+    from app.platform.agent.middleware.artifact_capture import EvidenceCaptureError
+    from app.platform.agent.runtime import artifact_capture_scope
     # CON-005/FR-003（trace 可见性根治）：复用生产路径的平台级安全边界注入。
     # A/B + 单次测试是 EVD-003 的实际复现入口，必须与生产路径同施加 task 防重放 +
     # 模型重试可观测，否则该入口仍会出现约 18 分钟等待与整任务重放。
@@ -182,6 +184,28 @@ def run_ab_generation(
         external_refs_extra=extra_refs or None,
     )
     trace_id = trace.trace_id
+    from app.platform.agent.runtime_identity import build_runtime_identity
+
+    trace_recorder.set_run_snapshot(
+        trace_id,
+        build_runtime_identity(harness_root=source_root),
+    )
+    trace_recorder.append_event(trace_id, {
+        "type": "run_meta",
+        "status": "running",
+        "source": "system",
+        "input": {"contract_snapshot": {
+            "task_type": "screenplay.ab_run",
+            "run_purpose": "evolution",
+            "endpoint": "screenplay.ab_run",
+            "thread_id": thread.thread_id,
+            "workspace_id": thread.workspace_id,
+            "session_name": thread.session_name,
+            "demand_md": demand_md,
+            "demand_available": True,
+            "missing": [],
+        }},
+    })
 
     # trace 已创建，立即通知调用方（供 running 期间实时展示）。
     # 回传 workspace_path：主进程据此登记进主 recorder，让 /internal/traces/{id}
@@ -220,7 +244,13 @@ def run_ab_generation(
         )
 
         # 5. assemble（单参数契约，与生产路径 agent.py 一致）
-        agent = pkg.assemble(ctx)
+        with artifact_capture_scope(
+            recorder=trace_recorder,
+            trace_id=trace_id,
+            workspace_root=workspace_path,
+            strict=True,
+        ):
+            agent = pkg.assemble(ctx)
 
         # 6. 构造输入（简单 prompt，interview 直通后会进 storybuilding）
         user_prompt = (
@@ -253,6 +283,10 @@ def run_ab_generation(
         logger.info("A/B 生成完成: trace_id=%s", trace_id)
         return trace_id
 
+    except EvidenceCaptureError as exc:
+        logger.exception("A/B 生成取证失败: trace_id=%s", trace_id)
+        trace_recorder.fail_evidence_capture_run(thread, trace_id, exc)
+        raise
     except BaseException as exc:
         logger.exception("A/B 生成失败: trace_id=%s", trace_id)
         trace_recorder.fail_run(thread, trace_id, exc)

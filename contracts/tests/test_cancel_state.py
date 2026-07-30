@@ -43,6 +43,10 @@ class CancelStateContractTest(unittest.TestCase):
         self.assertTrue(is_cancel_terminal("cancelled"))
         self.assertFalse(is_cancel_terminal("failed"))
 
+    def test_evidence_capture_failure_is_terminal(self) -> None:
+        self.assertIn("evidence_capture_failed", TERMINAL_STATES)
+        self.assertTrue(is_terminal("evidence_capture_failed"))
+
 
 class MonotonicTransitionTest(unittest.TestCase):
     """CON-003 / EDGE-002：终态单调性规则。"""

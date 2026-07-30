@@ -32,6 +32,33 @@ class RollbackRequest(BaseModel):
     reason: str = ""
 
 
+def _compensate_failed_rollback(
+    current: dict[str, Any], failed_target_version: int
+) -> str | None:
+    """恢复 registry 与 executor；返回 None 表示补偿已确认。"""
+    from app.core import git_ops
+    from app.versioning.snapshot_publisher import reload_executor
+
+    try:
+        registry_repo.restore_failed_rollback(current["version"], failed_target_version)
+        git_ops.commit_registry_and_push(
+            f"恢复 Harness production v{current['version']}: rollback 激活失败"
+        )
+        restored = reload_executor(current["version"])
+        if restored.get("commit") != current.get("commit_hash"):
+            raise RuntimeError("executor 未恢复到原 production commit")
+        expected_identity = current.get("runtime_identity") or {}
+        actual_identity = restored.get("runtime_identity") or {}
+        if expected_identity and (
+            actual_identity.get("identity_digest")
+            != expected_identity.get("identity_digest")
+        ):
+            raise RuntimeError("executor 未恢复到原 production runtime identity")
+        return None
+    except Exception as exc:
+        return str(exc)
+
+
 @router.get("")
 def list_snapshots(status: str | None = None) -> list[dict[str, Any]]:
     """列版本（按版本倒序）。可按 status 过滤（production/retired）。"""
@@ -68,18 +95,43 @@ def rollback_snapshot(body: RollbackRequest, request: Request) -> dict[str, Any]
     )
 
     from app.core import git_ops
-    from app.versioning.snapshot_publisher import notify_executor
+    from app.versioning.snapshot_publisher import reload_executor
 
     try:
         target = registry_repo.rollback(body.to_version, reason=body.reason or None)
-        commit = git_ops.commit_and_push(
-            f"回滚 production v{current['version']} -> v{body.to_version}"
-        )
-        if not notify_executor(body.to_version):
+        try:
+            registry_commit = git_ops.commit_registry_and_push(
+                f"回滚 production v{current['version']} -> v{body.to_version}"
+            )
+        except Exception as exc:
+            restore_error = _compensate_failed_rollback(current, body.to_version)
             raise HTTPException(
                 status_code=502,
-                detail="registry 已回滚并提交，但 executor reload 未确认",
-            )
+                detail={
+                    "message": f"rollback registry 提交失败：{exc}",
+                    "executor_restore_error": restore_error,
+                },
+            ) from exc
+        try:
+            activated = reload_executor(body.to_version)
+            activated_identity = activated.get("runtime_identity") or {}
+            expected_identity = target.get("runtime_identity") or {}
+            if activated.get("commit") != target.get("commit_hash"):
+                raise RuntimeError("executor 未加载目标 production commit")
+            if expected_identity and (
+                activated_identity.get("identity_digest")
+                != expected_identity.get("identity_digest")
+            ):
+                raise RuntimeError("executor runtime identity 与目标版本不一致")
+        except Exception as exc:
+            restore_error = _compensate_failed_rollback(current, body.to_version)
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": f"rollback 激活失败，已恢复原 production：{exc}",
+                    "executor_restore_error": restore_error,
+                },
+            ) from exc
         if release:
             append_release_event(
                 release_id=release["release_id"],
@@ -91,7 +143,8 @@ def rollback_snapshot(body: RollbackRequest, request: Request) -> dict[str, Any]
             "status": "rollback_activated",
             "from_version": current["version"],
             "to_version": target["version"],
-            "source_commit": commit,
+            "source_commit": target["commit_hash"],
+            "registry_commit": registry_commit,
             "release_id": release["release_id"] if release else None,
             "release_tracking": "v2" if release else "legacy",
         }

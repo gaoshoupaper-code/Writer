@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import nullcontext
 
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -328,7 +329,7 @@ class MetaAgentService(BaseAgentService):
             return None
         return style.get("meta_style") or None
 
-    def _agent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, workspace_id: str | None = None, *, model=None, checkpointer=None, owner_id: str | None = None):
+    def _agent_for_workspace(self, workspace_path: Path, trace_id: str | None = None, workspace_id: str | None = None, *, model=None, checkpointer=None, owner_id: str | None = None, strict_evidence: bool = False):
         # 多用户隔离（T2.4/T2.5）：model 用用户解密 key 构建，
         # checkpointer 用用户的分库 saver。两者外部注入，缺省回退全局（管理员兜底）。
         # Phase 7 包化重构：装配逻辑从 evolution 拉 manifest 改为同进程 import Agent 包。
@@ -336,6 +337,7 @@ class MetaAgentService(BaseAgentService):
         return self._assemble_via_package(
             workspace_path, trace_id, workspace_id,
             model=model, checkpointer=checkpointer, owner_id=owner_id,
+            strict_evidence=strict_evidence,
         )
 
     def _assemble_via_package(
@@ -347,6 +349,7 @@ class MetaAgentService(BaseAgentService):
         model=None,
         checkpointer=None,
         owner_id: str | None = None,
+        strict_evidence: bool = False,
     ):
         """Phase 7：经 Agent 包装配（替代 _assemble_via_manifest）。
 
@@ -361,6 +364,7 @@ class MetaAgentService(BaseAgentService):
         """
         from contracts.runtime_context import RuntimeContext
         from app.platform.agent.loader import load_current_package
+        from app.platform.agent.runtime import artifact_capture_scope
         from app.domains.writing.models import build_writer_model
         from app.platform.agent.middleware import TraceMiddleware
         from app.platform.credits.middleware import CreditsMiddleware
@@ -377,15 +381,20 @@ class MetaAgentService(BaseAgentService):
             model = build_writer_model(self.settings)
         if checkpointer is None:
             checkpointer = self.checkpointer
+        pkg = load_current_package()
 
         if trace_id:
             try:
-                from importlib.metadata import version
-                from app.platform.agent.git_sync import production_commit
+                from app.platform.agent.git_sync import production_checkout, production_commit
+                from app.platform.agent.runtime_identity import build_runtime_identity
 
-                self.trace_recorder.set_run_snapshot(trace_id, {
-                    "harness_version": production_commit() or "unknown",
-                    "deepagents_version": version("deepagents"),
+                harness_commit = production_commit()
+                run_snapshot = build_runtime_identity(
+                    harness_root=production_checkout(),
+                    harness_commit=harness_commit,
+                )
+                run_snapshot.update({
+                    "harness_version": harness_commit or "unknown",
                     "model_class": f"{model.__class__.__module__}.{model.__class__.__name__}",
                     "model_name": str(
                         getattr(model, "model_name", None)
@@ -402,6 +411,7 @@ class MetaAgentService(BaseAgentService):
                         "langchain_openai_version": _safe_version("langchain_openai"),
                     },
                 })
+                self.trace_recorder.set_run_snapshot(trace_id, run_snapshot)
             except Exception as exc:
                 self.trace_recorder._mark_capture_degraded(
                     trace_id, f"run_snapshot_failed:{type(exc).__name__}"
@@ -459,8 +469,13 @@ class MetaAgentService(BaseAgentService):
             artifact_snapshot_callback=_make_artifact_snapshot_cb(self.trace_recorder, trace_id),
         )
 
-        pkg = load_current_package()
-        return pkg.assemble(ctx)
+        with artifact_capture_scope(
+            recorder=self.trace_recorder,
+            trace_id=trace_id or "",
+            workspace_root=workspace_path,
+            strict=strict_evidence,
+        ) if trace_id else nullcontext():
+            return pkg.assemble(ctx)
 
     # get_thread_checkpoint 复用 BaseAgentService 基类实现（PR-10 已提取，
     # 含 _normalize_message 规范化）。本地重复的 override + _normalize_message
@@ -566,6 +581,7 @@ class MetaAgentService(BaseAgentService):
         agent = self._agent_for_workspace(
             Path(thread.workspace_path), trace.trace_id, thread.workspace_id,
             model=model, checkpointer=checkpointer, owner_id=owner_id,
+            strict_evidence=run_purpose != "user_generation",
         )
 
         # resume 分支已在上方判定，据此构造 agent 输入
@@ -668,7 +684,12 @@ class MetaAgentService(BaseAgentService):
                     "thread_id": thread.thread_id,
                 })
                 return
-            self.trace_recorder.fail_run(thread, trace.trace_id, exc)
+            from app.platform.agent.middleware.artifact_capture import EvidenceCaptureError
+
+            if isinstance(exc, EvidenceCaptureError) and run_purpose != "user_generation":
+                self.trace_recorder.fail_evidence_capture_run(thread, trace.trace_id, exc)
+            else:
+                self.trace_recorder.fail_run(thread, trace.trace_id, exc)
             for trace_update in self._trace_updates(trace_queue):
                 yield trace_update
             raise

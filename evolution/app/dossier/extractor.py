@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 import app.core.db as db
+import app.trace_payloads as trace_payloads
+from app.core.models import TraceLogEvent
 from app.core.settings import settings
 from app.common.flow_metrics import compute_flow_metrics
 from app.eval_agent import eval_extractor
@@ -310,6 +312,29 @@ def _extract_v2_contract(
         if isinstance(candidate, dict):
             snapshot = candidate
             break
+    if not snapshot:
+        recovery_rows = db.query_all(
+            """SELECT event.payload_json
+               FROM lineage_edges edge
+               JOIN event_payloads event ON event.trace_id=edge.from_id
+               WHERE edge.from_type='trace' AND edge.relation='recovers'
+                 AND edge.to_type='trace' AND edge.to_id=? AND event.type='run_meta'
+               ORDER BY event.sequence DESC""",
+            (run.trace_id,),
+        )
+        for row in recovery_rows:
+            try:
+                recovery_event = trace_payloads.hydrate_event(
+                    TraceLogEvent.model_validate(json.loads(row["payload_json"]))
+                )
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if not isinstance(recovery_event.input, dict):
+                continue
+            candidate = recovery_event.input.get("contract_snapshot")
+            if isinstance(candidate, dict):
+                snapshot = candidate
+                break
 
     contract: dict[str, Any] = {
         "available": True,
@@ -503,27 +528,60 @@ def _load_v2_artifact_revisions(
         """SELECT revision.artifact_revision_id, revision.artifact_id,
                   revision.parent_revision_id, revision.payload_id,
                   revision.content_hash, revision.producer_event_id,
+                  revision.producer_trace_id, revision.provenance,
+                  revision.source_trace_id, revision.support_event_ids_json,
+                  revision.support_payload_ids_json,
                   artifact.logical_key, artifact.artifact_type,
                   payload.content_hash AS payload_content_hash, payload.deleted_at
            FROM artifact_revisions revision
            JOIN artifacts artifact ON artifact.artifact_id=revision.artifact_id
            JOIN payload_objects payload ON payload.payload_id=revision.payload_id
-           WHERE revision.producer_trace_id=?""",
-        (trace_id,),
+           WHERE revision.producer_trace_id=? OR revision.source_trace_id=?""",
+        (trace_id, trace_id),
     )
     materialized = {row["artifact_revision_id"]: row for row in rows}
+    event_by_revision = {
+        event.artifact_revision_id: event
+        for event in events
+        if event.type == "artifact_revision" and event.artifact_revision_id
+    }
+    missing_event_ids = {
+        row["producer_event_id"]
+        for row in rows
+        if row["artifact_revision_id"] not in event_by_revision
+    }
+    if missing_event_ids:
+        placeholders = ",".join("?" for _ in missing_event_ids)
+        recovery_event_rows = db.query_all(
+            f"SELECT payload_json FROM event_payloads WHERE event_id IN ({placeholders})",
+            tuple(sorted(missing_event_ids)),
+        )
+        for event_row in recovery_event_rows:
+            event = trace_payloads.hydrate_event(
+                TraceLogEvent.model_validate(json.loads(event_row["payload_json"]))
+            )
+            if event.artifact_revision_id:
+                event_by_revision[event.artifact_revision_id] = event
     revisions: list[dict[str, Any]] = []
 
-    for event in events:
-        if event.type != "artifact_revision":
-            continue
-        revision_id = event.artifact_revision_id
+    source_event_revisions = {
+        event.artifact_revision_id
+        for event in events
+        if event.type == "artifact_revision" and event.artifact_revision_id
+    }
+    missing_materialized = source_event_revisions - set(materialized)
+    if missing_materialized:
+        raise ValueError(
+            f"V2 artifact revisions were not materialized: {sorted(missing_materialized)}"
+        )
+
+    for revision_id, row in materialized.items():
+        event = event_by_revision.get(revision_id)
+        if event is None:
+            raise ValueError(f"V2 artifact revision {revision_id} has no producer event")
         artifact = event.artifact
         if not revision_id or not isinstance(artifact, dict):
             raise ValueError(f"V2 artifact event {event.event_id} is missing revision metadata")
-        row = materialized.get(revision_id)
-        if row is None:
-            raise ValueError(f"V2 artifact revision {revision_id} was not materialized")
         payload_ref = event.payload_refs.get("output")
         output = event.output
         content = output.get("content") if isinstance(output, dict) else None
@@ -561,6 +619,10 @@ def _load_v2_artifact_revisions(
             "content_length": len(content),
             "parent_revision_id": row["parent_revision_id"],
             "artifact_type": row["artifact_type"],
+            "provenance": row.get("provenance") or "trace_time",
+            "source_trace_id": row.get("source_trace_id"),
+            "support_event_ids": json.loads(row.get("support_event_ids_json") or "[]"),
+            "support_payload_ids": json.loads(row.get("support_payload_ids_json") or "[]"),
             "_content": content,
         })
 

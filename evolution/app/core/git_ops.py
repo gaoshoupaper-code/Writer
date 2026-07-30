@@ -89,9 +89,71 @@ def commit_and_push(message: str) -> str:
     return commit_hash
 
 
+def commit_candidate(message: str, *, required_paths: tuple[str, ...] = ()) -> str:
+    """显式提交 Harness 源码候选，不夹带 registry promotion。"""
+    wd = work_dir()
+    staged = set(_changed_paths(["diff", "--cached", "--name-only"], wd))
+    if "registry.json" in staged:
+        raise RuntimeError("registry.json 已预先暂存，无法冻结独立 candidate 源码提交")
+
+    source_paths = sorted(_all_changed_paths(wd) - {"registry.json"})
+    if source_paths:
+        _git_with_author(["add", "--", *source_paths], wd)
+        _git_with_author(["commit", "-m", message], wd)
+
+    remaining = _all_changed_paths(wd) - {"registry.json"}
+    if remaining:
+        raise RuntimeError(f"candidate 提交后仍有未固化源码: {sorted(remaining)}")
+    for path in required_paths:
+        _git(["cat-file", "-e", f"HEAD:{path}"], wd)
+    _push_to_bare(wd, settings.harness_bare_repo_path)
+    return current_commit()
+
+
+def commit_registry_and_push(message: str) -> str:
+    """只提交 registry.json，禁止夹带 candidate 测试后的源码漂移。"""
+    wd = work_dir()
+    changed = _all_changed_paths(wd)
+    unexpected = changed - {"registry.json"}
+    if unexpected:
+        raise RuntimeError(f"registry 提交前 Harness 源码发生漂移: {sorted(unexpected)}")
+    if "registry.json" in changed:
+        _git_with_author(["add", "--", "registry.json"], wd)
+        _git_with_author(["commit", "-m", message], wd)
+    _push_to_bare(wd, settings.harness_bare_repo_path)
+    return current_commit()
+
+
+def commit_registry_metadata_and_push(message: str) -> str:
+    """只提交 registry 元数据，允许启动升级源码继续留在未暂存 working。"""
+    wd = work_dir()
+    staged = set(_changed_paths(["diff", "--cached", "--name-only"], wd))
+    unexpected_staged = staged - {"registry.json"}
+    if unexpected_staged:
+        raise RuntimeError(
+            f"registry 元数据提交夹带已暂存源码: {sorted(unexpected_staged)}"
+        )
+    if "registry.json" in _all_changed_paths(wd):
+        _git_with_author(["add", "--", "registry.json"], wd)
+        _git_with_author(["commit", "-m", message], wd)
+    _push_to_bare(wd, settings.harness_bare_repo_path)
+    return current_commit()
+
+
+def _all_changed_paths(wd: Path) -> set[str]:
+    changed = set(_changed_paths(["diff", "--name-only", "HEAD"], wd))
+    changed.update(_changed_paths(["ls-files", "--others", "--exclude-standard"], wd))
+    return changed
+
+
+def _changed_paths(args: list[str], wd: Path) -> list[str]:
+    output = _git(args, wd)
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
 def current_commit() -> str:
-    """当前工作目录 HEAD 的 commit hash（7 位短 hash）。"""
-    return _git(["rev-parse", "--short", "HEAD"], work_dir())
+    """当前工作目录 HEAD 的完整 commit hash。"""
+    return _git(["rev-parse", "HEAD"], work_dir())
 
 
 def log_oneline(limit: int = 200) -> list[str]:
@@ -268,6 +330,9 @@ __all__ = [
     "work_dir",
     "has_changes",
     "commit_and_push",
+    "commit_candidate",
+    "commit_registry_and_push",
+    "commit_registry_metadata_and_push",
     "current_commit",
     "log_oneline",
     "show_file",

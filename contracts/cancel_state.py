@@ -37,7 +37,7 @@ class CancelState(str, Enum):
 # 业务终态集合（CON-003 单调性保护对象）。
 # 一旦进入这些状态，不得被迟到写入（轮询/摄入/执行结果）覆写为另一终态。
 TERMINAL_STATES = frozenset({
-    "completed", "done", "failed", "cancelled", "cancel_timeout",
+    "completed", "done", "failed", "evidence_capture_failed", "cancelled", "cancel_timeout",
     "interrupted",  # 心跳超时/进程重启的中断态（非用户取消，但也是终态）
 })
 

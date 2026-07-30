@@ -99,13 +99,16 @@ def _poll_task_status(test_id: str, task_id: str) -> None:
                 if row and row["status"] not in ("done", "failed", "cancelled"):
                     test_repo.mark_done(test_id, trace_ids[0] if trace_ids else "")
                 return
-            if status == "failed":
+            if status in {"failed", "evidence_capture_failed"}:
                 # trace 可能已创建（assemble 前的 create_run）但后续抛异常；回填 trace_id
                 # 让用户能从失败记录点进去看部分 trace。
                 failed_trace_ids = data.get("trace_ids") or []
                 test_repo.mark_failed(
                     test_id,
-                    data.get("error") or "executor task failed",
+                    data.get("error") or (
+                        "创作写入成功但证据采集失败，结果不可用于评估或发布"
+                        if status == "evidence_capture_failed" else "executor task failed"
+                    ),
                     failed_trace_ids[0] if failed_trace_ids else None,
                 )
                 return

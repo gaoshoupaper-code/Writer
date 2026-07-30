@@ -16,7 +16,7 @@ import asyncio
 import logging
 from contextlib import suppress
 
-from app.platform.agent.git_sync import production_commit, pull_production
+from app.platform.agent.git_sync import bare_production_commit, production_commit, pull_production
 from app.platform.agent.loader import reload_current
 
 logger = logging.getLogger("writer.harness_reconcile")
@@ -26,29 +26,15 @@ _reconcile_task: asyncio.Task | None = None
 
 
 def _bare_repo_main_commit() -> str | None:
-    """bare repo 的 main 分支当前 commit（executor 应该跑的版本）。
+    """bare registry 声明的 production commit（executor 应该跑的版本）。
 
     通过 git ls-remote 或直接查 bare repo 的 refs 取 main HEAD。
     返回空串表示 bare repo 未就绪（首次启动可能还没 push）。
     """
-    import subprocess
-    from app.platform.core.settings import get_settings
-
-    bare = get_settings().harness_bare_repo
-    # 相对路径基于项目根解析（和 git_sync._project_root 一致：parents[4] = Writer/）
-    from pathlib import Path
-    if not Path(bare).is_absolute():
-        bare = str(Path(__file__).resolve().parents[4] / bare)
-
     try:
-        result = subprocess.run(
-            ["git", "-C", bare, "rev-parse", "--short", "main"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
+        return bare_production_commit()
     except Exception:  # noqa: BLE001
-        logger.debug("查 bare repo main commit 失败", exc_info=True)
+        logger.debug("查 bare registry production commit 失败", exc_info=True)
     return ""
 
 
@@ -67,7 +53,7 @@ def _reconcile_once() -> bool:
     if current == target:
         return False  # 已同步
 
-    logger.info("reconcile 发现版本漂移：本地 %s → bare main %s，触发 reload", current, target)
+    logger.info("reconcile 发现版本漂移：本地 %s → production %s，触发 reload", current, target)
     try:
         pull_production()  # git reset --hard origin/main
         reload_current()   # 清缓存 + 重新加载包

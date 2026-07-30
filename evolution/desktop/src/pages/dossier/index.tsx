@@ -16,7 +16,7 @@ import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
 import {
-  getTraces,
+  getDossierCandidates,
   getTraceDossiers,
   startCompileDossier,
   getDossierSession,
@@ -49,11 +49,8 @@ export default function DossiersPage() {
   // 拉候选 trace 列表（排除自观测）
   const refreshTraces = useCallback(async () => {
     try {
-      const resp = await getTraces({ limit: 100 });
-      const filtered = resp.items.filter(
-        (t) => t.run_purpose !== "evolution_eval" && t.run_purpose !== "evolution_evolve",
-      );
-      setTraces(filtered);
+      const resp = await getDossierCandidates(100);
+      setTraces(resp.items);
     } catch {
       /* toast 由 evoJson 统一处理 */
     } finally {

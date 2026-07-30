@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from contracts.cancel_state import HARD_STOP_DEADLINE_SECONDS
+from app.platform.agent.middleware.artifact_capture import EvidenceCaptureError
 
 logger = logging.getLogger("executor.isolation")
 
@@ -65,6 +66,7 @@ def _worker_main(
         except (OSError, PermissionError):
             # setsid 失败（极罕见）不阻断启动——_force_terminate 会退化为只 kill 单 PID。
             logger.warning("子进程 setsid 失败，强杀将退化为单 PID 终止", exc_info=True)
+    captured: dict[str, str | None] = {"workspace_path": None, "trace_id": None}
     try:
         # 子进程内独立初始化（spawn 模式不继承父进程的已初始化全局变量）。
         from app.platform.trace import TraceRecorder
@@ -84,10 +86,9 @@ def _worker_main(
         # 捕获 workspace_path：既经 trace_id 消息即时回传，也带入终态 WorkerResult，
         # 这样即使父进程先消费到 result 消息（result 在 trace_id 之后入队但被先 drain），
         # 也能拿到 workspace_path 完成主进程登记（FR-001 边界加固，EDGE-001 竞态）。
-        captured: dict[str, str | None] = {"workspace_path": None}
-
         def _on_trace_created(tid: str, workspace_path: str) -> None:
             captured["workspace_path"] = workspace_path
+            captured["trace_id"] = tid
             # trace 创建后立即回传 trace_id + workspace_path，让父进程在 running
             # 期间就能拿到 trace_id，并把 workspace_path 登记进主 recorder
             # （FR-001 跨进程发现根因修复）。
@@ -119,10 +120,19 @@ def _worker_main(
                 trace_id=trace_id, status="done",
                 workspace_path=captured["workspace_path"],
             )))
+    except EvidenceCaptureError as exc:
+        logger.exception("隔离子进程取证失败")
+        result_queue.put_nowait(("result", WorkerResult(
+            trace_id=captured["trace_id"],
+            status="evidence_capture_failed",
+            error=str(exc),
+            workspace_path=captured["workspace_path"],
+        )))
     except BaseException as exc:
         logger.exception("隔离子进程执行失败")
         result_queue.put_nowait(("result", WorkerResult(
-            status="failed", error=str(exc),
+            trace_id=captured["trace_id"],
+            status="failed", error=str(exc), workspace_path=captured["workspace_path"],
         )))
 
 

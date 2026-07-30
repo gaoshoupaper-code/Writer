@@ -65,6 +65,11 @@ export default function ReviewReport() {
     setActing(true);
     try {
       const resp = await publishEvolve(sessionId);
+      if (resp.status === "candidate_pending_snapshot") {
+        toast.success(`candidate v${resp.snapshot_version} 已冻结，请运行该版本的 snapshot 测试并完成证据与评估`);
+        setSession(await getEvolveSession(sessionId));
+        return;
+      }
       toast.success(`已发布为 v${resp.snapshot_version}`);
       navigate("/evolve");
     } catch (err) {
@@ -187,7 +192,15 @@ export default function ReviewReport() {
       {isPendingReview && (
         <div className="review-actions-bar">
           <div className="review-actions-info">
-            审查完毕后，发布将固化新 Agent 版本；丢弃将回退到上个生产版本。
+            {session.release_candidate ? (
+              <>
+                candidate v{session.release_candidate.version} 已冻结（
+                <span className="mono">{session.release_candidate.commit_hash.slice(0, 12)}</span>）。
+                请先在测试页对该版本运行 snapshot，并完成证据编纂与评估；再次点击才会验证并发布。
+              </>
+            ) : (
+              "首次点击只冻结不可变 candidate，不会移动 production。"
+            )}
           </div>
           <div className="review-actions-buttons">
             <button
@@ -202,7 +215,11 @@ export default function ReviewReport() {
               onClick={handlePublish}
               disabled={acting}
             >
-              {acting ? "处理中…" : "✓ 发布"}
+              {acting
+                ? "处理中…"
+                : session.release_candidate
+                  ? "✓ 验证并发布"
+                  : "✓ 冻结 candidate"}
             </button>
           </div>
         </div>

@@ -79,7 +79,7 @@ class ABReplayResponse(BaseModel):
     trace_id: str
     workspace_id: str
     thread_id: str
-    status: str  # completed / failed
+    status: str  # completed / failed / evidence_capture_failed
     error: str | None = None
 
 
@@ -259,6 +259,10 @@ class SnapshotRefreshNotice(BaseModel):
     snapshot_version: int
 
 
+class HarnessProbeRequest(BaseModel):
+    source_commit: str
+
+
 # ── Phase 8 compose：热加载 + 候选执行端点（决策 #16/D7a/E5a）──
 
 
@@ -278,8 +282,87 @@ def reload_harness() -> dict[str, Any]:
     pkg = reload_current()
     from app.platform.agent.git_sync import production_commit
     commit = production_commit()
+    from app.platform.agent.runtime_identity import build_runtime_identity
+    from app.platform.agent.git_sync import production_checkout
+
+    runtime_identity = build_runtime_identity(
+        harness_root=production_checkout(), harness_commit=commit
+    )
     logger.info("harness 热加载完成: commit=%s", commit)
-    return {"status": "reloaded", "commit": commit}
+    return {"status": "reloaded", "commit": commit, "runtime_identity": runtime_identity}
+
+
+@router.post("/harness/probe")
+def probe_harness(body: HarnessProbeRequest) -> dict[str, Any]:
+    """从 candidate 干净 checkout 导入并真实编译最小 DeepAgent 图。"""
+    import sys
+    import tempfile
+    import uuid
+    from pathlib import Path
+
+    from contracts.runtime_context import RuntimeContext
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+    from app.platform.agent.git_sync import checkout_commit, cleanup_checkout
+    from app.platform.agent.loader import load_package
+    from app.platform.agent.runtime import FilesystemBackend, artifact_capture_scope
+    from app.platform.agent.runtime_identity import build_runtime_identity
+
+    class _ProbeRecorder:
+        def record_artifact_revision(self, *_args, **_kwargs):
+            return None
+
+        def record_middleware_assembly(self, *_args, **_kwargs):
+            return None
+
+        def record_skill_catalog(self, *_args, **_kwargs):
+            return None
+
+    checkout = checkout_commit(body.source_commit)
+    module_name = f"harness_probe_{uuid.uuid4().hex}"
+    try:
+        middleware_path = checkout / "middleware" / "artifact_snapshot.py"
+        if not middleware_path.is_file():
+            raise RuntimeError(
+                f"candidate {body.source_commit} 缺少 middleware/artifact_snapshot.py"
+            )
+        package = load_package(checkout, module_name)
+        recorder = _ProbeRecorder()
+        with tempfile.TemporaryDirectory(prefix="harness_probe_workspace_") as tmp:
+            workspace = Path(tmp)
+            context = RuntimeContext(
+                model=FakeListChatModel(responses=["ok"]),
+                backend=FilesystemBackend(root_dir=workspace, virtual_mode=True),
+                checkpointer=None,
+                workspace_path=workspace,
+                trace_id="harness-probe",
+                trace_recorder=recorder,
+                artifact_snapshot_callback=lambda _data: None,
+            )
+            with artifact_capture_scope(
+                recorder=recorder,
+                trace_id="harness-probe",
+                workspace_root=workspace,
+                strict=True,
+            ):
+                graph = package.assemble(context)
+        identity = build_runtime_identity(
+            harness_root=checkout, harness_commit=body.source_commit
+        )
+        if identity["harness_dirty"]:
+            raise RuntimeError(f"candidate {body.source_commit} checkout 不干净")
+        return {
+            "status": "ready",
+            "assembled": graph is not None,
+            "harness_commit": body.source_commit,
+            "artifact_snapshot_middleware": True,
+            "runtime_identity": identity,
+        }
+    finally:
+        for name in list(sys.modules):
+            if name == module_name or name.startswith(module_name + "."):
+                sys.modules.pop(name, None)
+        cleanup_checkout(checkout)
 
 
 class ABRunRequest(BaseModel):
@@ -421,7 +504,7 @@ def _execute_ab(task_id: str, req: "ABRunRequest") -> None:
                 _ab_tasks[task_id]["trace_ids"] = [result.trace_id]
             if result.error:
                 _ab_tasks[task_id]["error"] = result.error
-            if result.status == "failed":
+            if result.status in {"failed", "evidence_capture_failed"}:
                 _notify_evolution_task_failed(task_id, result.error or "")
         logger.info(
             "候选执行任务结束: task=%s status=%s",

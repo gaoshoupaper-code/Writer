@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 TraceStatus = Literal[
     "pending", "running", "awaiting_input",
     "cancelling",  # 已受理停止、执行收敛中（立即可见中间态，FR-006）
-    "completed", "failed",
+    "completed", "failed", "evidence_capture_failed",
     "cancelled", "cancel_timeout",  # 取消类终态（cancel_timeout 仅可恢复为 cancelled）
     "interrupted",  # 无存活 owner 的历史/失联中断态（FR-009）
 ]

@@ -406,6 +406,16 @@ export async function getTraces(params?: {
   return evoJson<TraceListResponse>(`/api/traces${q ? "?" + q : ""}`, { method: "GET" });
 }
 
+export async function getDossierCandidates(
+  limit = 100,
+  offset = 0,
+): Promise<TraceListResponse> {
+  return evoJson<TraceListResponse>(
+    `/api/dossier/candidates?limit=${limit}&offset=${offset}`,
+    { method: "GET" },
+  );
+}
+
 export async function getLineage(
   objectType: LineageObjectType,
   objectId: string,
@@ -520,6 +530,8 @@ export interface IntegrityCheck {
 export interface IntegrityDiagnosis {
   trace_id: string;
   integrity_status: string;          // verified / incomplete / conflict / legacy
+  evidence_status: string;           // complete / incomplete / ineligible_source / unknown
+  evidence_gaps: string[];
   recoverable: boolean;              // 是否可通过重跑恢复
   missing_checks: IntegrityCheck[];
   affected_downstreams: string[];    // 受影响下游
@@ -793,6 +805,14 @@ export interface EvolveSession {
   design_doc?: DesignDoc | null;
   change_log?: ChangeLog | null;
   eval_snapshot?: EvalSnapshot | null;
+  release_candidate?: ReleaseCandidate | null;
+}
+
+export interface ReleaseCandidate {
+  version: number;
+  commit_hash: string;
+  status: "candidate";
+  promotion_status: "candidate";
 }
 
 // ── 审查视图数据类型（D1：get_session 内联）──────────────────────
@@ -913,7 +933,15 @@ export async function getEvolveSession(sessionId: string): Promise<EvolveSession
   return evoJson<EvolveSession>(`/api/evolve/sessions/${sessionId}`, { method: "GET" });
 }
 
-export async function publishEvolve(sessionId: string): Promise<{ status: string; snapshot_version: number; source_commit: string }> {
+export interface PublishEvolveResponse {
+  status: "candidate_pending_snapshot" | "activated";
+  snapshot_version: number;
+  source_commit: string;
+  release_id: string;
+  snapshot_trace_id?: string;
+}
+
+export async function publishEvolve(sessionId: string): Promise<PublishEvolveResponse> {
   return evoJson(`/api/evolve/sessions/${sessionId}/publish`, { method: "POST" });
 }
 

@@ -15,7 +15,7 @@ from contracts.trace.payload import ContentAddressedPayloadStore
 
 _OBJECT_TYPES = {
     "trace", "artifact_revision", "evidence_dossier", "evaluation_dossier",
-    "score", "experiment", "candidate", "release",
+    "score", "experiment", "candidate", "release", "trace_event", "payload",
 }
 _OUTCOME_TYPES = {
     "copy", "regenerate", "adopt", "edit_diff", "human_rating",
@@ -27,7 +27,7 @@ _RELEASE_TRANSITIONS: dict[str | None, set[str]] = {
     "registry_promoted": {"executor_refresh_ack", "activation_failed"},
     "executor_refresh_ack": {"activated", "activation_failed"},
     "activated": {"rollback_activated"},
-    "activation_failed": {"rollback_activated"},
+    "activation_failed": {"registry_promoted", "rollback_activated"},
     "rollback_activated": set(),
 }
 
@@ -49,22 +49,16 @@ class ConsumptionRejected(RuntimeError):
 
 
 def require_verified_creation_trace(trace_id: str) -> dict[str, Any]:
-    row = db.query_one("SELECT * FROM runs WHERE trace_id=?", (trace_id,))
-    if row is None:
-        _reject("evidence_compile", "trace", trace_id, "unknown", ["trace"])
-    missing: list[str] = []
-    if int(row.get("schema_version") or 1) < 2:
-        missing.append("schema_version")
-    if row.get("workload") != "creation":
-        missing.append("workload=creation")
-    if row.get("integrity_status") != "verified":
-        missing.append("integrity_status=verified")
-    if missing:
+    from app.dossier.eligibility import assess_creation_trace
+
+    report = assess_creation_trace(trace_id)
+    if not report.eligible:
         _reject(
             "evidence_compile", "trace", trace_id,
-            str(row.get("integrity_status") or "unknown"), missing,
+            report.transport_integrity, list(report.missing_fields),
         )
-    return row
+    assert report.row is not None
+    return report.row
 
 
 def require_ready_evidence_dossier(dossier_id: str) -> dict[str, Any]:

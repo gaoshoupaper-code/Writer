@@ -70,13 +70,14 @@ class IntegrityDiagnosisTest(unittest.TestCase):
             (trace_id, json.dumps(missing_ranges or []), manifest_json, manifest_status),
         )
 
-    def test_verified_trace_has_no_missing_checks(self) -> None:
-        """verified Trace 返回空 missing_checks（前端用同一套渲染逻辑）。"""
+    def test_verified_transport_still_reports_missing_business_evidence(self) -> None:
+        """传输 verified 不得掩盖 ArtifactRevision 等业务证据缺口。"""
         self._insert_run("trace-ok", integrity="verified")
         diag = _compute_integrity_diagnosis("trace-ok")
         self.assertEqual(diag.integrity_status, "verified")
-        self.assertEqual(diag.missing_checks, [])
-        self.assertEqual(diag.affected_downstreams, [])
+        self.assertEqual(diag.evidence_status, "incomplete")
+        self.assertIn("artifact_revision", diag.evidence_gaps)
+        self.assertIn("evidence_compile", diag.affected_downstreams)
 
     def test_pending_phase_returns_neutral_not_fault(self) -> None:
         """FR-008/AC-010：pending（记录/封存中）返回中性诊断，不当终态 incomplete 故障。

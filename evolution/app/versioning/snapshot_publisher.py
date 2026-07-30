@@ -17,6 +17,18 @@ from app.core.settings import settings
 logger = logging.getLogger("evolution.snapshot_publisher")
 
 
+def reload_executor(version: int) -> dict:
+    """触发 executor reload 并返回其实际 commit/runtime identity。"""
+    executor_url = getattr(settings, "executor_url", "").rstrip("/")
+    if not executor_url:
+        raise RuntimeError("executor_url 未配置")
+    import httpx
+
+    response = httpx.post(f"{executor_url}/internal/reload", timeout=120.0)
+    response.raise_for_status()
+    return response.json()
+
+
 def notify_executor(version: int) -> bool:
     """通知执行端「新 production 版本发布了」。
 
@@ -35,16 +47,12 @@ def notify_executor(version: int) -> bool:
         logger.debug("executor_url 未配置，跳过通知（reconcile 兜底）")
         return False
     try:
-        import httpx
-        resp = httpx.post(f"{executor_url}/internal/reload", timeout=10.0)
-        if resp.status_code < 300:
-            logger.info("已通知执行端 v%s", version)
-            return True
-        logger.warning("通知执行端失败: HTTP %s", resp.status_code)
-        return False
+        reload_executor(version)
+        logger.info("已通知执行端 v%s", version)
+        return True
     except Exception:
         logger.debug("通知执行端失败（v%s）", version, exc_info=True)
         return False
 
 
-__all__ = ["notify_executor"]
+__all__ = ["notify_executor", "reload_executor"]

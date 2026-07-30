@@ -134,6 +134,9 @@ def ingest_events(
         conn.execute("DELETE FROM nodes WHERE trace_id = ?", (run.trace_id,))
         _write_nodes(conn, run.trace_id, run, canonical_events)
 
+    from app.dossier.eligibility import assess_creation_trace
+
+    assess_creation_trace(run.trace_id)
     return run.trace_id
 
 
@@ -178,7 +181,7 @@ def _derive_run_summary(
         error = run_cancelled.error
     elif run_error:
         ended_at = run_error.timestamp
-        status = "failed"
+        status = run_error.status
         duration_ms = run_error.duration_ms
         error = run_error.error
     elif run_awaiting:
@@ -494,8 +497,9 @@ def _materialize_artifact_revisions(
         conn.execute(
             """INSERT INTO artifact_revisions
                (artifact_revision_id, artifact_id, parent_revision_id, payload_id, content_hash,
-                producer_trace_id, producer_event_id, harness_version, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(artifact_revision_id) DO NOTHING""",
+                producer_trace_id, producer_event_id, harness_version, provenance, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'trace_time', ?)
+               ON CONFLICT(artifact_revision_id) DO NOTHING""",
             (event.artifact_revision_id, artifact_id, event.artifact.get("parent_revision_id"),
              payload_ref.payload_id, event.artifact.get("content_hash") or payload_ref.content_hash,
              run.trace_id, event.event_id,

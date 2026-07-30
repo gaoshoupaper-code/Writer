@@ -74,6 +74,8 @@ class TraceListItem(BaseModel):
     service: str | None = None
     workload: str | None = None
     integrity_status: str = "legacy"
+    evidence_status: str = "unknown"
+    evidence_gaps: list[str] = Field(default_factory=list)
     coverage: dict[str, str] = Field(default_factory=dict)
     skill_activation_count: int = 0
     middleware_intervention_count: int = 0
@@ -178,6 +180,8 @@ def list_traces(
                 service=r.get("service"),
                 workload=r.get("workload"),
                 integrity_status=r.get("integrity_status") or "legacy",
+                evidence_status=r.get("evidence_status") or "unknown",
+                evidence_gaps=json.loads(r.get("evidence_gaps_json") or "[]"),
                 coverage=json.loads(r.get("coverage_json") or "{}"),
                 skill_activation_count=int(r.get("skill_activation_count") or 0),
                 middleware_intervention_count=int(r.get("middleware_intervention_count") or 0),
@@ -289,6 +293,8 @@ class IntegrityDiagnosis(BaseModel):
 
     trace_id: str
     integrity_status: str           # verified / incomplete / conflict / legacy
+    evidence_status: str = "unknown"  # complete / incomplete / ineligible_source / unknown
+    evidence_gaps: list[str] = Field(default_factory=list)
     recoverable: bool               # 正文是否可恢复（历史丢失=false，重跑可恢复=true）
     missing_checks: list[IntegrityCheck]
     affected_downstreams: list[str]  # 受影响的下游（evaluation/evolution/evidence_compile）
@@ -349,12 +355,35 @@ def _compute_integrity_diagnosis(trace_id: str) -> IntegrityDiagnosis:
         )
 
     if integrity == "verified":
+        evidence_status = run_row.get("evidence_status") or "unknown"
+        evidence_gaps = json.loads(run_row.get("evidence_gaps_json") or "[]")
+        if run_row.get("service") == "executor" and run_row.get("workload") == "creation":
+            from app.dossier.eligibility import assess_creation_trace
+
+            report = assess_creation_trace(trace_id)
+            evidence_status = report.evidence_status
+            evidence_gaps = list(report.missing_fields)
+        evidence_checks = [
+            IntegrityCheck(
+                check=gap,
+                stage="业务证据完整性",
+                impact="Trace 已完整传输，但缺少可核验的创作产物证据，证据卷宗不可消费",
+                recovery="若受治理 Payload 足够则执行显式恢复，否则修复取证后重新创作",
+            )
+            for gap in evidence_gaps
+        ]
         return IntegrityDiagnosis(
             trace_id=trace_id,
             integrity_status="verified",
+            evidence_status=evidence_status,
+            evidence_gaps=evidence_gaps,
             recoverable=True,
-            missing_checks=[],
-            affected_downstreams=[],
+            missing_checks=evidence_checks,
+            affected_downstreams=(
+                ["evidence_compile", "evaluation", "evolution"]
+                if evidence_checks
+                else []
+            ),
         )
 
     # incomplete / conflict：从 receipt 提取具体缺口（AC-004）。

@@ -25,6 +25,7 @@ from pydantic import BaseModel
 
 from app.dossier import repo
 from app.dossier.extractor import COMPILE_RULE_VERSION
+from app.dossier.eligibility import list_creation_trace_candidates
 from app.view.traces import load_trace_detail
 from app.trace.facts import (
     ConsumptionRejected,
@@ -40,6 +41,15 @@ router = APIRouter(prefix="/dossier", tags=["dossier"])
 
 # dossier_id → 后台编译 task。stop 端点靠它 cancel。
 _running_tasks: dict[str, asyncio.Task] = {}
+
+
+@router.get("/candidates")
+def list_candidates(
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    """列出与启动接口使用同一资格规则的证据编纂候选。"""
+    return list_creation_trace_candidates(limit=limit, offset=offset)
 
 
 # ── 启动编译 ──────────────────────────────────────────────────
@@ -83,14 +93,6 @@ async def start_compile(req: CompileStartRequest) -> CompileStartResponse:
                 "missing_fields": list(exc.missing_fields),
             },
         ) from exc
-
-    # 防自观测：不能编译进化端自观测 trace
-    run_purpose = run_row.get("run_purpose") or "user_generation"
-    if run_purpose in ("evolution_eval", "evolution_evolve"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"trace {trace_id} 是进化端自观测 trace（run_purpose={run_purpose}），不能编译证据卷宗。",
-        )
 
     owner_user_id = run_row.get("owner_user_id") or "unknown"
 
@@ -201,8 +203,9 @@ def _record_compile_lineage(
 ) -> None:
     add_lineage("trace", compile_trace_id, "produces", "evidence_dossier", dossier_id)
     revisions = db.query_all(
-        "SELECT artifact_revision_id FROM artifact_revisions WHERE producer_trace_id=?",
-        (source_trace_id,),
+        """SELECT artifact_revision_id FROM artifact_revisions
+           WHERE producer_trace_id=? OR source_trace_id=?""",
+        (source_trace_id, source_trace_id),
     )
     for row in revisions:
         revision_id = row["artifact_revision_id"]

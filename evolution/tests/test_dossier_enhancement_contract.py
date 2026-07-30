@@ -298,8 +298,8 @@ class CompileEligibilityGateTest(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("不具备编译资格", result["reason"])
 
-    def test_completed_trace_passes_eligibility_gate(self):
-        """completed 的 trace 通过资格门槛（后续产物检查仍各自独立判定）。"""
+    def test_completed_legacy_trace_does_not_bypass_evidence_gate(self):
+        """仅 completed 不能证明来源与业务证据完整。"""
         from app.dossier.compiler import _check_compile_eligibility
         # 用一条 completed trace 验证：应返回 None（具备资格）
         db.execute(
@@ -309,7 +309,9 @@ class CompileEligibilityGateTest(unittest.TestCase):
              "2026-01-01", "create"),
         )
         try:
-            self.assertIsNone(_check_compile_eligibility("trace-ok"))
+            gap = _check_compile_eligibility("trace-ok")
+            self.assertIn("schema_version>=2", gap)
+            self.assertIn("integrity_status=verified", gap)
         finally:
             db.execute("DELETE FROM runs WHERE trace_id='trace-ok'")
 

@@ -70,9 +70,12 @@ def _with_status(version_entry: dict[str, Any], prod_version: int | None) -> dic
     status 字段。这里动态计算：等于 production 指针 → "production"，否则 "retired"。
     """
     entry = dict(version_entry)
-    entry["status"] = (
-        STATUS_PRODUCTION if entry["version"] == prod_version else STATUS_RETIRED
-    )
+    if entry["version"] == prod_version:
+        entry["status"] = STATUS_PRODUCTION
+    elif entry.get("promotion_status") == "candidate":
+        entry["status"] = "candidate"
+    else:
+        entry["status"] = STATUS_RETIRED
     return entry
 
 
@@ -215,6 +218,116 @@ def _next_version_number(data: dict[str, Any]) -> int:
     return max(v["version"] for v in data["versions"]) + 1
 
 
+def next_version_number() -> int:
+    return _next_version_number(_read())
+
+
+def get_candidate_by_session(session_id: str) -> dict[str, Any] | None:
+    data = _read()
+    production = data.get("production")
+    for entry in reversed(data.get("versions", [])):
+        if (
+            entry.get("source_session") == session_id
+            and entry.get("promotion_status") == "candidate"
+            and entry.get("version") != production
+        ):
+            return _with_status(entry, production)
+    return None
+
+
+def get_version_by_session(session_id: str) -> dict[str, Any] | None:
+    """返回 session 已注册的最新版本，包括崩溃窗口中的 production。"""
+    data = _read()
+    production = data.get("production")
+    for entry in reversed(data.get("versions", [])):
+        if entry.get("source_session") == session_id:
+            return _with_status(entry, production)
+    return None
+
+
+def create_candidate(
+    *, version: int, commit_hash: str, change_summary: str,
+    source_session: str, probe_identity: dict[str, Any],
+) -> dict[str, Any]:
+    """注册不可变 candidate，不移动 production 指针。"""
+    data = _read()
+    if any(item.get("version") == version for item in data.get("versions", [])):
+        raise ValueError(f"candidate version v{version} already exists")
+    if any(item.get("source_session") == source_session for item in data.get("versions", [])):
+        raise ValueError(f"session {source_session} already has a registered version")
+    entry = {
+        "version": version,
+        "parent_version": data.get("production"),
+        "change_summary": change_summary,
+        "eval_score": None,
+        "eval_status": "pending",
+        "created_at": _now(),
+        "source_session": source_session,
+        "commit_hash": commit_hash,
+        "executable": True,
+        "promotion_status": "candidate",
+        "probe_identity": probe_identity,
+        "snapshot_trace_id": None,
+        "runtime_identity": None,
+    }
+    data["versions"].append(entry)
+    _write(data)
+    return dict(entry)
+
+
+def promote_candidate(
+    version: int, *, snapshot_trace_id: str, runtime_identity: dict[str, Any]
+) -> dict[str, Any]:
+    """仅移动已验证 candidate 的 production 指针。"""
+    data = _read()
+    target = next(
+        (item for item in data.get("versions", []) if item.get("version") == version),
+        None,
+    )
+    if target is None or target.get("promotion_status") != "candidate":
+        raise ValueError(f"v{version} is not a promotable candidate")
+    for item in data.get("versions", []):
+        if item.get("version") == data.get("production"):
+            item["promotion_status"] = "retired"
+    target["promotion_status"] = "production"
+    target["snapshot_trace_id"] = snapshot_trace_id
+    target["runtime_identity"] = runtime_identity
+    target["eval_status"] = "passed"
+    data["production"] = version
+    _write(data)
+    return dict(target)
+
+
+def restore_production(previous_version: int | None, failed_candidate_version: int) -> None:
+    """激活未确认时恢复旧指针，并保留 candidate 供修复后重试。"""
+    data = _read()
+    data["production"] = previous_version
+    for item in data.get("versions", []):
+        if item.get("version") == failed_candidate_version:
+            item["promotion_status"] = "candidate"
+        elif item.get("version") == previous_version:
+            item["promotion_status"] = "production"
+    _write(data)
+
+
+def restore_failed_rollback(previous_version: int, failed_target_version: int) -> None:
+    """回滚激活失败时恢复原 production，历史目标仍保持 retired。"""
+    data = _read()
+    data["production"] = previous_version
+    for item in data.get("versions", []):
+        if item.get("version") == failed_target_version:
+            item["promotion_status"] = "retired"
+        elif item.get("version") == previous_version:
+            item["promotion_status"] = "production"
+    data.setdefault("rollback_log", []).append({
+        "at": _now(),
+        "from": failed_target_version,
+        "to": previous_version,
+        "reason": "rollback_activation_failed_restore",
+    })
+    _write(data)
+
+
 def publish_version(
     *,
     change_summary: str | None = None,
@@ -310,9 +423,18 @@ def rollback(to_version: int, *, reason: str | None = None) -> dict[str, Any]:
             break
     if target is None:
         raise ValueError(f"版本 v{to_version} 不存在于 registry")
+    if target.get("promotion_status") == "candidate":
+        raise ValueError(f"candidate v{to_version} 未经发布门禁，不可直接回滚为 production")
+    if not target.get("commit_hash"):
+        raise ValueError(f"版本 v{to_version} 缺少不可变 commit 绑定，不可回滚")
 
     from_version = data.get("production")
     data["production"] = to_version
+    for version in data["versions"]:
+        if version.get("version") == from_version:
+            version["promotion_status"] = "retired"
+        elif version.get("version") == to_version:
+            version["promotion_status"] = "production"
     data["rollback_log"].append({
         "at": _now(),
         "from": from_version,
@@ -356,6 +478,13 @@ __all__ = [
     "list_versions",
     "get_production_version_number",
     "get_version_commit",
+    "get_candidate_by_session",
+    "get_version_by_session",
+    "next_version_number",
+    "create_candidate",
+    "promote_candidate",
+    "restore_production",
+    "restore_failed_rollback",
     "prune_unexecutable_history_and_bind_production",
     "publish_version",
     "bind_version_commit",

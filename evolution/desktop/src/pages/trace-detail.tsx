@@ -118,7 +118,7 @@ export default function TraceDetailPage() {
     return () => { ignore = true; };
   }, [drawerNode, traceId]);
 
-  // 完整性诊断：run.integrity_status 非 verified 且 trace 终态时拉取。
+  // 完整性诊断：终态统一拉取，verified 仍需独立检查业务证据完整性。
   // FR-008：pending（记录中/封存中）是中性态，不拉诊断、不当故障展示（EVD-005 根因）。
   // 失败时有限重试（最多 3 次，每次退避），避免永久停在"诊断信息暂时不可用"（AC-004）。
   useEffect(() => {
@@ -126,8 +126,8 @@ export default function TraceDetailPage() {
     const isTerminal = activeRun?.status
       ? !["running", "awaiting_input", "pending", "cancelling"].includes(activeRun.status)
       : false;
-    // pending 不拉诊断（记录中/校验中，由 banner 显示中性态）；verified 不需要诊断。
-    if (!traceId || !status || status === "verified" || status === "pending" || !isTerminal) {
+    // pending 不拉诊断（记录中/校验中，由 banner 显示中性态）。
+    if (!traceId || !status || status === "pending" || !isTerminal) {
       setIntegrityDiagnosis(null);
       return;
     }
@@ -405,6 +405,24 @@ export default function TraceDetailPage() {
           // 不显示故障横幅，只提示用户等待封存校验（EVD-005 根因：运行中不得误报 incomplete）。
           <div className="integrity-hint integrity-pending">
             <span>Trace 完整性：{integrityLabel(run.integrity_status)}。运行结束后将自动校验，这不是数据损坏，无需重新运行。</span>
+          </div>
+        )}
+        {run.integrity_status === "verified" && integrityDiagnosis?.evidence_status === "incomplete" && (
+          <div className="integrity-hint integrity-incomplete">
+            <div className="integrity-diagnosis">
+              <div className="integrity-diagnosis-summary">
+                Trace 传输完整性：已验证。业务证据完整性：不完整；证据、评估和进化不可消费。
+              </div>
+              <ul className="integrity-check-list">
+                {integrityDiagnosis.missing_checks.map((check) => (
+                  <li key={check.check} className="integrity-check-item">
+                    <span className="integrity-check-stage">{check.stage}</span>
+                    <span className="integrity-check-impact">{check.impact}</span>
+                    <span className="integrity-check-recovery">恢复：{check.recovery}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
           </div>
         )}
         {run.integrity_status && run.integrity_status !== "verified" && run.integrity_status !== "pending" && (

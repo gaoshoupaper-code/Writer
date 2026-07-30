@@ -487,6 +487,85 @@ class TraceRecorderTest(unittest.TestCase):
                 any(event.type == "artifact_revision" for event in recorder.read_trace_events(run.trace_id) or [])
             )
 
+    def test_artifact_revision_capture_is_idempotent_and_detects_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            thread = ThreadSummary(
+                thread_id="thread-artifact-idempotent",
+                workspace_id="workspace-artifact-idempotent",
+                session_name="session",
+                workspace_path=str(workspace),
+                created_at="2026-05-22T00:00:00+00:00",
+                updated_at="2026-05-22T00:00:00+00:00",
+            )
+            recorder = TraceRecorder()
+            run = recorder.create_run(thread, "/screenplay/generate")
+
+            first = recorder.record_artifact_revision(
+                run.trace_id,
+                "writing-subagent",
+                file_path="/chapter/1.md",
+                content="same content",
+                tool_name="write_file",
+                tool_call_id="call-1",
+            )
+            replay = recorder.record_artifact_revision(
+                run.trace_id,
+                "writing-subagent",
+                file_path="/chapter/1.md",
+                content="same content",
+                tool_name="write_file",
+                tool_call_id="call-1",
+            )
+            second_call = recorder.record_artifact_revision(
+                run.trace_id,
+                "writing-subagent",
+                file_path="/chapter/1.md",
+                content="same content",
+                tool_name="write_file",
+                tool_call_id="call-2",
+            )
+
+            self.assertEqual(replay, first)
+            self.assertNotEqual(second_call, first)
+            revisions = [
+                event
+                for event in recorder.read_trace_events(run.trace_id) or []
+                if event.type == "artifact_revision"
+            ]
+            self.assertEqual(len(revisions), 2)
+
+            with self.assertRaises(ValueError):
+                recorder.record_artifact_revision(
+                    run.trace_id,
+                    "writing-subagent",
+                    file_path="/chapter/1.md",
+                    content="conflicting content",
+                    tool_name="edit_file",
+                    tool_call_id="call-1",
+                )
+
+    def test_strict_capture_failure_has_distinct_trace_terminal_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            thread = ThreadSummary(
+                thread_id="thread-capture-failure",
+                workspace_id="workspace-capture-failure",
+                session_name="session",
+                workspace_path=tmpdir,
+                created_at="2026-05-22T00:00:00+00:00",
+                updated_at="2026-05-22T00:00:00+00:00",
+            )
+            recorder = TraceRecorder()
+            run = recorder.create_run(thread, "/screenplay/ab")
+
+            recorder.fail_evidence_capture_run(thread, run.trace_id, OSError("payload down"))
+
+            summary = recorder.find_run_by_trace_id(run.trace_id)
+            self.assertIsNotNone(summary)
+            self.assertEqual(summary.status, "evidence_capture_failed")
+            terminal = (recorder.read_trace_events(run.trace_id) or [])[-1]
+            self.assertEqual(terminal.status, "evidence_capture_failed")
+
     def test_skill_activation_is_bound_to_registered_runtime_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir)

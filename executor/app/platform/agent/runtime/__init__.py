@@ -22,6 +22,7 @@ from app.platform.agent.runtime.backend import (
 )
 from app.platform.agent.runtime.factory import (
     GENERAL_PURPOSE_SUBAGENT,
+    artifact_capture_scope,
     create_deep_agent,
 )
 from app.platform.agent.runtime.types import (
@@ -42,6 +43,7 @@ __all__ = [
     "FilesystemBackend",
     "FilesystemPermission",
     "GENERAL_PURPOSE_SUBAGENT",
+    "artifact_capture_scope",
     "MiddlewareFactory",
     "SubAgent",
     "SubAgentSpec",

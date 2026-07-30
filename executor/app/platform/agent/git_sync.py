@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import shutil
 import subprocess
 import tempfile
@@ -83,10 +84,7 @@ def pull_production() -> Path:
     bare = _bare_repo()
 
     if checkout.exists() and (checkout / ".git").exists():
-        # 已 clone，pull 更新
         _git(["fetch", "origin"], checkout)
-        _git(["reset", "--hard", "origin/main"], checkout)
-        logger.info("生产 harness 已 pull 更新: %s", checkout)
     else:
         # 首次 clone
         checkout.parent.mkdir(parents=True, exist_ok=True)
@@ -95,15 +93,49 @@ def pull_production() -> Path:
         _git(["clone", bare, str(checkout)])
         logger.info("生产 harness 首次 clone: %s", checkout)
 
+    target = remote_production_commit(checkout)
+    _git(["cat-file", "-e", f"{target}^{{commit}}"], checkout)
+    _git(["reset", "--hard", target], checkout)
+    logger.info("生产 harness 已对齐 registry commit=%s: %s", target, checkout)
+
     return checkout
 
 
+def remote_production_commit(checkout: Path) -> str:
+    """从 origin/main 的 registry 解析 production exact commit。"""
+    raw = _git(["show", "origin/main:registry.json"], checkout)
+    return _production_commit_from_registry(raw)
+
+
+def bare_production_commit() -> str:
+    """读取 bare main 中 registry 声明的 production exact commit。"""
+    bare = Path(_bare_repo())
+    raw = _git(["show", "main:registry.json"], bare)
+    return _production_commit_from_registry(raw)
+
+
+def _production_commit_from_registry(raw: str) -> str:
+    try:
+        registry = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("harness registry.json 无法解析") from exc
+    production = registry.get("production")
+    entry = next(
+        (item for item in registry.get("versions", []) if item.get("version") == production),
+        None,
+    )
+    commit = entry.get("commit_hash") if isinstance(entry, dict) else None
+    if not isinstance(commit, str) or not commit:
+        raise RuntimeError(f"harness production v{production} 缺少不可变 commit 绑定")
+    return commit
+
+
 def production_commit() -> str:
-    """生产 checkout 目录当前的 commit hash（7 位短 hash）。"""
+    """生产 checkout 目录当前的完整 commit hash。"""
     checkout = production_checkout()
     if not (checkout / ".git").exists():
         return ""
-    return _git(["rev-parse", "--short", "HEAD"], checkout)
+    return _git(["rev-parse", "HEAD"], checkout)
 
 
 # ── 候选路径：clone 指定 commit 到临时目录 ───────────────────────
@@ -170,6 +202,8 @@ __all__ = [
     "production_checkout",
     "pull_production",
     "production_commit",
+    "bare_production_commit",
+    "remote_production_commit",
     "checkout_commit",
     "cleanup_checkout",
 ]

@@ -1062,6 +1062,10 @@ def _init_trace_v2_tables(conn: sqlite3.Connection) -> None:
                 producer_trace_id TEXT,
                 producer_event_id TEXT,
                 harness_version TEXT,
+                provenance TEXT NOT NULL DEFAULT 'trace_time',
+                source_trace_id TEXT,
+                support_event_ids_json TEXT NOT NULL DEFAULT '[]',
+                support_payload_ids_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS lineage_edges (
@@ -1161,6 +1165,8 @@ def _init_trace_v2_tables(conn: sqlite3.Connection) -> None:
             ("service", "TEXT"),
             ("workload", "TEXT"),
             ("integrity_status", "TEXT NOT NULL DEFAULT 'legacy'"),
+            ("evidence_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("evidence_gaps_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("coverage_json", "TEXT NOT NULL DEFAULT '{}'"),
             ("run_snapshot_json", "TEXT NOT NULL DEFAULT '{}'"),
             ("external_refs_json", "TEXT NOT NULL DEFAULT '{}'"),
@@ -1185,10 +1191,25 @@ def _init_trace_v2_tables(conn: sqlite3.Connection) -> None:
         }
         if "deleted_at" not in payload_columns:
             conn.execute("ALTER TABLE payload_objects ADD COLUMN deleted_at TEXT")
+        revision_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(artifact_revisions)").fetchall()
+        }
+        for column, ddl in (
+            ("provenance", "TEXT NOT NULL DEFAULT 'trace_time'"),
+            ("source_trace_id", "TEXT"),
+            ("support_event_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("support_payload_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ):
+            if column not in revision_columns:
+                conn.execute(f"ALTER TABLE artifact_revisions ADD COLUMN {column} {ddl}")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_event_trace_id ON event_payloads(trace_id, event_id) WHERE event_id IS NOT NULL")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_event_trace_sequence ON event_payloads(trace_id, sequence)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_workload_started ON runs(workload, started_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_integrity ON runs(integrity_status)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_artifact_revisions_source "
+            "ON artifact_revisions(source_trace_id, provenance)"
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_event_trace_type ON event_payloads(trace_id, type)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_lineage_from ON lineage_edges(from_type, from_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_lineage_to ON lineage_edges(to_type, to_id)")

@@ -229,6 +229,8 @@ export type TraceListItem = {
   service: string | null;
   workload: TraceWorkload | null;
   integrity_status: TraceIntegrityStatus;
+  evidence_status: string;
+  evidence_gaps: string[];
   coverage: Record<string, TraceCoverageStatus>;
   skill_activation_count: number;
   middleware_intervention_count: number;

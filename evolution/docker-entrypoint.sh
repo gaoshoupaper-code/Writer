@@ -97,9 +97,11 @@ print('[entrypoint] harness 仓库初始化完成')
 # 1d. 显式 commit 绑定上线前的历史版本无法安全执行。保留当前 production 作为
 #     新谱系根（工作树 HEAD 就是当前实际包），删除其余无绑定记录，避免前端继续展示。
 cd /app/evolution && python -c "
-from app.core.git_ops import current_commit
+from app.core.git_ops import commit_registry_metadata_and_push, current_commit
 from app.versioning.registry_repo import prune_unexecutable_history_and_bind_production
 result = prune_unexecutable_history_and_bind_production(current_commit())
+if result['changed']:
+    commit_registry_metadata_and_push('收敛 Harness production 的不可变 commit 绑定')
 print('[entrypoint] harness 版本注册表收敛:', result)
 " || echo "[entrypoint] ⚠ harness 版本注册表收敛失败（非致命，继续启动）"
 

@@ -555,6 +555,27 @@ class TraceRecorder:
     def fail_run(self, thread: ThreadSummary, trace_id: str, error: BaseException) -> TraceLogEvent:
         return self._fail_run(thread, trace_id, f"{error.__class__.__name__}: {error}")
 
+    def fail_evidence_capture_run(
+        self, thread: ThreadSummary, trace_id: str, error: BaseException
+    ) -> TraceLogEvent:
+        """以独立终态标记严格创作测试的取证失败。"""
+        duration_ms = self._duration_ms(trace_id)
+        error_message = f"{error.__class__.__name__}: {error}"
+        event = self.append_event(
+            trace_id,
+            {
+                "type": "run_error",
+                "status": "evidence_capture_failed",
+                "source": "system",
+                "duration_ms": duration_ms,
+                "error": error_message,
+            },
+        )
+        self._finalize_run(
+            thread, trace_id, "evidence_capture_failed", duration_ms, error_message
+        )
+        return event
+
     def cancel_run(
         self,
         thread: ThreadSummary,
@@ -1454,12 +1475,41 @@ class TraceRecorder:
             )
             raise
 
+        capture_tool_call_id = tool_call_id or f"legacy:{agent_name}:{tool_name or ''}"
+        capture_key = hashlib.sha256(
+            json.dumps(
+                [trace_id, capture_tool_call_id, logical_key, actual_content_hash],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        call_path_key = f"{capture_tool_call_id}\x00{logical_key}"
+
         with self._artifact_head_lock:
             heads_path = self._artifact_heads_path(trace_id)
             heads = self._read_artifact_heads(trace_id, heads_path)
+            index_path = self._artifact_capture_index_path(trace_id)
+            capture_index = self._read_artifact_capture_index(trace_id, index_path)
+            known_hash = capture_index["call_paths"].get(call_path_key)
+            if known_hash is not None and known_hash != actual_content_hash:
+                self._mark_capture_degraded(trace_id, "artifact_capture_hash_conflict")
+                raise ValueError("artifact capture hash conflict for tool call and path")
+            known_revision = capture_index["captures"].get(capture_key)
+            if known_revision:
+                return known_revision
+
+            existing_revision = self._find_existing_artifact_revision(
+                trace_id, tool_call_id, logical_key, actual_content_hash
+            )
+            if existing_revision:
+                capture_index["captures"][capture_key] = existing_revision
+                capture_index["call_paths"][call_path_key] = actual_content_hash
+                self._write_artifact_capture_index(index_path, capture_index)
+                return existing_revision
+
             previous = heads.get(logical_key) or {}
             parent_id = parent_revision_id or previous.get("revision_id")
-            revision_id = f"artifact-rev-{uuid4().hex}"
+            revision_id = f"artifact-rev-{capture_key[:32]}"
             event = self.append_event(trace_id, {
                 "type": "artifact_revision", "status": "completed", "source": "runtime",
                 "agent_name": agent_name, "tool_name": tool_name,
@@ -1487,6 +1537,9 @@ class TraceRecorder:
                 "content_hash": actual_content_hash,
             }
             self._write_artifact_heads(heads_path, heads)
+            capture_index["captures"][capture_key] = revision_id
+            capture_index["call_paths"][call_path_key] = actual_content_hash
+            self._write_artifact_capture_index(index_path, capture_index)
             return revision_id
 
     def _artifact_heads_path(self, trace_id: str) -> Path:
@@ -1494,6 +1547,12 @@ class TraceRecorder:
         if run_path is None:
             raise KeyError(f"Trace path is not registered: {trace_id}")
         return run_path.parent.parent / "artifact_heads.json"
+
+    def _artifact_capture_index_path(self, trace_id: str) -> Path:
+        run_path = self._run_paths.get(trace_id)
+        if run_path is None:
+            raise KeyError(f"Trace path is not registered: {trace_id}")
+        return run_path.parent.parent / "artifact_capture_index.json"
 
     def _read_artifact_heads(self, trace_id: str, path: Path) -> dict[str, dict[str, str]]:
         if not path.exists():
@@ -1507,13 +1566,54 @@ class TraceRecorder:
             self._mark_capture_degraded(trace_id, f"artifact_heads_invalid:{type(exc).__name__}")
             raise
 
+    def _read_artifact_capture_index(self, trace_id: str, path: Path) -> dict[str, dict[str, str]]:
+        if not path.exists():
+            return {"captures": {}, "call_paths": {}}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            captures = value.get("captures") if isinstance(value, dict) else None
+            call_paths = value.get("call_paths") if isinstance(value, dict) else None
+            if not isinstance(captures, dict) or not isinstance(call_paths, dict):
+                raise ValueError("artifact capture index must contain object maps")
+            if not all(isinstance(key, str) and isinstance(item, str) for key, item in captures.items()):
+                raise ValueError("artifact capture index captures must be strings")
+            if not all(isinstance(key, str) and isinstance(item, str) for key, item in call_paths.items()):
+                raise ValueError("artifact capture index call_paths must be strings")
+            return {"captures": captures, "call_paths": call_paths}
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self._mark_capture_degraded(trace_id, f"artifact_capture_index_invalid:{type(exc).__name__}")
+            raise
+
+    def _find_existing_artifact_revision(
+        self, trace_id: str, tool_call_id: str | None, logical_key: str, content_hash: str
+    ) -> str | None:
+        for event in self._read_events(self._run_paths[trace_id]):
+            if (
+                event.type == "artifact_revision"
+                and event.tool_call_id == tool_call_id
+                and event.artifact is not None
+                and event.artifact.get("logical_key") == logical_key
+                and event.artifact.get("content_hash") == content_hash
+                and event.artifact_revision_id
+            ):
+                return event.artifact_revision_id
+        return None
+
     @staticmethod
     def _write_artifact_heads(path: Path, heads: dict[str, dict[str, str]]) -> None:
+        TraceRecorder._write_artifact_metadata(path, heads)
+
+    @staticmethod
+    def _write_artifact_capture_index(path: Path, index: dict[str, dict[str, str]]) -> None:
+        TraceRecorder._write_artifact_metadata(path, index)
+
+    @staticmethod
+    def _write_artifact_metadata(path: Path, value: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
         try:
             temporary.write_text(
-                json.dumps(heads, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+                json.dumps(value, ensure_ascii=False, sort_keys=True), encoding="utf-8"
             )
             temporary.replace(path)
         finally:

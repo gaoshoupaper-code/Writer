@@ -19,7 +19,6 @@ import logging
 import re
 from typing import Any
 
-import app.core.db as db
 import app.core.llm as llm
 from app.dossier import repo
 from app.dossier.extractor import extract_facts, COMPILE_RULE_VERSION
@@ -177,31 +176,14 @@ def compile_dossier(trace_id: str, dossier_id: str) -> dict[str, Any]:
 
 # ── 编译资格门槛 ──────────────────────────────────────────────
 
-# 源 trace 只有 completed 才有可信产物可言。failed / cancelled 意味着主链未走完，
-# primary/review subagent 来不及写出白名单路径下的交付物——编译这种 trace 没有意义。
-# （running 理论上不会到达此处：编译由 API 层在 trace 落终态后触发，但即便误触，
-#  running 也不该被当作可编译，故不在白名单内。）
-_COMPILE_ELIGIBLE_RUN_STATUS = frozenset({"completed"})
-
-
 def _check_compile_eligibility(trace_id: str) -> str | None:
-    """检查源 trace 是否具备被编译的资格。不具备返回原因，具备返回 None。
+    """复用候选和启动接口的来源及业务证据资格。"""
+    from app.dossier.eligibility import assess_creation_trace
 
-    这是运行资格判定（区别于 _check_critical_evidence 的产物完整性判定）：
-      - 源 trace 没跑完（failed / cancelled / running）→ 没有可信产物可提取，
-        直接拦下，避免误把"没资格"报成"编译发现无产物"。
-      - runs 记录缺失 → 同样拦下（契约/产物都无从谈起）。
-    只有 completed 的 trace 才进入后续提取与关键证据检查。
-    """
-    run = db.query_one(
-        "SELECT status FROM runs WHERE trace_id = ?", (trace_id,),
-    )
-    if run is None:
-        return f"源 trace 不存在（runs 记录缺失，trace_id={trace_id}）"
-    status = run.get("status")
-    if status not in _COMPILE_ELIGIBLE_RUN_STATUS:
-        return f"源 trace 未完成（status={status}），仅 completed 的 trace 可编译"
-    return None
+    report = assess_creation_trace(trace_id)
+    if report.eligible:
+        return None
+    return "；".join(report.missing_fields)
 
 
 # ── 关键证据检查 ──────────────────────────────────────────────

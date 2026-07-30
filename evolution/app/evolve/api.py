@@ -462,6 +462,9 @@ def get_session(session_id: str) -> dict[str, Any]:
     # 内联关联评估的 findings + scores（审查证据来源）
     session["eval_snapshot"] = _try_load_eval_snapshot(session.get("eval_ref"))
 
+    from app.versioning import registry_repo
+    session["release_candidate"] = registry_repo.get_candidate_by_session(session_id)
+
     return session
 
 
@@ -715,14 +718,7 @@ def _trace_event_to_sse(event: Any) -> dict[str, Any] | None:
 
 @router.post("/evolve/sessions/{session_id}/publish")
 def publish_session(session_id: str, request: Request) -> dict[str, Any]:
-    """发版：把进化改动固化为新 Agent 版本（去 DB 重构）。
-
-    流程（4步）：
-      1. 更新 registry.json（publish_version：append 新版本 + 移 production 指针）
-      2. git commit + push（registry 变更 + 源码改动在同一个 commit，单 commit 原子性）
-      3. 通知执行端并等待 reload 确认
-      4. 只有 reload 成功才推进 activated / published
-    """
+    """两阶段发版：先冻结 candidate，再凭同一身份的 snapshot 晋升。"""
     session = ev_db.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"session {session_id} 不存在")
@@ -734,100 +730,198 @@ def publish_session(session_id: str, request: Request) -> dict[str, Any]:
 
     from app.core import git_ops
     from app.versioning import registry_repo
-    from app.versioning.snapshot_publisher import notify_executor
+    from app.versioning.release_gate import probe_candidate, validate_candidate_snapshot
+    from app.versioning.snapshot_publisher import reload_executor
 
     release_id = f"release-{session_id}"
     actor_user_id = getattr(request.state, "user_id", None)
-    release_started = False
+    candidate = registry_repo.get_version_by_session(session_id)
 
     try:
-        # 1. 更新 registry.json（源码改动已在 repo/ 工作目录，evolve 落盘的）
-        entry = registry_repo.publish_version(
-            change_summary=f"进化 session {session_id} 产出的改动",
-            source_session=session_id,
+        if candidate is None:
+            version = registry_repo.next_version_number()
+            source_commit = git_ops.commit_candidate(
+                f"冻结 Harness candidate v{version}: session={session_id}",
+                required_paths=("middleware/artifact_snapshot.py",),
+            )
+            probe = probe_candidate(source_commit)
+            candidate = registry_repo.create_candidate(
+                version=version,
+                commit_hash=source_commit,
+                change_summary=f"进化 session {session_id} 产出的改动",
+                source_session=session_id,
+                probe_identity=probe.get("runtime_identity") or {},
+            )
+            git_ops.commit_registry_and_push(
+                f"注册 Harness candidate v{version}: session={session_id}"
+            )
+            candidate_id = f"harness-version-{version}"
+            append_release_event(
+                release_id=release_id,
+                status="committed",
+                candidate_id=candidate_id,
+                actor_user_id=actor_user_id,
+            )
+            return {
+                "status": "candidate_pending_snapshot",
+                "release_id": release_id,
+                "snapshot_version": version,
+                "source_commit": source_commit,
+            }
+
+        version = candidate["version"]
+        source_commit = candidate["commit_hash"]
+        candidate_id = f"harness-version-{version}"
+        release_fact = db.query_one(
+            """SELECT status FROM release_events_v2 WHERE release_id=?
+               ORDER BY rowid DESC LIMIT 1""",
+            (release_id,),
+        )
+        if release_fact is None:
+            git_ops.commit_registry_and_push(
+                f"注册 Harness candidate v{version}: session={session_id}"
+            )
+            append_release_event(
+                release_id=release_id,
+                status="committed",
+                candidate_id=candidate_id,
+                actor_user_id=actor_user_id,
+            )
+            release_status = "committed"
+        else:
+            release_status = release_fact["status"]
+        if release_status == "activated" and candidate.get("status") == "production":
+            ev_db.update_session(session_id, status="published")
+            return {
+                "status": "activated",
+                "release_id": release_id,
+                "snapshot_version": version,
+                "source_commit": source_commit,
+                "snapshot_trace_id": candidate.get("snapshot_trace_id"),
+            }
+        probe = probe_candidate(source_commit)
+        gate = validate_candidate_snapshot(candidate, probe)
+        already_promoted = candidate.get("status") == "production"
+        previous_production = (
+            candidate.get("parent_version")
+            if already_promoted
+            else registry_repo.get_production_version_number()
         )
 
-        # 2. git commit + push（registry 变更 + 源码改动 → 同一个 commit，原子）
-        commit_msg = f"进化发版 v{entry['version']}: session={session_id}"
-        source_commit = git_ops.commit_and_push(commit_msg)
-        # C1 / FR-005: commit 后回填不可变 commit 绑定，使版本可执行。
-        registry_repo.bind_version_commit(entry["version"], source_commit)
-        candidate_id = f"harness-version-{entry['version']}"
-        append_release_event(
-            release_id=release_id,
-            status="committed",
-            candidate_id=candidate_id,
-            actor_user_id=actor_user_id,
-        )
-        append_release_event(
-            release_id=release_id,
-            status="registry_promoted",
-            candidate_id=candidate_id,
-            actor_user_id=actor_user_id,
-        )
-        release_started = True
+        if not already_promoted:
+            registry_repo.promote_candidate(
+                version,
+                snapshot_trace_id=gate["snapshot_trace_id"],
+                runtime_identity=gate["runtime_identity"],
+            )
+        try:
+            git_ops.commit_registry_and_push(
+                f"晋升 Harness production v{version}: session={session_id}"
+            )
+        except Exception as promote_exc:
+            registry_repo.restore_production(previous_production, version)
+            compensation_error = None
+            try:
+                git_ops.commit_registry_and_push(
+                    f"恢复 Harness production v{previous_production}: candidate v{version} registry 提交失败"
+                )
+            except Exception as restore_exc:
+                compensation_error = str(restore_exc)
+            raise RuntimeError(
+                f"candidate registry 提交失败: {promote_exc}; "
+                f"恢复结果: {compensation_error or 'ok'}"
+            ) from promote_exc
+        if release_status in {"committed", "activation_failed"}:
+            append_release_event(
+                release_id=release_id,
+                status="registry_promoted",
+                candidate_id=candidate_id,
+                actor_user_id=actor_user_id,
+            )
+            release_status = "registry_promoted"
 
-        # 3. reload 成功响应才表示 executor 已刷新。
-        notified = notify_executor(entry["version"])
-        if not notified:
+        try:
+            activated = reload_executor(version)
+            activated_identity = activated.get("runtime_identity") or {}
+            if activated.get("commit") != source_commit:
+                raise RuntimeError(
+                    f"executor commit mismatch: {activated.get('commit')} != {source_commit}"
+                )
+            if (
+                activated_identity.get("identity_digest")
+                != gate["runtime_identity"].get("identity_digest")
+            ):
+                raise RuntimeError("executor runtime identity mismatch")
+        except Exception as exc:
             append_release_event(
                 release_id=release_id,
                 status="activation_failed",
                 candidate_id=candidate_id,
                 actor_user_id=actor_user_id,
             )
-            ev_db.update_session(session_id, status="failed")
+            ev_db.update_session(session_id, status="pending_review")
+            rollback_error = None
+            try:
+                registry_repo.restore_production(previous_production, version)
+                git_ops.commit_registry_and_push(
+                    f"恢复 Harness production v{previous_production}: candidate v{version} 激活失败"
+                )
+                restored = reload_executor(previous_production or 0)
+                previous = registry_repo.get_production_version()
+                if previous and restored.get("commit") != previous.get("commit_hash"):
+                    raise RuntimeError("executor 未恢复到原 production commit")
+            except Exception as restore_exc:
+                rollback_error = str(restore_exc)
+                logger.exception(
+                    "candidate 激活失败后的 executor 恢复也失败: version=%s", version
+                )
             raise HTTPException(
                 status_code=502,
                 detail={
-                    "message": "版本已提交并提升 registry，但 executor reload 未确认",
+                    "message": f"candidate v{version} 激活失败，已恢复原 production：{exc}",
                     "release_id": release_id,
                     "release_status": "activation_failed",
+                    "executor_restore_error": rollback_error,
                 },
-            )
-        append_release_event(
-            release_id=release_id,
-            status="executor_refresh_ack",
-            candidate_id=candidate_id,
-            actor_user_id=actor_user_id,
-        )
-        append_release_event(
-            release_id=release_id,
-            status="activated",
-            candidate_id=candidate_id,
-            actor_user_id=actor_user_id,
-        )
+            ) from exc
 
-        # 4. 推进状态
+        if release_status == "registry_promoted":
+            append_release_event(
+                release_id=release_id,
+                status="executor_refresh_ack",
+                candidate_id=candidate_id,
+                actor_user_id=actor_user_id,
+            )
+            release_status = "executor_refresh_ack"
+        if release_status == "executor_refresh_ack":
+            append_release_event(
+                release_id=release_id,
+                status="activated",
+                candidate_id=candidate_id,
+                actor_user_id=actor_user_id,
+            )
+
         ev_db.update_session(session_id, status="published")
 
         logger.info(
-            "进化发版成功: session=%s v%s commit=%s",
-            session_id, entry["version"], source_commit,
+            "进化 candidate 晋升成功: session=%s v%s commit=%s",
+            session_id, version, source_commit,
         )
         return {
             "status": "activated",
             "release_id": release_id,
-            "snapshot_version": entry["version"],
+            "snapshot_version": version,
             "source_commit": source_commit,
-            "notified": notified,
+            "snapshot_trace_id": gate["snapshot_trace_id"],
         }
     except HTTPException:
         raise
-    except Exception as e:
-        if release_started:
-            try:
-                append_release_event(
-                    release_id=release_id,
-                    status="activation_failed",
-                    candidate_id=locals().get("candidate_id"),
-                    actor_user_id=actor_user_id,
-                )
-                ev_db.update_session(session_id, status="failed")
-            except Exception:
-                logger.exception("记录 activation_failed 失败: release=%s", release_id)
+    except ValueError as exc:
+        logger.info("candidate 发布门禁未通过: session=%s error=%s", session_id, exc)
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
         logger.exception("发版失败: session=%s", session_id)
-        raise HTTPException(status_code=500, detail=f"发版失败：{e}")
+        raise HTTPException(status_code=500, detail=f"发版失败：{exc}") from exc
 
 
 @router.post("/evolve/sessions/{session_id}/discard")
