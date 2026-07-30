@@ -79,6 +79,23 @@ async def lifespan(app: FastAPI):
     start_user_sync_scheduler()
     start_payload_lifecycle_scheduler()
 
+    # FR-004 / EDGE-003：评估终态一致性对账——以不可变 sealed dossier 为事实，
+    # 把封存成功后收尾崩溃造成的「业务 failed / 封存成功」分裂态收敛为 completed。
+    # 不重跑模型、不改卷宗内容、不改历史 Trace 事件。
+    from app.eval_agent.reconcile import reconcile_eval_terminal_states
+    try:
+        recon = reconcile_eval_terminal_states()
+        if recon["scanned"]:
+            import logging
+            logging.getLogger("evolution.eval_agent.reconcile").info(
+                "评估终态对账：%s", recon,
+            )
+    except Exception:
+        import logging
+        logging.getLogger("evolution.eval_agent.reconcile").exception(
+            "评估终态对账失败（不影响启动）"
+        )
+
     # D5/D8：创建 recorder 单例 + 崩溃恢复 + 启动 drain + 心跳扫描。
     # 顺序保证：init_db 先于 recorder（recorder 写 DB 依赖表已建）。
     recorder = EvolutionTraceRecorder()

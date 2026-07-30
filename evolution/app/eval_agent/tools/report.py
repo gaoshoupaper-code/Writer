@@ -63,6 +63,24 @@ def make_report_tools() -> list:
             content_scores: dict[str, Any] = {}
             cr = get_content_task_result(ctx.eval_id)
             if cr and not cr.get("error") and not cr.get("skipped"):
+                # CON-003 / EDGE-002 / FR-004：内容评分必须全部完成才能封存。
+                # complete=False（部分必需组失败）→ 整次评估失败，绝不封存 partial 评估。
+                # 这是「错误不伪装成工具成功」的硬闸门：content 工具返回的机器可读 complete
+                # 在这里被强制消费，绝不让 incomplete scores 原样喂给 sealer。
+                if not cr.get("complete", True):
+                    failed_groups = cr.get("failed_groups", [])
+                    ctx.emit_step(
+                        "write_eval_report", "failed",
+                        reason="内容评分未全部完成", failed_groups=failed_groups,
+                    )
+                    eval_repo.update_session(
+                        ctx.eval_id, status="failed",
+                        failure_reason=f"内容评分未全部完成（失败组：{failed_groups}），不得封存评估卷宗",
+                    )
+                    return (
+                        f"内容评分未全部完成（complete=false），失败组：{failed_groups}。"
+                        "本次评估不得封存评估卷宗（DEC-002 严格完整性）。"
+                    )
                 content_scores = cr
 
             # 流程硬指标从证据卷宗 facts 读（阶段 C 切断 load_trace_detail 旁路）。

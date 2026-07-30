@@ -230,15 +230,18 @@ async def _run_eval_bg(ctx: EvaluationContext) -> None:
 
     D3/D4：trace 终态（complete/fail_run）已在 run_eval_session 内处理，
     这里只管 evaluation_sessions 表的业务状态。
+
+    FR-004 / CON-002：评估成功的唯一判据是封存成功（completed + 有效 sealed_dossier_id）。
+    收尾层不得用不同状态词重复判定——封存已写 completed 就保留，绝不改回 failed。
     """
+    from app.eval_agent.agent import _is_eval_successfully_sealed
     try:
         result = await run_eval_session(ctx)
         if result["status"] == "done":
-            # Agent 正常结束。但「正常结束」≠「评估卷宗已封存」：
-            # write_eval_report 工具若成功，sealer 已把尝试标 completed 并回填 sealed_dossier_id。
-            # 若 Agent 没调报告工具就结束，或封存失败，DB 仍是 running/failed —— 视为失败。
+            # Agent 正常结束。成功 = 封存成功（status=completed + sealed_dossier_id）。
             session = eval_repo.get_session(ctx.eval_id)
-            if session is None or session.get("status") != "completed":
+            if not _is_eval_successfully_sealed(session):
+                # 未封存 = 失败。但若 sealer 已写 completed（封存成功），绝不再覆盖。
                 eval_repo.update_session(ctx.eval_id, status="failed",
                                          failure_reason="评估未封存卷宗（Agent 未产报告或封存失败）")
         elif result["status"] == "cancelled":
@@ -513,6 +516,23 @@ def _trace_event_to_sse(event: Any) -> dict[str, Any] | None:
             # step 事件（emit_step 产的）
             return {"type": "step", **data}
     return None
+
+
+# ── FR-006：历史误标评估一次性纠正（DEC-003，仅部署/数据维护）──────────
+
+
+@router.post("/admin/correct-mislabeled-history")
+def correct_mislabeled_history(confirm: bool = Query(False)) -> dict[str, Any]:
+    """一次性纠正可证明成功的历史误标评估（FR-006 / DEC-003 / AC-008）。
+
+    默认 dry_run（只读预演，输出目标集合 + 排除集合 + 证据，不写库）。
+    confirm=true 时精确更新可证明记录，保留更新前快照与审计。
+
+    严格按多方不可变事实证明（有效 sealed dossier + 完整内容 + 成功 Trace 终态），
+    绝不按单字段批量改写（RSK-003）。不重跑模型、不改卷宗内容、不改历史 Trace 事件。
+    """
+    from app.eval_agent.migrations import correct_mislabeled_eval_history
+    return correct_mislabeled_eval_history(dry_run=not confirm)
 
 
 __all__ = ["router"]

@@ -132,8 +132,8 @@ class EvalReportNoTraceBypassTest(unittest.TestCase):
                     referenced.add(alias.asname or alias.name)
         self.assertNotIn("extract_deliveries", referenced,
                          "content.py 引用了 extract_deliveries（工作区旁路未切断）")
-        self.assertIn("evaluate_from_facts", referenced,
-                      "content.py 应改用 evaluate_from_facts（从卷宗评估）")
+        self.assertIn("evaluate_content_groups", referenced,
+                      "content.py 应改用 evaluate_content_groups（DEC-002 并发/预算评分）")
 
 
 class EvalStartDossierGateTest(unittest.TestCase):

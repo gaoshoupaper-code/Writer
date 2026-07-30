@@ -123,6 +123,21 @@ def _extract_last_ai_text(result: Any) -> str:
     return ""
 
 
+def _is_eval_successfully_sealed(session: dict[str, Any] | None) -> bool:
+    """FR-004 评估成功的唯一判据：业务 completed 且有有效 sealed_dossier_id。
+
+    统一完成判据（CON-002）：封存成功是唯一成功标志，由 sealer 在单事务内写入
+    status='completed' + sealed_dossier_id。这里只认 completed（不认旧 done 字面量），
+    消除 Agent/sealer/API 三层对成功状态词的分裂。
+    """
+    if not session:
+        return False
+    return (
+        session.get("status") == "completed"
+        and bool(session.get("sealed_dossier_id"))
+    )
+
+
 def _fallback_report(ctx: EvaluationContext, result: Any) -> None:
     """降级兜底：Agent 正常结束但没调 write_eval_report（未封存评估卷宗）。
 
@@ -216,13 +231,15 @@ async def run_eval_session(ctx: EvaluationContext) -> dict[str, Any]:
         logger.info("eval %s: 评估 Agent 执行完成", ctx.eval_id)
 
         # 清理后台内容评估任务引用
-        clear_content_tasks()
+        clear_content_tasks(ctx.eval_id)
 
-        # 降级兜底：Agent 正常结束但若没调 write_eval_report（DB 状态仍 running），
-        # 从 Agent 最后一条 AI 消息提取内容构造降级报告，避免 trace=completed /
-        # eval=failed 状态不一致。Agent 确实跑完了诊断，只是漏调了报告工具。
+        # FR-004 / CON-002：评估成功的唯一判据是「封存成功」——sealer 在封存成功时
+        # 已把 evaluation_sessions.status 写为 completed 并回填 sealed_dossier_id。
+        # Agent 正常结束但若没调 write_eval_report（status 仍 running），视为失败。
+        # 关键：判据统一为 completed（不再检查旧的 done 字面量——那是状态迁移未闭合
+        # 制造的 bug：封存成功写 completed，收尾却只认 done，于是把已封存的评估改回 failed）。
         session = eval_repo.get_session(ctx.eval_id)
-        if session and session.get("status") != "done":
+        if session and not _is_eval_successfully_sealed(session):
             _fallback_report(ctx, result)
 
         if ctx.recorder and ctx.trace_id_self:
@@ -239,7 +256,7 @@ async def run_eval_session(ctx: EvaluationContext) -> dict[str, Any]:
             "评估 Agent 消耗了过多步数仍未完成诊断"
             "（可能反复查阅信息未收尾）。请重试，或检查模型是否稳定。"
         )
-        clear_content_tasks()
+        clear_content_tasks(ctx.eval_id)
         if ctx.recorder and ctx.trace_id_self:
             ctx.recorder.fail_run(
                 ctx.trace_id_self,
@@ -255,14 +272,14 @@ async def run_eval_session(ctx: EvaluationContext) -> dict[str, Any]:
         # 的 except Exception 当失败处理，覆盖刚标的 cancelled。
         logger.info("eval %s: 评估 Agent 被用户停止", ctx.eval_id)
         ctx.emit_log("评估已被手动停止。")
-        clear_content_tasks()
+        clear_content_tasks(ctx.eval_id)
         eval_repo.update_session(ctx.eval_id, status="cancelled")
         if ctx.recorder and ctx.trace_id_self:
             ctx.recorder.cancel_run(ctx.trace_id_self, reason="user_stop")
         return {"status": "cancelled", "eval_id": ctx.eval_id}
     except Exception as e:
         logger.exception("eval %s: 评估 Agent 执行失败", ctx.eval_id)
-        clear_content_tasks()
+        clear_content_tasks(ctx.eval_id)
         if ctx.recorder and ctx.trace_id_self:
             ctx.recorder.fail_run(ctx.trace_id_self, e)
         return {"status": "failed", "eval_id": ctx.eval_id, "error": str(e)}

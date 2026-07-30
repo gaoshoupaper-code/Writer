@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any
 
 import app.core.llm as llm
@@ -27,6 +28,7 @@ from app.dossier.prompt import (
     build_global_priorities_prompt,
     build_contract_parse_prompt,
 )
+from app.trace.observers import TraceLlmObserver, elapsed_ms
 
 logger = logging.getLogger("evolution.dossier.compiler")
 
@@ -37,8 +39,16 @@ MAX_LLM_CALLS = 20
 _STAGES = ["interview", "storybuilding", "detail-outline", "writing"]
 
 
-def compile_dossier(trace_id: str, dossier_id: str) -> dict[str, Any]:
+def compile_dossier(
+    trace_id: str,
+    dossier_id: str,
+    observer: TraceLlmObserver | None = None,
+) -> dict[str, Any]:
     """编译一条 trace 的证据卷宗（同步函数，由 API 层 asyncio.to_thread 调用）。
+
+    observer（DEC-001 / FR-002）：传入时，每个确定性阶段和每次内部 llm.chat 调用
+    都作为 span 写进同一编纂 Trace，让 2 分多钟的真实耗时可分解为阶段 + 模型调用。
+    None 时保持旧行为（仅 run 边界），供未接 Trace 的调用方兼容。
 
     Returns:
         {"status": "ready"|"partial"|"failed", "reason": str|None, "llm_calls": int}
@@ -54,33 +64,61 @@ def compile_dossier(trace_id: str, dossier_id: str) -> dict[str, Any]:
         # subagent 来不及写出白名单路径下的交付物。让它进入提取只会被
         # _check_critical_evidence 判 failed，并把"没资格编译"误报成"编译发现
         # 无产物"，混淆两类性质不同的问题。这里按运行资格直接拦下。
+        t0 = time.perf_counter()
+        if observer:
+            observer.phase_start("eligibility_check", message="编译资格校验")
         eligible_gap = _check_compile_eligibility(trace_id)
         if eligible_gap:
             reason = f"不具备编译资格：{eligible_gap}"
+            if observer:
+                observer.phase_fail("eligibility_check", error=reason, duration_ms=elapsed_ms(t0))
             repo.update_dossier(
                 dossier_id, status="failed", failure_reason=reason,
                 finished=True,
             )
             return {"status": "failed", "reason": reason, "llm_calls": 0}
+        if observer:
+            observer.phase_end("eligibility_check", duration_ms=elapsed_ms(t0), result="eligible")
 
         # 1. 提取事实层
+        t1 = time.perf_counter()
+        if observer:
+            observer.phase_start("fact_extraction", message="事实层提取")
         facts = extract_facts(trace_id)
+        if observer:
+            observer.phase_end(
+                "fact_extraction", duration_ms=elapsed_ms(t1),
+                artifact_revisions=len((facts.get("revisions") or [])),
+            )
 
         # 2. 检查关键证据
+        if observer:
+            observer.phase_start("critical_evidence_check", message="关键证据校验")
         critical_gap = _check_critical_evidence(facts)
         if critical_gap:
             reason = f"关键证据缺失：{critical_gap}"
+            if observer:
+                observer.phase_fail("critical_evidence_check", error=reason)
             repo.update_dossier(
                 dossier_id, status="failed", failure_reason=reason,
                 facts=facts, finished=True,
             )
             return {"status": "failed", "reason": reason, "llm_calls": 0}
+        if observer:
+            observer.phase_end("critical_evidence_check", result="pass")
 
         # 3. 任务契约语义提取（B3）：LLM 从 demand.md 提取八类字段。
         # 提取结果 contract_parsed 进 semantic 层，供确定性覆盖矩阵判定（需求 §32/§33）。
+        t3 = time.perf_counter()
+        if observer:
+            observer.phase_start("contract_parse", message="任务契约语义提取")
         contract = facts.get("contract", {})
-        contract_parsed, contract_llm_calls = _extract_contract_semantic(contract)
+        contract_parsed, contract_llm_calls = _extract_contract_semantic(contract, observer)
         llm_calls += contract_llm_calls
+        if observer:
+            observer.phase_end(
+                "contract_parse", duration_ms=elapsed_ms(t3), llm_calls=contract_llm_calls,
+            )
 
         # 4. 任务契约驱动的覆盖矩阵（B3，确定性闸门）。
         # 即使 Agent 声称完成，矩阵 missing_count>0 仍判不完整（§33）。
@@ -94,15 +132,31 @@ def compile_dossier(trace_id: str, dossier_id: str) -> dict[str, Any]:
                         "reason": "LLM 未配置，语义归纳跳过"}
         else:
             try:
-                semantic, llm_calls = _compile_semantic_layer(facts)
+                t5 = time.perf_counter()
+                if observer:
+                    observer.phase_start("semantic_induction", message="LLM 分段语义归纳")
+                semantic, llm_calls = _compile_semantic_layer(facts, observer)
+                if observer:
+                    observer.phase_end(
+                        "semantic_induction", duration_ms=elapsed_ms(t5), llm_calls=llm_calls,
+                    )
             except _LLMLimitExceeded as e:
                 logger.warning("compile_dossier %s: LLM 调用达上限，降级为 partial", trace_id)
                 semantic = e.partial_result
+                if observer:
+                    observer.phase_fail(
+                        "semantic_induction",
+                        error=f"LLM 调用达上限（{MAX_LLM_CALLS}次）", duration_ms=elapsed_ms(t5),
+                    )
                 # 不在此处落终态（B4 不可变性：避免后面再次 update 终态卷宗）。
                 # 只更新 llm_calls_used，最终状态由 step 9 统一判定并落库。
                 repo.update_dossier(dossier_id, llm_calls_used=llm_calls)
             except Exception as exc:
                 logger.exception("compile_dossier %s: 语义归纳失败，降级为 partial", trace_id)
+                if observer:
+                    observer.phase_fail(
+                        "semantic_induction", error=str(exc), duration_ms=elapsed_ms(t5),
+                    )
                 semantic = {"stages": [], "priorities": [], "error": str(exc)}
 
         # 把契约语义提取结果挂进 semantic 层（覆盖矩阵在 manifest，因其属确定性判定）
@@ -140,6 +194,9 @@ def compile_dossier(trace_id: str, dossier_id: str) -> dict[str, Any]:
             fail_reason = None
 
         # 8. 落卷宗
+        t8 = time.perf_counter()
+        if observer:
+            observer.phase_start("persist", message="卷宗落库")
         repo.update_dossier(
             dossier_id,
             status=final_status,
@@ -157,6 +214,10 @@ def compile_dossier(trace_id: str, dossier_id: str) -> dict[str, Any]:
         # 9. 标记当前版本（旧卷宗 superseded）
         if final_status in ("ready", "partial"):
             repo.mark_current(dossier_id)
+        if observer:
+            observer.phase_end(
+                "persist", duration_ms=elapsed_ms(t8), status=final_status, llm_calls=llm_calls,
+            )
 
         logger.info(
             "compile_dossier %s: 完成 status=%s llm_calls=%d",
@@ -166,6 +227,8 @@ def compile_dossier(trace_id: str, dossier_id: str) -> dict[str, Any]:
 
     except Exception as exc:
         logger.exception("compile_dossier %s: 编译异常", trace_id)
+        if observer:
+            observer.phase_fail("persist", error=f"编译异常：{exc}")
         repo.update_dossier(
             dossier_id, status="failed",
             failure_reason=f"编译异常：{exc}",
@@ -210,7 +273,9 @@ def _check_critical_evidence(facts: dict[str, Any]) -> str | None:
 # ── 任务契约语义提取 + 覆盖矩阵（B3，2026-07-27）──────────────
 
 
-def _extract_contract_semantic(contract: dict[str, Any]) -> tuple[dict[str, Any] | None, int]:
+def _extract_contract_semantic(
+    contract: dict[str, Any], observer: TraceLlmObserver | None = None,
+) -> tuple[dict[str, Any] | None, int]:
     """LLM 从 demand.md 提取任务契约八类字段（B3）。
 
     返回 (contract_parsed_dict, llm_call_count)。
@@ -228,7 +293,7 @@ def _extract_contract_semantic(contract: dict[str, Any]) -> tuple[dict[str, Any]
 
     messages = build_contract_parse_prompt(demand_md)
     try:
-        raw = llm.chat(messages, temperature=0.0)
+        raw = llm.chat(messages, temperature=0.0, trace=observer, phase="contract_parse")
         parsed = _parse_json_response(raw)
         # 契约字段无 evidence_id 要求（依据是 demand.md 整体），但补一个溯源标记
         parsed["_source"] = "demand_md_semantic"
@@ -442,7 +507,9 @@ class _LLMLimitExceeded(Exception):
         self.partial_result = partial_result
 
 
-def _compile_semantic_layer(facts: dict[str, Any]) -> tuple[dict[str, Any], int]:
+def _compile_semantic_layer(
+    facts: dict[str, Any], observer: TraceLlmObserver | None = None,
+) -> tuple[dict[str, Any], int]:
     """LLM 分段语义归纳。返回 (semantic_dict, llm_call_count)。
 
     分两步：
@@ -479,7 +546,7 @@ def _compile_semantic_layer(facts: dict[str, Any]) -> tuple[dict[str, Any], int]
 
         messages = build_stage_summary_prompt(stage, artifact_text, event_summaries, metrics)
         try:
-            raw = llm.chat(messages, temperature=0.0)
+            raw = llm.chat(messages, temperature=0.0, trace=observer, phase=f"stage_summary:{stage}")
             llm_calls += 1
             parsed = _parse_json_response(raw)
             # 校验：丢弃无 evidence_id 的 key_facts
@@ -500,7 +567,7 @@ def _compile_semantic_layer(facts: dict[str, Any]) -> tuple[dict[str, Any], int]
             reliability,
         )
         try:
-            raw = llm.chat(messages, temperature=0.0)
+            raw = llm.chat(messages, temperature=0.0, trace=observer, phase="global_priorities")
             llm_calls += 1
             parsed = _parse_json_response(raw)
             priorities = _enforce_evidence_refs(parsed).get("priorities", [])

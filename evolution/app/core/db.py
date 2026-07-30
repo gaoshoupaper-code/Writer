@@ -515,6 +515,10 @@ def init_db() -> None:
         _migrate_evolve_sessions_bound_eval_dossier(conn)
         # 评估卷宗冻结证据片段（阶段 D：供进化归因，需求 §22）
         _migrate_evaluation_dossiers_frozen_evidence(conn)
+        # 终态对账查询索引（FR-004/EDGE-003：加速 reconcile/migrations 启动查询）
+        _migrate_evaluation_sessions_mislabeled_index(conn)
+        # 历史误标纠正审计表（FR-006/DEC-003/RSK-003：可审计可回滚）
+        _migrate_eval_correction_audit_table(conn)
 
 
 def _migrate_evolve_sessions_driver_fields(conn: sqlite3.Connection) -> None:
@@ -650,6 +654,48 @@ def _migrate_evaluation_dossiers_frozen_evidence(conn: sqlite3.Connection) -> No
         return
     with _lock:
         conn.execute("ALTER TABLE evaluation_dossiers ADD COLUMN frozen_evidence_json TEXT")
+        conn.commit()
+
+
+def _migrate_evaluation_sessions_mislabeled_index(conn: sqlite3.Connection) -> None:
+    """幂等迁移：evaluation_sessions 加部分索引，加速终态对账查询（FR-004/EDGE-003）。
+
+    reconcile/migrations 查询「sealed_dossier_id 非空且 status != 'completed'」
+    在启动 hot path 跑；无索引会全表扫描。部分索引只覆盖有 sealed 的行，体积小。
+    CREATE INDEX IF NOT EXISTS 天然幂等。
+    """
+    with _lock:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_eval_sealed_status "
+            "ON evaluation_sessions(sealed_dossier_id, status) "
+            "WHERE sealed_dossier_id IS NOT NULL AND sealed_dossier_id != ''"
+        )
+        conn.commit()
+
+
+def _migrate_eval_correction_audit_table(conn: sqlite3.Connection) -> None:
+    """幂等迁移：建 eval_correction_audit 表（FR-006 / DEC-003 可审计纠正）。
+
+    历史误标评估一次性纠正必须保留可审计、可回滚证据（RSK-003）。本表逐条记录
+    每次纠正的 eval_id / 前后状态 / sealed_dossier_id / 判据 / 快照 / 时间，
+    审计写入与 UPDATE 同事务，保证「改了就有据」。
+    """
+    with _lock:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS eval_correction_audit (
+                audit_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                eval_id       TEXT NOT NULL,
+                status_before TEXT,
+                status_after  TEXT NOT NULL,
+                sealed_dossier_id TEXT,
+                criterion     TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL DEFAULT '{}',
+                corrected_at  TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_eval_audit_eval ON eval_correction_audit(eval_id)"
+        )
         conn.commit()
 
 

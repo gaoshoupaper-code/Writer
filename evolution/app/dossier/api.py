@@ -177,8 +177,12 @@ async def _run_compile_bg(
     用 asyncio.to_thread 丢线程池，保持事件循环响应。
     """
     from app.dossier.compiler import compile_dossier
+    from app.trace.observers import TraceLlmObserver
+    # DEC-001 / FR-002：把统一观测桥传入确定性编译器，让每个阶段和每次 llm.chat
+    # 写进同一编纂 Trace，消除"只有 run_start/run_end、看不到 2 分多钟内部执行"。
+    observer = TraceLlmObserver(recorder, compile_trace_id, component="dossier-compiler")
     try:
-        result = await asyncio.to_thread(compile_dossier, trace_id, dossier_id)
+        result = await asyncio.to_thread(compile_dossier, trace_id, dossier_id, observer)
         if result.get("status") in {"ready", "partial"}:
             _record_compile_lineage(trace_id, dossier_id, compile_trace_id)
             recorder.complete_run(compile_trace_id)

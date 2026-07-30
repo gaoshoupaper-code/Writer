@@ -11,6 +11,7 @@ schema 走 contracts/trace（单一真源）。
 from __future__ import annotations
 
 from app.trace.recorder import EvolutionTraceRecorder, TraceRunHandle
+from app.trace.observers import TraceLlmObserver
 from app.trace.trace_callback import TraceCallbackHandler
 from app.trace.trace_middleware import TraceMiddleware
 
@@ -19,4 +20,5 @@ __all__ = [
     "TraceRunHandle",
     "TraceMiddleware",
     "TraceCallbackHandler",
+    "TraceLlmObserver",
 ]
