@@ -107,7 +107,7 @@ def recover_trace_artifacts(
         run_purpose="trace_payload_recovery",
         endpoint="dossier.trace_payload_recovery",
         workload="evidence_compile",
-        links=[TraceSpanLink(target_trace_id=source_trace_id, relation="recovers")],
+        links=[TraceSpanLink(target_trace_id=source_trace_id, relation="derived_from")],
         external_refs={"source_trace_id": source_trace_id},
     )
     recovery_trace_id = handle.trace_id
