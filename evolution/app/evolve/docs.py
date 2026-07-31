@@ -327,5 +327,46 @@ __all__ = [
     "parse_design_doc_intent",
     "write_change_log",
     "generate_design_doc_from_points",
+    "write_issue_report",
     "_extract_finding_refs",
 ]
+
+
+# ── issue_report.md（架构层问题上报，DEC-006 / FR-007）──────────────
+
+
+def write_issue_report(
+    session_id: str,
+    *,
+    layer: str,
+    problem: str,
+    evidence_ref: str,
+    note: str | None = None,
+    issue_id: str,
+) -> str:
+    """架构层问题上报落 issue_report.md（与 design_doc/change_log 同 session 目录）。
+
+    与 design_doc 区分：design_doc 是"要怎么改六要素"，issue_report 是"六要素外够不着的
+    问题，交给人类"。一份 issue_report 记一条上报（多次上报追加新文件名带 issue_id 短缀，
+    避免覆盖）。
+    """
+    safe_suffix = issue_id[:8] if issue_id else "xxxxxx"
+    path = session_dir(session_id) / f"issue_report_{safe_suffix}.md"
+    meta = {
+        "reported_at": datetime.now(UTC).isoformat(),
+        "issue_id": issue_id,
+        "layer": layer,
+        "evidence_ref": evidence_ref,
+        "note": note,
+    }
+    lines = [
+        "# 架构层问题上报",
+        "",
+        f"**归属层**：{layer}",
+        f"**证据引用**：{evidence_ref}",
+    ]
+    if note:
+        lines.append(f"**Agent 判断理由**：{note}")
+    lines.extend(["", "## 问题描述", "", problem])
+    body = "\n".join(lines)
+    return _dump_doc(path, meta, body)

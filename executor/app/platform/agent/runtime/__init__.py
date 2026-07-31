@@ -8,7 +8,8 @@ expert_agent）只 import 本包，不直接 import deepagents。未来 6 个月
 - ``create_deep_agent``（runtime.factory）
 - ``CompiledSubAgent`` / ``SubAgent`` / ``SubAgentSpec`` / ``AgentMiddleware`` /
   ``FilesystemPermission`` / ``BackendProtocol``（runtime.types）
-- ``FilesystemBackend`` / ``CompositeBackend`` / ``compose_skills_backend``（runtime.backend）
+- ``FilesystemBackend`` / ``OverwritingFilesystemBackend`` / ``CompositeBackend`` /
+  ``compose_skills_backend``（runtime.backend）
 - ``GENERAL_PURPOSE_SUBAGENT``（runtime.factory）
 
 写作专属装配（build_deep_subagent + evolution + RevisionLimit）仍在
@@ -16,8 +17,10 @@ writer/expert_agent/，不在本包。
 """
 
 from app.platform.agent.runtime.backend import (
+    OVERWRITE_PRODUCT_PATTERNS,
     CompositeBackend,
     FilesystemBackend,
+    OverwritingFilesystemBackend,
     compose_skills_backend,
 )
 from app.platform.agent.runtime.factory import (
@@ -43,6 +46,8 @@ __all__ = [
     "FilesystemBackend",
     "FilesystemPermission",
     "GENERAL_PURPOSE_SUBAGENT",
+    "OVERWRITE_PRODUCT_PATTERNS",
+    "OverwritingFilesystemBackend",
     "artifact_capture_scope",
     "MiddlewareFactory",
     "SubAgent",

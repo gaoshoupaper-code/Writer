@@ -264,6 +264,9 @@ def assemble(ctx: RuntimeContext):
     from .middleware.file_state_tracker import FileStateTrackerMiddleware
     from .middleware.write_result_inspector import WriteResultInspectorMiddleware
     from .middleware.artifact_snapshot import ArtifactSnapshotMiddleware
+    # DEC-005 方案C / FR-002：覆盖式产物写路由（观测信号；覆盖能力由
+    # OverwritingFilesystemBackend 在隔离层提供，本中间件只发可观测信号）。
+    from .middleware.overwrite_routing import OverwriteRoutingMiddleware
     from .subagents.interview import build_interview_deep_subagent
     from .subagents.types import apply_style_suffix
     # runtime 是 DeepAgents SDK 隔离层（执行端平台能力，包依赖它如同依赖 deepagents）
@@ -283,6 +286,7 @@ def assemble(ctx: RuntimeContext):
     #   → EncodingGuard（写入后编码+完整性校验；在 PathGuard 之后拿规范化路径）
     #   → FileStateTracker（edit_file 前 old_string 预检）
     #   → FileWriteSerialize（按 file_path 串行化写）
+    #   → OverwriteRouting（覆盖式产物写观测信号；方案C，覆盖能力在隔离层 subclass）
     #   → WriteResultInspector（在串行化内、ErrorRecovery 内，转抛 WriteFailedError）
     #   → GoalMiddleware（最内层）
     meta_middleware = [
@@ -299,6 +303,7 @@ def assemble(ctx: RuntimeContext):
         EncodingGuardMiddleware(),
         FileStateTrackerMiddleware(),
         FileWriteSerializeMiddleware(intervention_callback=_make_intervention_callback(ctx, "meta-agent")),
+        OverwriteRoutingMiddleware(intervention_callback=_make_intervention_callback(ctx, "meta-agent")),
         WriteResultInspectorMiddleware(),
         GoalMiddleware(),
     ]
@@ -346,6 +351,7 @@ def assemble(ctx: RuntimeContext):
     #   → EncodingGuard（写入校验）
     #   → FileStateTracker（edit_file 预检）
     #   → FileWriteSerialize（写串行化）
+    #   → OverwriteRouting（覆盖式产物写观测信号；方案C）
     #   → WriteResultInspector（最内层，转抛 WriteFailedError）
     def middleware_factory(agent_name: str) -> list:
         intervention_callback = _make_intervention_callback(ctx, agent_name)
@@ -362,6 +368,7 @@ def assemble(ctx: RuntimeContext):
             EncodingGuardMiddleware(),
             FileStateTrackerMiddleware(),
             FileWriteSerializeMiddleware(intervention_callback=intervention_callback),
+            OverwriteRoutingMiddleware(intervention_callback=intervention_callback),
             WriteResultInspectorMiddleware(),
         ]
         if ctx.trace_recorder is not None and ctx.trace_id and ctx.trace_middleware_cls:

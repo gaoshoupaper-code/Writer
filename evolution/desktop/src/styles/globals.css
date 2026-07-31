@@ -10375,6 +10375,106 @@ html[data-theme="dark"] .blueprint-body h1 { color: var(--teal); }
   background: var(--bg);
 }
 
+.evolve-right-rail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 待处理架构问题面板（DEC-006 / FR-008）——右侧栏顶部，进化点浮窗之上 */
+.arch-issues-panel {
+  border-bottom: 1px solid var(--border);
+  padding: 12px 14px;
+  max-height: 40%;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+.arch-issues-panel .panel-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.arch-issues-panel .panel-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+.arch-issues-panel .panel-badge {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-radius: 10px;
+  padding: 0 7px;
+  font-size: 11px;
+  line-height: 16px;
+}
+.arch-issues-panel .panel-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.arch-issues-panel .issue-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.arch-issues-panel .issue-item {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--surface);
+  font-size: 12px;
+}
+.arch-issues-panel .issue-item.issue-reported {
+  border-left: 3px solid var(--warn, #d97706);
+}
+.arch-issues-panel .issue-item.issue-resolved {
+  opacity: 0.6;
+}
+.arch-issues-panel .issue-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.arch-issues-panel .issue-layer {
+  font-weight: 600;
+}
+.arch-issues-panel .issue-status {
+  color: var(--muted);
+  font-size: 11px;
+}
+.arch-issues-panel .issue-seq {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+.arch-issues-panel .issue-problem {
+  margin: 0 0 4px;
+  line-height: 1.4;
+}
+.arch-issues-panel .issue-evidence {
+  margin: 0 0 4px;
+  color: var(--muted);
+}
+.arch-issues-panel .issue-evidence code {
+  font-size: 11px;
+}
+.arch-issues-panel .issue-note {
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-style: italic;
+}
+.arch-issues-panel .issue-meta {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .session-list {
   list-style: none;
   margin: 0;

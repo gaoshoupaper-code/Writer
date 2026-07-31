@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Minimal screenplay agent executor (执行端) powered by FastAPI and DeepAgents"
 requires-python = ">=3.11"
 dependencies = [
-  "deepagents>=0.5.0",
+  "deepagents>=0.6.1,<0.7",
   "fastapi>=0.115.0",
   "httpx>=0.27.0",
   "langchain>=0.3.0",

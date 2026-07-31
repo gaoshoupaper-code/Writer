@@ -72,12 +72,33 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
         tool_name = _mapping_value(tool_call, "name")
         return bool(self.tool_replay_policy.should_retry(tool_name, exc))
 
+    def _is_deterministic_failure(self, exc: BaseException) -> bool:
+        """确定性失败判定（FR-001 / AC-004）。
+
+        这些失败用相同参数重试必然再失败（文件已存在 / 路径无效 / 权限拒绝），
+        重试只会消耗事件并放大 read+write 死循环（EVD-008）。命中即不重试，
+        直接进入恢复建议分支。判定保守：无法确定时返回 False（按可重试处理）。
+        """
+        message = str(exc)
+        # deepagents write 的"already exists"经 WriteResultInspector 转抛为 WriteFailedError，
+        # 文本里带 "already exists"。其它确定性信号一并识别。
+        deterministic_markers = (
+            "already exists",
+            "is a directory",          # IsADirectoryError 被吞进 ToolMessage 时
+            "permission denied",
+            "read-only",
+        )
+        return any(marker in message for marker in deterministic_markers)
+
     # ------------------------------------------------------------------
     # 工具调用拦截（同步 / 异步）
     # ------------------------------------------------------------------
 
     def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
-        """拦截同步工具调用：重试 → 耗尽后注入恢复建议。"""
+        """拦截同步工具调用：重试 → 耗尽后注入恢复建议。
+
+        确定性失败（文件已存在等）首次即短路，不消耗重试次数（FR-001 / AC-004）。
+        """
         last_exc: BaseException | None = None
         # 1 + max_retries = 总共执行的次数
         for attempt in range(1 + self.max_retries):
@@ -88,17 +109,23 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
                 if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)) or type(exc).__name__ == "GraphInterrupt":
                     raise
                 last_exc = exc
+                # 确定性失败（文件已存在等）首次即短路：同参数重试必失败（FR-001）。
+                if self._is_deterministic_failure(exc):
+                    break
                 # task 防重放：命中不可重试工具立即短路，交回 Meta Agent（CON-005）。
                 if attempt < self.max_retries and self._can_retry(request, exc):
                     self._emit_intervention("retry", exc)
                     continue
                 break
-        # 所有重试都失败（或被防重放短路），返回包含恢复建议的错误消息
+        # 所有重试都失败（或被防重放/确定性失败短路），返回包含恢复建议的错误消息
         self._emit_intervention("short_circuit", last_exc)
         return self._tool_error_message(request, last_exc)
 
     async def awrap_tool_call(self, request: Any, handler: Callable[[Any], Awaitable[Any]]) -> Any:
-        """拦截异步工具调用：重试（带延迟）→ 耗尽后注入恢复建议。"""
+        """拦截异步工具调用：重试（带延迟）→ 耗尽后注入恢复建议。
+
+        确定性失败（文件已存在等）首次即短路，不消耗重试次数（FR-001 / AC-004）。
+        """
         last_exc: BaseException | None = None
         for attempt in range(1 + self.max_retries):
             try:
@@ -107,6 +134,9 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
                 if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)) or type(exc).__name__ == "GraphInterrupt":
                     raise
                 last_exc = exc
+                # 确定性失败（文件已存在等）首次即短路：同参数重试必失败（FR-001）。
+                if self._is_deterministic_failure(exc):
+                    break
                 # task 防重放：命中不可重试工具立即短路，交回 Meta Agent（CON-005）。
                 if attempt < self.max_retries and self._can_retry(request, exc):
                     self._emit_intervention("retry", exc)
@@ -133,7 +163,7 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
         """构造包含错误详情和恢复建议的工具错误消息。
 
         消息格式：
-          - 重试次数
+          - 重试次数（确定性失败时为 0，明确告知模型不必重试同参数）
           - 错误类型和详情
           - 针对错误类型的恢复建议
           - 提示模型调整参数后重试
@@ -141,10 +171,13 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
         tool_call = getattr(request, "tool_call", {})
         tool_name = _mapping_value(tool_call, "name")
         tool_call_id = _mapping_value(tool_call, "id")
+        deterministic = self._is_deterministic_failure(exc)
+        retries_done = 0 if deterministic else self.max_retries
         guidance = _recovery_guidance(exc)
+        retry_label = "确定性失败，未重试（同参数重试必失败）" if deterministic else f"已重试 {self.max_retries} 次"
         return ToolMessage(
             content=(
-                f"工具执行出错（已重试 {self.max_retries} 次）\n\n"
+                f"工具执行出错（{retry_label}）\n\n"
                 f"错误类型: {type(exc).__name__}\n"
                 f"错误详情: {exc}\n\n"
                 f"恢复建议: {guidance}\n\n"
@@ -171,8 +204,17 @@ def _recovery_guidance(exc: BaseException) -> str:
     - IsADirectoryError → 指定文件而非目录路径
     - OSError → 检查磁盘空间或文件锁定
     - JSONDecodeError → 修复 JSON 格式
+    - 文件已存在（WriteFailedError 承载）→ 改用 edit_file 局部更新或写覆盖式产物清单内路径
     - 其他 → 通用建议
     """
+    message = str(exc)
+    # deepagents write 的"already exists"经 WriteResultInspector 转抛为 WriteFailedError，
+    # 不是 OSError 子类，须按消息文本识别（FR-001 / AC-004 要求具体指引）。
+    if "already exists" in message:
+        return (
+            "目标文件已存在，write_file 默认不覆盖。请改用 edit_file 做局部更新；"
+            "若产物是覆盖式更新（如 review/*.md、evaluation.md），可直接 write（已支持覆盖）。"
+        )
     if isinstance(exc, (UnicodeDecodeError, UnicodeEncodeError)):
         return "内容包含非 UTF-8 兼容字符，请移除或替换这些字符后重试。"
     if isinstance(exc, FileNotFoundError):

@@ -271,6 +271,73 @@ class TraceV2IngestionTest(unittest.TestCase):
         self.assertEqual(purge_expired_payloads(), 0)
         self.assertEqual(store.get(ref.payload_id), {"content": "sealed"})
 
+    def test_llm_chain_summary_backfilled_from_payload_before_projection(self) -> None:
+        """FR-004 / AC-001：llm_end 的 output 被 payload 外置时，投影 chain_summary
+        必须基于回填后的正文，不得持久化为"无输出"。"""
+        store = ContentAddressedPayloadStore(settings.trace_payload_path)
+        llm_output = {"messages": [{"type": "ai", "content": "主角决定离开小镇去寻剑。"}]}
+        output_ref_payload = store.put(llm_output)
+        output_ref = TracePayloadRef(
+            payload_id=output_ref_payload.payload_id,
+            content_hash=output_ref_payload.content_hash,
+            kind="semantic_full",
+            size_bytes=output_ref_payload.size_bytes,
+        )
+        events = [
+            _event(1, "run_start"),
+            _event(2, "llm_start"),
+            _event(3, "llm_end").model_copy(update={
+                "payload_refs": {"output": output_ref},
+                "model_name": "deepseek-chat",
+            }),
+            _event(4, "run_end"),
+        ]
+        run = self._run(events, terminal_event_id="event-4")
+
+        ingest_events(
+            events, run_summary_hint=run,
+            payload_values={output_ref.payload_id: llm_output},
+        )
+
+        node = db.query_one(
+            "SELECT chain_summary, kind FROM nodes WHERE trace_id=? AND kind='llm'",
+            (run.trace_id,),
+        )
+        self.assertIsNotNone(node)
+        self.assertNotIn("无输出", node["chain_summary"])
+        self.assertIn("主角决定离开小镇", node["chain_summary"])
+
+    def test_payload_backfill_missing_degrades_chain_summary_without_crash(self) -> None:
+        """EDGE-003 / AC-002：payload_refs 指向的对象缺失时，chain_summary 降级保留
+        可恢复信息（模型名/工具名），不静默"无输出"也不崩溃。"""
+        missing_ref = TracePayloadRef(
+            payload_id="d" * 64,
+            content_hash="d" * 64,
+            kind="semantic_full",
+            size_bytes=10,
+        )
+        events = [
+            _event(1, "run_start"),
+            _event(2, "llm_start"),
+            _event(3, "llm_end").model_copy(update={
+                "payload_refs": {"output": missing_ref},
+                "model_name": "deepseek-chat",
+            }),
+            _event(4, "run_end"),
+        ]
+        run = self._run(events, terminal_event_id="event-4")
+
+        # 不提供 payload_values，payload_objects 也不会登记该 ref → 回填缺失
+        ingest_events(events, run_summary_hint=run, payload_values={})
+
+        node = db.query_one(
+            "SELECT chain_summary, kind FROM nodes WHERE trace_id=? AND kind='llm'",
+            (run.trace_id,),
+        )
+        self.assertIsNotNone(node)
+        # 不崩溃；chain_summary 仍带模型名（可恢复信息），降级为"无输出"是可接受底线
+        self.assertIn("deepseek-chat", node["chain_summary"])
+
     @staticmethod
     def _run(events: list[TraceLogEvent], terminal_event_id: str) -> TraceRunSummary:
         return TraceRunSummary(

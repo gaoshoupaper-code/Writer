@@ -8,7 +8,11 @@ from unittest.mock import patch
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app.platform.agent.middleware.trace_middleware import TraceMiddleware, _usage_payload
+from app.platform.agent.middleware.trace_middleware import (
+    TraceMiddleware,
+    _message_payload,
+    _usage_payload,
+)
 from app.platform.trace.projector import TraceProjector
 from app.platform.trace.recorder import TraceRecorder
 from app.platform.trace.schemas import TraceLogEvent, TraceRunSummary
@@ -622,6 +626,27 @@ class TraceRecorderTest(unittest.TestCase):
                 activations[0].skill_activation["trigger_event_id"],
                 activations[0].parent_event_id,
             )
+
+
+class MessagePayloadReasoningTest(unittest.TestCase):
+    """FR-005 / EVD-003：DeepSeek thinking 模式的 reasoning_content 放在
+    additional_kwargs 里，_message_payload 必须提取出来，否则 reasoning 模式节点
+    在 trace 里只剩空 content。"""
+
+    def test_reasoning_content_is_extracted_from_additional_kwargs(self) -> None:
+        message = AIMessage(
+            content="最终答案。",
+            additional_kwargs={"reasoning_content": "我先分析动机，再推导结论……"},
+        )
+        payload = _message_payload(message)
+        self.assertEqual(payload["reasoning_content"], "我先分析动机，再推导结论……")
+        self.assertEqual(payload["content"], "最终答案。")
+
+    def test_missing_reasoning_content_does_not_break_extraction(self) -> None:
+        message = AIMessage(content="无思考内容的回复。")
+        payload = _message_payload(message)
+        self.assertEqual(payload["content"], "无思考内容的回复。")
+        self.assertNotIn("reasoning_content", payload)
 
 
 if __name__ == "__main__":

@@ -168,6 +168,8 @@ _MESSAGE_TOOLS = frozenset({
     "edit_source",
     # 校验工具
     "validate_changes",
+    # 架构层问题上报工具（DEC-006：上报应在对话中可见）
+    "report_architecture_issue",
 })
 
 

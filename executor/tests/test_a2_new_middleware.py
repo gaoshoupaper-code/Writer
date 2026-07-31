@@ -51,6 +51,7 @@ from _harness_test_pkg.middleware.file_state_tracker import (  # noqa: E402
 )
 from _harness_test_pkg.middleware.error_recovery import ErrorRecoveryMiddleware  # noqa: E402
 from _harness_test_pkg.middleware.artifact_snapshot import ArtifactSnapshotMiddleware  # noqa: E402
+from _harness_test_pkg.middleware.overwrite_routing import OverwriteRoutingMiddleware  # noqa: E402
 
 
 # ── 公共工具：构造伪 request（对齐 test_meta_readonly_middleware 模式）──
@@ -108,6 +109,57 @@ class ErrorRecoveryInterventionTest(unittest.TestCase):
 
         self.assertIsInstance(result, ToolMessage)
         self.assertEqual([item["action"] for item in interventions], ["retry", "short_circuit"])
+
+    def test_deterministic_already_exists_failure_does_not_retry(self) -> None:
+        """FR-001 / AC-004：'文件已存在' 是确定性失败，不应消耗重试次数；
+        恢复建议须具体（改用 edit_file 或覆盖式产物清单内的 write），不是通用建议。"""
+        from _harness_test_pkg.middleware.write_result_inspector import WriteFailedError
+
+        interventions: list[dict[str, Any]] = []
+        call_count = {"n": 0}
+        def handler(_req: Any) -> Any:
+            call_count["n"] += 1
+            raise WriteFailedError(
+                "write_file 失败：Cannot write to /novel.md because it already exists. "
+                "Read and then make an edit, or write to a new path."
+            )
+
+        middleware = ErrorRecoveryMiddleware(
+            max_retries=2,
+            retry_delay=0,
+            intervention_callback=lambda **item: interventions.append(item),
+        )
+        result = middleware.wrap_tool_call(_request("write_file", file_path="/novel.md"), handler)
+
+        # 确定性失败：handler 只被调一次（首次），0 重试
+        self.assertEqual(call_count["n"], 1, "确定性失败不应重试")
+        # 短路信号（不经过 retry 信号）
+        self.assertEqual([item["action"] for item in interventions], ["short_circuit"])
+        self.assertIsInstance(result, ToolMessage)
+        content = result.content if isinstance(result.content, str) else str(result.content)
+        # 恢复建议须含 edit_file / 覆盖式产物指引（非通用"检查输入参数"）
+        self.assertIn("edit_file", content)
+
+    def test_retryable_oserror_still_retries(self) -> None:
+        """回归：可重试失败（如瞬时 OSError）行为不变，仍重试 max_retries 次。"""
+        interventions: list[dict[str, Any]] = []
+        call_count = {"n": 0}
+        def handler(_req: Any) -> Any:
+            call_count["n"] += 1
+            raise OSError("resource temporarily unavailable")
+
+        middleware = ErrorRecoveryMiddleware(
+            max_retries=2,
+            retry_delay=0,
+            intervention_callback=lambda **item: interventions.append(item),
+        )
+        middleware.wrap_tool_call(_request("write_file", file_path="/x.md"), handler)
+        # 1 首次 + 2 重试 = 3 次
+        self.assertEqual(call_count["n"], 3)
+        self.assertEqual(
+            [item["action"] for item in interventions],
+            ["retry", "retry", "short_circuit"],
+        )
 
 
 class ArtifactRevisionCaptureTest(unittest.TestCase):
@@ -571,6 +623,72 @@ class FileStateTrackerPrunedTest(unittest.TestCase):
 
         self.mw.wrap_tool_call(_request("read_file", file_path="/x.md"), handler)
         self.assertEqual(handler_called["n"], 1)
+
+
+class OverwriteRoutingTest(unittest.TestCase):
+    """FR-002 / DEC-005 方案C：OverwriteRoutingMiddleware 观测信号验证。
+
+    覆盖能力由 OverwritingFilesystemBackend 提供（见 test_overwriting_backend.py）；
+    本中间件只发可观测信号，不改 tool_call、不绕过 handler。
+    """
+
+    def setUp(self) -> None:
+        self.signals: list[dict[str, Any]] = []
+        def cb(**kwargs: Any) -> None:
+            self.signals.append(kwargs)
+        self.mw = OverwriteRoutingMiddleware(intervention_callback=cb)
+
+    def test_overwrite_product_write_emits_signal(self) -> None:
+        """命中覆盖式产物清单的 write_file → 发 overwrite_routing 信号，仍调用 handler。"""
+        called = {"n": 0}
+        def handler(_req: Any) -> Any:
+            called["n"] += 1
+            return "ok"
+
+        self.mw.wrap_tool_call(
+            _request("write_file", file_path="/review/storybuilding.md", content="v2"),
+            handler,
+        )
+        self.assertEqual(called["n"], 1, "handler 必须被调用（不绕过）")
+        self.assertTrue(self.signals, "应发干预信号")
+        self.assertEqual(self.signals[0]["action"], "overwrite_routing")
+        self.assertEqual(self.signals[0]["reason"], "overwrite_product_path")
+
+    def test_non_overwrite_write_does_not_emit_signal(self) -> None:
+        """EDGE-001：清单外路径（如 /novel.md 正文）不发信号（走默认拒覆盖）。"""
+        self.mw.wrap_tool_call(
+            _request("write_file", file_path="/novel.md", content="x"), lambda _r: "ok"
+        )
+        self.assertFalse(self.signals)
+
+    def test_non_write_tool_passthrough(self) -> None:
+        """非 write_file 工具（edit_file/read_file）不发信号。"""
+        self.mw.wrap_tool_call(
+            _request("edit_file", file_path="/review/x.md", old_string="a"), lambda _r: "ok"
+        )
+        self.assertFalse(self.signals)
+
+    def test_no_callback_does_not_raise(self) -> None:
+        """无 intervention_callback 时不抛异常（观测降级不影响业务）。"""
+        mw = OverwriteRoutingMiddleware()
+        # 不应抛异常
+        mw.wrap_tool_call(
+            _request("write_file", file_path="/evaluation.md", content="v2"),
+            lambda _r: "ok",
+        )
+
+    def test_async_path_emits_signal(self) -> None:
+        """异步路径同样发信号。"""
+        async def handler(_req: Any) -> Any:
+            return "ok"
+
+        asyncio.run(
+            self.mw.awrap_tool_call(
+                _request("write_file", file_path="/detail/evaluation.md", content="v2"),
+                handler,
+            )
+        )
+        self.assertTrue(self.signals)
 
 
 if __name__ == "__main__":

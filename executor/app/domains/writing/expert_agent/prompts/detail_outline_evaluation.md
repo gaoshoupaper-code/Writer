@@ -5,6 +5,7 @@
 2. 你只能写入 detail/evaluation.md，不得修改 detail/ 目录下的其他文件或工作目录中的任何文件。
 3. 评估必须基于已写入的文件内容 + timeline.md，不能只根据父代理转述下结论。
 4. **唯一的评估完成标志是 detail/evaluation.md 写入成功**。在此之前不得向父代理回复总结、不得停止调用工具。
+5. **写入规则**：`detail/evaluation.md` 是覆盖式产物（每次评估都重写同一文件）。首次用 `write_file` 创建；文件已存在时直接用 `write_file` 写入完整新内容即可（系统已支持对该路径整体覆盖），**不要**反复 `read_file` 后再用 `write_file` 重试同一参数（会触发"文件已存在"且无效）。若需只改局部，用 `edit_file` 做 old_string→new_string 替换。
 
 ## ⚠ 评估对象不预注入，必须自行 read_file（防退化，硬性要求）
 

@@ -431,6 +431,27 @@ def get_points(session_id: str) -> dict[str, Any]:
     return {"points": points, "accepted_count": accepted_count}
 
 
+@router.get("/evolve/sessions/{session_id}/architecture-issues")
+def get_architecture_issues(session_id: str) -> dict[str, Any]:
+    """列出 session 的架构层问题清单（DEC-006 / FR-008，前端待处理架构问题列表数据源）。
+
+    返回该 session 全部架构上报（reported/acknowledged/resolved），按 seq 升序。
+    与进化点区分：进化点是 agent 可改要素的改进建议；架构问题是 agent 够不着的层
+    的根因上报，交人类处置。
+
+    Returns:
+        {issues: [ArchitectureIssue, ...], pending_count: <int>}
+    """
+    session = ev_db.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"session {session_id} 不存在")
+
+    from app.evolve.evolve_repo import ArchitectureIssuesRepo
+    issues = ArchitectureIssuesRepo.list_by_session(session_id)
+    pending_count = sum(1 for i in issues if i.get("status") != "resolved")
+    return {"issues": issues, "pending_count": pending_count}
+
+
 @router.get("/evolve/sessions")
 def list_sessions(limit: int = 50) -> dict[str, Any]:
     """列出进化 session（最新在前）。"""

@@ -415,6 +415,25 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_ep_session ON evolve_points(session_id, seq);
             CREATE INDEX IF NOT EXISTS idx_ep_status ON evolve_points(session_id, status);
 
+            -- evolve_architecture_issues：进化 Agent 上报的"架构层问题"（六要素外，DEC-006）。
+            -- 与 evolve_points 区分：points 的 target 是 agent 可改要素（六要素内）；
+            -- issues 的 layer 是 agent 够不着的归属层（assembly/executor/framework/...）。
+            -- 落盘 issue_report.md + 此表 + 前端列表三件套，让人类在进化界面看到并处置。
+            CREATE TABLE IF NOT EXISTS evolve_architecture_issues (
+                id              TEXT PRIMARY KEY,             -- uuid，Agent 调 report 时生成
+                session_id      TEXT NOT NULL,                -- FK evolve_sessions
+                seq             INTEGER NOT NULL,             -- 会话内序号
+                layer           TEXT NOT NULL,                -- 归属层：assembly/executor/framework/eval-infra/data-pipeline
+                problem         TEXT NOT NULL,                -- 问题描述
+                evidence_ref    TEXT NOT NULL,                -- 引用 finding id 或 trace 证据
+                note            TEXT,                         -- Agent 的归属层判断理由
+                status          TEXT NOT NULL DEFAULT 'reported',  -- reported / acknowledged / resolved
+                report_path     TEXT,                         -- issue_report.md 落盘路径
+                created_at      TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_eai_session ON evolve_architecture_issues(session_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_eai_status ON evolve_architecture_issues(status);
+
             -- evidence_dossiers：证据卷宗（Evidence Dossier，2026-07，原名 evidence_packs）。
             -- 一条 trace × 一个编译规则版本 = 一行；同 trace 可有多版本（追加，不覆盖）。
             -- 证据卷宗是评估 Agent 与进化 Agent 的共享事实底座，替代各自直读 trace。

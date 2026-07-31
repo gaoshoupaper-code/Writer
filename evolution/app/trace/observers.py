@@ -83,6 +83,9 @@ class TraceLlmObserver:
     def on_llm_end(
         self, *, phase: str, model: str, duration_ms: float, output: str,
     ) -> None:
+        # output schema 必须与 TraceMiddleware 的 {messages:[...]} 契约对齐：
+        # 前端抽屉/投影/usage 提取都依赖 output.messages（EVD-004 / FR-005）。
+        # 把确定性 llm.chat 的纯文本回复包成单条 ai 消息，phase 作为同级元数据保留。
         self._emit(
             {
                 "type": "llm_end",
@@ -92,7 +95,10 @@ class TraceLlmObserver:
                 "model_name": model,
                 "node_name": phase,
                 "duration_ms": duration_ms,
-                "output": _truncate({"phase": phase, "content": output}),
+                "output": _truncate({
+                    "phase": phase,
+                    "messages": [{"type": "ai", "content": output}],
+                }),
             },
         )
 

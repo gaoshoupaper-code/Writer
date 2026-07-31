@@ -7,15 +7,18 @@ import {
   getEvolvePoints,
   getEvolveSession,
   getEvalDossiers,
+  getEvolveArchitectureIssues,
   getEvolveSessionEventsSince,
   sendEvolveMessage,
   startEvolveConverse,
   stopEvolve,
   type EvalDossierSummary,
+  type EvolveArchitectureIssue,
   type EvolveMessage,
   type EvolvePoint,
   type EvolveSession,
 } from "@/lib/api";
+import ArchitectureIssuesPanel from "./ArchitectureIssuesPanel";
 import ConversationPanel from "./ConversationPanel";
 import PointsDrawer from "./PointsDrawer";
 
@@ -60,6 +63,9 @@ export default function WorkbenchTab({
   const [messages, setMessages] = useState<EvolveMessage[]>([]);
   const [points, setPoints] = useState<EvolvePoint[]>([]);
   const [acceptedCount, setAcceptedCount] = useState(0);
+  // 架构层问题上报（DEC-006 / FR-008）：与进化点同流拉取，右侧独立面板展示。
+  const [archIssues, setArchIssues] = useState<EvolveArchitectureIssue[]>([]);
+  const [archPendingCount, setArchPendingCount] = useState(0);
 
   // 交互态
   const [starting, setStarting] = useState(false);
@@ -84,18 +90,27 @@ export default function WorkbenchTab({
     };
   }, [refreshEvalDossiers]);
 
-  // ── 拉取会话详情（messages + points）────────────────────────
+  // ── 拉取会话详情（messages + points + architecture-issues）────
   // 拉取进化点（独立于消息——proposal 事件时只刷进化点，避免覆盖流式 token）
   const loadPoints = useCallback(async (sessionId: string) => {
     try {
-      const ptsResp = await getEvolvePoints(sessionId);
+      const [ptsResp, issuesResp] = await Promise.all([
+        getEvolvePoints(sessionId),
+        getEvolveArchitectureIssues(sessionId),
+      ]);
       if (ptsResp) {
         setPoints(ptsResp.points);
         setAcceptedCount(ptsResp.accepted_count);
       }
+      if (issuesResp) {
+        setArchIssues(issuesResp.issues);
+        setArchPendingCount(issuesResp.pending_count);
+      }
     } catch {
       setPoints([]);
       setAcceptedCount(0);
+      setArchIssues([]);
+      setArchPendingCount(0);
     }
   }, []);
 
@@ -160,6 +175,8 @@ export default function WorkbenchTab({
     setMessages([]);
     setPoints([]);
     setAcceptedCount(0);
+    setArchIssues([]);
+    setArchPendingCount(0);
     try {
       const resp = await startEvolveConverse(evalDossierId);
       setSelectedSessionId(resp.session_id);
@@ -394,16 +411,19 @@ export default function WorkbenchTab({
         onPointHover={setHighlightedPointId}
       />
 
-      {/* 右：进化点浮窗 */}
-      <PointsDrawer
-        points={points}
-        acceptedCount={acceptedCount}
-        canFinalize={canFinalize}
-        finalizing={finalizing}
-        highlightedPointId={highlightedPointId}
-        onPointClick={(id) => setHighlightedPointId(id)}
-        onFinalize={handleFinalize}
-      />
+      {/* 右：进化点浮窗 + 架构问题面板 */}
+      <div className="evolve-right-rail">
+        <ArchitectureIssuesPanel issues={archIssues} pendingCount={archPendingCount} />
+        <PointsDrawer
+          points={points}
+          acceptedCount={acceptedCount}
+          canFinalize={canFinalize}
+          finalizing={finalizing}
+          highlightedPointId={highlightedPointId}
+          onPointClick={(id) => setHighlightedPointId(id)}
+          onFinalize={handleFinalize}
+        />
+      </div>
     </div>
   );
 }

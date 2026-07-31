@@ -487,4 +487,128 @@ def _try_assign_point_ownership(point_id: str, session_id: str, problem_text: st
         log.exception("进化点归属登记异常 point=%s（已忽略）", point_id)
 
 
-__all__ = ["EvolveMessagesRepo", "EvolvePointsRepo"]
+__all__ = ["EvolveMessagesRepo", "EvolvePointsRepo", "ArchitectureIssuesRepo"]
+
+
+# ════════════════════════════════════════════════════════════
+#  ArchitectureIssuesRepo：架构层问题上报 CRUD（DEC-006 / FR-007）
+# ════════════════════════════════════════════════════════════
+
+# agent 够不着的归属层枚举（六要素外）。灰色地带一律上报，layer 选最贴近的。
+ARCHITECTURE_LAYERS: tuple[str, ...] = (
+    "assembly",        # 装配入口 __init__.py assemble（agent 只读）
+    "executor",        # executor 端：trace 投影/recorder/隔离层/API
+    "framework",       # 第三方框架：deepagents/langchain 等包内行为
+    "eval-infra",      # 评估 infra：评估器/评估流水线代码
+    "data-pipeline",   # 数据管道：摄入/dataset 生成等非 harness 代码
+)
+
+
+class ArchitectureIssuesRepo:
+    """架构层问题上报（report_architecture_issue 工具的数据层）。
+
+    与 EvolvePointsRepo 区分：points 的 target 是 agent 可改要素（六要素内），
+    issues 的 layer 是 agent 够不着的归属层（六要素外）。status 从 reported 起步，
+    人类在进化界面看到后可标记 acknowledged / resolved。
+    """
+
+    @staticmethod
+    def report(
+        session_id: str,
+        *,
+        layer: str,
+        problem: str,
+        evidence_ref: str,
+        note: str | None = None,
+        report_path: str | None = None,
+        issue_id: str | None = None,
+    ) -> dict[str, Any]:
+        """上报一条架构层问题，返回新建记录 dict。
+
+        issue_id 可由调用方预先生成（_uuid()），便于先以最终文件名落 issue_report，
+        再一次性 INSERT（避免先写占位文件再 rename + UPDATE 回填）。
+        """
+        if layer not in ARCHITECTURE_LAYERS:
+            raise ValueError(
+                f"非法 layer '{layer}'，合法值：{', '.join(ARCHITECTURE_LAYERS)}"
+            )
+        issue_id = issue_id or _uuid()
+        now = _now()
+        row = db.query_one(
+            "SELECT MAX(seq) AS max_seq FROM evolve_architecture_issues WHERE session_id = ?",
+            (session_id,),
+        )
+        seq = (row["max_seq"] + 1) if row and row["max_seq"] is not None else 1
+        db.execute(
+            """INSERT INTO evolve_architecture_issues
+               (id, session_id, seq, layer, problem, evidence_ref, note,
+                status, report_path, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'reported', ?, ?)""",
+            (issue_id, session_id, seq, layer, problem, evidence_ref, note,
+             report_path, now),
+        )
+        return {
+            "id": issue_id,
+            "session_id": session_id,
+            "seq": seq,
+            "layer": layer,
+            "problem": problem,
+            "evidence_ref": evidence_ref,
+            "note": note,
+            "status": "reported",
+            "report_path": report_path,
+            "created_at": now,
+        }
+
+    @staticmethod
+    def update_status(issue_id: str, status: str) -> dict[str, Any] | None:
+        """人类处置：标记 acknowledged / resolved。"""
+        db.execute(
+            "UPDATE evolve_architecture_issues SET status=? WHERE id=?",
+            (status, issue_id),
+        )
+        row = db.query_one(
+            "SELECT * FROM evolve_architecture_issues WHERE id=?",
+            (issue_id,),
+        )
+        return ArchitectureIssuesRepo._row_to_dict(row) if row else None
+
+    @staticmethod
+    def list_by_session(session_id: str) -> list[dict[str, Any]]:
+        """按 seq 升序列出 session 的全部架构问题（前端列表数据源）。"""
+        rows = db.query_all(
+            """SELECT id, session_id, seq, layer, problem, evidence_ref, note,
+                      status, report_path, created_at
+               FROM evolve_architecture_issues
+               WHERE session_id = ?
+               ORDER BY seq ASC""",
+            (session_id,),
+        )
+        return [ArchitectureIssuesRepo._row_to_dict(r) for r in rows]
+
+    @staticmethod
+    def list_pending() -> list[dict[str, Any]]:
+        """列出所有未解决（reported/acknowledged）的架构问题（跨 session 总览）。"""
+        rows = db.query_all(
+            """SELECT id, session_id, seq, layer, problem, evidence_ref, note,
+                      status, report_path, created_at
+               FROM evolve_architecture_issues
+               WHERE status IN ('reported', 'acknowledged')
+               ORDER BY created_at DESC""",
+        )
+        return [ArchitectureIssuesRepo._row_to_dict(r) for r in rows]
+
+    @staticmethod
+    def _row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "session_id": row["session_id"],
+            "seq": row["seq"],
+            "layer": row["layer"],
+            "problem": row["problem"],
+            "evidence_ref": row["evidence_ref"],
+            "note": row.get("note"),
+            "status": row["status"],
+            "report_path": row.get("report_path"),
+            "created_at": row["created_at"],
+        }

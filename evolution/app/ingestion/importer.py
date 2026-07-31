@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,8 @@ from app.core.models import TraceLogEvent, TraceNode, TraceRunSummary, TraceUsag
 from contracts.trace import compute_trace_events_hash
 from contracts.trace.payload import ContentAddressedPayloadStore, PayloadRejected
 from app.core.settings import settings
+
+logger = logging.getLogger("evolution.ingestion.importer")
 
 
 def ingest_trace(trace_path: Path, workspace_id_hint: str | None = None) -> str | None:
@@ -531,8 +534,29 @@ def _missing_ranges(sequences: list[int], contiguous: int, max_seen: int) -> lis
 
 
 def _write_nodes(conn: Any, trace_id: str, run: TraceRunSummary, events: list[TraceLogEvent]) -> None:
-    """投影 events → nodes 树 → 写入 nodes 表。"""
-    projection = projector.TraceProjector().project(run, events)
+    """投影 events → nodes 树 → 写入 nodes 表。
+
+    投影前回填 payload 正文（FR-004 / EVD-001）：executor 把 llm_end 的 output
+    内容寻址外置到 payload_refs，事件里只剩 output=None。chain_summary 在投影里
+    从 event.output 提取摘要，若不回填会被持久化成"(无输出)"。这里复用 hydrate_event
+    把正文填回再投影——_store_payload_metadata 已在本事务先行登记 payload_objects，
+    同连接读取可见。
+
+    回填按事件兜底（EDGE-003 / AC-002）：hydrate_event 内部对 store.get 吞错，
+    但其 db.query_one / model_validate 不在吞错范围内。单条 payload 元数据查询失败
+    时回退到未回填事件投影（chain_summary 降级为"(无输出)"而非整事务崩溃）。
+    """
+    # 局部导入避免与 trace_payloads 的其它依赖形成循环。
+    from app.trace_payloads import hydrate_event
+
+    hydrated: list[TraceLogEvent] = []
+    for event in events:
+        try:
+            hydrated.append(hydrate_event(event))
+        except Exception:
+            logger.warning("event 回填失败，降级用未回填事件投影 seq=%s", event.sequence, exc_info=True)
+            hydrated.append(event)
+    projection = projector.TraceProjector().project(run, hydrated)
     rows = [_node_row(trace_id, node) for node in projection.nodes]
     if rows:
         conn.executemany(

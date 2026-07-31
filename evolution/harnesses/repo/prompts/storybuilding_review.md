@@ -126,7 +126,12 @@
 
 ## 输出格式
 
-将审查报告写入 `/review/storybuilding.md`，必须严格遵循以下格式：
+将审查报告写入 `/review/storybuilding.md`，必须严格遵循以下格式。
+
+**写入规则**：`/review/storybuilding.md` 是覆盖式产物（每次审查都重写同一文件）。
+- 初查（文件不存在）：用 `write_file` 创建。
+- 复查（文件已存在）：直接用 `write_file` 写入完整新内容即可，系统已支持对该路径整体覆盖；**不要**反复 `read_file` 后再用 `write_file` 重试同一参数（会触发"文件已存在"且无效）。
+- 若需只改局部，用 `edit_file` 做 old_string→new_string 替换，不要整文件重写。
 
 ```markdown
 # 故事构建审查报告

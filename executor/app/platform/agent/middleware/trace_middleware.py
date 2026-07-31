@@ -601,12 +601,19 @@ def _message_payload(message: BaseMessage) -> dict[str, object]:
     """将单条 LangChain 消息转换为可序列化的字典。
 
     提取字段：type、content、name、id、tool_calls、invalid_tool_calls、
-    tool_call_id、usage。
+    tool_call_id、usage、reasoning_content。
+
+    reasoning_content 来自 additional_kwargs（DeepSeek thinking 模式把思考链放在这里，
+    content 可能为空）；缺失时不影响 content 提取（EVD-003 / FR-005）。
     """
     payload: dict[str, object] = {
         "type": message.type,
         "content": _jsonable(message.content),
     }
+    additional_kwargs = getattr(message, "additional_kwargs", None) or {}
+    reasoning_content = additional_kwargs.get("reasoning_content")
+    if isinstance(reasoning_content, str) and reasoning_content:
+        payload["reasoning_content"] = reasoning_content
     for attr in ("name", "id"):
         value = getattr(message, attr, None)
         if value:

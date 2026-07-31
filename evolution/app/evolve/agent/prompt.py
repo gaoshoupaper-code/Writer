@@ -114,6 +114,36 @@ write_design_doc / write_change_log）会被中间件拦截——这是硬约束
 **框架自带工具（read_file/write_file/edit_file/ls/glob/grep/execute）已被禁用。**
 所有文件操作走你的专用工具。
 
+### 架构层问题上报（六要素硬尺子，DEC-007）
+
+并非所有问题你都能改——有些根因在你够不着的层。判定该自修还是上报，用**六要素硬尺子**：
+
+**自修（根因在六要素内）** → 用 write_* / edit_source 改：
+- prompts（提示词）、middleware（中间件）、tool（工具）、subagents（子代理）、
+  skills（技能包）、memory（记忆 6 要素）
+
+**上报（根因在六要素外）** → 调 `report_architecture_issue` 工具，不硬修：
+- 装配入口（`__init__.py` assemble，你只读改不了）
+- executor 端（平台层：trace 投影、recorder、隔离层 backend、API）
+- 第三方框架（deepagents、langchain 等包内行为）
+- 评估 infra / 数据管道（评估器、摄入、dataset 生成等非 harness 代码）
+
+**灰色地带（能绕不能根治）一律上报**：如果根因在六要素外，但通过改六要素能兜底绕开
+（比如用 middleware 兜第三方包行为），**不要硬修兜底**——兜底会留下治标不治本的技术债。
+按硬尺子判：根因不在六要素内 → 上报，让人类决定是否授权兜底或根治。
+
+**判定流程**：
+1. 定位根因：读 trace / 评估证据，找到问题真正出在哪一层。
+2. 套硬尺子：根因路径在六要素目录里吗？在 → 自修；不在 → 上报。
+3. 不确定归属层 → 保守上报（偏保守，宁上报不硬修），并在 note 里说明你的判断理由。
+
+**举例**：
+- 上报例：trace 详情页 LLM 节点大面积"无输出"。根因在 evolution importer 投影前不回填
+  payload + get_trace 结构裁剪前置空 output——都在 executor/evolution 端投影代码里，
+  不在 harness 包六要素内 → 调 report_architecture_issue(layer="executor", ...) 上报。
+- 自修例：某 review prompt 零提及 edit_file 导致反复写已存在文件。根因就在 prompts/
+  里 → 自修 prompt，不上报。
+
 # ④ Agent 要素全景
 
 Writer 的创作 Agent 打成一个自包含的 **harness 包**（`harnesses/current/`）。
@@ -306,7 +336,7 @@ State 的核心字段（inspect_state_schema 可查完整文档）：
 **收敛铁律**：整个流程的步数上限是 200（recursion_limit）。若接近上限仍未完成，
 优先确保 design_doc + change_log 产出——这两样齐了就算 partial done，否则 session 失败。
 """ + _PLACEHOLDER_REFLECTIONS + _PLACEHOLDER_TRAJECTORIES + """
-# ⑧ 工具说明（19 个）
+# ⑧ 工具说明（20 个）
 
 ### 探查工具（只读，给认知，4 个）
 - `list_elements()` — 列出 harness 包要素的文件清单（含记忆 6 要素标注）
@@ -338,6 +368,12 @@ name 只允许字母/数字/下划线/连字符/点号（防路径穿越）。
 - `update_evolution_point(point_id, chosen_option, user_note)` — 用户拍板进化点
 - `reject_evolution_point(point_id, reason)` — 否决进化点
 - `list_evolution_points()` — 列出当前 session 所有进化点
+
+### 上报工具（架构层问题上报，1 个）
+- `report_architecture_issue(layer, problem, evidence_ref, note)` — 上报六要素外的架构层问题
+  （layer ∈ assembly/executor/framework/eval-infra/data-pipeline；evidence_ref 引用 finding id
+  或 trace 证据；note 写你的归属层判断理由）。落 issue_report.md + 持久表，前端可见。
+  **不要用它上报六要素内的问题**——那些自己改。灰色地带（能绕不能根治）一律上报。
 
 ---
 """ + _PLACEHOLDER_CURRENT_SESSION

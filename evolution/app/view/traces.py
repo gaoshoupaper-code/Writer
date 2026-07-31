@@ -217,16 +217,25 @@ def load_trace_detail(trace_id: str) -> TraceDetail | None:
 
 
 def load_trace_structure(trace_id: str) -> TraceDetail | None:
-    """Project reference-only events without reading governed payload bodies."""
+    """列表/时间线结构视图：返回 run + nodes（含 chain_summary）+ 结构事件。
+
+    FR-004 / EVD-002：投影与结构裁剪分离。chain_summary 在投影里从 event.output
+    提取，若先把 output 置空再投影，LLM 节点会持久化成"(无输出)"。这里先回填正文
+    投影（chain_summary / usage 拿到真实值），再对返回给前端的 events 列表做结构
+    裁剪——节点本身的 chain_summary 是摘要文本，不含正文，无需再裁。正文按需走
+    /events 抽屉懒加载（hydrate_event）。
+    """
     run_row = db.query_one("SELECT * FROM runs WHERE trace_id = ?", (trace_id,))
     if run_row is None:
         return None
     run = _run_summary_from_row(run_row)
-    events = [_structural_event(event) for event in _load_events(trace_id)]
-    projection = projector.TraceProjector().project(run, events)
+    hydrated = [hydrate_event(event) for event in _load_events(trace_id)]
+    projection = projector.TraceProjector().project(run, hydrated)
+    # 返回给前端的 events 做结构裁剪：去掉正文，只留结构与 tool_calls 元数据。
+    structural_events = [_structural_event(event) for event in hydrated]
     return TraceDetail(
         run=run,
-        events=events,
+        events=structural_events,
         nodes=projection.nodes,
         context=[],
         todos=[],

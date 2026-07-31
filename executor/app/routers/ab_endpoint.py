@@ -222,9 +222,10 @@ def run_ab_generation(
 
         # backend 必须绑定到 A/B 临时 workspace（与生产路径 base_service 一致），
         # 否则 MetaAgent 的文件操作工具在错误的根目录找 demand.md，找不到。
-        from app.platform.agent.runtime import FilesystemBackend
+        # 用 OverwritingFilesystemBackend 与生产路径保持一致（DEC-005 方案C / FR-002）。
+        from app.platform.agent.runtime import OverwritingFilesystemBackend
 
-        backend = FilesystemBackend(root_dir=workspace_path, virtual_mode=True)
+        backend = OverwritingFilesystemBackend(root_dir=workspace_path, virtual_mode=True)
         model = build_writer_model(writer_settings)
 
         ctx = RuntimeContext(

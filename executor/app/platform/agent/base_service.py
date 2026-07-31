@@ -25,7 +25,7 @@ from typing import Any
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from app.platform.core.settings import Settings
-from app.platform.agent.runtime import FilesystemBackend
+from app.platform.agent.runtime import OverwritingFilesystemBackend
 from app.schemas.checkpoint import CheckpointMessage, CheckpointState, CheckpointToolCall
 
 
@@ -51,10 +51,15 @@ class BaseAgentService:
 
     # ── workspace backend ────────────────────────────────────
 
-    def _backend_for_workspace(self, workspace_path: Path) -> FilesystemBackend:
-        """构建 workspace 的虚拟文件系统 backend。"""
+    def _backend_for_workspace(self, workspace_path: Path) -> OverwritingFilesystemBackend:
+        """构建 workspace 的虚拟文件系统 backend。
+
+        用 OverwritingFilesystemBackend（DEC-005 方案C / FR-002）：覆盖式产物路径
+        （review/*.md、evaluation.md 等）允许整体覆盖，根治 review/evaluation
+        反复写已存在文件的死循环；其余路径仍走 deepagents 默认"拒覆盖"语义。
+        """
         workspace_path.mkdir(parents=True, exist_ok=True)
-        return FilesystemBackend(root_dir=workspace_path, virtual_mode=True)
+        return OverwritingFilesystemBackend(root_dir=workspace_path, virtual_mode=True)
 
     # ── 多用户隔离：model / checkpointer 解析 ────────────────
 

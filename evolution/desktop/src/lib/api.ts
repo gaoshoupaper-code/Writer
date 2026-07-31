@@ -989,6 +989,20 @@ export interface EvolvePoint {
   created_at: string;
 }
 
+/** 架构层问题上报（evolve_architecture_issues 表，DEC-006 / FR-008） */
+export interface EvolveArchitectureIssue {
+  id: string;
+  session_id: string;
+  seq: number;
+  layer: "assembly" | "executor" | "framework" | "eval-infra" | "data-pipeline";
+  problem: string;
+  evidence_ref: string;
+  note?: string | null;
+  status: "reported" | "acknowledged" | "resolved";
+  report_path?: string | null;
+  created_at: string;
+}
+
 /** 架构蓝图 API 返回（决策 Q） */
 export interface EvolveSystemPrompt {
   blueprint: string; // markdown
@@ -1034,6 +1048,12 @@ export async function getEvolvePoints(
   sessionId: string,
 ): Promise<{ points: EvolvePoint[]; accepted_count: number }> {
   return evoJson(`/api/evolve/sessions/${sessionId}/points`, { method: "GET" });
+}
+
+export async function getEvolveArchitectureIssues(
+  sessionId: string,
+): Promise<{ issues: EvolveArchitectureIssue[]; pending_count: number }> {
+  return evoJson(`/api/evolve/sessions/${sessionId}/architecture-issues`, { method: "GET" });
 }
 
 export async function finalizeEvolve(

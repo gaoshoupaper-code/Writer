@@ -305,7 +305,7 @@ def probe_harness(body: HarnessProbeRequest) -> dict[str, Any]:
 
     from app.platform.agent.git_sync import checkout_commit, cleanup_checkout
     from app.platform.agent.loader import load_package
-    from app.platform.agent.runtime import FilesystemBackend, artifact_capture_scope
+    from app.platform.agent.runtime import OverwritingFilesystemBackend, artifact_capture_scope
     from app.platform.agent.runtime_identity import build_runtime_identity
 
     class _ProbeRecorder:
@@ -332,7 +332,7 @@ def probe_harness(body: HarnessProbeRequest) -> dict[str, Any]:
             workspace = Path(tmp)
             context = RuntimeContext(
                 model=FakeListChatModel(responses=["ok"]),
-                backend=FilesystemBackend(root_dir=workspace, virtual_mode=True),
+                backend=OverwritingFilesystemBackend(root_dir=workspace, virtual_mode=True),
                 checkpointer=None,
                 workspace_path=workspace,
                 trace_id="harness-probe",
