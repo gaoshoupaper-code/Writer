@@ -201,7 +201,16 @@ export default function WorkbenchTab({
         const resp = await getEvolveSessionEventsSince(sessionId, sinceSeq);
         if (cancelled) return;
 
-        // 派发每帧到 handleSseFrame
+        // 事件驱动刷新（对齐 eval 端范式）：只要拉到任意新事件帧，就刷新消息 + 进化点。
+        // 不再依赖后端产出特定的 message_updated 帧——后端 converse round 产出的
+        // step/llm/tool 等任意事件都意味着 Agent 在推进，此时拉一次权威存储即可。
+        // sinceSeq 游标保证不重复处理事件；loadMessages 全量替换 state，天然幂等。
+        if (resp.frames.length > 0) {
+          void loadMessages(sessionId);
+          void loadPoints(sessionId);
+        }
+
+        // 派发每帧到 handleSseFrame（处理 phase/proposal/end/error 等副作用）
         for (const frame of resp.frames) {
           handleSseFrame(sessionId, frame);
         }
@@ -248,33 +257,21 @@ export default function WorkbenchTab({
     switch (frame.type) {
       case "heartbeat":
         break;
-      case "message_updated": {
-        // Agent 落了一条新消息（assistant/tool）到 evolve_messages。
-        // 拉权威存储——前端不维护临时消息，刷新即拿到最新内容。
-        void loadMessages(sessionId);
+      case "message_updated":
+        // 消息刷新已由 poll 的事件驱动统一处理（拉到任意新帧即 loadMessages）。
+        // 此 case 仅作语义标记，无额外副作用。
         break;
-      }
-      case "phase": {
-        // 阶段切换（inspect → conversing → finalizing）
+      case "phase":
+        // 阶段切换（inspect → conversing → finalizing）——立即纠正本地状态。
+        // 消息/进化点刷新已由 poll 统一处理。
         setSelectedStatus(frame.phase);
-        // 切到 conversing 时拉消息（Agent 开场白已落库）+ 进化点。
-        if (frame.phase === "conversing") {
-          void loadMessages(sessionId);
-          void loadPoints(sessionId);
-        }
         break;
-      }
-      case "proposal": {
-        // 进化点状态变更 → 刷浮窗（决策 B/M）+ 刷消息（tool 消息已落库）
-        void loadPoints(sessionId);
-        void loadMessages(sessionId);
+      case "proposal":
+        // 进化点状态变更——浮窗刷新已由 poll 的 loadPoints 统一处理。
         break;
-      }
-      case "finalizing": {
-        // 落地进度事件——后端已把 tool 消息落库，刷消息即可
-        void loadMessages(sessionId);
+      case "finalizing":
+        // 落地进度事件——消息刷新已由 poll 统一处理。
         break;
-      }
       case "log": {
         // 思考日志事件——后端 emit_log 写的 run_meta，未落消息表。
         // 这里不展示（避免与持久化消息重复），日志可去 trace 详情页看。

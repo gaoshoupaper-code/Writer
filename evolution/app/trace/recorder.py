@@ -255,6 +255,76 @@ class EvolutionTraceRecorder:
         )
         return handle
 
+    def resume_run(self, trace_id: str, session_id: str = "") -> bool:
+        """为已存在 DB 记录但内存状态丢失的 trace 重建运行期内存状态。
+
+        场景：进化对话式共创的 converse / finalize round 每次请求都从 DB 重建 ctx
+        （_rebuild_ctx_from_db），复用 inspect round 创建的同一个 trace_id_self。
+        但 recorder 的 _locks / _sequences / _queues 等是纯内存，进程重启后即丢，
+        导致后续 append_business_event 在 _lock_for 抛 KeyError，converse round
+        第一行 emit_log 就崩（实测：run_converse_round 异常退出，message_updated
+        帧永不产出，前端只能靠切换 tab 全量拉消息）。
+
+        本方法让 recorder 对一个「DB 已有、内存未注册」的 trace 重新装填内存状态，
+        使 append_event 能继续写事件（sequence 从 DB 当前最大值续上，不冲突）。
+
+        幂等：trace 内存状态已存在时直接返回 True（不重复初始化，防并发双调覆盖 seq）。
+        trace 在 DB 不存在时返回 False（无法凭空 resume，调用方据日志排查）。
+
+        Args:
+            trace_id:  要恢复的 trace id（须已在 runs 表存在）
+            session_id: 对应 session id（重建 session_id→trace_id 映射用，可空）
+        Returns:
+            True 已恢复（或本来就活跃）；False trace 在 DB 不存在，无法恢复
+        """
+        # 幂等：内存状态已注册，说明 trace 当前活跃，无需 resume。
+        if trace_id in self._locks and trace_id in self._sequences:
+            return True
+
+        # 确认 trace 在 DB 存在（防凭空 resume 一个不存在的 trace）。
+        row = db.query_one(
+            "SELECT trace_id, started_at, run_purpose, workload FROM runs WHERE trace_id=?",
+            (trace_id,),
+        )
+        if row is None:
+            logger.warning(
+                "resume_run: trace %s 在 runs 表不存在，无法恢复内存状态", trace_id,
+            )
+            return False
+
+        # sequence 从 DB 当前最大值续上（避免与已落盘事件 sequence 冲突）。
+        seq_row = db.query_one(
+            "SELECT COALESCE(MAX(sequence), 0) AS max_seq FROM event_payloads WHERE trace_id=?",
+            (trace_id,),
+        )
+        max_seq = (seq_row or {}).get("max_seq", 0) or 0
+
+        # 重建 create_run 初始化的全部运行期内存状态（与 _cleanup_run_state 对称）。
+        started_at = datetime.fromisoformat(row["started_at"]) if row.get("started_at") else datetime.now(UTC)
+        self._locks[trace_id] = RLock()
+        self._sequences[trace_id] = int(max_seq)
+        self._queues[trace_id] = asyncio.Queue()
+        # 进程重启后无法还原原始 monotonic 起点——用 0 占位，duration_ms 会从重启点算起，
+        # 仅影响「运行时长」展示精度，不影响事件写入正确性。
+        self._started_monotonic[trace_id] = time.perf_counter()
+        self._wal_paths[trace_id] = self._wal_path(trace_id, started_at)
+        self._wal_paths[trace_id].parent.mkdir(parents=True, exist_ok=True)
+        self._run_purposes[trace_id] = row.get("run_purpose") or ""
+        workload = row.get("workload")
+        self._run_workloads[trace_id] = workload if workload else _workload_for_purpose(row.get("run_purpose") or "")
+        self._run_links[trace_id] = []
+        self._run_external_refs[trace_id] = {}
+        self._increment_states[trace_id] = IncrementState()
+        from app.trace.differ import NodeSnapshotDiffer
+        self._differs[trace_id] = NodeSnapshotDiffer()
+        if session_id:
+            self._session_trace[session_id] = trace_id
+
+        logger.info(
+            "resume_run: trace %s 内存状态已恢复（从 seq=%d 续写）", trace_id, max_seq,
+        )
+        return True
+
     # trace 稳定性重构：session_type → (表名, 主键列名) 映射。
     # manual_tests 不在此表——测试用 executor 跑 trace，evolution 端不自观测录像。
     _SESSION_TABLE_MAP: dict[str, tuple[str, str]] = {

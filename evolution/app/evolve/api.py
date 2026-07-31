@@ -1044,6 +1044,20 @@ async def send_message(session_id: str, req: EvolveMessageRequest) -> dict[str, 
             detail=f"重建 ctx 失败（session {session_id} 缺 eval_ref 或评估报告）",
         )
 
+    # 通知前端"用户消息已落库"（前端轮询拉到 message_updated 帧即调 loadMessages，
+    # 把乐观消息替换为权威消息）。_rebuild_ctx_from_db 已 resume trace 内存状态，
+    # 此处同步写——必须在启动 task 之前，否则前端要等 Agent 回复才能看到刷新。
+    if ctx.recorder and ctx.trace_id_self:
+        try:
+            ctx.recorder.append_business_event(
+                ctx.trace_id_self, tool="message_updated", status="user",
+            )
+        except Exception:
+            logger.exception(
+                "session %s: 写用户消息 message_updated 失败（不阻断 converse）",
+                session_id,
+            )
+
     # 启动 converse round（不传整条对话历史——LangGraph 通过 thread_id 从 checkpoint 取）
     from app.evolve.agent.agent import run_converse_round
     task = asyncio.create_task(_run_round_bg(ctx, run_converse_round, req.content))
@@ -1159,6 +1173,7 @@ def _rebuild_ctx_from_db(session_id: str) -> EvolveContext | None:
                 "findings": eval_dossier.get("findings"),
                 "report_md": eval_dossier.get("report_md"),
             }
+            _ensure_trace_resumed(ctx)
             return ctx
         except HTTPException:
             # 评估卷宗丢失（级联删除等），降级到旧链路重建（向后兼容）
@@ -1182,7 +1197,30 @@ def _rebuild_ctx_from_db(session_id: str) -> EvolveContext | None:
             if not ctx.trace_id:
                 ctx.trace_id = ev.get("trace_id") or ""
 
+    _ensure_trace_resumed(ctx)
     return ctx
+
+
+def _ensure_trace_resumed(ctx: EvolveContext) -> None:
+    """重建 ctx 后，确保 recorder 对 trace_id_self 的内存状态已注册。
+
+    converse / finalize round 每次请求都从 DB 重建 ctx，复用 inspect round 创建的
+    同一个 trace_id_self。但 recorder 的 _locks/_sequences 是纯内存，进程重启即丢，
+    导致 append_business_event 抛 KeyError（converse round 第一行 emit_log 就崩，
+    message_updated 帧永不产出 → 前端只能靠切换 tab 全量拉消息）。
+
+    resume_run 幂等：trace 内存状态已存在时 no-op，所以 inspect round 首次 create_run
+    后再调也安全。
+    """
+    if ctx.recorder and ctx.trace_id_self:
+        try:
+            ctx.recorder.resume_run(ctx.trace_id_self, ctx.session_id)
+        except Exception:
+            # resume 失败不应阻断请求——但要让运维看到（后续 emit 会抛 KeyError 暴露）。
+            logger.exception(
+                "resume_run 失败 session=%s trace=%s",
+                ctx.session_id, ctx.trace_id_self,
+            )
 
 
 async def _cleanup_checkpoint(session_id: str) -> None:
