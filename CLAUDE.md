@@ -1,9 +1,6 @@
-# AGENTS.md
+# CLAUDE.md
 
-## 内部思考
-多想一步，考虑的更全面一些
-
-## 文档同步铁律
+## 文档同步铁律（最高优先级）
 
 **必须遵守**：任何开发任务（写新功能 / 修 bug / 重构 / 改配置）收尾前，**必须**执行
 下方的【文档同步自检清单】。**未执行完不得宣告任务完成。**
@@ -18,23 +15,38 @@
 
 ```
 docs/
-├── README.md                       ← 系统全景入口（给产品负责人的通俗版 + 下钻到心智模型图）
-├── 系统心智模型.md                  ← ★ 系统唯一文档真相源 ★
-│                                     7 张 Mermaid 图分层下钻：
-│                                     图1 系统总览 / 图2-4 三端请求流 / 图5-7 三机制深潜
-├── deployment.md                    ← 部署细节
-└── (executor/evolution/frontend/文件大地图.md + 架构分层图.md + likec4/ 已废弃归档，不再维护)
+├── README.md                       ← 系统全景（整个系统一张图 + 三大端下钻入口）
+├── executor/文件大地图.md           ← executor 每个文件（目录树+作用，含 writing 域全部文件）
+├── evolution/文件大地图.md          ← evolution 每个文件（目录树+作用）
+├── frontend/文件大地图.md           ← frontend 每个文件（目录树+作用）
 ```
-**核心约定**：`docs/系统心智模型.md` 是看全局的唯一地图——按**系统协作 + 请求流转 + 机制深潜**
-组织，不是按文件组织。改了系统的任何机制/流转/组件，必须同步对应的那张图。
-具体改哪张图：
-- 改了三端协作关系 / 外部依赖 → 图 1 系统总览
-- 改了 executor 的请求流 / 分层 / 路由 → 图 2 executor 端级
-- 改了 evolution 的摄入流 / 进化闭环 / 发版 → 图 3 evolution 端级
-- 改了前端结构（Web/桌面/官网）→ 图 4 前端
-- 改了 memory 收集/入图/回填 → 图 5 memory 闭环
-- 改了 harness 中间件组装/执行 → 图 6 harness 中间件
-- 改了 writing 装配/subagent/review-revise → 图 7 writing 流程
+**核心约定**：三大端的"文件大地图"是看全局的地图——按真实目录树组织，
+每个文件标两三句精炼作用。改了某端的文件，必须同步该端的文件大地图。
+
+### 文档同步自检清单（每个任务收尾必走）
+
+**第 1 步：列出本次改了哪些文件**
+把所有被改动 / 新增 / 删除的文件列出来。
+
+**第 2 步：把改动文件映射到 docs/ 对应篇目**
+按下表判断每处改动该检查哪篇文档：
+
+| 改动类型 | 该检查 |
+|---------|--------|
+| 改了 executor 任何文件 | `docs/executor/文件大地图.md` |
+| 改了 evolution 任何文件 | `docs/evolution/文件大地图.md` |
+| 改了 frontend 任何文件 | `docs/frontend/文件大地图.md` |
+| 改了系统级结构（跨端、顶层目录、main.py） | `docs/README.md`（系统全景） |
+| 改了 writing 域编排逻辑/流程 | `docs/executor/文件大地图.md`（写作流水线分组） |
+| 改了 writing 域支撑组件（风格/护栏/服务/工具） | `docs/executor/文件大地图.md`（写作流水线分组） |
+| 新增/删除/改了某文件本身的职责 | 该端的**文件大地图.md 必须更新** |
+| 只改了提示词内容（prompts/*.md）或技能内容（skills/） | 通常无需改 docs（内容非结构）；**除非增删整个文件 → 更新文件大地图** |
+
+**第 3 步：对每篇该检查的文档，标注三态之一**
+
+- `已更新`：你同步了文档内容，使其反映本次改动。
+- `无需更新`：你确认过，本次改动不影响该篇（即使代码变了，文档描述仍准确）。
+- `待补`：需要更新但本次没做完——**必须说明原因**，不能默默放过。
 
 ### 收尾汇报（D6）
 
@@ -42,46 +54,24 @@ docs/
 "本次更新了 docs/ 下：[文件名列表]"（或"无需更新"）。
 让用户知道文档动了哪，可随时抽查。
 
----
+### 写作规范（更新文档时遵守）
 
-## 部署与验证流程
-
-**开发完成后先 push 到仓库，然后由 agent 自己 SSH 上服务器执行部署命令，不要让用户手动操作。本机对服务器已有 SSH 权限，直接 `ssh writer` 即可。** 本地不看效果。
-
-- 本地不跑效果验证；push 后 agent 自己 SSH 上服务器拉代码、重建服务、直接观测线上行为。
-- 部署完成后 agent 自己去线上确认本次改动是否符合预期，若不符合再迭代，不要把验证也甩给用户。
-
-### 收尾自部署（D-部署）
-
-每次开发任务收尾时，**必须**先确认已 push，然后 agent 自己 SSH 上服务器执行部署命令。**禁止把命令丢给用户手动跑**——执行权和验证权都在 agent 这边。
-
-**原则：只部署本次实际改动的服务，不要无脑全量重建。**
-- 改了 `website` → 部署 website
-- 改了 `executor` → 部署 executor
-- 改了 `evolution` → 部署 evolution
-- 改了 `desktop`（桌面端）→ 桌面端不走 docker，跳过，另行说明打包/发布方式
-
-**执行流程**（按本次改动保留对应服务段，删掉没改的；agent 自己在终端里跑，不要贴给用户）：
-
-```bash
-# 1. 本地：先 push 代码
-
-# 2. SSH 登录服务器（deploy 用户，22222 端口，已配置 ssh writer，本机有权限）
-ssh writer
-
-# 3. 服务器上：拉最新代码
-cd ~/Writer && git pull
-
-# 4. 重建并重启【本次改动】的服务 —— 只跑动了的，别全量
-docker compose build --no-cache website      # 仅 website 改了才跑
-docker compose up -d website
-
-docker compose build executor                # 仅 executor 改了才跑
-docker compose up -d executor
-
-docker compose build evolution               # 仅 evolution 改了才跑
-docker compose up -d evolution
-```
+- **活文档**：只写"现在的样子"，不写"本次改了什么"。不记 changelog。
+- **语言风格：白话但不口语化**。用直白易懂的表述讲清楚逻辑，但保持书面语的专业感——
+  避免口水话、网络用语、随意感叹（不要"其实吧""超级""哦"这类词）。
+- **大白话逻辑为主**：正文用直接陈述 + 因果逻辑 + 层次递进（"X 做 A，产出 B，传给 Y 做 C"），语言精炼不说冗余过度的词语。
+- **术语括号注释**：专业术语**第一次出现时**括号注大白话，
+  如"路由（router，就是分发请求的交警）"。同篇重复出现不再注。
+- **尽量少用类比**：类比只在纯逻辑实在讲不清时偶尔用一处，不作为主要表达手段。
+- **文件级掌控（L2 颗粒度）**：文件地图里每个文件的作用**至少写两三句话**——
+  要说清它**干什么 + 为什么需要它 / 在流程里解决什么问题**，不能只一句话带过。
+  不列 `__init__.py`（仅为 Python 包标记，无业务逻辑）。
+- **文件大地图用卡片式（重要范式）**：三大端的文件大地图用"分区卡片"组织，不是 ASCII 目录树。
+  规范：每个逻辑分组（按目录或按职责）= 一张卡片，卡片之间用 `---` 分隔；每张卡片顶部用
+  `> **这组管什么**：...` 一句话说清该组的定位；下面是该组的文件表（列：文件/行数/作用）。
+  大文件（如 meta/agent.py 1161 行、projector.py 900 行）在作用描述里点明体量和重要性。
+  每张大地图末尾附"文件体量速览"条形图，让大头一眼可见。
+- **不自造结构**：严格按"文档结构"的层级和命名，不随意新建文档。
 
 ---
 
@@ -159,28 +149,6 @@ For multi-step tasks, state a brief plan:
 Strong success criteria let you loop independently.
 Weak criteria ("make it work") require constant clarification.
 
-## 5. 零技术债，代码更健壮
-
-**写代码不留技术债——功能干净落地，而不是"先这样后面再说"。**
-
-技术债不是"以后再说"，是**现在就还**：每一处妥协都会变成下一次改动的陷阱。
-
-**不留债：**
-- 不写 TODO / FIXME / "临时方案" / 跳过的边界条件当成交付。要写就写对，要么明确标注并当任务跟踪，绝不静默溜过去。
-- 不留"先这样能用就行"的脆弱写法——空 catch、吞异常、魔法数字、隐式依赖、硬编码路径，这些当下省 10 分钟，日后还 10 小时。
-- 不留死代码、注释掉的代码、重复逻辑、无人调用的函数。**不干活的东西就删掉**，留着只会让读者怀疑它还有用。
-- 改动产生的孤儿（未用的 import / 变量 / 函数 / 不再触发的分支）当场清理，不留给下一个人。
-
-**写得更健壮：**
-- 对**真实存在的失败路径**有处理：外部输入、网络、文件、并发、空值——该校验校验，该降级降级，该报错就报错并带清楚信息。但不为不可能发生的情况写防御代码。
-- 错误信息要让接手的人能定位问题：说什么错在哪、上下文是什么，而不是一句 `失败` 或裸 stack。
-- 函数职责单一，命名说人话，让人读代码不用逆向工程。
-
-**自检三问（每次提交前过一遍）：**
-1. 这段代码里有"先这样后面再说"吗？有就现在解决。
-2. 我这次改动留下了死代码 / 孤儿 / 脆弱点吗？有就清掉。
-3. 换个人接手这段代码，他能看懂、能放心改吗？不能就再打磨。
-
 ---
 **These guidelines are working if:** fewer unnecessary changes in diffs,
 fewer rewrites due to overcomplication, and clarifying questions come
@@ -192,8 +160,8 @@ before implementation rather than after mistakes.
 如果有不清楚的，或有必要的话，去查阅官网文档https://docs.langchain.com/oss/python/deepagents/overview
 使用中文思考回答
 
-## 智能体功能开发
-做智能体功能时，优先参考工业成熟 Agent 工程（Claude Code、Cursor、Codex、Hermes、OpenClaw 等）。
+## 云服务器
+111.228.4.165
 
 
 ## Coding & Interaction Style
@@ -217,3 +185,4 @@ Please adhere to the following rules based on the task:
 - **Direct First:** Start with a clear, direct answer or definition.
 - **Mental Models:** If the concept is abstract, complex, or low-level, use simple, real-world analogies to make it intuitive.
 - **Check for Clarity:** End your explanation by asking if the analogy made sense or if I need you to break down a specific part further.
+
