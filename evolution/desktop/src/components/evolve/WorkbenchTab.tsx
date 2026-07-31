@@ -207,6 +207,15 @@ export default function WorkbenchTab({
         }
         sinceSeq = resp.max_seq;
 
+        // 用后端权威 session_status 纠正本地 selectedStatus（防 phase 帧丢失导致
+        // 状态漂移——漂移到非 conversing 会让输入框 + 拍板按钮误禁用）。
+        // 函数式更新避免闭包里的 selectedStatus 陈旧。参考 evaluation.tsx 范式。
+        if (resp.session_status) {
+          setSelectedStatus((prev) =>
+            prev !== resp.session_status ? resp.session_status : prev,
+          );
+        }
+
         // has_more=true：事件积压（罕见，重构后事件密度低），立即续拉。
         if (resp.has_more) {
           timer = setTimeout(poll, 0);

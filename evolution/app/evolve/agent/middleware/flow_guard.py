@@ -85,8 +85,12 @@ class FlowGuardMiddleware(AgentMiddleware):
             return (
                 f"当前是对话共创阶段（conversing），不能调用 {tool_name}——"
                 f"这是落地工具，会修改 harness 源码或产出落地文档。"
-                f"请先通过 propose_evolution_point 提出改进点，等用户在对话中拍板"
-                f"（accepted 至少一个进化点）后，由用户触发 finalize 进入落地阶段。"
+                f"请先通过 propose_evolution_point 提出改进点，等用户在界面浮窗里"
+                f"采纳（accepted 至少一个进化点）后，由用户点击界面上的"
+                f"「确认全部进化点，开始落地」按钮触发拍板进入落地阶段。"
+                f"注意：用户在对话里发'finalize'/'开始落地'文字是不会触发的，"
+                f"若用户这么说，请引导他去点界面按钮。拍板后系统会自动给你派发"
+                f"落地任务（带 design_doc），你无需等待文字指令。"
             )
         return None
 
