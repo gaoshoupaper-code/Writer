@@ -41,7 +41,17 @@ logger = logging.getLogger("evolution.evolve.agent")
 
 def _start_evolution_trace(ctx: EvolveContext, endpoint: str) -> None:
     """为一次进化工作流创建唯一 Trace；后续对话与落地轮次复用它。"""
+    # [诊断] 确认守卫命中情况
+    logger.warning(
+        "[诊断] _start_evolution_trace 入口: session=%s recorder=%s trace_id_self=%r",
+        ctx.session_id, ctx.recorder is not None, ctx.trace_id_self,
+    )
     if not ctx.recorder or ctx.trace_id_self:
+        logger.warning(
+            "[诊断] _start_evolution_trace 提前 return: session=%s 原因=%s",
+            ctx.session_id,
+            "no_recorder" if not ctx.recorder else "trace_id_self_already_set",
+        )
         return
     evaluation_trace_id = str(ctx.eval_dossier.get("evaluation_trace_id") or "")
     handle = ctx.recorder.create_run(
@@ -62,6 +72,11 @@ def _start_evolution_trace(ctx: EvolveContext, endpoint: str) -> None:
         },
     )
     ctx.trace_id_self = handle.trace_id
+    # [诊断] 确认赋值成功
+    logger.warning(
+        "[诊断] _start_evolution_trace 已赋值: session=%s trace_id_self=%s",
+        ctx.session_id, ctx.trace_id_self,
+    )
     try:
         add_lineage(
             "trace", ctx.trace_id_self, "consumes",
@@ -100,6 +115,12 @@ async def _run_agent_streamed(
     """
     from app.evolve.agent.event_sink import EvolveEventSink
     from app.evolve.evolve_repo import EvolveMessagesRepo
+
+    # [诊断] 进入流式循环前确认 ctx.trace_id_self
+    logger.warning(
+        "[诊断] _run_agent_streamed 入口: session=%s recorder=%s trace_id_self=%r",
+        ctx.session_id, ctx.recorder is not None, ctx.trace_id_self,
+    )
 
     sink = EvolveEventSink(session_id=ctx.session_id)
     agent_events = agent.astream_events(
@@ -238,6 +259,11 @@ def _emit_notification_frame(ctx: "EvolveContext", frame: dict[str, Any]) -> Non
     token 流（model_stream）完全移除。
     """
     if not (ctx.recorder and ctx.trace_id_self):
+        # [诊断] 守卫命中：暴露为什么 message_updated 没写
+        logger.warning(
+            "[诊断] _emit_notification_frame 守卫 return: session=%s recorder=%s trace_id_self=%r frame_type=%s",
+            ctx.session_id, ctx.recorder is not None, ctx.trace_id_self, frame.get("type"),
+        )
         return
 
     frame_type = frame.get("type")
@@ -252,6 +278,10 @@ def _emit_notification_frame(ctx: "EvolveContext", frame: dict[str, Any]) -> Non
             tool="message_updated",
             status="assistant",
         )
+        logger.warning(
+            "[诊断] _emit_notification_frame 已写 message_updated(assistant): session=%s trace=%s",
+            ctx.session_id, ctx.trace_id_self,
+        )
         return
 
     if frame_type == "tool_output":
@@ -263,6 +293,10 @@ def _emit_notification_frame(ctx: "EvolveContext", frame: dict[str, Any]) -> Non
             tool="message_updated",
             status="tool",
             tool_name=tool_name,
+        )
+        logger.warning(
+            "[诊断] _emit_notification_frame 已写 message_updated(tool): session=%s trace=%s tool=%s",
+            ctx.session_id, ctx.trace_id_self, tool_name,
         )
         return
 
