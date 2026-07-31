@@ -266,6 +266,10 @@ class EvolvePointsRepo:
                 recommendation, note, now,
             ),
         )
+        # 进化点一对一归属（需求 20260731 REQ-01.3/DEC-20/AC-33）：
+        # 表达"为什么提出该计划"，与是否采纳无关。从 problem 文本解析 finding 引用，
+        # 反查该 session 绑定评估卷宗的问题实例。解析不到不阻断 propose（可后续治理补录）。
+        _try_assign_point_ownership(point_id, session_id, problem)
         return {
             "id": point_id,
             "session_id": session_id,
@@ -430,6 +434,57 @@ class EvolvePointsRepo:
             "design_ref": row.get("design_ref"),
             "created_at": row["created_at"],
         }
+
+
+def _try_assign_point_ownership(point_id: str, session_id: str, problem_text: str) -> None:
+    """尽力登记进化点归属（REQ-01.3/DEC-20/AC-33），解析不到不阻断。
+
+    从 problem 文本解析 finding 引用（f01/f02…），反查该 session 绑定评估卷宗的
+    问题实例。若该实例已确认归并到某标准问题，则把进化点归属到该标准问题；
+    否则只记 source_instance_id（待治理补录 problem_id）。始终不抛错。
+
+    一个进化点只能归属一个目标问题（DEC-20/AC-33）——取首个解析到的 finding。
+    """
+    import logging
+    import re
+
+    log = logging.getLogger("evolution.evolve.points")
+    try:
+        if not problem_text:
+            return
+        # 匹配 finding 引用：f01 / f02 / finding f03 等（大小写不敏感）
+        matches = re.findall(r"\bf(0?\d{1,3})\b", problem_text, re.IGNORECASE)
+        if not matches:
+            return
+        finding_id = f"f{int(matches[0]):02d}"  # 规范化为 f01 形式
+
+        # session → 绑定评估卷宗（evolve_sessions 业务键是 session_id，非自增 id）
+        session = db.query_one(
+            "SELECT bound_eval_dossier_id FROM evolve_sessions WHERE session_id=?",
+            (session_id,),
+        )
+        if not session or not session.get("bound_eval_dossier_id"):
+            return
+        dossier_id = session["bound_eval_dossier_id"]
+
+        # 评估卷宗 → 问题实例
+        from app.problem_kb import repo as pk_repo
+        instance = pk_repo.get_instance_by_finding(dossier_id, finding_id)
+        if not instance:
+            return
+        instance_id = instance["instance_id"]
+
+        # 实例 → 已确认归并的标准问题（若有）
+        link = pk_repo.get_link_for_instance(instance_id)
+        problem_id = link["problem_id"] if link else None
+
+        pk_repo.assign_ownership(
+            point_id=point_id,
+            problem_id=problem_id,
+            source_instance_id=instance_id,
+        )
+    except Exception:
+        log.exception("进化点归属登记异常 point=%s（已忽略）", point_id)
 
 
 __all__ = ["EvolveMessagesRepo", "EvolvePointsRepo"]

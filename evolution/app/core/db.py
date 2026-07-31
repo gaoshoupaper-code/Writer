@@ -473,6 +473,111 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_evdo_source ON evaluation_dossiers(source_dossier_id);
             CREATE INDEX IF NOT EXISTS idx_evdo_trace ON evaluation_dossiers(trace_id);
+
+            -- ════════════════════════════════════════════════════════════════
+            -- 问题知识库（一期：历史问题—计划—结果轨迹，需求 20260731_135839）
+            -- 双层模型：不可变问题实例账本（problem_instances）+ 可治理标准问题库（standard_problems）
+            -- 权威存储在本库 SQLite；语义向量/FTS 仅作派生索引，不是事实真源（REQ-09/DEC-11）。
+            -- ════════════════════════════════════════════════════════════════
+
+            -- problem_instances：不可变问题实例账本（REQ-01.1/DEC-01）。
+            -- 每条来自一份 sealed 评估卷宗的一个 finding，保留来源证据/评估/时间/上下文，
+            -- 归并操作不得覆盖或删除该事实。UNIQUE(dossier_id, finding_id) 防重复收录（AC-42）。
+            CREATE TABLE IF NOT EXISTS problem_instances (
+                instance_id         TEXT PRIMARY KEY,           -- 问题实例 id（uuid）
+                dossier_id          TEXT NOT NULL,              -- FK evaluation_dossiers（来源评估卷宗）
+                trace_id            TEXT NOT NULL,              -- FK runs（冗余便于频率统计与筛选）
+                finding_id          TEXT NOT NULL,              -- 评估卷宗内的 finding id（f01/f02…）
+                severity            TEXT NOT NULL,              -- high/medium/low（来自 finding，归并不改写）
+                dimension           TEXT NOT NULL DEFAULT '未分类',  -- 评估维度（协作拓扑/错误保障/资源消耗/内容质量）
+                statement           TEXT NOT NULL,              -- 问题陈述快照（来自 finding.finding，不可变）
+                frozen_evidence_ref TEXT,                       -- JSON：证据引用快照（finding.evidence_ref/evidence），受控回钻边界
+                classification_json TEXT,                       -- JSON：多轴分类 {location:{agent,component,stage}, affected_mechanism, failure_nature, task_scenario}，未知值统一"未分类"（REQ-02/AC-32）
+                raw_description     TEXT,                       -- 原始问题描述（词表无适用类别时保留，REQ-02.4）
+                created_at          TEXT NOT NULL,
+                UNIQUE(dossier_id, finding_id)                  -- 一个卷宗内同一 finding 只收录一次（幂等，AC-42）
+            );
+            CREATE INDEX IF NOT EXISTS idx_pinst_dossier ON problem_instances(dossier_id);
+            CREATE INDEX IF NOT EXISTS idx_pinst_trace ON problem_instances(trace_id);
+            CREATE INDEX IF NOT EXISTS idx_pinst_severity ON problem_instances(severity);
+
+            -- standard_problems：可治理标准问题库（REQ-01.4/DEC-01）。
+            -- 聚合已确认问题实例，承载生命周期、正式频率与历史方案。只有用户确认后才形成（DEC-28）。
+            CREATE TABLE IF NOT EXISTS standard_problems (
+                problem_id          TEXT PRIMARY KEY,           -- 标准问题 id（uuid）
+                title               TEXT NOT NULL,              -- 标准问题标题
+                description         TEXT,                       -- 标准问题描述
+                classification_json TEXT,                       -- JSON：多轴分类（聚合，REQ-02）
+                severity            TEXT NOT NULL DEFAULT '未分类',  -- 聚合严重度高水位
+                lifecycle_status    TEXT NOT NULL DEFAULT '开放',  -- 开放/观察中/已控制/已过时（REQ-08/DEC-07）
+                formal_frequency    INTEGER NOT NULL DEFAULT 0, -- 正式频率：已确认关联的独立 trace 数（REQ-01.5/DEC-09）
+                suspect_count       INTEGER NOT NULL DEFAULT 0, -- 疑似出现数：待确认候选计数（与正式频率分开，REQ-01.5）
+                retrieval_count     INTEGER NOT NULL DEFAULT 0, -- 被检索命中次数（利用率统计，REQ-01.5）
+                created_at          TEXT NOT NULL,
+                updated_at          TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sp_status ON standard_problems(lifecycle_status);
+            CREATE INDEX IF NOT EXISTS idx_sp_severity ON standard_problems(severity);
+
+            -- problem_merge_candidates：候选归并（REQ-03/DEC-05）。
+            -- Agent 判断某实例可能属于某标准问题但未确认；或没有相似历史时提出新标准问题候选。
+            -- 只计入疑似出现，不污染正式频率（REQ-03.5）。非阻塞——失败不丢实例事实（AC-14）。
+            CREATE TABLE IF NOT EXISTS problem_merge_candidates (
+                candidate_id            TEXT PRIMARY KEY,       -- 候选 id（uuid）
+                instance_id             TEXT NOT NULL,          -- FK problem_instances
+                target_problem_id       TEXT,                   -- 目标标准问题（归并已有候选时填；新标准问题候选为 NULL）
+                is_new_problem_proposal INTEGER NOT NULL DEFAULT 0,  -- 1=新标准问题候选（待确认，REQ-03.2/AC-41）
+                match_method            TEXT,                   -- 匹配方法（如 rrf_hybrid/structural_fts）
+                match_model_version     TEXT,                   -- 匹配模型/规则版本（AC-45 可追溯）
+                confidence              REAL,                    -- 置信度 0..1
+                match_evidence          TEXT,                   -- 匹配依据文本（命中的轴/关键词/分数）
+                status                  TEXT NOT NULL DEFAULT 'pending',  -- pending/confirmed/rejected/superseded
+                decided_by              TEXT,                    -- 治理操作者（确认/否决时填）
+                decided_at              TEXT,                    -- 治理时间
+                created_at              TEXT NOT NULL,
+                FOREIGN KEY (instance_id) REFERENCES problem_instances(instance_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cand_status ON problem_merge_candidates(status);
+            CREATE INDEX IF NOT EXISTS idx_cand_target ON problem_merge_candidates(target_problem_id);
+            CREATE INDEX IF NOT EXISTS idx_cand_instance ON problem_merge_candidates(instance_id);
+
+            -- problem_instance_links：已确认归并关系（REQ-01.4）。
+            -- 与候选分离——确认后才写入此表并计入正式频率。UNIQUE(instance_id) 一个实例最多归一个标准问题。
+            CREATE TABLE IF NOT EXISTS problem_instance_links (
+                link_id         TEXT PRIMARY KEY,               -- 链接 id（uuid）
+                instance_id     TEXT NOT NULL UNIQUE,           -- FK problem_instances（一个实例最多一个标准问题）
+                problem_id      TEXT NOT NULL,                  -- FK standard_problems
+                confirmed_by    TEXT NOT NULL,                  -- 确认操作者
+                confirmed_at    TEXT NOT NULL,
+                FOREIGN KEY (instance_id) REFERENCES problem_instances(instance_id),
+                FOREIGN KEY (problem_id) REFERENCES standard_problems(problem_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_link_problem ON problem_instance_links(problem_id);
+
+            -- evolution_point_ownership：进化点一对一归属（REQ-01.3/DEC-20/AC-33）。
+            -- 一个进化点必须且只能归属于一个提出它的目标问题。point_id 即 evolve_points.id（PK 强制一对一）。
+            -- 表达"为什么提出该计划"，与是否采纳无关（accept/reject 不动此表）。
+            CREATE TABLE IF NOT EXISTS evolution_point_ownership (
+                point_id            TEXT PRIMARY KEY,           -- FK evolve_points.id（PK 即 UNIQUE，强制一对一归属）
+                problem_id          TEXT,                       -- 目标标准问题（归属解析不到时为 NULL，可后续治理补录）
+                source_instance_id  TEXT,                       -- 触发该点的 finding 对应问题实例（可空）
+                created_at          TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_epo_problem ON evolution_point_ownership(problem_id);
+
+            -- current_problem_cards：当前问题卡冻结快照（REQ-04.8/DEC-15/AC-27）。
+            -- 历史检索前冻结结构化当前问题分析；后续历史比较只追加不覆盖此快照。
+            CREATE TABLE IF NOT EXISTS current_problem_cards (
+                card_id             TEXT PRIMARY KEY,           -- 卡 id（uuid）
+                session_id          TEXT NOT NULL,              -- FK evolve_sessions
+                instance_id         TEXT,                       -- 关联问题实例（本地分析时可能为空）
+                problem_group       TEXT NOT NULL,              -- 当前问题组 id（同根因/同机制归组，REQ-04.4/AC-28）
+                frozen_snapshot_json TEXT NOT NULL,             -- JSON：问题陈述/直接证据/症状/Agent组件阶段/任务场景/影响严重度/根因假设及置信度/替代解释/未知项（不可变）
+                retrieval_state     TEXT NOT NULL DEFAULT 'frozen',  -- frozen/retrieved/degraded（检索后追加状态）
+                created_at          TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_card_session ON current_problem_cards(session_id);
+            CREATE INDEX IF NOT EXISTS idx_card_group ON current_problem_cards(problem_group);
             """
         )
         conn.commit()
@@ -519,6 +624,8 @@ def init_db() -> None:
         _migrate_evaluation_sessions_mislabeled_index(conn)
         # 历史误标纠正审计表（FR-006/DEC-003/RSK-003：可审计可回滚）
         _migrate_eval_correction_audit_table(conn)
+        # 问题知识库一期：6 张表靠 CREATE IF NOT EXISTS 自补；此处做幂等加列/索引演进（需求 20260731）
+        _migrate_problem_kb_tables(conn)
 
 
 def _migrate_evolve_sessions_driver_fields(conn: sqlite3.Connection) -> None:
@@ -695,6 +802,32 @@ def _migrate_eval_correction_audit_table(conn: sqlite3.Connection) -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_eval_audit_eval ON eval_correction_audit(eval_id)"
+        )
+        conn.commit()
+
+
+def _migrate_problem_kb_tables(conn: sqlite3.Connection) -> None:
+    """幂等迁移：问题知识库一期表演进（需求 20260731_135839）。
+
+    6 张核心表（problem_instances / standard_problems / problem_merge_candidates /
+    problem_instance_links / evolution_point_ownership / current_problem_cards）
+    靠 executescript 内 CREATE IF NOT EXISTS 自补，本函数仅承载未来的加列/索引演进。
+
+    当前职责：确保向量/FTS 派生索引表存在（供 retrieval/store.py 使用）。
+    派生索引不是事实真源，删除重建不影响权威数据（AC-24）。
+    """
+    with _lock:
+        # FTS5 全文索引（标准问题召回）。tokenize=trigram 支持中文子串匹配。
+        # 用 content='standard_problems' 外部内容表，避免数据双写；重建即可恢复。
+        conn.execute(
+            """CREATE VIRTUAL TABLE IF NOT EXISTS standard_problems_fts
+               USING fts5(
+                   problem_id UNINDEXED,
+                   title,
+                   description,
+                   statement,
+                   tokenize='trigram'
+               )"""
         )
         conn.commit()
 

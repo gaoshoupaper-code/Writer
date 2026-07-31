@@ -76,6 +76,14 @@ class Settings(BaseSettings):
     # LangGraph 通过 thread_id 自动恢复对话史。discarded session 删文件清理。
     evolve_checkpoints_dir: str = "data/checkpoints"
 
+    # ── 问题知识库 embedding（一期相似检索，需求 20260731 REQ-04/AC-39）──
+    # 向量重排用智谱 embedding-3（2048 维）。配置留空 → 向量降级，仅用结构化+FTS（AC-26）。
+    # api_key/base_url 默认复用 evolution scope 的 llm_config（同一供应商 key 通常通用），
+    # 也可单独配置。model 固定 embedding-3（与 executor 端对齐）。
+    problem_kb_embed_api_key: str = ""   # 留空则复用 llm_config evolution scope 的 key
+    problem_kb_embed_base_url: str = ""  # 留空则复用 llm_config evolution scope 的 base_url
+    problem_kb_embed_model: str = "embedding-3"
+
     @property
     def _evolution_root(self) -> Path:
         """evolution/ 目录（本文件在 app/core/ 下，上三级是 evolution/）。"""

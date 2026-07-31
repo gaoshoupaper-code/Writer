@@ -168,6 +168,23 @@ def seal_evaluation_dossier(
                     "evidence_dossier", source_dossier_id, "evaluated_by",
                     "score", score_id, conn=conn,
                 )
+            # 问题知识库收录（需求 20260731 REQ-01.2）：与封存同事务。
+            # 把全部 findings 收录为不可变问题实例并触发候选归并。
+            # 非阻塞——ingest 内部整体 try/except，失败不阻断封存（AC-14/AC-46）。
+            try:
+                from app.problem_kb.ingest import ingest_findings_on_seal
+                ingested = ingest_findings_on_seal(
+                    dossier_id=dossier_id,
+                    trace_id=trace_id,
+                    findings=findings,
+                    frozen_evidence=frozen_evidence,
+                    conn=conn,
+                )
+                if ingested:
+                    logger.info("问题实例收录 %d 条 evd=%s", ingested, dossier_id)
+            except Exception:
+                # 双保险：ingest 已自吞异常，这里兜底确保绝不阻断封存
+                logger.exception("问题实例收录异常 evd=%s（已忽略，不阻断封存）", dossier_id)
             conn.commit()
     except SealError:
         conn.rollback()

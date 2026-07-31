@@ -339,6 +339,7 @@ async def build_evolve_agent(ctx: EvolveContext):
         trace_id=ctx.trace_id,
         eval_summary=_format_eval_summary(ctx),
         reflections_summary=_format_reflections(ctx),
+        trajectories_summary=_format_similar_trajectories(ctx),
     )
 
     # middleware：禁框架 fs + 产出约束 + 自观测 trace
@@ -821,6 +822,195 @@ def _format_reflections(ctx: EvolveContext) -> str:
         hit = r.get("hit_count", 0)
         lines.append(f"  • [{r['category']}] (命中{hit}次) {r['pattern'][:120]}")
     return "\n".join(lines)
+
+
+# embedding 调用缓存（同一运行内同一查询文本复用，AC-39）。
+# key = query 文本的 md5，value = embedding 向量。进程级，查询幂等故无 session 隔离必要。
+_embedding_cache: dict[str, list[float]] = {}
+
+
+def _format_similar_trajectories(ctx: EvolveContext) -> str:
+    """相似历史问题轨迹注入（问题知识库一期，REQ-04.9 / DEC-18 / AC-06/30/31）。
+
+    流程：
+      1. 冻结当前问题卡（独立分析锚点，DEC-15）
+      2. 按 problem_group 顺序检索相似标准问题（每组最多 5 个，REQ-04.2/AC-23）
+      3. 深挖≤3 条事实轨迹（REQ-04.5）
+      4. 格式化为文本：标注确认状态/匹配依据/效果验证阶段
+
+    约束（AC-30/31）：只陈述事实，不生成经验对象/等级/推荐。
+    降级（AC-26）：检索失败返回降级说明，不阻塞进化，不表述为"无历史问题"。
+    embedding 复用（AC-39）：同一查询文本复用缓存向量，每组最多 1 次 embedding。
+    """
+    try:
+        from app.problem_kb import current_card, repo as pk_repo
+        from app.problem_kb.retrieval import search as pk_search
+        from app.problem_kb.retrieval.embedder import get_embedder
+        from app.problem_kb.retrieval import store as pk_store
+    except ImportError:
+        return ""
+
+    dossier = ctx.eval_dossier
+    if not dossier or not dossier.get("dossier_id"):
+        return ""
+
+    # 1. 冻结当前问题卡（检索前，DEC-15）
+    cards = current_card.freeze_current_cards(ctx.session_id, dossier)
+    if not cards:
+        # 无 findings 或冻结失败——标准问题库为空时也无从检索
+        return _format_trajectory_empty_note()
+
+    # 2. 按 problem_group 聚合，逐组检索
+    groups: dict[str, list[dict]] = {}
+    for card in cards:
+        groups.setdefault(card["problem_group"], []).append(card)
+
+    embedder = get_embedder()
+    vec_available = pk_store.is_vector_available()
+
+    sections: list[str] = []
+    any_degraded = False
+    for group_key, group_cards in groups.items():
+        # 用该组首张卡的代表陈述作为查询（同组问题同根因）
+        rep_snapshot = group_cards[0]["frozen_snapshot"]
+        query_text = rep_snapshot.get("statement", "")
+        classification = rep_snapshot.get("classification", {})
+
+        # 3. embedding（每组最多 1 次，缓存复用，AC-39）
+        query_vec = None
+        if embedder is not None and vec_available and query_text:
+            cache_key = _embed_cache_key(query_text)
+            if cache_key in _embedding_cache:
+                query_vec = _embedding_cache[cache_key]
+            else:
+                try:
+                    query_vec = embedder.embed_one(query_text)
+                    _embedding_cache[cache_key] = query_vec
+                except Exception:
+                    query_vec = None  # embedding 失败，降级到 FTS+结构化
+
+        # 4. 检索
+        result = pk_search.search_similar_problems(
+            query_text=query_text,
+            query_vec=query_vec,
+            classification=classification,
+            top_k=5,
+        )
+        if result.degraded:
+            any_degraded = True
+
+        section = _format_one_group(group_key, group_cards, result)
+        if section:
+            sections.append(section)
+
+    # 5. 拼装
+    if not sections:
+        return _format_trajectory_empty_note(degraded=any_degraded)
+
+    header = "（按问题组召回相似历史标准问题，仅作事实参考）"
+    if any_degraded:
+        header += "\n注意：部分检索已降级（向量或全文索引不可用），结果可能不完整。"
+    return header + "\n\n" + "\n\n".join(sections)
+
+
+def _embed_cache_key(text: str) -> str:
+    import hashlib
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+def _format_one_group(
+    group_key: str,
+    cards: list[dict],
+    result: "object",
+) -> str:
+    """格式化一个问题组的检索结果（含≤3条事实轨迹深挖，REQ-04.5）。"""
+    mechanism, _, nature = group_key.partition("#")
+    lines = [f"### 问题组：{mechanism} / {nature}"]
+    lines.append(f"当前问题（{len(cards)} 张卡）：")
+    for c in cards[:3]:
+        snap = c["frozen_snapshot"]
+        lines.append(
+            f"  - [{snap.get('severity', '?')}] {snap.get('statement', '')[:80]}"
+            f"（根因假设：{snap.get('root_cause_hypothesis', '')[:50]}，"
+            f"置信度{snap.get('root_cause_confidence', 0):.1f}）"
+        )
+    if len(cards) > 3:
+        lines.append(f"  - …（另 {len(cards) - 3} 张）")
+
+    if result.empty:  # type: ignore[attr-defined]
+        lines.append("  相似历史标准问题：无（该问题组可能是新问题）")
+        return "\n".join(lines)
+
+    lines.append("相似历史标准问题（Top 5，深挖≤3 条事实轨迹）：")
+    from app.problem_kb import repo as pk_repo
+    for i, hit in enumerate(result.hits[:5], 1):  # type: ignore[attr-defined]
+        lines.append(
+            f"  {i}. 【{hit.get('confirmation_status', '?')}】{hit.get('title', '?')}"
+            f"（效果验证：{hit.get('effect_stage', '?')}，"
+            f"已确认实例 {hit.get('evidence_count', 0)}，"
+            f"匹配：{hit.get('match_basis', '')[:60]}）"
+        )
+        # 深挖≤3 条事实轨迹（REQ-04.5）：取该标准问题的已确认实例 + 进化点
+        if i <= 3:
+            trajectory = _dig_trajectory(hit["problem_id"])
+            if trajectory:
+                lines.append(f"     事实轨迹：{trajectory}")
+
+    # 增加检索命中计数（利用率统计，REQ-01.5）
+    for hit in result.hits[:5]:  # type: ignore[attr-defined]
+        try:
+            pk_repo.increment_retrieval(hit["problem_id"])
+        except Exception:
+            pass
+    return "\n".join(lines)
+
+
+def _dig_trajectory(problem_id: str) -> str:
+    """深挖一条标准问题的事实轨迹（REQ-04.5/REQ-10）。
+
+    事实链：问题实例 → 进化点（含备选/决策）→ 效果状态。
+    只陈述事实，不生成经验（AC-30/31）。
+    """
+    from app.problem_kb import repo as pk_repo
+    parts: list[str] = []
+    # 已确认实例摘要（最多 2 条）
+    links = pk_repo.list_links_for_problem(problem_id)
+    if links:
+        import app.core.db as _db
+        instance_ids = [l["instance_id"] for l in links[:2]]
+        placeholders = ",".join("?" * len(instance_ids))
+        instances = _db.query_all(
+            f"SELECT statement, severity, created_at FROM problem_instances "
+            f"WHERE instance_id IN ({placeholders})",
+            tuple(instance_ids),
+        )
+        for inst in instances:
+            parts.append(
+                f"实例[{inst['severity']}] {inst['statement'][:40]}"
+            )
+    # 进化点归属（含 proposed/accepted/rejected 全态）
+    ownerships = pk_repo.list_ownership_for_problem(problem_id)
+    if ownerships:
+        import app.core.db as _db
+        point_ids = [o["point_id"] for o in ownerships[:2]]
+        placeholders = ",".join("?" * len(point_ids))
+        points = _db.query_all(
+            f"SELECT target, status, problem FROM evolve_points "
+            f"WHERE id IN ({placeholders})",
+            tuple(point_ids),
+        )
+        for p in points:
+            parts.append(
+                f"进化点[{p['status']}] 改 {p['target'][:30]}"
+            )
+    return "；".join(parts) if parts else "（无已确认事实轨迹）"
+
+
+def _format_trajectory_empty_note(degraded: bool = False) -> str:
+    """检索无结果时的说明（AC-26：不得表述为"无历史问题"）。"""
+    if degraded:
+        return "（知识检索不可用：向量或全文索引降级，本次未注入历史轨迹）"
+    return "（问题知识库暂无相似历史标准问题；本次问题可能为新问题）"
 
 
 __all__ = [
