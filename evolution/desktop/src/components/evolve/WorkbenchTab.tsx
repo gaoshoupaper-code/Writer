@@ -201,11 +201,15 @@ export default function WorkbenchTab({
         const resp = await getEvolveSessionEventsSince(sessionId, sinceSeq);
         if (cancelled) return;
 
-        // 事件驱动刷新（对齐 eval 端范式）：只要拉到任意新事件帧，就刷新消息 + 进化点。
-        // 不再依赖后端产出特定的 message_updated 帧——后端 converse round 产出的
-        // step/llm/tool 等任意事件都意味着 Agent 在推进，此时拉一次权威存储即可。
+        // 事件驱动刷新：只要 trace 有新事件（max_seq 推进），就刷新消息 + 进化点。
+        // 不依赖后端产出特定的 message_updated 帧——max_seq 推进说明 Agent 在跑
+        // （写 llm/tool/business 事件），此时拉一次权威存储即可拿到最新消息。
+        // 注：业务事件的 input 被 recorder 外化后 event.input 为 null，导致
+        // _trace_event_to_sse 派生出的 frames 可能为空，故以 max_seq 推进为准，
+        // 不以 frames.length 为准（否则永远不刷新）。
         // sinceSeq 游标保证不重复处理事件；loadMessages 全量替换 state，天然幂等。
-        if (resp.frames.length > 0) {
+        const has_new_events = resp.max_seq > sinceSeq;
+        if (has_new_events) {
           void loadMessages(sessionId);
           void loadPoints(sessionId);
         }
