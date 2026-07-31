@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Trace 列表 · Writer 监测{% endblock %}
+{% block content %}
+<h1>Trace 列表 <span class="muted" style="font-size:14px; font-weight:400;">（共 {{ traces|length }} 条）</span></h1>
+
+{# ── 过滤栏 ── #}
+<form class="toolbar" method="get" action="/traces">
+  <select name="workspace">
+    <option value="">所有工作区</option>
+    {% for w in workspaces %}
+    <option value="{{ w }}" {{ 'selected' if filter_workspace == w }}>{{ w }}</option>
+    {% endfor %}
+  </select>
+  <select name="status">
+    <option value="">所有状态</option>
+    <option value="completed" {{ 'selected' if filter_status == 'completed' }}>成功</option>
+    <option value="failed" {{ 'selected' if filter_status == 'failed' }}>失败</option>
+    <option value="running" {{ 'selected' if filter_status == 'running' }}>运行中</option>
+  </select>
+  <button type="submit">筛选</button>
+  <a href="/traces"><button type="button" class="ghost">重置</button></a>
+</form>
+
+<div class="card" style="padding: 0;">
+  {% if traces %}
+  <table>
+    <thead>
+      <tr>
+        <th>Trace ID</th><th>工作区</th><th>状态</th><th>耗时</th>
+        <th>事件数</th><th>Token</th><th>标红</th><th>开始时间</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in traces %}
+      <tr>
+        <td><a href="/traces/{{ t.trace_id }}" class="mono">{{ t.trace_id[:24] }}…</a></td>
+        <td>{{ t.workspace_id }}</td>
+        <td><span class="badge {{ t.status }}">{{ t.status }}</span></td>
+        <td>{{ '%.1f'|format(t.duration_ms / 1000) if t.duration_ms else '--' }}s</td>
+        <td>{{ t.event_count }}</td>
+        <td class="muted">{{ t.token_count if t.token_count is defined else '--' }}</td>
+        <td>
+          {% if t.flag_count > 0 %}<span class="badge flag">{{ t.flag_count }}</span>
+          {% else %}<span class="muted">0</span>{% endif %}
+        </td>
+        <td class="muted">{{ t.started_at[:19].replace('T', ' ') if t.started_at else '--' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">暂无 trace 数据</div>
+  {% endif %}
+</div>
+{% endblock %}

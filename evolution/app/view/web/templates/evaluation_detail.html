@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}评估详情 · {{ run.trace_id[:16] }}{% endblock %}
+
+{% block content %}
+<h1>评估详情</h1>
+<p class="muted mono">{{ run.trace_id }}</p>
+
+{# ── 评估状态 ── #}
+{% if not eval_run %}
+  <div class="card empty">该 trace 尚未评估</div>
+  {% if judge_enabled %}
+  <div class="toolbar">
+    <button onclick="fetch('/api/evaluation/{{ run.trace_id }}',{method:'POST'}).then(()=>location.reload())">触发评估</button>
+  </div>
+  {% else %}
+  <p class="muted">LLM 未配置（JUDGE_MODEL/JUDGE_API_KEY），无法评估</p>
+  {% endif %}
+{% elif eval_run.status != 'done' %}
+  <div class="card">
+    <span class="badge {{ eval_run.status }}">{{ eval_run.status }}</span>
+    {% if eval_run.error %}<p class="muted mono" style="margin-top:8px">{{ eval_run.error }}</p>{% endif %}
+  </div>
+{% else %}
+
+{# ── 双层分数 ── #}
+{% set content_scores = scores|selectattr('layer','equalto','content')|list %}
+{% set subagent_scores = scores|selectattr('layer','equalto','subagent')|list %}
+
+<h2>内容维度（作品好不好看）</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>维度</th><th>分数</th><th>状态</th><th>依据</th></tr></thead>
+    <tbody>
+      {% for s in content_scores %}
+      <tr>
+        <td>{{ s.metric }}</td>
+        <td class="mono" style="font-weight:600">{{ '%.2f'|format(s.score) }}</td>
+        <td>{% if s.score < content_threshold %}<span class="badge flag">badcase</span>{% else %}<span class="badge completed">达标</span>{% endif %}</td>
+        <td class="muted">{{ s.evidence or '-' }}</td>
+      </tr>
+      {% endfor %}
+      {% if not content_scores %}<tr><td colspan="4" class="empty">无内容维度分数（可能无 writing 正文交付物）</td></tr>{% endif %}
+    </tbody>
+  </table>
+</div>
+
+<h2>subagent 维度（各环节能力强弱）</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>环节</th><th>能力维度</th><th>分数</th><th>状态</th><th>依据</th></tr></thead>
+    <tbody>
+      {% for s in subagent_scores %}
+      <tr>
+        <td class="mono">{{ s.target }}</td>
+        <td>{{ s.metric }}</td>
+        <td class="mono" style="font-weight:600">{{ '%.2f'|format(s.score) }}</td>
+        <td>{% if s.score < subagent_threshold %}<span class="badge flag">badcase</span>{% else %}<span class="badge completed">达标</span>{% endif %}</td>
+        <td class="muted">{{ s.evidence or '-' }}</td>
+      </tr>
+      {% endfor %}
+      {% if not subagent_scores %}<tr><td colspan="5" class="empty">无 subagent 维度分数</td></tr>{% endif %}
+    </tbody>
+  </table>
+</div>
+
+{# ── 交付物概要 ── #}
+<h2>交付物概要（评估输入）</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>subagent</th><th>文件数</th><th>总字数</th><th>路径</th></tr></thead>
+    <tbody>
+      {% for agent, info in deliveries.items() %}
+      <tr>
+        <td class="mono">{{ agent }}</td>
+        <td>{{ info.file_count }}</td>
+        <td>{{ info.total_chars }}</td>
+        <td class="muted mono">{{ info.paths|join(', ') }}</td>
+      </tr>
+      {% endfor %}
+      {% if not deliveries %}<tr><td colspan="4" class="empty">未提取到交付物</td></tr>{% endif %}
+    </tbody>
+  </table>
+</div>
+
+<div class="toolbar" style="margin-top:16px">
+  <button onclick="fetch('/api/evaluation/{{ run.trace_id }}',{method:'POST'}).then(()=>location.reload())">重跑评估</button>
+</div>
+
+{% endif %}
+{% endblock %}

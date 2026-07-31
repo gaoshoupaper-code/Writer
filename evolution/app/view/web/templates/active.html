@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}活跃大盘 · Writer 监测{% endblock %}
+{% block content %}
+<h1>活跃大盘</h1>
+<p class="muted" style="margin-bottom:20px;">
+  当前正在运行的 trace（每 5 秒轮询后端，只展示不存储）。
+</p>
+
+{% if not runs %}
+<div class="empty">
+  <p>当前无活跃 trace。</p>
+</div>
+{% else %}
+<div class="card" style="overflow-x:auto;">
+  <table>
+    <thead>
+      <tr>
+        <th>Trace ID</th>
+        <th>Endpoint</th>
+        <th>已运行</th>
+        <th>事件数</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in runs %}
+      <tr>
+        <td class="mono">{{ r.trace_id[:20] }}...</td>
+        <td>{{ r.endpoint }}</td>
+        <td>
+          {% set secs = (r.duration_ms / 1000) | round(1) %}
+          {% if secs > 60 %}
+            <span class="badge failed">{{ (secs / 60) | round(1) }} 分钟</span>
+          {% elif secs > 10 %}
+            <span class="badge flag">{{ secs }} 秒</span>
+          {% else %}
+            {{ secs }} 秒
+          {% endif %}
+        </td>
+        <td>{{ r.event_count }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<p class="muted" style="margin-top:12px;">共 {{ runs|length }} 个活跃 trace</p>
+{% endif %}
+
+<meta http-equiv="refresh" content="10">
+{% endblock %}

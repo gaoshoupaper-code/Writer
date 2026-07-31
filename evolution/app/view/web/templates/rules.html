@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %}规则管理 · Writer 监测{% endblock %}
+{% block content %}
+<h1>规则管理</h1>
+<p class="muted" style="margin-bottom: 16px;">
+  阈值型规则：trace 摄入时自动评估，命中则在 trace 上打标。
+  LLM-judge {% if judge_enabled %}<span class="badge completed">已启用</span>{% else %}<span class="badge failed">未配置</span>{% endif %}
+  发现的可量化异常会生成候选规则，在下方"待审核"区人工审核后生效。
+</p>
+
+{# ── 待审核候选规则（LLM 建议）── #}
+{% if pending %}
+<h2>⏳ 待审核候选规则（{{ pending|length }}）</h2>
+<div class="card" style="padding: 0; margin-bottom: 20px; border-color: var(--orange);">
+  <table>
+    <thead><tr><th>建议规则</th><th>依据</th><th>来源trace</th><th>操作</th></tr></thead>
+    <tbody>
+      {% for r in pending %}
+      <tr>
+        <td class="mono">{{ r.metric }} {{ r.op }} {{ r.threshold }}</td>
+        <td class="muted" style="max-width:300px;">{{ r.evidence or r.description or '' }}</td>
+        <td><a href="/traces/{{ r.source_trace_id }}" class="mono">{{ (r.source_trace_id or '')[:16] }}…</a></td>
+        <td>
+          <button onclick="approveRule({{ r.id }})" style="background:var(--green);">批准</button>
+          <button class="ghost" onclick="rejectRule({{ r.id }})">拒绝</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{# ── 新建规则 ── #}
+<div class="card" style="margin-bottom: 20px;">
+  <h2 style="margin-top: 0;">新建规则</h2>
+  <form class="toolbar" id="createForm" style="align-items: end;">
+    <input type="text" name="name" placeholder="规则名（如：超时）" required style="min-width: 180px;">
+    <select name="metric">
+      <option value="duration_ms">duration_ms（耗时）</option>
+      <option value="status">status（状态）</option>
+      <option value="total_tokens">total_tokens（token总量）</option>
+      <option value="error_count">error_count（错误节点数）</option>
+      <option value="event_count">event_count（事件数）</option>
+    </select>
+    <select name="op">
+      <option value=">">&gt;</option>
+      <option value=">=">&gt;=</option>
+      <option value="<">&lt;</option>
+      <option value="<=">&lt;=</option>
+      <option value="==">==</option>
+      <option value="!=">!=</option>
+    </select>
+    <input type="text" name="threshold" placeholder="阈值（如 120000）" required style="width: 140px;">
+    <button type="submit">添加</button>
+  </form>
+</div>
+
+{# ── 现有规则 ── #}
+<h2>现有规则（{{ rules|length }}）</h2>
+<div class="card" style="padding: 0;">
+  {% if rules %}
+  <table>
+    <thead>
+      <tr><th>ID</th><th>名称</th><th>条件</th><th>命中数</th><th>来源</th><th>启用</th><th>操作</th></tr>
+    </thead>
+    <tbody>
+      {% for r in rules %}
+      <tr data-id="{{ r.id }}">
+        <td>{{ r.id }}</td>
+        <td>{{ r.name }}</td>
+        <td class="mono muted">{{ r.metric }} {{ r.op }} {{ r.threshold }}</td>
+        <td><span class="badge flag">{{ hit_counts.get(r.id, 0) }}</span></td>
+        <td><span class="muted">{{ r.source }}</span></td>
+        <td><span class="badge {{ 'completed' if r.enabled else 'failed' }}">{{ '启用' if r.enabled else '禁用' }}</span></td>
+        <td>
+          <button class="ghost" onclick="toggleRule({{ r.id }}, {{ 0 if r.enabled else 1 }})">{{ '禁用' if r.enabled else '启用' }}</button>
+          <button class="ghost" onclick="deleteRule({{ r.id }})">删除</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">暂无规则</div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.getElementById('createForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = {
+    name: fd.get('name'), metric: fd.get('metric'), op: fd.get('op'),
+    threshold: fd.get('threshold'), enabled: true,
+  };
+  const res = await fetch('/api/rules', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  if (res.ok) { location.reload(); } else { alert('创建失败'); }
+});
+
+async function toggleRule(id, enabled) {
+  await fetch(`/api/rules/${id}`, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({enabled: !!enabled}) });
+  location.reload();
+}
+
+async function deleteRule(id) {
+  if (!confirm('确认删除该规则？')) return;
+  await fetch(`/api/rules/${id}`, { method: 'DELETE' });
+  location.reload();
+}
+
+async function approveRule(id) {
+  const res = await fetch(`/api/rules/${id}/approve`, { method: 'POST' });
+  if (res.ok) { const d = await res.json(); alert('已批准，新增标红 ' + (d.new_flags||0) + ' 条'); location.reload(); }
+  else { alert('批准失败'); }
+}
+
+async function rejectRule(id) {
+  if (!confirm('确认拒绝该候选规则？')) return;
+  await fetch(`/api/rules/${id}/reject`, { method: 'POST' });
+  location.reload();
+}
+</script>
+{% endblock %}
