@@ -1,8 +1,12 @@
-"""报告产出类工具（决策 T4/S14：评估只诊断不提方案）。
+"""报告产出类工具（决策 T4/S14：评估诊断 + 方向性提示）。
 
 评估 Agent 最终一步：组装评分 + 诊断条目 + 证据，封存为不可变评估卷宗
 （evaluation_dossiers 表，阶段 C）。
-铁律：产出里不含任何改进建议/suggestion 字段（那是进化 Agent 方案阶段的活）。
+
+FR-010（S3 翻转）：评估 finding 可含可选 `direction` 字段——"该往哪个方向改"
+的方向性提示（非具体方案）。ABC R 字段 + CRITIC validate-then-correct + Anthropic PBT
+reflection 都是"发现+方向一体"。进化 Agent 消费 direction 作强先验，但仍自己产 design_doc。
+铁律：direction 不含"改评估器/契约代码"的建议（CON-002 不破，防 reward hacking）。
 
 阶段 C 切断：flow_metrics 从证据卷宗 facts 读（B 阶段已冻结），
 不再 load_trace_detail 直读 trace。
@@ -17,22 +21,28 @@ from pydantic import BaseModel, Field
 
 from app.eval_agent import repo as eval_repo
 from app.eval_agent.ctx import get_eval_context
+from app.eval_agent.structural import build_structural_findings
 from app.eval_agent.tools.content import get_content_task_result
 
 logger = logging.getLogger("evolution.eval_agent.tools.report")
 
 
 # write_eval_report 的诊断条目结构（Pydantic schema，取代手写 JSON 字符串）。
-# 注意不含 suggestion 字段——评估只诊断不提方案（改进方案归进化 Agent）。
+# FR-010：可选 direction 字段——方向性提示（非具体方案），不含"改评估器/契约"建议。
 # id 由工具强制生成（f01/f02…），模型无需填写，故 schema 不暴露。
 class EvalFinding(BaseModel):
     """单条评估诊断条目。"""
 
-    dimension: str = Field(description="维度：协作拓扑|错误保障|资源消耗|内容质量")
+    dimension: str = Field(description="维度：协作拓扑|错误保障|资源消耗|内容质量|结构性")
     severity: str = Field(description="严重程度：high|medium|low")
     evidence_type: str = Field(description="证据类型：实证（有trace证据）|推断（基于常识的判断）")
     finding: str = Field(description="问题描述")
     evidence: str = Field(description="trace 证据（节点id/指标值）")
+    direction: str | None = Field(
+        default=None,
+        description="可选：该往哪个方向改的方向性提示（非具体代码方案）。"
+        "不准建议改评估器/契约代码。结构性 finding 尤其建议附 direction。",
+    )
 
 
 def make_report_tools() -> list:
@@ -45,11 +55,11 @@ def make_report_tools() -> list:
         评估只做诊断（评分 + 问题清单 + 证据），不提改进方案（改进方案归进化 Agent）。
 
         Args:
-            findings: 诊断条目列表。每条含 dimension/severity/evidence_type/finding/evidence。
-              注意：不要包含 suggestion/改进建议 字段（评估只诊断不提方案）。
+            findings: 诊断条目列表。每条含 dimension/severity/evidence_type/finding/evidence，
+              可选 direction（FR-010：方向性提示，非具体方案，不准建议改评估器/契约）。
               每条 finding 的 id 由工具强制生成（f01/f02…），你无需填写。
             summary: 自然语言总述（整体评估结论：主要问题在哪、严重程度如何，
-              不要写"该怎么改"）
+              方向性提示可内联，但不要写具体代码方案）
         """
         ctx = get_eval_context()
         if ctx is None:
@@ -58,9 +68,22 @@ def make_report_tools() -> list:
         try:
             # 转 list[dict] 供后续规范化 + 下游封存消费（契约不变）
             findings_dicts: list[dict[str, Any]] = [f.model_dump() for f in findings]
-            # 规范化每条 finding：去 suggestion + 强制重编号 id（进化端 evidence_ref 依赖稳定 id）
+
+            # FR-002：合并结构性维度 finding（确定性，消费证据卷宗 contract_coverage_matrix）。
+            # 即使内容维度全绿，只要契约有 structural_omission 违反，就追加显式 finding
+            # （DEC-008 冲突仲裁：契约优先，不被内容维度全绿覆盖）。
+            # 结构性 finding 自带 evidence_ref=[cv-<key>]（满足 sealer 完整性校验）。
+            dossier = ctx.dossier or {}
+            manifest = dossier.get("manifest") or {}
+            contract_matrix = manifest.get("contract_coverage_matrix") or {}
+            facts = dossier.get("facts") or {}
+            structural = build_structural_findings(contract_matrix, facts)
+            if structural:
+                findings_dicts.extend(structural)
+
+            # 规范化每条 finding：强制重编号 id（进化端 evidence_ref 依赖稳定 id）。
+            # FR-010：保留 direction 字段（不再 pop suggestion——S3 翻转，允许方向性提示）。
             for i, f in enumerate(findings_dicts, 1):
-                f.pop("suggestion", None)
                 f["id"] = f"f{i:02d}"  # 强制覆盖，杜绝 Agent 产出格式不一致
 
             # 取内容分数（后台任务可能已完成）—— 只读访问 content 状态
@@ -88,13 +111,12 @@ def make_report_tools() -> list:
                 content_scores = cr
 
             # 流程硬指标从证据卷宗 facts 读（阶段 C 切断 load_trace_detail 旁路）。
-            # B 阶段已把 topology/reliability/resources 冻结进卷宗 facts。
-            dossier = ctx.dossier or {}
-            facts = dossier.get("facts") or {}
+            # B 阶段已把 topology/reliability/resources/memory 冻结进卷宗 facts。
             flow_metrics = {
                 "topology": facts.get("topology", {}),
                 "reliability": facts.get("reliability", {}),
                 "resources": facts.get("resources", {}),
+                "memory": facts.get("memory", {}),
             }
 
             # 组装 scores（第三期 28 维五级锚点结构）
@@ -120,6 +142,9 @@ def make_report_tools() -> list:
                     lines.append(f"- **类型**：{f.get('evidence_type', '?')}")
                     lines.append(f"- **发现**：{f.get('finding', '')}")
                     lines.append(f"- **证据**：{f.get('evidence', '')}")
+                    direction = f.get("direction")
+                    if direction:
+                        lines.append(f"- **方向**：{direction}")
                     lines.append("")
             report_md = "\n".join(lines)
 
@@ -128,8 +153,7 @@ def make_report_tools() -> list:
             # 封存失败 = 评估失败（R9），抛 SealError 由调用方标 failed。
             from app.eval_agent.sealer import seal_evaluation_dossier, collect_frozen_evidence, SealError
 
-            # 从卷宗拿 owner_user_id（评估卷宗继承证据卷宗血缘）
-            dossier = ctx.dossier or {}
+            # 从卷宗拿 owner_user_id（评估卷宗继承证据卷宗血缘）。dossier 已在上方读取。
             owner_user_id = dossier.get("owner_user_id") or "unknown"
 
             # 阶段 D：冻结 finding 引用的证据片段进评估卷宗（供进化归因，需求 §22）。

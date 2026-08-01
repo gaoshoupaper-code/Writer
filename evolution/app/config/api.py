@@ -35,7 +35,10 @@ logger = logging.getLogger("evolution.config")
 router = APIRouter(prefix="/config", tags=["config"])
 
 # scope 取值约束
-_VALID_SCOPES = ("evolution", "executor")
+# FR-007 判评分离：新增 eval scope。eval agent 的模型配置独立于 evolution scope，
+# 与 writer/evolve 异家族，根治 Preference Leakage（EVD-004）。eval scope 未配置时
+# build_agent_model 降级用 evolution scope（EDGE-005）。
+_VALID_SCOPES = ("evolution", "executor", "eval")
 
 
 def _normalize_scope(scope: str | None) -> str:
@@ -43,7 +46,7 @@ def _normalize_scope(scope: str | None) -> str:
     if scope is None or scope == "":
         return "evolution"
     if scope not in _VALID_SCOPES:
-        raise HTTPException(400, f"scope 非法：{scope}（允许：evolution / executor）")
+        raise HTTPException(400, f"scope 非法：{scope}（允许：evolution / executor / eval）")
     return scope
 
 

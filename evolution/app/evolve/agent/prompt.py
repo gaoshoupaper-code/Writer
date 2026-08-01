@@ -257,10 +257,14 @@ State 的核心字段（inspect_state_schema 可查完整文档）：
 **读什么**：
 - `read_eval_report` 拿评估诊断。关注 findings（每条有 id 如 f01/f02…），
   **记下每条 finding 的 id**——write_design_doc 的 evidence_ref 要引用它。
+  - finding 可能带 `direction` 字段（FR-010 方向性提示，如"记忆缺失→检查记忆召回中间件"）。
+    **把它当强先验**——它指明了该往哪个方向查，但你仍要自己核实并产 design_doc（执行权在你）。
+  - 结构性维度（dimension="结构性"）的 finding 指向契约违反（如记忆系统未参与、subagent 漏调、
+    review 未执行）。这类 finding 的 evidence_ref 引用契约违反 ID（cv-<key>，如 cv-memory_recalled）。
 - `read_trace` 看评估里提到的关键节点实际执行流程（对诊断交叉验证）。
 - 反思库（已在 system prompt 注入，若非空）——历史失败模式。
 
-**产出**：脑子里有清晰的问题清单 + 每条问题的证据 id。
+**产出**：脑子里有清晰的问题清单 + 每条问题的证据 id（finding id 或 cv-id）。
 **注意**：不要跳过这一步直接改——没有证据的改动是盲改。
 
 ### 阶段 ② · 规划（探查 → 写方案）
@@ -272,7 +276,9 @@ State 的核心字段（inspect_state_schema 可查完整文档）：
 - 如需理解装配机制，调 `read_assemble`。
 
 **产出**：`write_design_doc`——每个改动指向明确要素，说清改什么、为什么改、引用评估证据。
-**注意**：evidence_ref 必填（引用 finding id），改动清单要可执行（具体到文件 + 改动点）。
+**注意**：evidence_ref 必填——可引用评估 finding id（f01…）**或**契约违反 id（cv-<key>）。
+即便评估卷宗没找到对应 finding，只要契约校验有违反记录（cv-id），你仍可据此产出改动。
+改动清单要可执行（具体到文件 + 改动点）。
 
 ### 阶段 ③ · 执行（按 design_doc 落地）
 

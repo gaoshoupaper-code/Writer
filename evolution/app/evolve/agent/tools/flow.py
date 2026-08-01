@@ -39,9 +39,18 @@ class DesignChange(BaseModel):
     target: str = Field(description="目标（要素路径，如 middleware/pacing.py 或 prompts/writing_system.md）")
     change_desc: str = Field(description="改什么（描述性）")
     reason: str = Field(description="依据评估证据（自然语言）")
-    evidence_ref: list[str] = Field(description="引用评估 finding 的 id（必填，如 [\"f01\"]）")
+    evidence_ref: list[str] = Field(
+        description="引用证据源的 id（必填）。可引用评估 finding id（f01…）"
+        "或契约违反 id（cv-<key>，如 cv-memory_recalled）。至少一个。"
+    )
     expected_up: str = Field(description="预期涨的方面")
     expected_down: str = Field(description="预期跌的方面（诚实声明）")
+    source_class: str | None = Field(
+        default=None,
+        description="可选：证据可靠度分级（ASM-004）。sealed=强可审计（finding/cv，确定性），"
+        "degradable=弱可审计会衰减（trace 锚点），meta=元证据（变异发现）。"
+        "不填则工具按引用的 id 推断。",
+    )
 
 
 class AppliedRecord(BaseModel):
@@ -147,8 +156,11 @@ def make_flow_tools() -> list:
         Args:
             changes: 改动列表。每条含：
               - target / change_desc / reason / evidence_ref / expected_up / expected_down
-              **evidence_ref 是硬性必填**：每个改动必须引用至少一个评估 finding 的 id，
-              证明"为什么改"。id 格式 f01/f02…，从 read_eval_report 的 findings 里取。
+              **evidence_ref 是硬性必填**：每个改动必须引用至少一个证据源 id，
+              证明"为什么改"。可引用：
+                - 评估 finding id（f01/f02…，从 read_eval_report 的 findings 取）
+                - 契约违反 id（cv-<key>，如 cv-memory_recalled，从结构性 finding 暴露）
+              即便评估无内容 finding，只要契约校验有违反（cv-id），仍可据此产出改动（FR-004）。
             rationale: 自然语言总述（基于评估报告的整体判断，为什么这么改）
         """
         ctx = get_tool_context()
@@ -159,35 +171,63 @@ def make_flow_tools() -> list:
             if not changes:
                 return "changes 不能为空（至少一个改动）"
 
-            # 提取评估报告里的合法 finding id 集合
-            valid_finding_ids: set[str] = set()
+            # FR-004：合法证据源 = 评估 finding id（f01…）∪ 契约违反 id（cv-<key>…）。
+            # cv-id 来自结构性 finding 自己声明的 evidence_ref（FR-002 的结构性 finding
+            # 带 evidence_ref=[cv-<key>]）。这样 cv-id 只有在评估卷宗里真有对应结构性
+            # finding 时才合法——不会出现凭空引用不存在的 cv-id。
             snap = ctx.eval_snapshot or {}
             findings = snap.get("findings") or []
+            valid_finding_ids: set[str] = set()
+            valid_contract_ids: set[str] = set()
             for f in findings:
-                if isinstance(f, dict) and f.get("id"):
+                if not isinstance(f, dict):
+                    continue
+                if f.get("id"):
                     valid_finding_ids.add(str(f["id"]))
+                # 收集这条 finding 自己暴露的 cv-id（结构性 finding 的 evidence_ref）
+                refs = f.get("evidence_ref")
+                if isinstance(refs, str):
+                    refs = [refs]
+                if isinstance(refs, list):
+                    for r in refs:
+                        if isinstance(r, str) and r.startswith("cv-"):
+                            valid_contract_ids.add(r)
+            all_valid_refs = valid_finding_ids | valid_contract_ids
 
-            # 死局短路：评估报告无可用 finding id
-            if not valid_finding_ids:
-                ctx.emit_step("write_design_doc", "failed", reason="no_findings")
+            # FR-004：移除"无 finding 死局短路"。所有证据源都为空才返回死局。
+            # 即：评估无内容 finding 但有契约违反 cv-id 时，进化仍可产出 design_doc（AC-005）。
+            if not all_valid_refs:
+                ctx.emit_step("write_design_doc", "failed", reason="no_evidence_source")
                 return (
-                    "评估报告没有可引用的结构化 finding（findings 为空或无 id）。"
+                    "评估报告没有任何可引用的证据源（既无 finding id 也无契约违反 cv-id）。"
                     "evidence_ref 校验无法满足，无法产出 design_doc。"
                     "这是评估阶段的问题——请结束当前进化，提示重新评估该 trace 后再启动进化。"
                 )
 
-            # Pydantic 已保证字段齐全，这里校验业务约束：evidence_ref 必须引用真实 finding id
+            # Pydantic 已保证字段齐全，这里校验业务约束：
+            # evidence_ref 必须引用真实证据源（finding id 或 cv-id）。
+            # 单源校验失败时报具体哪个源类型，便于 Agent 定位。
             for i, c in enumerate(changes):
                 if not c.evidence_ref:
                     return (
-                        f"changes[{i}] 缺少 evidence_ref：每个改动必须引用至少一个评估 "
-                        f"finding 的 id。请先 read_eval_report 拿到 finding id。"
+                        f"changes[{i}] 缺少 evidence_ref：每个改动必须引用至少一个证据源 id"
+                        f"（finding id 如 f01，或契约违反 id 如 cv-memory_recalled）。"
+                        f"请先 read_eval_report 拿到合法 id。"
                     )
-                bad = [r for r in c.evidence_ref if str(r) not in valid_finding_ids]
+                bad = [r for r in c.evidence_ref if str(r) not in all_valid_refs]
                 if bad:
+                    # 区分 bad 的类型，报具体哪个源校验失败
+                    bad_findings = [r for r in bad if not str(r).startswith("cv-")]
+                    bad_contracts = [r for r in bad if str(r).startswith("cv-")]
+                    parts = []
+                    if bad_findings:
+                        parts.append(f"finding id {bad_findings} 不在评估 finding 列表中")
+                    if bad_contracts:
+                        parts.append(f"契约违反 id {bad_contracts} 不在结构性 finding 暴露的 cv-id 列表中")
                     return (
-                        f"changes[{i}] 的 evidence_ref {bad} 不存在于评估报告的 finding 列表中。"
-                        f"合法 id：{sorted(valid_finding_ids) or '（无）'}。"
+                        f"changes[{i}] 的 evidence_ref 校验失败：{'; '.join(parts)}。"
+                        f"合法 finding id：{sorted(valid_finding_ids) or '（无）'}；"
+                        f"合法 cv-id：{sorted(valid_contract_ids) or '（无）'}。"
                     )
 
             # 转 list[dict] 传给 docs 层（落盘契约不变）

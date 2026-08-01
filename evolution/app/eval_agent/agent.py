@@ -54,8 +54,9 @@ def build_eval_agent(ctx: EvaluationContext):
     # 注入工具上下文（评估专属 contextvar，与进化 ctx 独立）
     set_eval_context(ctx)
 
-    # model（复用 judge 配置）
-    model = build_agent_model(temperature=0.2)
+    # model（FR-007 判评分离：eval agent 用独立 eval scope，与 evolve/writer 异家族，
+    # 根治 Preference Leakage。eval scope 未配置时 build_agent_model 降级用 evolution scope）
+    model = build_agent_model(temperature=0.2, scope="eval")
 
     # 评估专属工具
     tools = make_eval_tools()

@@ -158,6 +158,7 @@ def extract_facts(trace_id: str) -> dict[str, Any]:
         "topology": flow_metrics.get("topology", {}),
         "reliability": flow_metrics.get("reliability", {}),
         "resources": flow_metrics.get("resources", {}),
+        "memory": flow_metrics.get("memory", {}),
         "deliveries": deliveries,
         "artifact_revisions": artifact_revisions,
         "review_artifacts": review_artifacts,

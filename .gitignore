@@ -114,3 +114,8 @@ releases/*
 
 # 桌面端 Tauri 运行时生成的 schema（构建产物）
 desktop/src-tauri/gen/
+
+# 深度调研产物（/require、/deep-research 生成的本地调研报告与中间产物，不上库）
+# 这些目录是需求文档 related: 引用的研究底料，本地保留即可，commit 会污染仓库。
+agent_evo_research/
+agent_evaluation_mechanisms/

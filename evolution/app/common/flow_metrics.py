@@ -1,25 +1,32 @@
 """流程硬指标算子（决策 E10 / D8）。
 
-从 TraceDetail（nodes + events）算三类流程硬指标，供评估子代理诊断。
+从 TraceDetail（nodes + events）算四类流程硬指标，供评估子代理诊断。
 代码从 trace 算，无 LLM 成本，确定性分数。
 
-三类指标（E10）：
+四类指标（E10 + G003）：
   1. 协作拓扑：subagent 调用顺序/次数、委托链深度、并行组数、各 subagent 耗时占比。
      评估「协作流程设计」。
   2. 错误保障：错误率、重试次数、middleware 拦截事件数、HITL 等待次数。
      评估「Middleware 保障」。
   3. 资源消耗：总 token、各阶段 token 分布、重复读同一文件次数。
      评估「Prompt/Skills 效率」。
+  4. 记忆系统（G003）：memory_recall middleware 写的 run_meta 事件计数。
+     记忆系统"本该参与却没参与"是缺失性缺陷的标本案例（EVD-002），需要可数才能
+     做确定性契约校验（FR-001）。注意：成功参与只数 retrieval_ok==True 的事件——
+     degraded/失败路径也写事件（middleware:106/115/119/144），不能只数事件存在。
 
 数据来源：
   - nodes（TraceNode）：agent_role / agent_name / parallel_group_id / depth /
     duration_ms / usage / kind。
   - events（TraceLogEvent）：type / source / tool_name / usage / error。
+  - 记忆埋点：run_meta 事件的 input.memory_quality（TraceMemoryQuality）。
 
 判据来源（E21/E24）：本模块只算指标值（客观），不做"好坏"判断——
 "是否异常"交给评估子代理的 LLM（凭指标值 + 写作常识判断）。
+例外：记忆维度除供 LLM 诊断外，还供 FR-001 确定性契约层直接消费
+（memory_participated 布尔值是契约可判定的客观信号）。
 
-设计依据：设计文档 D8（flow_metrics 自动算注入）/ E10（三类指标）。
+设计依据：设计文档 D8（flow_metrics 自动算注入）/ E10（三类指标）/ G003（记忆可数）。
 """
 from __future__ import annotations
 
@@ -33,7 +40,7 @@ logger = logging.getLogger("evolution.common.flow_metrics")
 
 
 def compute_flow_metrics(detail: TraceDetail) -> dict[str, Any]:
-    """从 TraceDetail 算三类流程硬指标。
+    """从 TraceDetail 算四类流程硬指标。
 
     Args:
         detail: 完整 trace 详情（nodes + events + run summary）
@@ -43,12 +50,14 @@ def compute_flow_metrics(detail: TraceDetail) -> dict[str, Any]:
           "topology": {协作拓扑指标},
           "reliability": {错误保障指标},
           "resources": {资源消耗指标},
+          "memory": {记忆系统参与指标},
         }
     """
     return {
         "topology": _topology_metrics(detail.nodes),
         "reliability": _reliability_metrics(detail.nodes, detail.events),
         "resources": _resource_metrics(detail.nodes, detail.events),
+        "memory": _memory_metrics(detail.events),
     }
 
 
@@ -216,6 +225,53 @@ def _resource_metrics(
         "repeated_read_files": len(repeated_reads),
         "repeated_read_waste": repeated_read_waste,
         "repeated_read_details": repeated_reads,
+    }
+
+
+# ── 4. 记忆系统参与（G003）────────────────────────────────────
+
+
+def _memory_metrics(events: list[TraceLogEvent]) -> dict[str, Any]:
+    """记忆系统参与指标：从 run_meta 的 memory_quality 埋点计数。
+
+    执行端 memory_recall middleware 每次召回写一条 run_meta 事件（input.memory_quality），
+    G003 要让"记忆系统本该参与却没参与"这类缺失性缺陷可数、可做确定性契约校验。
+
+    关键：memory_participated 只看成功召回（retrieval_ok==True）的事件——
+    degraded/失败路径（backend 不健康、健康检查失败、retrieve 抛异常）也写事件，
+    不能只数事件存在，否则"记忆系统挂了"会被误判成"记忆系统参与了"。
+
+    与 dossier/extractor._extract_memory_quality 的关系：两者扫同一批 run_meta 事件，
+    但 extractor 冻结的是逐章明细（entries + 聚合 summary）进 facts.memory_quality；
+    本函数在 flow_metrics 层给出"可数布尔信号"，供评估流程诊断与 FR-001 契约层
+    直接消费 memory_participated。
+
+    Returns:
+        {
+          "memory_recall_events": 写入的 run_meta 事件总数（含失败），
+          "memory_recall_ok": 成功召回次数（retrieval_ok==True），
+          "memory_recall_failed": 失败次数，
+          "memory_participated": 成功召回 ≥1 次（契约可消费的布尔信号），
+          "memory_available": 是否存在任何记忆埋点（含失败，即记忆系统被装配过），
+        }
+    """
+    recall_events = [
+        e for e in events
+        if e.type == "run_meta"
+        and isinstance(e.input, dict)
+        and isinstance(e.input.get("memory_quality"), dict)
+    ]
+    ok_count = sum(
+        1 for e in recall_events
+        if bool(e.input.get("memory_quality", {}).get("retrieval_ok", True))
+    )
+    total = len(recall_events)
+    return {
+        "memory_recall_events": total,
+        "memory_recall_ok": ok_count,
+        "memory_recall_failed": total - ok_count,
+        "memory_participated": ok_count >= 1,
+        "memory_available": total >= 1,
     }
 
 

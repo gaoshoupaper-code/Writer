@@ -432,7 +432,131 @@ def _compute_contract_coverage_matrix(
                 "reason": f"{field} 无法从 demand.md 提取",
             })
 
+    # 4. 结构性 omission 契约（FR-001，确定性）：消费 demand.md 声明的结构性期望 +
+    #    证据卷宗 facts 的客观计数，判 covered/missing/na。这是"缺失性缺陷"检测的确定性兜底层
+    #    （EVD-002 记忆缺失案例的直接解法）。
+    #    命名词汇借 MASFT omission 型（FM-2.4 信息隐匿 / FM-3.2 未验证 / 必要协作缺失），
+    #    但求值是纯布尔/成员/计数判定（CON-003 确定性，0 LLM）。
+    #    契约未声明某期望 → na（不惩罚，EDGE-001 契约盲区诚实记录）；
+    #    契约声明 true 但 facts 不符 → missing（缺失性缺陷，触发 FR-002 结构性 finding）。
+    items.extend(_structural_omission_items(contract_parsed, facts))
+
     return _summarize_matrix(items)
+
+
+def _structural_omission_items(
+    contract_parsed: dict[str, Any], facts: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """结构性 omission 契约项（FR-001 确定性层）。
+
+    三类结构性断言（DEC-001）的确定性求值版：
+      - "必须出现某动作"：memory_recalled / review_executed
+      - "必须经过某路径"：subagents_complete（应参与的 subagent 是否都出现）
+      - "任务结束时某状态必须为真"：（本轮不新增，前两类已覆盖标本案例）
+
+    所有断言的期望值来自 demand.md（人/可信通道维护，CON-002 进化禁写），
+    实际值来自证据卷宗 facts（已冻结），求值纯确定性。
+
+    返回的每条 item 与现有维度同构（dim/key/status/evidence/reason），喂 _summarize_matrix。
+    """
+    items: list[dict[str, Any]] = []
+    expectations = contract_parsed.get("structural_expectations") or {}
+
+    # (a) 记忆系统参与（EVD-002 标本案例：记忆本该出现却没出现）
+    memory_required = expectations.get("memory_required")
+    if memory_required is None:
+        items.append({
+            "dim": "structural_omission", "key": "memory_recalled",
+            "status": "na", "evidence": None,
+            "reason": "demand.md 未声明是否需要记忆系统，不纳入结构性判定",
+        })
+    else:
+        memory_metrics = facts.get("memory") or {}
+        # 优先用 G003 的 flow_metrics.memory.memory_participated；
+        # 兜底用 facts.memory_quality.summary.ok_count（dossier extractor 冻结的逐章明细）。
+        participated = bool(memory_metrics.get("memory_participated"))
+        if not participated:
+            mq_summary = (facts.get("memory_quality") or {}).get("summary") or {}
+            participated = (mq_summary.get("ok_count", 0) >= 1)
+        expected = bool(memory_required)
+        items.append({
+            "dim": "structural_omission", "key": "memory_recalled",
+            "status": "covered" if (participated or not expected) else "missing",
+            "evidence": {
+                "memory_participated": participated,
+                "memory_recall_ok": memory_metrics.get("memory_recall_ok", 0),
+            },
+            "reason": (
+                f"记忆系统成功召回 {memory_metrics.get('memory_recall_ok', 0)} 次"
+                if participated else
+                "契约声明需要记忆系统但 trace 中无成功召回记录（MASFT FM-2.4 信息隐匿）"
+            ),
+        })
+
+    # (b) subagent 齐备性（必要协作缺失检测）
+    expected_subs = expectations.get("expected_subagents")
+    if not expected_subs:
+        items.append({
+            "dim": "structural_omission", "key": "subagents_complete",
+            "status": "na", "evidence": None,
+            "reason": "demand.md 未声明应参与的 subagent 列表，不纳入结构性判定",
+        })
+    else:
+        if not isinstance(expected_subs, list):
+            expected_subs = []
+        # expected_subagents 用短名（与 applicable_stages / deliveries 同口径），
+        # 不能拿 topology.subagent_calls_by_name 的键比（那是带 -subagent 后缀的全名）。
+        # 主信号：deliveries 的 agent 短名集合（必经路径）；辅助：review_chain 的 reviewer。
+        deliveries = facts.get("deliveries") or {}
+        actual_agents = set(deliveries.keys())
+        for rc in (facts.get("review_chain") or []):
+            if isinstance(rc, dict) and rc.get("reviewer"):
+                actual_agents.add(rc["reviewer"])
+        missing_subs = [s for s in expected_subs if s not in actual_agents]
+        items.append({
+            "dim": "structural_omission", "key": "subagents_complete",
+            "status": "missing" if missing_subs else "covered",
+            "evidence": {
+                "expected": expected_subs,
+                "actual": sorted(actual_agents),
+                "missing": missing_subs,
+            },
+            "reason": (
+                f"应参与的 subagent 全部出现：{expected_subs}"
+                if not missing_subs else
+                f"应参与的 subagent 缺失：{missing_subs}（必要协作缺失，MASFT omission）"
+            ),
+        })
+
+    # (c) review 执行（MASFT FM-3.2 未验证）
+    review_required = expectations.get("review_required")
+    if review_required is None:
+        items.append({
+            "dim": "structural_omission", "key": "review_executed",
+            "status": "na", "evidence": None,
+            "reason": "demand.md 未声明是否需要 review，不纳入结构性判定",
+        })
+    else:
+        reliability = facts.get("reliability") or {}
+        review_calls = int(reliability.get("review_calls", 0) or 0)
+        # review_chain 非空也算 review 执行过（reliability.review_calls 依赖 tool_name 含 review，
+        # review 走 subagent 时可能不计入 tool_name，用 review_chain 兜底）
+        if review_calls == 0 and facts.get("review_chain"):
+            review_calls = len(facts.get("review_chain") or [])
+        has_review = review_calls >= 1
+        expected = bool(review_required)
+        items.append({
+            "dim": "structural_omission", "key": "review_executed",
+            "status": "covered" if (has_review or not expected) else "missing",
+            "evidence": {"review_calls": review_calls},
+            "reason": (
+                f"review 执行 {review_calls} 次"
+                if has_review else
+                "契约声明需要 review 但 trace 中无 review 记录（MASFT FM-3.2 未验证）"
+            ),
+        })
+
+    return items
 
 
 def _summarize_matrix(items: list[dict[str, Any]]) -> dict[str, Any]:

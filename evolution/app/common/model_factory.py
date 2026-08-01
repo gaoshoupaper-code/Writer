@@ -50,25 +50,48 @@ def _ensure_gp_disabled() -> None:
     _GP_DISABLED_REGISTERED = True
 
 
-def build_agent_model(*, temperature: float = 0.2) -> BaseChatModel:
+def build_agent_model(*, temperature: float = 0.2, scope: str = "evolution") -> BaseChatModel:
     """构建 Agent 用的 ChatModel（从 llm_config 表读配置）。
 
     Args:
         temperature: 温度（Agent 决策需要一定探索性，默认 0.2）
+        scope: 模型配置作用域。FR-007 判评分离：
+            - "evolution"（默认）：evolve agent 用
+            - "eval"：eval_agent 用，与 evolution 异家族根治 PLS（EVD-004）
+            - "executor"：写作 agent 用（本工厂不直接用，保留）
+            eval scope 未配置时降级用 evolution scope 并警告（EDGE-005，不阻塞）。
 
     Returns:
         BaseChatModel 实例（给 create_deep_agent）
 
     Raises:
-        RuntimeError: LLM 未配置（llm_config 表无 key）
+        RuntimeError: LLM 未配置（llm_config 表无 key 且无降级路径）
     """
-    config = db.LlmConfigsRepository.get_active("evolution")
+    import logging
+    logger = logging.getLogger("evolution.common.model_factory")
+
+    config = db.LlmConfigsRepository.get_active(scope)
+    effective_scope = scope
     if config is None:
-        raise RuntimeError(
-            "Agent 模型未配置：请在桌面端「进化端模型」页填写大模型 API"
-            "（base_url / api_key / model）"
-        )
+        if scope == "eval":
+            # EDGE-005：eval scope 未配置 → 降级用 evolution scope（不阻塞，警告 PLS 风险）
+            logger.warning(
+                "eval scope 未配置，降级用 evolution scope 模型（PLS 风险：评估与 writer/evolve "
+                "可能同家族，缺失性缺陷会被同源偏好静默放过）。"
+                "请在桌面端为 eval scope 配置异家族模型以根治 Preference Leakage。"
+            )
+            config = db.LlmConfigsRepository.get_active("evolution")
+            effective_scope = "evolution"
+        if config is None:
+            raise RuntimeError(
+                f"Agent 模型未配置：scope={scope}（及降级 evolution）在 llm_config 表均无激活配置。"
+                "请在桌面端「进化端模型」页填写大模型 API（base_url / api_key / model）"
+            )
     api_key, base_url_raw, model_raw = config
+
+    # 启动期同家族警告（EDGE-005 第二档：配了但同家族）。不阻塞，只标 PLS 风险。
+    if effective_scope == "eval":
+        _warn_eval_same_family(model_raw)
 
     # 关闭 deepagents 默认注入的 general-purpose 子代理（详见模块顶部说明）。
     _ensure_gp_disabled()
@@ -99,6 +122,43 @@ def build_agent_model(*, temperature: float = 0.2) -> BaseChatModel:
         request_timeout=300,
         max_retries=1,
     )
+
+
+def _model_family(model_raw: str) -> str:
+    """从模型名粗判家族（同家族=同底座，判评分离要异家族）。
+
+    判评分离（DEC-007）要求 eval 与 writer/evolve 异家族。model 名的前缀通常标明
+    底座（deepseek/glm/qwen/gpt/claude 等）。这里提取前缀作家族签名。
+    本判定是粗粒度的——精确的同家族检测需对照 writer/evolve 的实际激活模型。
+    """
+    name = (model_raw or "").lower().split(":", 1)[-1]
+    for fam in ("deepseek", "glm", "qwen", "gpt", "claude", "llama", "mistral", "gemini"):
+        if fam in name:
+            return fam
+    return name.split("-")[0] if name else "unknown"
+
+
+def _warn_eval_same_family(eval_model_raw: str) -> None:
+    """eval 与 writer/evolve 同家族时警告（EDGE-005，不阻塞）。
+
+    判评分离只切 eval↔evolution 边；evolution scope 是 evolve agent 用的，
+    writer 用 executor scope（默认是 evolution 副本）。三者任一同家族都有 PLS 风险。
+    """
+    import logging
+    logger = logging.getLogger("evolution.common.model_factory")
+    eval_fam = _model_family(eval_model_raw)
+    for other_scope in ("evolution", "executor"):
+        other = db.LlmConfigsRepository.get_active(other_scope)
+        if other is None:
+            continue
+        other_fam = _model_family(other[2])
+        if other_fam == eval_fam:
+            logger.warning(
+                "PLS 风险：eval 模型（%s，家族=%s）与 %s scope 模型（%s，家族=%s）同家族。"
+                "Preference Leakage 会让评估对同源输出放水，缺失性缺陷可能被静默放过。"
+                "建议 eval scope 配置异家族模型。",
+                eval_model_raw, eval_fam, other_scope, other[2], other_fam,
+            )
 
 
 __all__ = ["build_agent_model"]
