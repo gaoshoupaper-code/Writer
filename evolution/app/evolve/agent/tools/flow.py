@@ -227,6 +227,10 @@ def make_flow_tools() -> list:
         # 2. import 检查：尝试 import 包内各模块（捕获运行时错误）
         _import_check_all(pkg_root, errors)
 
+        # 3. FR-002 / EDGE-002 落地原子性校验：__init__.py 里构造的中间件，其实际
+        #    __init__ 签名必须接受构造调用传的 kwargs。拦截签名漂移。
+        _middleware_signature_check(pkg_root, errors)
+
         passed = len(errors) == 0
         ctx.emit_step(
             "validate_changes", "done" if passed else "failed",
@@ -330,6 +334,71 @@ def _import_check_all(pkg_root: Path, errors: list[str]) -> None:
             importlib.import_module(mod_name)
         except Exception as e:
             errors.append(f"import 错误 {rel}: {e}")
+
+
+def _middleware_signature_check(pkg_root: Path, errors: list[str]) -> None:
+    """FR-002 / EDGE-002：校验 __init__.py 构造中间件的调用与类定义签名一致。
+
+    遍历 __init__.py 里所有 `XxxMiddleware(...)` 构造调用，对每个调用校验
+    类的 __init__ 是否接受调用传的 keyword 参数。拦截"改了 __init__.py 调用处
+    但漏改 middleware 定义"的签名漂移（probe_candidate 装配时才 TypeError）。
+    """
+    import ast
+    import inspect
+
+    init_path = pkg_root / "__init__.py"
+    try:
+        tree = ast.parse(init_path.read_text(encoding="utf-8"))
+    except SyntaxError:
+        return  # py_compile 已报过语法错误
+
+    pkg = sys.modules.get("harness_current")
+    if pkg is None:
+        return  # _import_check_all 失败时包未注册，那条错误已记录
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Name):
+            continue
+        class_name = func.id
+        if not class_name.endswith("Middleware"):
+            continue
+        kw_names = [kw.arg for kw in node.keywords if kw.arg is not None]
+        if not kw_names:
+            continue
+
+        klass = getattr(pkg, class_name, None)
+        if klass is None:
+            continue
+        try:
+            own_init = "__init__" in klass.__dict__
+            sig = inspect.signature(klass.__init__)
+            params = sig.parameters
+            has_var_keyword = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+            if has_var_keyword and own_init:
+                continue  # 类自己定义 __init__(**kwargs)，显式接受任意 keyword
+            if not own_init:
+                errors.append(
+                    f"签名漂移 {class_name}: 类未定义自己的 __init__，"
+                    f"但 __init__.py 构造时传了 keyword 参数 {kw_names}。"
+                    f"基类 __init__ 可能不接受（→ TypeError: takes no arguments）。"
+                    f"请确认基类签名或为 {class_name} 补 __init__。"
+                )
+                continue
+            accepted = set(params.keys()) - {"self"}
+            unknown = [k for k in kw_names if k not in accepted]
+            if unknown:
+                errors.append(
+                    f"签名漂移 {class_name}: __init__ 不接受参数 {unknown}，"
+                    f"但 __init__.py 构造时传了。可接受: {sorted(accepted) or '(无参数)'}。"
+                    f"这是落地原子性违约——probe 装配会 TypeError。"
+                )
+        except (ValueError, TypeError) as e:
+            logger.debug("中间件 %s 签名内省失败: %s", class_name, e)
 
 
 __all__ = ["make_flow_tools"]

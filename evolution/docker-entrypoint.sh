@@ -55,11 +55,13 @@ if [ ! -d "$REPO_DIR" ]; then
   fi
 fi
 
-# 1b-升级. 受控系统中间件升级（C3 / FR-004 / EVD-007）：
+# 1b-升级. 受控系统中间件升级（C3 / FR-004 / EVD-007 / FR-001）：
 #     repo/ 已存在时，把镜像 seed 中新增的承重系统文件（middleware/）合并进来。
 #     只合并 seed 有但 repo 没有的文件（新增），不覆盖用户进化改动过的同名文件
 #     （冲突时记录到升级日志，不静默覆盖——EDGE-006 / RSK-003）。
 #     这样 ArtifactSnapshotMiddleware 等镜像新增的承重中间件能进入活跃 Harness。
+#     FR-001 关键：cp 后必须把新增承重文件 commit 进 HEAD tree，否则它们停留在
+#     untracked，commit_candidate 的 cat-file 校验必崩（CON-001 单一真相源）。
 if [ -d "$SEED_REPO/middleware" ] && [ -d "$REPO_DIR/middleware" ]; then
   echo "[entrypoint] 受控系统中间件升级：检查 seed 新增的承重文件..."
   UPGRADE_LOG="/app/evolution/harnesses/.system_upgrade.log"
@@ -84,6 +86,29 @@ if [ -d "$SEED_REPO/middleware" ] && [ -d "$REPO_DIR/middleware" ]; then
   done
   echo "[upgrade] 完成: 新增 $added 个, 冲突 $conflicts 个（保留现状）" >> "$UPGRADE_LOG"
   echo "[entrypoint] 系统中间件升级完成: 新增 $added, 冲突 $conflicts（详见 $UPGRADE_LOG）"
+
+  # FR-001：新增的承重中间件文件必须进 HEAD tree，否则 commit_candidate 的
+  # required_paths 校验（cat-file HEAD:middleware/xxx.py）必然 rc=128。
+  # 只在有新增文件且 repo 已是 git 仓库时提交（首次部署由 init_work_repo 的
+  # 首次 commit 统一收编，无需此处重复）。
+  if [ "$added" -gt 0 ] && [ -d "$REPO_DIR/.git" ]; then
+    echo "[entrypoint] 把 $added 个新增承重中间件 commit 进 HEAD tree..."
+    cd "$REPO_DIR" || true
+    git add middleware/*.py 2>>"$UPGRADE_LOG" || true
+    # 只在有暂存内容时 commit（避免空 commit 报错；-c 提供独立 author 不依赖全局配置）
+    if git diff --cached --quiet 2>/dev/null; then
+      echo "  （无新增可 commit，已全部在 HEAD）" >> "$UPGRADE_LOG"
+    else
+      git -c user.name=evolution -c user.email=evolution@local \
+        commit -m "承重中间件升级：纳入 $added 个新增系统中间件（FR-001）" \
+        >>"$UPGRADE_LOG" 2>&1 || echo "  ⚠ commit 失败（非致命）" >> "$UPGRADE_LOG"
+      # 对齐 bare repo（executor pull 的源），fast-forward 优先
+      git push origin main >>"$UPGRADE_LOG" 2>&1 \
+        || git push --force-with-lease origin main >>"$UPGRADE_LOG" 2>&1 \
+        || echo "  ⚠ push 到 bare repo 失败（非致命，init_work_repo 会重试）" >> "$UPGRADE_LOG"
+    fi
+    cd /app/evolution || true
+  fi
 fi
 
 # 1c. git 仓库初始化（repo/ 有 .git 则跳过，无则 init + 首次 commit + push）

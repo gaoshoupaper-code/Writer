@@ -53,6 +53,28 @@ router = APIRouter(tags=["evolve"])
 _running_tasks: dict[str, asyncio.Task] = {}
 
 
+def _reject_if_round_running(session_id: str, action: str) -> None:
+    """FR-006 / EDGE-005 并发保护：同一 session 有未完成 round 时拒绝新请求。
+
+    publish / send_message / finalize 任一在跑时，后到的并发请求返回 409，
+    避免产生孤儿 task + checkpoint 竞态 + registry.json 丢失更新。
+    已完成（done/cancelled）的旧 task 不阻塞——清理后放行。
+
+    Args:
+        session_id: session id
+        action: 触发动作名（用于错误信息，如 '发版' / '发消息' / '拍板'）
+    """
+    task = _running_tasks.get(session_id)
+    if task is not None and not task.done():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"session {session_id} 有未完成的进化 round，无法{action}。"
+                f"等当前 round 完成或先 stop 后重试（FR-006 并发保护）。"
+            ),
+        )
+
+
 def get_recorder() -> EvolutionTraceRecorder | None:
     """获取全局 recorder 实例（main.py lifespan 注入到 app.state）。"""
     from app.main import app
@@ -727,6 +749,9 @@ def publish_session(session_id: str, request: Request) -> dict[str, Any]:
             status_code=400,
             detail=f"session 状态为 {session.get('status')}，只有 pending_review 可发版",
         )
+    # FR-006 / EDGE-005：并发发版/round 保护——同一 session 有未完成 round 时拒绝，
+    # 避免 candidate 冻结与 converse/finalize 竞态 + registry.json 丢失更新。
+    _reject_if_round_running(session_id, "发版")
 
     from app.core import git_ops
     from app.versioning import registry_repo
@@ -861,12 +886,39 @@ def publish_session(session_id: str, request: Request) -> dict[str, Any]:
             )
             ev_db.update_session(session_id, status="pending_review")
             rollback_error = None
+            # FR-007 / EDGE-003：首次发版（previous_production is None）激活失败时，
+            # 无前序 production 可回退——不能调 reload_executor(0)（version 0 不存在，
+            # 会让 executor 拉一个幽灵版本）。registry production 保持 None，明确告知
+            # 首次发版失败需人工确认 executor 状态。
+            if previous_production is None:
+                registry_repo.restore_production(None, version)
+                try:
+                    git_ops.commit_registry_and_push(
+                        f"首次发版 candidate v{version} 激活失败：production 回退为 None"
+                    )
+                except Exception as restore_exc:
+                    rollback_error = str(restore_exc)
+                    logger.exception(
+                        "首次发版激活失败后的 registry 提交也失败: version=%s", version
+                    )
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "message": (
+                            f"首次发版 candidate v{version} 激活失败，无前序 production 可回退。"
+                            f"registry production 已置 None，executor 状态需人工确认。原因：{exc}"
+                        ),
+                        "release_id": release_id,
+                        "release_status": "activation_failed",
+                        "executor_restore_error": None,
+                    },
+                ) from exc
             try:
                 registry_repo.restore_production(previous_production, version)
                 git_ops.commit_registry_and_push(
                     f"恢复 Harness production v{previous_production}: candidate v{version} 激活失败"
                 )
-                restored = reload_executor(previous_production or 0)
+                restored = reload_executor(previous_production)
                 previous = registry_repo.get_production_version()
                 if previous and restored.get("commit") != previous.get("commit_hash"):
                     raise RuntimeError("executor 未恢复到原 production commit")
@@ -971,6 +1023,22 @@ async def discard_session(session_id: str) -> dict[str, Any]:
         if result.returncode != 0:
             raise RuntimeError(f"git reset 失败: {result.stderr.strip()}")
 
+        # FR-008 / EDGE-006：reset 只回退 tracked 文件，untracked 的承重中间件
+        # （如 Agent finalize 落地产生的新文件、entrypoint 升级 cp 来的新文件）
+        # 会残留，working tree 不等于目标 commit tree。补 git clean -fd 清理它们，
+        # 让下次进化从干净状态开始。承重文件已在 HEAD tree（FR-001 已 tracked），
+        # clean 不会删 tracked 文件——安全。
+        clean_result = subprocess.run(
+            ["git", "clean", "-fd"],
+            cwd=wd, capture_output=True, text=True, timeout=30,
+        )
+        if clean_result.returncode != 0:
+            # clean 失败不致命（最多留 untracked 残留），记日志继续
+            logger.warning(
+                "discard git clean 失败（不阻断）: session=%s stderr=%s",
+                session_id, clean_result.stderr.strip(),
+            )
+
         # 推进状态
         ev_db.update_session(session_id, status="discarded")
 
@@ -1029,6 +1097,9 @@ async def send_message(session_id: str, req: EvolveMessageRequest) -> dict[str, 
                 f"只有 conversing 可发消息（启动会话调 /start-converse）"
             ),
         )
+    # FR-006 / EDGE-005：并发 round 保护——上一轮 converse/finalize 未完成时拒绝新消息，
+    # 避免孤儿 task + checkpoint 竞态。
+    _reject_if_round_running(session_id, "发消息")
 
     # 持久化用户消息（决策 H）
     from app.evolve.evolve_repo import EvolveMessagesRepo
@@ -1101,6 +1172,8 @@ async def finalize_session(session_id: str) -> dict[str, Any]:
                 f"只有 conversing 可拍板（先 /start-converse + 对话）"
             ),
         )
+    # FR-006 / EDGE-005：并发 round 保护——converse 未完成时拒绝拍板，避免孤儿 task。
+    _reject_if_round_running(session_id, "拍板")
 
     # 校验至少 1 个 accepted 进化点（决策 C/A）
     from app.evolve.evolve_repo import EvolvePointsRepo

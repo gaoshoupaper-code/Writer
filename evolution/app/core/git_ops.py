@@ -104,8 +104,34 @@ def commit_candidate(message: str, *, required_paths: tuple[str, ...] = ()) -> s
     remaining = _all_changed_paths(wd) - {"registry.json"}
     if remaining:
         raise RuntimeError(f"candidate 提交后仍有未固化源码: {sorted(remaining)}")
+    # 承重文件完整性校验：candidate commit 的 HEAD tree 必须含 required_paths
+    # （CON-001 单一真相源 / FR-001）。cat-file 失败时给出可定位的错误，而不是
+    # 裸 rc=128——区分三种根因：.gitignore 误排除、磁盘缺失、git 跟踪态损坏。
     for path in required_paths:
-        _git(["cat-file", "-e", f"HEAD:{path}"], wd)
+        result = subprocess.run(
+            ["git", "cat-file", "-e", f"HEAD:{path}"],
+            cwd=wd, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            on_disk = (wd / path).is_file()
+            if not on_disk:
+                hint = (
+                    f"承重文件 {path} 既不在 HEAD tree 也不在磁盘——镜像 seed 缺失或"
+                    f"被 git clean 误删。检查 docker-entrypoint 承重中间件升级段。"
+                )
+            elif _is_ignored(path, wd):
+                hint = (
+                    f"承重文件 {path} 在磁盘存在但被 .gitignore 排除，无法进 git 跟踪。"
+                    f"修正 .gitignore 后重试。"
+                )
+            else:
+                hint = (
+                    f"承重文件 {path} 在磁盘存在但未进 HEAD tree（git 跟踪态损坏）。"
+                    f"手动 git add 后重试。"
+                )
+            raise RuntimeError(
+                f"承重文件完整性校验失败: HEAD:{path} 不存在 (rc={result.returncode})。{hint}"
+            )
     _push_to_bare(wd, settings.harness_bare_repo_path)
     return current_commit()
 
@@ -149,6 +175,15 @@ def _all_changed_paths(wd: Path) -> set[str]:
 def _changed_paths(args: list[str], wd: Path) -> list[str]:
     output = _git(args, wd)
     return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def _is_ignored(path: str, wd: Path) -> bool:
+    """判断相对路径是否被 .gitignore 排除（git check-ignore）。"""
+    result = subprocess.run(
+        ["git", "check-ignore", path],
+        cwd=wd, capture_output=True, text=True, timeout=10,
+    )
+    return result.returncode == 0
 
 
 def current_commit() -> str:

@@ -161,10 +161,10 @@ async def _run_agent_streamed(
 _MESSAGE_TOOLS = frozenset({
     # 进化点工具
     "propose_evolution_point", "update_evolution_point", "reject_evolution_point",
-    # 落地写工具
-    "write_design_doc", "write_meta_system", "write_outline_system",
-    "write_writing_system", "write_interview_system", "write_detail_outline_system",
-    "write_memory_system", "write_change_log",
+    # 落地写工具（必须与 writers.py 实际注册名 + flow_guard.FINALIZE_ONLY_TOOLS 对齐，
+    # 否则 finalizing 阶段 write_* 落地前端收不到 message_updated 通知——EVD-005）
+    "write_prompt", "write_middleware", "write_tool", "write_skill", "write_subagent",
+    "write_design_doc", "write_change_log",
     "edit_source",
     # 校验工具
     "validate_changes",
