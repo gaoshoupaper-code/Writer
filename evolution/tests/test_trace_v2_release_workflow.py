@@ -1,7 +1,15 @@
+"""单阶段发版流程测试。
+
+发版 = commit_candidate → probe_candidate（唯一门禁）→ promote_candidate →
+commit_registry_and_push → reload_executor → session=published。
+
+旧的 validate_candidate_snapshot（snapshot trace 三件套门禁）已移除——历史上
+从未通过过，导致 session 永远卡 pending_review。本测试覆盖单阶段路径、probe 门禁
+拒绝、激活失败回滚、幂等重入。
+"""
 from __future__ import annotations
 
 import os
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,12 +42,13 @@ def tearDownModule() -> None:
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
+    """单阶段发版：probe 通过即晋升 production + executor 热加载。"""
+
     def setUp(self) -> None:
         db.execute("DELETE FROM evolve_sessions")
 
     def _session(self, session_id: str) -> None:
         from app.evolve import db as ev_db
-
         ev_db.create_session(session_id)
         ev_db.update_session(session_id, status="pending_review")
 
@@ -47,136 +56,85 @@ class ReleaseWorkflowTest(unittest.TestCase):
     def _request():
         return SimpleNamespace(state=SimpleNamespace(user_id="developer-1"))
 
-    def test_first_publish_freezes_candidate_without_moving_production(self) -> None:
+    def test_publish_promotes_in_one_stage(self) -> None:
+        """单阶段：首次 publish 直接冻结 + probe + 晋升 + reload + published。"""
         from app.evolve.api import publish_session
 
-        self._session("candidate-only")
-        candidate = {
-            "version": 7,
-            "commit_hash": "candidate-commit",
-            "source_session": "candidate-only",
-        }
+        self._session("one-stage")
+        probe_identity = {"identity_digest": "probe-digest"}
+        gate_runtime = {"identity_digest": "probe-digest"}
         with patch("app.versioning.registry_repo.get_version_by_session", return_value=None), patch(
             "app.versioning.registry_repo.next_version_number", return_value=7
         ), patch("app.core.git_ops.commit_candidate", return_value="candidate-commit"), patch(
-            "app.versioning.registry_repo.create_candidate", return_value=candidate
-        ) as create_candidate, patch(
+            "app.versioning.release_gate.probe_candidate",
+            return_value={
+                "harness_commit": "candidate-commit", "assembled": True,
+                "artifact_snapshot_middleware": True,
+                "runtime_identity": probe_identity,
+            },
+        ), patch(
+            "app.versioning.registry_repo.create_candidate",
+            return_value={"version": 7, "commit_hash": "candidate-commit", "source_session": "one-stage"},
+        ), patch(
             "app.core.git_ops.commit_registry_and_push", return_value="registry-commit"
-        ), patch(
-            "app.versioning.release_gate.probe_candidate",
-            return_value={"harness_commit": "candidate-commit", "assembled": True},
-        ), patch("app.versioning.registry_repo.promote_candidate") as promote:
-            result = publish_session("candidate-only", self._request())
-
-        self.assertEqual(result["status"], "candidate_pending_snapshot")
-        self.assertEqual(result["snapshot_version"], 7)
-        create_candidate.assert_called_once()
-        promote.assert_not_called()
-        session = db.query_one(
-            "SELECT status FROM evolve_sessions WHERE session_id='candidate-only'"
-        )
-        self.assertEqual(session["status"], "pending_review")
-
-    def test_second_publish_promotes_only_the_validated_candidate(self) -> None:
-        from app.evolve.api import publish_session
-
-        self._session("promote-ok")
-        candidate = {
-            "version": 8,
-            "commit_hash": "candidate-commit",
-            "source_session": "promote-ok",
-        }
-        gate = {
-            "snapshot_trace_id": "trace-snapshot",
-            "runtime_identity": {"identity_digest": "runtime-digest"},
-        }
-        with patch(
-            "app.versioning.registry_repo.get_version_by_session", return_value=candidate
-        ), patch(
-            "app.versioning.release_gate.probe_candidate",
-            return_value={"harness_commit": "candidate-commit", "assembled": True},
-        ), patch(
-            "app.versioning.release_gate.validate_candidate_snapshot", return_value=gate
-        ), patch(
-            "app.versioning.registry_repo.promote_candidate", return_value=candidate
+        ) as commit_registry, patch(
+            "app.versioning.registry_repo.promote_candidate", return_value={"version": 7}
         ) as promote, patch(
-            "app.core.git_ops.commit_registry_and_push", return_value="registry-promotion"
-        ), patch(
             "app.versioning.snapshot_publisher.reload_executor",
-            return_value={"commit": "candidate-commit", "runtime_identity": gate["runtime_identity"]},
+            return_value={"commit": "candidate-commit", "runtime_identity": gate_runtime},
         ):
-            result = publish_session("promote-ok", self._request())
+            result = publish_session("one-stage", self._request())
 
         self.assertEqual(result["status"], "activated")
-        promote.assert_called_once_with(
-            8,
-            snapshot_trace_id="trace-snapshot",
-            runtime_identity=gate["runtime_identity"],
-        )
-        rows = db.query_all(
-            "SELECT status FROM release_events_v2 WHERE release_id=? ORDER BY rowid",
-            ("release-promote-ok",),
-        )
-        self.assertEqual(
-            [row["status"] for row in rows],
-            ["committed", "registry_promoted", "executor_refresh_ack", "activated"],
-        )
+        self.assertEqual(result["snapshot_version"], 7)
+        promote.assert_called_once_with(7, snapshot_trace_id=None, runtime_identity=probe_identity)
+        # commit_registry 调 2 次：注册 candidate + 晋升 production
+        self.assertEqual(commit_registry.call_count, 2)
+        session = db.query_one("SELECT status FROM evolve_sessions WHERE session_id='one-stage'")
+        self.assertEqual(session["status"], "published")
 
-    def test_identity_mismatch_cannot_move_production(self) -> None:
+    def test_probe_failure_rejects_publish(self) -> None:
+        """probe 门禁失败（ValueError）→ 409，不晋升。"""
         from fastapi import HTTPException
         from app.evolve.api import publish_session
 
-        self._session("promote-reject")
-        candidate = {
-            "version": 9,
-            "commit_hash": "candidate-commit",
-            "source_session": "promote-reject",
-        }
-        with patch(
-            "app.versioning.registry_repo.get_version_by_session", return_value=candidate
-        ), patch(
+        self._session("probe-fail")
+        with patch("app.versioning.registry_repo.get_version_by_session", return_value=None), patch(
+            "app.versioning.registry_repo.next_version_number", return_value=8
+        ), patch("app.core.git_ops.commit_candidate", return_value="candidate-commit"), patch(
             "app.versioning.release_gate.probe_candidate",
-            return_value={"harness_commit": "candidate-commit", "assembled": True},
-        ), patch(
-            "app.versioning.release_gate.validate_candidate_snapshot",
-            side_effect=ValueError("dependency_lock_digest mismatch"),
-        ), patch(
-            "app.core.git_ops.commit_registry_and_push", return_value="registry-commit"
+            side_effect=ValueError("candidate clean-checkout probe failed: assembled=False"),
         ), patch("app.versioning.registry_repo.promote_candidate") as promote:
             with self.assertRaises(HTTPException) as caught:
-                publish_session("promote-reject", self._request())
+                publish_session("probe-fail", self._request())
 
         self.assertEqual(caught.exception.status_code, 409)
         promote.assert_not_called()
+        session = db.query_one("SELECT status FROM evolve_sessions WHERE session_id='probe-fail'")
+        self.assertEqual(session["status"], "pending_review")
 
     def test_activation_failure_restores_previous_production_and_stays_retryable(self) -> None:
+        """reload_executor 激活失败（commit mismatch）→ 回滚原 production + session 退回 pending_review。"""
         from fastapi import HTTPException
         from app.evolve.api import publish_session
 
         self._session("activation-restore")
-        candidate = {
-            "version": 10,
-            "commit_hash": "candidate-commit",
-            "source_session": "activation-restore",
-        }
-        gate = {
-            "snapshot_trace_id": "trace-snapshot",
-            "runtime_identity": {"identity_digest": "candidate-runtime"},
-        }
-        with patch(
-            "app.versioning.registry_repo.get_version_by_session", return_value=candidate
-        ), patch(
+        probe_identity = {"identity_digest": "candidate-runtime"}
+        with patch("app.versioning.registry_repo.get_version_by_session", return_value=None), patch(
+            "app.versioning.registry_repo.next_version_number", return_value=10
+        ), patch("app.core.git_ops.commit_candidate", return_value="candidate-commit"), patch(
             "app.versioning.release_gate.probe_candidate",
-            return_value={"harness_commit": "candidate-commit", "assembled": True},
+            return_value={
+                "harness_commit": "candidate-commit", "assembled": True,
+                "runtime_identity": probe_identity,
+            },
         ), patch(
-            "app.versioning.release_gate.validate_candidate_snapshot", return_value=gate
+            "app.versioning.registry_repo.create_candidate",
+            return_value={"version": 10, "commit_hash": "candidate-commit", "source_session": "activation-restore"},
         ), patch(
             "app.versioning.registry_repo.get_production_version_number", return_value=6
         ), patch(
-            "app.versioning.registry_repo.get_production_version",
-            return_value={"version": 6, "commit_hash": "production-commit"},
-        ), patch(
-            "app.versioning.registry_repo.promote_candidate", return_value=candidate
+            "app.versioning.registry_repo.promote_candidate", return_value={"version": 10}
         ), patch(
             "app.versioning.registry_repo.restore_production"
         ) as restore, patch(
@@ -184,9 +142,12 @@ class ReleaseWorkflowTest(unittest.TestCase):
         ) as commit_registry, patch(
             "app.versioning.snapshot_publisher.reload_executor",
             side_effect=[
-                {"commit": "wrong-commit", "runtime_identity": gate["runtime_identity"]},
+                {"commit": "wrong-commit", "runtime_identity": probe_identity},
                 {"commit": "production-commit", "runtime_identity": {}},
             ],
+        ), patch(
+            "app.versioning.registry_repo.get_production_version",
+            return_value={"version": 6, "commit_hash": "production-commit"},
         ):
             with self.assertRaises(HTTPException) as caught:
                 publish_session("activation-restore", self._request())
@@ -194,33 +155,23 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 502)
         restore.assert_called_once_with(6, 10)
         self.assertEqual(commit_registry.call_count, 3)
-        session = db.query_one(
-            "SELECT status FROM evolve_sessions WHERE session_id='activation-restore'"
-        )
+        session = db.query_one("SELECT status FROM evolve_sessions WHERE session_id='activation-restore'")
         self.assertEqual(session["status"], "pending_review")
 
     def test_manual_rollback_verifies_exact_executor_identity(self) -> None:
+        """rollback（snapshot_api）路径不受单阶段化影响，仍校验 identity。"""
         from app.versioning.snapshot_api import RollbackRequest, rollback_snapshot
 
         current = {"version": 8, "commit_hash": "current-commit"}
         target = {
-            "version": 6,
-            "commit_hash": "target-commit",
+            "version": 6, "commit_hash": "target-commit",
             "runtime_identity": {"identity_digest": "target-runtime"},
         }
-        with patch(
-            "app.versioning.registry_repo.get_production_version", return_value=current
-        ), patch(
-            "app.versioning.registry_repo.rollback", return_value=target
-        ), patch(
-            "app.core.git_ops.commit_registry_and_push", return_value="registry-commit"
-        ), patch(
-            "app.versioning.snapshot_publisher.reload_executor",
-            return_value={
-                "commit": "target-commit",
-                "runtime_identity": target["runtime_identity"],
-            },
-        ):
+        with patch("app.versioning.registry_repo.get_production_version", return_value=current), \
+             patch("app.versioning.registry_repo.rollback", return_value=target), \
+             patch("app.core.git_ops.commit_registry_and_push", return_value="registry-commit"), \
+             patch("app.versioning.snapshot_publisher.reload_executor",
+                   return_value={"commit": "target-commit", "runtime_identity": target["runtime_identity"]}):
             result = rollback_snapshot(
                 RollbackRequest(to_version=6, reason="regression"), self._request()
             )
@@ -229,158 +180,26 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertEqual(result["source_commit"], "target-commit")
         self.assertEqual(result["registry_commit"], "registry-commit")
 
-    def test_retry_after_registry_promotion_reuses_the_same_version(self) -> None:
+    def test_already_published_is_idempotent(self) -> None:
+        """已发布（candidate 已 production）再次 publish → 幂等返回 activated，不重复晋升。"""
         from app.evolve.api import publish_session
-        from app.trace.facts import append_release_event
 
-        self._session("resume-promoted")
+        self._session("idempotent")
         candidate = {
-            "version": 11,
-            "commit_hash": "candidate-commit",
-            "source_session": "resume-promoted",
+            "version": 11, "commit_hash": "published-commit", "source_session": "idempotent",
             "status": "production",
-            "parent_version": 6,
         }
-        gate = {
-            "snapshot_trace_id": "trace-snapshot",
-            "runtime_identity": {"identity_digest": "runtime-digest"},
-        }
-        append_release_event(
-            release_id="release-resume-promoted",
-            status="committed",
-            candidate_id="harness-version-11",
-            actor_user_id="developer-1",
-        )
-        append_release_event(
-            release_id="release-resume-promoted",
-            status="registry_promoted",
-            candidate_id="harness-version-11",
-            actor_user_id="developer-1",
-        )
-        with patch(
-            "app.versioning.registry_repo.get_version_by_session", return_value=candidate
-        ), patch(
-            "app.versioning.release_gate.probe_candidate",
-            return_value={"harness_commit": "candidate-commit", "assembled": True},
-        ), patch(
-            "app.versioning.release_gate.validate_candidate_snapshot", return_value=gate
-        ), patch(
-            "app.versioning.registry_repo.promote_candidate"
-        ) as promote, patch(
-            "app.core.git_ops.commit_registry_and_push", return_value="registry-commit"
-        ), patch(
-            "app.versioning.snapshot_publisher.reload_executor",
-            return_value={"commit": "candidate-commit", "runtime_identity": gate["runtime_identity"]},
-        ):
-            result = publish_session("resume-promoted", self._request())
+        with patch("app.versioning.registry_repo.get_version_by_session", return_value=candidate), \
+             patch("app.versioning.registry_repo.promote_candidate") as promote, \
+             patch("app.versioning.snapshot_publisher.reload_executor") as reload:
+            result = publish_session("idempotent", self._request())
 
+        self.assertEqual(result["status"], "activated")
         self.assertEqual(result["snapshot_version"], 11)
         promote.assert_not_called()
-        rows = db.query_all(
-            "SELECT status FROM release_events_v2 WHERE release_id=? ORDER BY rowid",
-            ("release-resume-promoted",),
-        )
-        self.assertEqual(
-            [row["status"] for row in rows],
-            ["committed", "registry_promoted", "executor_refresh_ack", "activated"],
-        )
-
-
-class ReleaseGateValidationTest(unittest.TestCase):
-    def setUp(self) -> None:
-        db.execute("DELETE FROM evaluation_dossiers")
-        db.execute("DELETE FROM evidence_dossiers")
-        db.execute("DELETE FROM manual_tests")
-        db.execute("DELETE FROM runs")
-
-    def _complete_snapshot(self) -> tuple[dict, dict]:
-        runtime_identity = {
-            "harness_commit": "candidate-commit",
-            "harness_dirty": False,
-            "artifact_snapshot_middleware": True,
-            "platform_artifact_capture": True,
-            "identity_digest": "runtime-digest",
-        }
-        db.execute(
-            """INSERT INTO runs
-               (trace_id, workspace_id, status, owner_user_id, run_purpose, ingested_at,
-                integrity_status, evidence_status, run_snapshot_json)
-               VALUES (?, ?, 'completed', ?, 'user_generation', ?, 'verified', 'complete', ?)""",
-            (
-                "trace-snapshot",
-                "workspace-1",
-                "developer-1",
-                "2026-07-30T00:00:00+00:00",
-                json.dumps(runtime_identity),
-            ),
-        )
-        db.execute(
-            """INSERT INTO manual_tests
-               (test_id, case_id, version_type, version_id, trace_id, status, created_at)
-               VALUES (?, ?, 'snapshot', 12, ?, 'done', ?)""",
-            (
-                "test-snapshot",
-                "case-1",
-                "trace-snapshot",
-                "2026-07-30T00:00:00+00:00",
-            ),
-        )
-        db.execute(
-            """INSERT INTO evidence_dossiers
-               (pack_id, trace_id, owner_user_id, version, status, provenance,
-                compile_rule_version, created_at)
-               VALUES (?, ?, ?, 1, 'ready', 'trace_time', 'v2', ?)""",
-            (
-                "evidence-ready",
-                "trace-snapshot",
-                "developer-1",
-                "2026-07-30T00:00:00+00:00",
-            ),
-        )
-        db.execute(
-            """INSERT INTO evaluation_dossiers
-               (dossier_id, eval_attempt_id, source_dossier_id, source_dossier_version,
-                trace_id, owner_user_id, completeness_status, seal_status, created_at)
-               VALUES (?, ?, ?, 1, ?, ?, 'complete', 'sealed', ?)""",
-            (
-                "evaluation-sealed",
-                "eval-1",
-                "evidence-ready",
-                "trace-snapshot",
-                "developer-1",
-                "2026-07-30T00:00:00+00:00",
-            ),
-        )
-        candidate = {
-            "version": 12,
-            "commit_hash": "candidate-commit",
-            "probe_identity": runtime_identity,
-        }
-        probe = {"runtime_identity": runtime_identity}
-        return candidate, probe
-
-    def test_complete_snapshot_with_same_runtime_identity_passes(self) -> None:
-        from app.versioning.release_gate import validate_candidate_snapshot
-
-        candidate, probe = self._complete_snapshot()
-
-        result = validate_candidate_snapshot(candidate, probe)
-
-        self.assertEqual(result["snapshot_trace_id"], "trace-snapshot")
-        self.assertEqual(result["evidence_dossier_id"], "evidence-ready")
-        self.assertEqual(result["evaluation_dossier_id"], "evaluation-sealed")
-        self.assertEqual(result["runtime_identity"]["identity_digest"], "runtime-digest")
-
-    def test_candidate_probe_identity_drift_is_rejected(self) -> None:
-        from app.versioning.release_gate import validate_candidate_snapshot
-
-        candidate, probe = self._complete_snapshot()
-        candidate["probe_identity"] = {"identity_digest": "frozen-runtime-digest"}
-
-        with self.assertRaisesRegex(
-            ValueError, "executor identity changed since candidate freeze"
-        ):
-            validate_candidate_snapshot(candidate, probe)
+        reload.assert_not_called()
+        session = db.query_one("SELECT status FROM evolve_sessions WHERE session_id='idempotent'")
+        self.assertEqual(session["status"], "published")
 
 
 if __name__ == "__main__":

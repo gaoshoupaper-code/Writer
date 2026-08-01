@@ -292,39 +292,31 @@ class FirstPublishRollbackTest(unittest.TestCase):
         return SimpleNamespace(state=SimpleNamespace(user_id="developer-1"))
 
     def test_first_publish_activation_failure_skips_reload_zero(self) -> None:
-        """首次发版激活失败：不 reload_executor(0)，production 置 None，502 明确告知。"""
+        """首次发版激活失败：不 reload_executor(0)，production 置 None，502 明确告知。
+
+        单阶段路径：candidate=None（首次）→ commit_candidate → probe → promote →
+        reload_executor 激活失败（previous_production=None）→ 走首次发版回滚分支。
+        """
         from fastapi import HTTPException
         from app.evolve.api import publish_session
 
-        candidate = {
-            "version": 7,
-            "commit_hash": "candidate-commit",
-            "source_session": "session-first-publish",
-            "status": "candidate",
-        }
-        gate = {
-            "snapshot_trace_id": "trace-snapshot",
-            "runtime_identity": {"identity_digest": "candidate-runtime"},
-        }
-        reload_calls: list = []
+        probe_identity = {"identity_digest": "candidate-runtime"}
 
-        def fake_reload(version):
-            reload_calls.append(version)
-            return {"commit": "candidate-commit", "runtime_identity": gate["runtime_identity"]}
-
-        with patch("app.versioning.registry_repo.get_version_by_session", return_value=candidate), \
+        with patch("app.versioning.registry_repo.get_version_by_session", return_value=None), \
+             patch("app.versioning.registry_repo.next_version_number", return_value=7), \
+             patch("app.core.git_ops.commit_candidate", return_value="candidate-commit"), \
              patch("app.versioning.release_gate.probe_candidate",
-                   return_value={"harness_commit": "candidate-commit", "assembled": True}), \
-             patch("app.versioning.release_gate.validate_candidate_snapshot", return_value=gate), \
+                   return_value={"harness_commit": "candidate-commit", "assembled": True,
+                                 "runtime_identity": probe_identity}), \
+             patch("app.versioning.registry_repo.create_candidate",
+                   return_value={"version": 7, "commit_hash": "candidate-commit",
+                                 "source_session": "session-first-publish"}), \
              patch("app.versioning.registry_repo.get_production_version_number", return_value=None), \
-             patch("app.versioning.registry_repo.promote_candidate", return_value=candidate), \
+             patch("app.versioning.registry_repo.promote_candidate", return_value={"version": 7}), \
              patch("app.versioning.registry_repo.restore_production") as restore, \
              patch("app.core.git_ops.commit_registry_and_push", return_value="registry-commit"), \
-             patch("app.versioning.snapshot_publisher.reload_executor", side_effect=fake_reload) as reload_mock:
-            # 第一次 reload 激活时故意失败（commit mismatch 触发 RuntimeError）
-            reload_mock.side_effect = [
-                RuntimeError("executor reload failed: connection refused"),
-            ]
+             patch("app.versioning.snapshot_publisher.reload_executor",
+                   side_effect=RuntimeError("executor reload failed: connection refused")) as reload_mock:
             with self.assertRaises(HTTPException) as caught:
                 publish_session("session-first-publish", self._request())
 
@@ -337,13 +329,12 @@ class FirstPublishRollbackTest(unittest.TestCase):
         # restore_production(None, version) 被调用（production 置 None）
         restore.assert_called_once_with(None, 7)
         # 关键：reload_executor 只被调用 1 次（激活那次），没调 reload_executor(0)
-        self.assertEqual(reload_calls, [])  # side_effect 抛异常前记录的调用
-        # reload_executor 调用次数 = 1（激活失败），不含回滚的 reload(0)
         self.assertEqual(reload_mock.call_count, 1)
         # 验证回滚时没传 0
         for call in reload_mock.call_args_list:
             args, kwargs = call
             passed_version = args[0] if args else kwargs.get("version")
+            self.assertNotEqual(passed_version, 0, "首次发版回滚不得调 reload_executor(0)")
             self.assertNotEqual(passed_version, 0, "首次发版回滚不得调 reload_executor(0)")
 
 

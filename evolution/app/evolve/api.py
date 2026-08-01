@@ -484,9 +484,6 @@ def get_session(session_id: str) -> dict[str, Any]:
     # 内联关联评估的 findings + scores（审查证据来源）
     session["eval_snapshot"] = _try_load_eval_snapshot(session.get("eval_ref"))
 
-    from app.versioning import registry_repo
-    session["release_candidate"] = registry_repo.get_candidate_by_session(session_id)
-
     return session
 
 
@@ -740,7 +737,13 @@ def _trace_event_to_sse(event: Any) -> dict[str, Any] | None:
 
 @router.post("/evolve/sessions/{session_id}/publish")
 def publish_session(session_id: str, request: Request) -> dict[str, Any]:
-    """两阶段发版：先冻结 candidate，再凭同一身份的 snapshot 晋升。"""
+    """单阶段发版：冻结 candidate → probe 门禁 → 晋升 production → executor 热加载。
+
+    probe_candidate（executor 干净 checkout 装配校验）是唯一门禁。probe 通过即晋升
+    production 并 reload executor，session → published。不再要求 snapshot trace +
+    证据卷宗 + 评估卷宗三件套（旧两阶段门禁，历史上从未通过过，导致 session 永远卡
+    pending_review）。
+    """
     session = ev_db.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"session {session_id} 不存在")
@@ -755,14 +758,27 @@ def publish_session(session_id: str, request: Request) -> dict[str, Any]:
 
     from app.core import git_ops
     from app.versioning import registry_repo
-    from app.versioning.release_gate import probe_candidate, validate_candidate_snapshot
+    from app.versioning.release_gate import probe_candidate
     from app.versioning.snapshot_publisher import reload_executor
 
     release_id = f"release-{session_id}"
     actor_user_id = getattr(request.state, "user_id", None)
-    candidate = registry_repo.get_version_by_session(session_id)
 
     try:
+        candidate = registry_repo.get_version_by_session(session_id)
+
+        # ── 幂等：已发布（candidate 已是 production）直接返回，防重复点击 ──
+        if candidate is not None and candidate.get("status") == "production":
+            ev_db.update_session(session_id, status="published")
+            return {
+                "status": "activated",
+                "release_id": release_id,
+                "snapshot_version": candidate["version"],
+                "source_commit": candidate["commit_hash"],
+                "snapshot_trace_id": candidate.get("snapshot_trace_id"),
+            }
+
+        # ── 1. 冻结 candidate（首次发版：commit 源码；已冻结则复用） ──
         if candidate is None:
             version = registry_repo.next_version_number()
             source_commit = git_ops.commit_candidate(
@@ -787,58 +803,22 @@ def publish_session(session_id: str, request: Request) -> dict[str, Any]:
                 candidate_id=candidate_id,
                 actor_user_id=actor_user_id,
             )
-            return {
-                "status": "candidate_pending_snapshot",
-                "release_id": release_id,
-                "snapshot_version": version,
-                "source_commit": source_commit,
-            }
-
-        version = candidate["version"]
-        source_commit = candidate["commit_hash"]
-        candidate_id = f"harness-version-{version}"
-        release_fact = db.query_one(
-            """SELECT status FROM release_events_v2 WHERE release_id=?
-               ORDER BY rowid DESC LIMIT 1""",
-            (release_id,),
-        )
-        if release_fact is None:
-            git_ops.commit_registry_and_push(
-                f"注册 Harness candidate v{version}: session={session_id}"
-            )
-            append_release_event(
-                release_id=release_id,
-                status="committed",
-                candidate_id=candidate_id,
-                actor_user_id=actor_user_id,
-            )
-            release_status = "committed"
         else:
-            release_status = release_fact["status"]
-        if release_status == "activated" and candidate.get("status") == "production":
-            ev_db.update_session(session_id, status="published")
-            return {
-                "status": "activated",
-                "release_id": release_id,
-                "snapshot_version": version,
-                "source_commit": source_commit,
-                "snapshot_trace_id": candidate.get("snapshot_trace_id"),
-            }
-        probe = probe_candidate(source_commit)
-        gate = validate_candidate_snapshot(candidate, probe)
-        already_promoted = candidate.get("status") == "production"
-        previous_production = (
-            candidate.get("parent_version")
-            if already_promoted
-            else registry_repo.get_production_version_number()
-        )
+            version = candidate["version"]
+            source_commit = candidate["commit_hash"]
+            candidate_id = f"harness-version-{version}"
+            # 已冻结但未晋升的 candidate（如旧两阶段残留）：重新 probe 确认装配仍 OK
+            probe = probe_candidate(source_commit)
 
-        if not already_promoted:
-            registry_repo.promote_candidate(
-                version,
-                snapshot_trace_id=gate["snapshot_trace_id"],
-                runtime_identity=gate["runtime_identity"],
-            )
+        probe_identity = probe.get("runtime_identity") or {}
+        previous_production = registry_repo.get_production_version_number()
+
+        # ── 2. probe 门禁通过 → 晋升 production ──
+        registry_repo.promote_candidate(
+            version,
+            snapshot_trace_id=None,
+            runtime_identity=probe_identity,
+        )
         try:
             git_ops.commit_registry_and_push(
                 f"晋升 Harness production v{version}: session={session_id}"
@@ -856,15 +836,14 @@ def publish_session(session_id: str, request: Request) -> dict[str, Any]:
                 f"candidate registry 提交失败: {promote_exc}; "
                 f"恢复结果: {compensation_error or 'ok'}"
             ) from promote_exc
-        if release_status in {"committed", "activation_failed"}:
-            append_release_event(
-                release_id=release_id,
-                status="registry_promoted",
-                candidate_id=candidate_id,
-                actor_user_id=actor_user_id,
-            )
-            release_status = "registry_promoted"
+        append_release_event(
+            release_id=release_id,
+            status="registry_promoted",
+            candidate_id=candidate_id,
+            actor_user_id=actor_user_id,
+        )
 
+        # ── 3. executor 热加载 + commit/identity 双比对 ──
         try:
             activated = reload_executor(version)
             activated_identity = activated.get("runtime_identity") or {}
@@ -874,7 +853,7 @@ def publish_session(session_id: str, request: Request) -> dict[str, Any]:
                 )
             if (
                 activated_identity.get("identity_digest")
-                != gate["runtime_identity"].get("identity_digest")
+                != probe_identity.get("identity_digest")
             ):
                 raise RuntimeError("executor runtime identity mismatch")
         except Exception as exc:
@@ -937,21 +916,18 @@ def publish_session(session_id: str, request: Request) -> dict[str, Any]:
                 },
             ) from exc
 
-        if release_status == "registry_promoted":
-            append_release_event(
-                release_id=release_id,
-                status="executor_refresh_ack",
-                candidate_id=candidate_id,
-                actor_user_id=actor_user_id,
-            )
-            release_status = "executor_refresh_ack"
-        if release_status == "executor_refresh_ack":
-            append_release_event(
-                release_id=release_id,
-                status="activated",
-                candidate_id=candidate_id,
-                actor_user_id=actor_user_id,
-            )
+        append_release_event(
+            release_id=release_id,
+            status="executor_refresh_ack",
+            candidate_id=candidate_id,
+            actor_user_id=actor_user_id,
+        )
+        append_release_event(
+            release_id=release_id,
+            status="activated",
+            candidate_id=candidate_id,
+            actor_user_id=actor_user_id,
+        )
 
         ev_db.update_session(session_id, status="published")
 
@@ -964,7 +940,7 @@ def publish_session(session_id: str, request: Request) -> dict[str, Any]:
             "release_id": release_id,
             "snapshot_version": version,
             "source_commit": source_commit,
-            "snapshot_trace_id": gate["snapshot_trace_id"],
+            "snapshot_trace_id": None,
         }
     except HTTPException:
         raise

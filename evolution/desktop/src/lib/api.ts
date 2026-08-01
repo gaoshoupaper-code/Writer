@@ -805,14 +805,6 @@ export interface EvolveSession {
   design_doc?: DesignDoc | null;
   change_log?: ChangeLog | null;
   eval_snapshot?: EvalSnapshot | null;
-  release_candidate?: ReleaseCandidate | null;
-}
-
-export interface ReleaseCandidate {
-  version: number;
-  commit_hash: string;
-  status: "candidate";
-  promotion_status: "candidate";
 }
 
 // ── 审查视图数据类型（D1：get_session 内联）──────────────────────
@@ -934,7 +926,7 @@ export async function getEvolveSession(sessionId: string): Promise<EvolveSession
 }
 
 export interface PublishEvolveResponse {
-  status: "candidate_pending_snapshot" | "activated";
+  status: "activated";
   snapshot_version: number;
   source_commit: string;
   release_id: string;
