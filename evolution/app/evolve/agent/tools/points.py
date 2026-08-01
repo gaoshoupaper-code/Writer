@@ -16,16 +16,27 @@ propose 数据结构（决策 T 完整结构）：
 """
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
 from langchain_core.tools import tool
+from pydantic import BaseModel, Field
 
 from app.evolve.ctx import get_tool_context
 from app.evolve.evolve_repo import EvolvePointsRepo
 
 logger = logging.getLogger("evolution.evolve.agent.tools.points")
+
+
+# propose_evolution_point 的备选方案结构（Pydantic schema，取代手写 JSON 字符串）。
+# 模型 tool-call 时 API 层据 schema 组装结构化对象，绕过手写嵌套 JSON 易错问题。
+class EvolutionOption(BaseModel):
+    """单个备选方案。"""
+
+    description: str = Field(description="方案描述（具体怎么改）")
+    pros: list[str] = Field(description="优点列表")
+    cons: list[str] = Field(description="缺点列表")
+    expected_impact: str = Field(description="预期影响（如 +5% / 改善 X 维度）")
 
 
 def make_points_tools() -> list:
@@ -40,7 +51,7 @@ def make_points_tools() -> list:
     def propose_evolution_point(
         target: str,
         problem: str,
-        options_json: str,
+        options: list[EvolutionOption],
         recommendation: str = "",
         note: str = "",
     ) -> str:
@@ -60,13 +71,7 @@ def make_points_tools() -> list:
                     "subagents/writing.py"）。具体到文件，方便落地。
             problem: 为什么要改——基于哪条评估 finding，描述当前问题。
                      格式建议："评估 finding fXX 指出 ...（引用证据）"
-            options_json: 备选方案 JSON 数组字符串。每个方案：
-                {
-                  "description": "方案描述（具体怎么改）",
-                  "pros": ["优点1", "优点2"],
-                  "cons": ["缺点1"],
-                  "expected_impact": "预期影响（如 +5% / 改善 X 维度）"
-                }
+            options: 备选方案列表（2-4 个）。每个方案含 description/pros/cons/expected_impact。
                 至少 2 个方案（让用户有对比），至多 4 个（避免选择疲劳）。
             recommendation: 你推荐哪个方案 + 理由（自由文本）。
                             格式建议："推荐方案 N，因为 ..."
@@ -79,25 +84,18 @@ def make_points_tools() -> list:
 
         ctx.emit_step("propose_evolution_point", "running")
         try:
-            options = json.loads(options_json)
-            if not isinstance(options, list):
-                return "options_json 必须是 JSON 数组"
+            # Pydantic 已在 schema 层保证每个 option 结构合法，这里只校验业务数量约束
             if not (2 <= len(options) <= 4):
                 return f"options 数量需在 2-4 之间（当前 {len(options)}）——让用户有对比但不疲劳"
-            for i, opt in enumerate(options):
-                if not isinstance(opt, dict):
-                    return f"options[{i}] 必须是对象"
-                for field in ("description", "pros", "cons", "expected_impact"):
-                    if field not in opt:
-                        return f"options[{i}] 缺少必填字段：{field}"
-                if not isinstance(opt["pros"], list) or not isinstance(opt["cons"], list):
-                    return f"options[{i}].pros/cons 必须是数组"
+
+            # 转 list[dict] 传给 repo（repo/DB 层契约不变）
+            options_dicts: list[dict[str, Any]] = [opt.model_dump() for opt in options]
 
             point = EvolvePointsRepo.propose(
                 ctx.session_id,
                 target=target,
                 problem=problem,
-                options=options,
+                options=options_dicts,
                 recommendation=recommendation or None,
                 note=note or None,
             )
@@ -114,9 +112,6 @@ def make_points_tools() -> list:
                 f"现在请在对话中告诉用户，等用户表态（选择方案/否决/补充）后，"
                 f"调 update_evolution_point 或 reject_evolution_point 更新状态。"
             )
-        except json.JSONDecodeError as e:
-            ctx.emit_step("propose_evolution_point", "failed", error=str(e))
-            return f"options_json 解析失败：{e}"
         except Exception as e:
             ctx.emit_step("propose_evolution_point", "failed", error=str(e))
             return f"提出进化点失败：{e}"

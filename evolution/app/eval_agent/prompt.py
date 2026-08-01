@@ -104,7 +104,7 @@ EVAL_SYSTEM_PROMPT = """\
 
 ## 输出要求
 
-write_eval_report 的 findings 是 JSON 数组，每条：
+write_eval_report 的 findings 是结构化对象列表，每条：
 {
   "dimension": "协作拓扑|错误保障|资源消耗|内容质量",
   "severity": "high|medium|low",

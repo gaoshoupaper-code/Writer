@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import difflib
 import logging
 import re
 
@@ -170,7 +171,11 @@ def make_writer_tools(backend) -> list:
             return f"错误：非法路径 '{file_path}'（不允许 ..）"
         result = backend.edit(virt_path, old_string, new_string)
         if result.error:
-            return f"编辑失败（{file_path}）：{result.error}"
+            # 精确匹配失败时附上文件实际片段（带行号），让模型对照真实字节重试，
+            # 而非盲改。old_string 常因全角空格 / em-dash / 换行压缩差一字符而失配。
+            hint = _build_edit_failure_hint(backend, virt_path, old_string)
+            joined = f"{result.error}\n\n{hint}" if hint else result.error
+            return f"编辑失败（{file_path}）：{joined}"
         ctx.emit_step("edit_source", "done", path=virt_path, occurrences=result.occurrences)
         return f"已编辑 {file_path}（替换 {result.occurrences} 处）"
 
@@ -194,6 +199,66 @@ def _write_element(backend, subdir: str, name: str, suffix: str, content: str, l
         )
     ctx.emit_step(f"write_{label}", "done", path=virt_path)
     return f"{label}文件已创建：{virt_path}"
+
+
+# edit_source 失败时附带的上下文窗口大小（匹配行 ±N 行）
+_EDIT_HINT_WINDOW = 5
+# 无接近匹配时回退展示的文件头部行数
+_EDIT_HINT_FALLBACK_LINES = 20
+
+
+def _build_edit_failure_hint(backend, virt_path: str, old_string: str) -> str:
+    """edit_source 精确匹配失败时，读文件实际内容定位最接近片段，附行号返回。
+
+    让模型对照文件真实字节重试（而非盲改）。old_string 失配的常见原因——
+    全角/半角空格、em-dash vs hyphen、换行压缩——都能通过对照实际片段发现。
+
+    Returns:
+        带行号的文件片段提示文本；读文件失败则返回空串（调用方退化为只报 error）。
+    """
+    try:
+        from deepagents.backends.utils import format_content_with_line_numbers
+    except ImportError:
+        return ""  # 框架工具不可用则不强行 hint
+
+    read_result = backend.read(virt_path)
+    if getattr(read_result, "error", None):
+        return ""
+    file_data = getattr(read_result, "file_data", None)
+    if file_data is None:
+        return ""
+    content = getattr(file_data, "content", "")
+    if not content:
+        return ""
+
+    lines = content.splitlines(keepends=False)
+
+    # 用 old_string 首行做模糊定位（difflib 按相似度排序取最佳）
+    old_first_line = old_string.split("\n", 1)[0].strip()
+    candidates = [ln.strip() for ln in lines]
+    match_idx = -1
+    if old_first_line:
+        close = difflib.get_close_matches(old_first_line, candidates, n=1, cutoff=0.6)
+        if close:
+            match_idx = candidates.index(close[0])
+
+    if match_idx >= 0:
+        start = max(0, match_idx - _EDIT_HINT_WINDOW)
+        end = min(len(lines), match_idx + _EDIT_HINT_WINDOW + 1)
+        window = lines[start:end]
+        snippet = format_content_with_line_numbers(window, start_line=start + 1)
+        return (
+            f"文件实际最接近的内容（第 {start + 1}-{end} 行），请对照真实字节后"
+            f"用精确 old_string 重试（注意全角空格、破折号、换行差异）：\n{snippet}"
+        )
+
+    # 无接近匹配——回退展示文件头部，至少给模型一个参考面
+    head = lines[:_EDIT_HINT_FALLBACK_LINES]
+    snippet = format_content_with_line_numbers(head, start_line=1)
+    return (
+        f"未在文件中找到接近片段。文件开头（前 {len(head)} 行）如下，"
+        f"请先 read_source 确认目标位置再重试：\n{snippet}"
+    )
 
 
 __all__ = ["make_writer_tools"]

@@ -296,7 +296,7 @@ State 的核心字段（inspect_state_schema 可查完整文档）：
 
 ### 阶段 ⑤ · 记录（产出 change_log）
 
-**做什么**：`write_change_log(applied_json, summary)`——记录落地了哪些改动 + 校验结果。
+**做什么**：`write_change_log(applied, summary)`——记录落地了哪些改动 + 校验结果。
 （FlowGuard 强制 design_doc 必须在 change_log 之前产出，已由阶段 ② 满足。）
 
 **产出**：`change_log.md`，applied 里每条改动标 `done` / `failed`。
@@ -329,12 +329,12 @@ name 只允许字母/数字/下划线/连字符/点号（防路径穿越）。
 ### 流程工具（评估消费 + 产出 + 校验，5 个）
 - `read_eval_report()` — 读评估报告（从上下文 eval_snapshot）
 - `read_trace(trace_id)` — 读 trace 摘要
-- `write_design_doc(changes_json, rationale)` — 产 design_doc.md（evidence_ref 必填）
+- `write_design_doc(changes, rationale)` — 产 design_doc.md（evidence_ref 必填）
 - `validate_changes()` — 校验源码无语法/import 错误（建议最多 2 次）
-- `write_change_log(applied_json, summary)` — 产 change_log.md（最后一步）
+- `write_change_log(applied, summary)` — 产 change_log.md（最后一步）
 
 ### 进化点工具（对话式共创用，4 个）
-- `propose_evolution_point(target, problem, options_json, recommendation, note)` — 提出进化点
+- `propose_evolution_point(target, problem, options, recommendation, note)` — 提出进化点
 - `update_evolution_point(point_id, chosen_option, user_note)` — 用户拍板进化点
 - `reject_evolution_point(point_id, reason)` — 否决进化点
 - `list_evolution_points()` — 列出当前 session 所有进化点
