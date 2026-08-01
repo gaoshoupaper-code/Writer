@@ -409,6 +409,7 @@ export default function WorkbenchTab({
         onSend={handleSend}
         onStop={handleStop}
         onPointHover={setHighlightedPointId}
+        onReview={() => selectedSessionId && navigate(`/evolve/${selectedSessionId}/review`)}
       />
 
       {/* 右：进化点浮窗 + 架构问题面板 */}

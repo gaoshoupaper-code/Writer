@@ -5712,6 +5712,20 @@ html[data-theme="dark"] {
 
 .shell-main {
   flex: 1;
+  /* flex column：banner (auto) + content (flex:1)。
+     banner 出现时 content 自动收缩，不再挤掉页面底部。 */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+
+/* 页面内容区：吸收剩余高度，自身滚动。
+   flex:1 + min-height:0 让它能被 banner 压缩；overflow-y:auto 让滚动型页面照常滚动。
+   高度自适应型页面（如 evolve，内部用 height:100% 撑满）则天然填满。 */
+.shell-content {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 32px 40px;
 }
@@ -6392,9 +6406,9 @@ html[data-theme="dark"] {
   cursor: pointer;
 }
 
-/* ── evolve/eval 布局 ── */
+/* ── evolve/eval 布局（旧三栏，多数已迁移至三 Tab 重写）── */
 .evolve-page {
-  height: calc(100vh - 64px);
+  height: 100%;
 }
 
 .evolve-layout {
@@ -10193,7 +10207,9 @@ html[data-theme="dark"] {
    ════════════════════════════════════════════════════════════ */
 
 .evolve-page {
-  height: calc(100vh - 64px);
+  /* 自适应 shell-content 内容盒高度（= 可视区 - padding），不再用视口魔数。
+     这样顶部 UpdateBanner 出现时 shell-content 自动收缩，evolve 页底部不会被挤出可视区。 */
+  height: 100%;
   display: flex;
   flex-direction: column;
   background: var(--bg);
@@ -10721,6 +10737,27 @@ html[data-theme="dark"] .blueprint-body h1 { color: var(--teal); }
 }
 .stop-btn:hover:not(:disabled) { background: var(--danger); color: white; }
 .stop-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* header 右侧操作组（停止 / 审查并发布） */
+.conv-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* pending_review 的发布入口——关键 CTA，醒目主色 */
+.review-btn {
+  padding: 4px 14px;
+  font-size: 12px;
+  border: none;
+  border-radius: 6px;
+  background: var(--blue);
+  color: white;
+  cursor: pointer;
+  font-weight: 600;
+  transition: background 0.12s;
+}
+.review-btn:hover { filter: brightness(0.9); }
 
 .message-list {
   overflow-y: auto;

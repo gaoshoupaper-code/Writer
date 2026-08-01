@@ -157,8 +157,12 @@ export default function Shell() {
         </div>
       </aside>
       <main className="shell-main">
+        {/* shell-main 是 flex column 容器：banner 是 auto 项，content 是 flex:1 弹性项。
+            banner 出现时 content 自动收缩，避免内容区溢出可视区、底部按钮被遮。 */}
         <UpdateBanner />
-        <Outlet context={{ isSuperAdmin: me.is_super_admin }} />
+        <div className="shell-content">
+          <Outlet context={{ isSuperAdmin: me.is_super_admin }} />
+        </div>
       </main>
     </div>
   );

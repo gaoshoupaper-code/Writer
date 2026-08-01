@@ -32,6 +32,13 @@ interface Props {
   onSend: (content: string) => void;
   onStop: () => void;
   onPointHover: (pointId: string | null) => void;
+  /**
+   * 跳转审查页（决策 AA 补全）。
+   * pending_review 状态时 header 显示「审查并发布」入口，点击触发——
+   * 覆盖从历史 Tab / 刷新进入 pending_review 会话却无发布按钮的场景
+   * （原跳转只在活跃会话的 SSE end 帧触发，非活跃会话拿不到入口）。
+   */
+  onReview?: () => void;
 }
 
 export default function ConversationPanel({
@@ -47,6 +54,7 @@ export default function ConversationPanel({
   onSend,
   onStop,
   onPointHover,
+  onReview,
 }: Props) {
   const [selectedEvalDossierId, setSelectedEvalDossierId] = useState("");
   const [input, setInput] = useState("");
@@ -122,6 +130,7 @@ export default function ConversationPanel({
   // ── 对话视图 ────────────────────────────────────────────────
   const isConversing = status === "conversing";
   const isRunning = status === "running" || status === "finalizing";
+  const isPendingReview = status === "pending_review";
   const isTerminal =
     status === "published" ||
     status === "discarded" ||
@@ -158,16 +167,27 @@ export default function ConversationPanel({
           <span className="status-text">{statusBadge}</span>
           <code className="session-id">{selectedSessionId.slice(0, 8)}</code>
         </div>
-        {(isRunning || isConversing) && (
-          <button
-            type="button"
-            className="stop-btn"
-            onClick={onStop}
-            disabled={stopping}
-          >
-            {stopping ? "停止中…" : "停止"}
-          </button>
-        )}
+        <div className="conv-header-actions">
+          {(isRunning || isConversing) && (
+            <button
+              type="button"
+              className="stop-btn"
+              onClick={onStop}
+              disabled={stopping}
+            >
+              {stopping ? "停止中…" : "停止"}
+            </button>
+          )}
+          {isPendingReview && onReview && (
+            <button
+              type="button"
+              className="review-btn"
+              onClick={onReview}
+            >
+              审查并发布 →
+            </button>
+          )}
+        </div>
       </header>
 
       <div className="message-list">
