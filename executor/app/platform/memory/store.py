@@ -452,7 +452,9 @@ def _stringify(v: Any) -> str:
 class MemoryStorePool:
     """每个 workspace 一个 MemoryStore 的 LRU 缓存。
 
-    线程安全：asyncio + lock（get 可在事件循环中调，内部 to_thread 访问 store）。
+    线程安全：_stores 字典的读改写用 threading.Lock 保护（asyncio.Lock 无法从同步线程获取，
+    而 drop_sync 从 A/B 同步 worker 线程调用）。async 路径（get/drop）在 asyncio.Lock 之外
+    再取 _sync_lock，保证与 drop_sync 互斥；store 实际操作可跨线程（check_same_thread=False）。
     生命周期：进程单例，由 init_memory_store_pool 初始化。
     """
 
@@ -462,6 +464,9 @@ class MemoryStorePool:
         self.max_open = max_open
         self._stores: OrderedDict[str, MemoryStore] = OrderedDict()
         self._lock = asyncio.Lock()
+        # FR-004/EDGE-004：_stores 字典的跨线程互斥锁（drop_sync 从同步线程调用，
+        # get/drop 从 async 事件循环调用，两者都会改 _stores）。
+        self._sync_lock = threading.Lock()
 
     def _db_path(self, workspace_id: str) -> Path:
         return self.root / f"{workspace_id}.db"
@@ -469,33 +474,41 @@ class MemoryStorePool:
     async def get(self, workspace_id: str) -> MemoryStore:
         """获取某 workspace 的 store，惰性创建。线程安全。"""
         async with self._lock:
-            if workspace_id in self._stores:
-                self._stores.move_to_end(workspace_id)
-                return self._stores[workspace_id]
+            with self._sync_lock:  # 与 drop_sync 互斥，防 _stores 撕裂
+                if workspace_id in self._stores:
+                    self._stores.move_to_end(workspace_id)
+                    return self._stores[workspace_id]
 
-            while len(self._stores) >= self.max_open:
-                _evict_id, evict = self._stores.popitem(last=False)
-                evict.close()
+                while len(self._stores) >= self.max_open:
+                    _evict_id, evict = self._stores.popitem(last=False)
+                    evict.close()
 
-            store = MemoryStore(self._db_path(workspace_id))
-            # 实际连接在首次操作时惰性建立（_connect），这里不立即连避免持锁过久
-            self._stores[workspace_id] = store
-            return store
+                store = MemoryStore(self._db_path(workspace_id))
+                # 实际连接在首次操作时惰性建立（_connect），这里不立即连避免持锁过久
+                self._stores[workspace_id] = store
+                return store
 
     async def drop(self, workspace_id: str) -> None:
         """删作品记忆：关闭 store + 删 db 文件。"""
         async with self._lock:
+            with self._sync_lock:
+                store = self._stores.pop(workspace_id, None)
+        if store is not None:
+            store.close()
+        _unlink_db_files(self._db_path(workspace_id))
+
+    def drop_sync(self, workspace_id: str) -> None:
+        """同步删作品记忆：关闭 store + 删 db 文件（FR-004，供同步上下文用）。
+
+        与 drop 等价但不经过事件循环——A/B run 终态清理在同步 worker 线程执行，
+        无法 await。用 _sync_lock 与 async get/drop 互斥，防 _stores OrderedDict 撕裂
+        （asyncio.Lock 无法从同步线程获取）。
+        """
+        with self._sync_lock:
             store = self._stores.pop(workspace_id, None)
         if store is not None:
             store.close()
-        db_path = self._db_path(workspace_id)
-        for suffix in ("", "-wal", "-shm"):
-            p = Path(str(db_path) + suffix)
-            if p.exists():
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
+        _unlink_db_files(self._db_path(workspace_id))
 
     async def aclose_all(self) -> None:
         async with self._lock:
@@ -503,6 +516,17 @@ class MemoryStorePool:
             self._stores.clear()
         for s in stores:
             s.close()
+
+
+def _unlink_db_files(db_path: Path) -> None:
+    """删除 memory.db 及其 WAL/SHM 侧车文件（不存在则跳过）。"""
+    for suffix in ("", "-wal", "-shm"):
+        p = Path(str(db_path) + suffix)
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
 
 # ── 单例 ────────────────────────────────────────────────────────────

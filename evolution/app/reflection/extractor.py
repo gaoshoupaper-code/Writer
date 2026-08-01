@@ -206,7 +206,7 @@ def extract_from_memory_quality(trace_id: str) -> int:
         error = mq.get("error")
 
         if not ok:
-            # 检索异常
+            # 检索异常（retrieval_fail 对所有章节生效，包括第 1 章——检索基础设施故障不分章节）
             repo.merge_reflection(
                 category="retrieval_fail",
                 pattern=f"第{chapter}章记忆检索异常：{error or '未知错误'}",
@@ -216,6 +216,12 @@ def extract_from_memory_quality(trace_id: str) -> int:
             )
             count += 1
         elif nodes_count == 0 and edges_count == 0:
+            # EDGE-002：第 1 章召回为空是预期（记忆库此时为空，无前文可召回），不误报 recall_miss。
+            # 只有 chapter > 1（有前文积累却召回为空）才归纳 recall_miss。
+            # chapter 为 "?" 或非整数（拿不到章节号）时保守归纳（信号不可丢）。
+            chapter_num = chapter if isinstance(chapter, int) else None
+            if chapter_num is not None and chapter_num <= 1:
+                continue  # 第 1 章空召回属正常，跳过
             # 召回为空（图谱可能没入图，或查询条件不匹配）
             repo.merge_reflection(
                 category="recall_miss",

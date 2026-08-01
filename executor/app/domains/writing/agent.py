@@ -164,18 +164,20 @@ def _track_partial_response(invoke_async):
     return _factory
 
 
-def _get_memory_recall_cls():
+def _get_memory_recall_cls(pkg=None):
     """从 harness 包动态加载 MemoryRecallMiddleware 类。
 
     MemoryRecallMiddleware 定义在 harness 包的 middleware/ 下（可进化要素），
-    executor 运行时不硬依赖它——通过 load_current_package 动态获取。
+    executor 运行时不硬依赖它——通过包对象动态获取。生产路径默认用
+    ``load_current_package()``；A/B/单次测试路径传入自身已加载的候选包
+    （不同 source_root 的版本），确保装配的是该候选版本的中间件（FR-003 版本隔离）。
     harness 包尚未实现该 middleware 时返回 None（向后兼容，走全量注入）。
     """
     try:
         import importlib
 
-        pkg = load_current_package()
-        mw_module = importlib.import_module(f"{pkg.__name__}.middleware.memory_recall_middleware")
+        target = pkg or load_current_package()
+        mw_module = importlib.import_module(f"{target.__name__}.middleware.memory_recall_middleware")
         return getattr(mw_module, "MemoryRecallMiddleware", None)
     except Exception as e:
         logger.debug("MemoryRecallMiddleware 加载失败（走全量注入）：%s", e)

@@ -65,7 +65,13 @@ def _build_memory_recall_middleware(ctx: RuntimeContext):
     NWM 重构（Phase 5）：harness 可进化要素注入——
       - query_builder：harness tools/query_builder.py（task→writer query）
       - join_rules + packet_formatter：注入 MemoryRetriever（覆盖 executor 默认）
-    注入用 executor 的 set_memory_retriever 全局单例。
+    注入用 executor 的 set_memory_retriever 进程单例。
+
+    FR-003（DEC-003）：每次 assemble 都注入**本包**的检索要素，不再用进程级
+    "只注入一次"保护。同进程热加载多版本（v6→v7）时，每个版本装配自身 join_rules/
+    packet_formatter，杜绝首版本锁死后续版本（CON-002 版本隔离）。要素加载用本包的
+    PACKAGE_DIR（而非 load_current_package 的生产缓存包），保证 A/B 候选包注入的是
+    候选版本的要素。
 
     P4 进化闭环：构造 quality_callback 闭包，把检索质量写到 trace run_meta 事件。
     trace_recorder 或 trace_id 为 None 时不埋点（向后兼容）。
@@ -79,7 +85,7 @@ def _build_memory_recall_middleware(ctx: RuntimeContext):
     # group_id 兼容旧签名（backend 内部用 workspace_id，group_id 仅日志/兼容）
     group_id = workspace_id
 
-    # ── Phase 5：注入 harness 可进化检索要素 ──
+    # ── Phase 5 / FR-003：每次注入本包 harness 可进化检索要素（去单例保护）──
     _inject_harness_retriever()
 
     # P4：构造检索质量埋点回调（写 trace run_meta 事件）
@@ -97,32 +103,41 @@ def _build_memory_recall_middleware(ctx: RuntimeContext):
     )
 
 
-_harness_retriever_injected = False
+# FR-003：注入锁——保证并发 assemble 时 set_memory_retriever 不撕裂。
+# A/B 后台任务并发跑不同 harness 版本时（EDGE-004），若两个 assemble 同时
+# set_memory_retriever，可能造成短暂的全局 retriever 指向错版本。用锁串行化
+# 注入动作，每次 assemble 都重新设当前版本（要素是无状态的，retrieve 时从参数
+# 取 store，重设只影响下一次检索用哪个 join_rules/formatter）。
+import threading as _threading
+_harness_retriever_lock = _threading.Lock()
 
 
 def _inject_harness_retriever() -> None:
-    """把 harness 的 join_rules + packet_formatter 注入 executor MemoryRetriever。
+    """把本包的 join_rules + packet_formatter 注入 executor MemoryRetriever。
 
-    进程级单例注入（set_memory_retriever），只注入一次。harness 要素加载失败时
-    静默回退到 executor 默认（不影响功能）。
+    FR-003（DEC-003）：移除"只注入一次"进程级单例保护，每次 assemble 重新注入当前
+    harness 包版本的检索要素。同进程热加载 v6→v7 时 v7 注入自身要素，不被 v6 锁死。
+    要素加载用本包 PACKAGE_DIR（importlib 按 __name__ 定位），不依赖 load_current_package
+    的生产缓存包——保证 A/B 候选包注入候选版本要素（CON-002 版本隔离）。
+
+    要素加载失败时静默回退到 executor 默认 retriever（降级语义不变）。注入用锁串行化，
+    防并发 assemble 时全局 retriever 撕裂（EDGE-004）。
     """
-    global _harness_retriever_injected
-    if _harness_retriever_injected:
-        return
-    _harness_retriever_injected = True
     try:
         from app.platform.memory.retriever import MemoryRetriever, set_memory_retriever
         join_rules = _load_harness_callable("join_rules", "join_rules")
         packet_formatter = _load_harness_callable("packet_formatter", "packet_formatter")
-        if join_rules is not None or packet_formatter is not None:
-            set_memory_retriever(MemoryRetriever(
-                join_rules=join_rules,
-                packet_formatter=packet_formatter,
-            ))
+        if join_rules is None and packet_formatter is None:
+            return  # 本包无 harness 要素覆盖，保留 executor 默认 retriever
+        retriever = MemoryRetriever(
+            join_rules=join_rules,
+            packet_formatter=packet_formatter,
+        )
+        with _harness_retriever_lock:
+            set_memory_retriever(retriever)
     except Exception as e:
         # harness 要素注入失败不阻断——executor 默认 retriever 仍可用
-        import logging
-        logging.getLogger(__name__).debug("harness retriever 注入失败，用 executor 默认：%s", e)
+        logger.debug("harness retriever 注入失败，用 executor 默认：%s", e)
 
 
 def _load_harness_query_builder():
@@ -131,12 +146,15 @@ def _load_harness_query_builder():
 
 
 def _load_harness_callable(module_name: str, func_name: str):
-    """从 harness tools 子包加载可调用对象（失败返回 None，降级到 executor 默认）。"""
+    """从**本包** tools 子包加载可调用对象（失败返回 None，降级到 executor 默认）。
+
+    FR-003：用 importlib 按 __name__（当前包名）加载，而非 load_current_package 的
+    生产缓存包。这样 A/B 候选包（harness_current_ab）加载自身 tools，生产包
+    （harness_current）加载生产 tools，版本隔离正确。
+    """
     try:
         import importlib
-        from app.platform.agent.loader import load_current_package
-        pkg = load_current_package()
-        mod = importlib.import_module(f"{pkg.__name__}.tools.{module_name}")
+        mod = importlib.import_module(f"{__name__}.tools.{module_name}")
         return getattr(mod, func_name, None)
     except Exception:
         return None

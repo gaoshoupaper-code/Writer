@@ -38,7 +38,11 @@ class MemoryBackend:
 
     def __init__(self, workspace_id: str, *, retriever: MemoryRetriever | None = None) -> None:
         self._workspace_id = workspace_id
-        self._retriever = retriever or get_memory_retriever()
+        # FR-003：不在 __init__ 快照 retriever。harness assemble 时 set_memory_retriever 注入候选版本，
+        # 但 assemble 发生在 get_memory_backend 之后（ctx 构造先于 pkg.assemble）。
+        # __init__ 快照会冻结注入前的旧 retriever，导致 A/B 候选包的 join_rules/formatter 永不生效。
+        # 改为 retrieve() 时按需解析，保证拿到 assemble 后注入的版本（retriever 无状态，每次解析安全）。
+        self._retriever = retriever  # None → retrieve() 时走 get_memory_retriever() 全局
 
     async def retrieve(
         self,
@@ -64,6 +68,10 @@ class MemoryBackend:
         pool = get_memory_store_pool()
         store = await pool.get(self._workspace_id)
 
+        # FR-003：按需解析 retriever——拿到 assemble 时注入的全局版本（retriever 无状态）。
+        # _retriever 非 None（显式注入）时直接用；否则取当前全局（harness 已 set_memory_retriever）。
+        retriever = self._retriever or get_memory_retriever()
+
         # embed query（向量路；embedder 不可用或失败时 query_embedding=None，只走 BM25/LIKE）
         query_embedding: list[float] | None = None
         embedder = get_memory_embedder()
@@ -74,7 +82,7 @@ class MemoryBackend:
                 logger.warning("query embed 失败，退化为纯 BM25/LIKE 检索：%s", e)
                 query_embedding = None
 
-        return await self._retriever.retrieve(
+        return await retriever.retrieve(
             store,
             query,
             group_id=group_id,

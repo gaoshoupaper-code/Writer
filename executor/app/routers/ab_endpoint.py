@@ -156,6 +156,16 @@ def run_ab_generation(
     workspace_path = prepare_ab_workspace(demand_md)
     trace_id = f"trace-{uuid.uuid4().hex}"
 
+    # FR-004：A/B 记忆库 workspace_id（与 memory_backend / trigger_chapter_ingestion 一致）。
+    # 提前算出供 finally 清理 memory.db（成功/失败/取消三种终态都需清理，DEC-004）。
+    ab_memory_workspace_id = f"{AB_OWNER}_{workspace_path.name}"
+
+    # FR-001：确保 MemoryStorePool 已初始化。A/B 在隔离子进程（spawn）跑，不继承父进程
+    # 的已初始化全局（main.py 模块级 init_memory_store_pool 不在子进程 import 链上）。
+    # 未初始化时 get_memory_backend 返回 None → 记忆功能静默关闭（FR-001 失效）。
+    # 这里幂等初始化：已初始化则跳过，未初始化则用 resolve_memory_root 建池。
+    _ensure_memory_pool_initialized()
+
     # 2. 构建 thread summary（A/B 用虚拟 thread）
     now = datetime.now(UTC).isoformat()
     thread = ThreadSummary(
@@ -227,6 +237,15 @@ def run_ab_generation(
         backend = FilesystemBackend(root_dir=workspace_path, virtual_mode=True)
         model = build_writer_model(writer_settings)
 
+        # FR-001/NWM：A/B 接入记忆读取侧——注入 memory_backend + memory_recall_middleware_cls，
+        # 与生产路径对齐。memory_backend 按 A/B 临时 workspace_id 隔离（EVD-005，
+        # workspace_id=owner_workspace_name，与生产库不同名，物理隔离）。
+        # memory_recall_middleware_cls 从当前候选包加载（而非 load_current_package 的生产缓存包），
+        # 保证同进程多版本热加载时装配的是该候选版本的中间件（FR-003）。
+        # pool 未初始化时 get_memory_backend 返回 None → 走全量注入（与生产路径降级语义一致）。
+        from app.platform.memory import get_memory_backend
+        from app.domains.writing.agent import _get_memory_recall_cls
+
         ctx = RuntimeContext(
             model=model,
             backend=backend,
@@ -237,10 +256,13 @@ def run_ab_generation(
             styles=None,  # A/B 用裸 prompt
             trace_recorder=trace_recorder,
             trace_middleware_cls=TraceMiddleware,
-            # CON-005/FR-003：与生产路径同注入 task 防重放 + 模型重试可观测边界，
+            # CON-005/FR-003：与生产路径同注入 task 防重放 + 模型重试可观测边界,
             # 覆盖单次测试/A·B（EVD-003 实际复现入口）。
             tool_replay_policy=_build_tool_replay_policy(trace_recorder, trace_id),
             writer_retry_runner_factory=_make_retry_runner_factory(),
+            # FR-001：记忆读取侧接入。激活召回中间件 + quality_callback 埋点（写 trace run_meta）。
+            memory_backend=get_memory_backend(f"{AB_OWNER}_{workspace_path.name}"),
+            memory_recall_middleware_cls=_get_memory_recall_cls(pkg),
         )
 
         # 5. assemble（单参数契约，与生产路径 agent.py 一致）
@@ -266,8 +288,20 @@ def run_ab_generation(
             "configurable": {"thread_id": thread.thread_id},
             "recursion_limit": 300,
         }
+        # FR-002 写入侧：A/B 用裸 stream（非 astream_events），拿不到 task 事件，
+        # 在每个 super-step 边界扫描 chapter/ 目录检测新完成章节并触发逐章抽取入库。
+        # 与生产路径复用同一 trigger_chapter_ingestion（DEC-002 抽触发器方案），不破坏
+        # 逐 super-step 取消能力（CON-001：抽取在 super-step 边界同步执行，取消时已完成的
+        # 章节已抽取、未完成的不触发——EDGE-001）。
+        from app.domains.writing.events import scan_extracted_chapters, trigger_chapter_ingestion
+
+        extracted_chapters: set[int] = set()
         cancelled = False
         for _chunk in agent.stream(agent_input, config=run_config):
+            # FR-002：检测本次 super-step 新写盘的章节，触发逐章抽取入库（Causal Publish Flow）。
+            for ch_idx in sorted(scan_extracted_chapters(workspace_path, extracted_chapters)):
+                trigger_chapter_ingestion(workspace_path, ab_memory_workspace_id, ch_idx)
+                extracted_chapters.add(ch_idx)
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
                 break
@@ -291,6 +325,59 @@ def run_ab_generation(
         logger.exception("A/B 生成失败: trace_id=%s", trace_id)
         trace_recorder.fail_run(thread, trace_id, exc)
         raise
+    finally:
+        # FR-004/DEC-004：A/B run 终态（成功/失败/取消）清理临时 memory.db（含 -wal/-shm）。
+        # 进化复盘完全依赖 trace 的 memory_quality run_meta 事件（CON-003），memory.db 是
+        # 执行期临时工作记忆，清理不影响进化。pool 未初始化（记忆关闭）时跳过。生产 memory.db
+        # 不受影响（workspace 命名隔离，EVD-005）。清理失败记日志不阻断（memory.db 在临时目录）。
+        _cleanup_ab_memory_db(ab_memory_workspace_id)
+
+
+def _cleanup_ab_memory_db(workspace_id: str) -> None:
+    """FR-004：清理 A/B 临时 memory.db（成功/失败/取消终态统一调用）。
+
+    通过 MemoryStorePool.drop_sync 关闭可能缓存的 store 并删除 db 文件（含 -wal/-shm）。
+    pool 未初始化（记忆功能关闭）或 db 不存在时静默跳过。失败记日志不阻断
+    （memory.db 在临时目录，最终随容器/系统清理——RSK-004 兜底）。
+    """
+    try:
+        from app.platform.memory.store import get_memory_store_pool
+        pool = get_memory_store_pool()
+        pool.drop_sync(workspace_id)
+    except RuntimeError:
+        # MemoryStorePool 未初始化（记忆系统关闭）——无 db 可清。
+        pass
+    except Exception:
+        logger.debug("A/B memory.db 清理失败（workspace_id=%s）", workspace_id, exc_info=True)
+
+
+def _ensure_memory_pool_initialized() -> None:
+    """FR-001：幂等初始化 MemoryStorePool（A/B 子进程入口）。
+
+    A/B 在 spawn 子进程跑（worker_process._worker_main），子进程的 import 链不经过
+    executor/app/main.py（那里有模块级 init_memory_store_pool），导致子进程的 pool 单例为 None。
+    get_memory_backend 检测到 None 时返回 None，记忆功能静默关闭——FR-001 失效。
+
+    本函数在 run_ab_generation 入口幂等初始化：已初始化则跳过（get_memory_store_pool 不抛），
+    未初始化则用 resolve_memory_root 建池（与 main.py 一致的 root 解析逻辑）。
+    """
+    try:
+        from app.platform.memory.store import (
+            MemoryStorePool,
+            get_memory_store_pool,
+            init_memory_store_pool,
+            resolve_memory_root,
+        )
+        try:
+            get_memory_store_pool()  # 已初始化则不抛
+            return
+        except RuntimeError:
+            pass  # 未初始化，继续建池
+        init_memory_store_pool(MemoryStorePool(resolve_memory_root()))
+        logger.info("A/B 子进程 MemoryStorePool 已初始化")
+    except Exception:
+        # 记忆系统初始化失败不阻断 A/B 创作（降级为无记忆，与生产路径降级语义一致）。
+        logger.warning("A/B 子进程 MemoryStorePool 初始化失败，记忆系统将关闭", exc_info=True)
 
 
 __all__ = [

@@ -340,7 +340,7 @@ class WritingEventSink:
 
         两个副作用：
           1. 算字数塞进 output_payload（随 tool_output 推前端，D7）
-          2. 章节正文抽取 typed records 入 memory.db（Causal Publish Flow）
+          2. 章节正文抽取 typed records 入 memory.db（Causal Publish Flow，FR-002 抽触发器复用）
 
         抽取是 asyncio.to_thread 异步执行，失败由 ingestion.py 写 .memory_unhealthy flag，
         下一次 memory_recall 检测到则降级全量注入（D-R5-1），不阻断 SSE 流。
@@ -349,11 +349,56 @@ class WritingEventSink:
         if word_count is not None:
             output_payload["word_count"] = word_count
             output_payload["chapter_index"] = chapter_index
-        # NWM Causal Publish Flow：extract → embed → store
-        # 抽取器未启用时 extract_and_publish_sync 内部直接 return {}（记忆功能关闭）
+        # NWM Causal Publish Flow：extract → embed → store（FR-002 抽触发器，生产/A/B 复用同一逻辑）
+        # 抽取器未启用时 trigger_chapter_ingestion 内部直接 return（记忆功能关闭）
         await asyncio.to_thread(
-            extract_and_publish_sync, self._workspace_path, self._workspace_id, chapter_index
+            trigger_chapter_ingestion, self._workspace_path, self._workspace_id, chapter_index
         )
 
 
-__all__ = ["WritingEventSink"]
+def trigger_chapter_ingestion(
+    workspace_path: Path,
+    workspace_id: str,
+    chapter_index: int,
+) -> None:
+    """章节完成后触发逐章抽取入库（FR-002 抽触发器，生产路径与 A/B 路径复用）。
+
+    NWM Causal Publish Flow：extract → embed → store。从 WritingEventSink._on_writing_chapter_done
+    解耦出纯粹的"章节抽取入库"副作用，供生产路径（经 sink 包装）和 A/B 路径（stream 循环
+    在 super-step 边界检测到新章节后直接调用）复用同一逻辑，避免分叉。
+
+    抽取/向量化/入库失败由 extract_and_publish_sync 写 .memory_unhealthy flag（D-R5-1 降级语义），
+    下次召回检测到 unhealthy 则降级全量注入，不阻断创作主流程（NFR-001 可观测不静默）。
+    抽取器未启用时内部直接 return {}（记忆功能关闭，无副作用）。
+    """
+    extract_and_publish_sync(workspace_path, workspace_id, chapter_index)
+
+
+def scan_extracted_chapters(workspace_path: Path, already_extracted: set[int]) -> set[int]:
+    """扫描 workspace 的 chapter/ 目录，返回已写盘但尚未抽取的章节号集合（FR-002 A/B 检测用）。
+
+    A/B 路径用裸 ``agent.stream``（非 astream_events），拿不到 on_tool_end/task 事件，
+    故在每个 super-step 边界（取消检查点）按"章节文件是否新增"检测完成。
+    幂等：传入已抽取章节号集合，只返回差集（避免对同一章节重复抽取）。
+
+    Args:
+        workspace_path: workspace 根目录。
+        already_extracted: 已抽取过的章节号集合（调用方维护，跨 super-step 累积）。
+
+    Returns:
+        新写盘且尚未抽取的章节号集合（可能为空）。
+    """
+    chapter_dir = workspace_path / "chapter"
+    if not chapter_dir.exists():
+        return set()
+    new_chapters: set[int] = set()
+    for path in chapter_dir.glob("chapter-*.md"):
+        m = re.search(r"chapter-(\d+)", path.name)
+        if m:
+            idx = int(m.group(1))
+            if idx not in already_extracted and path.stat().st_size > 0:
+                new_chapters.add(idx)
+    return new_chapters
+
+
+__all__ = ["WritingEventSink", "trigger_chapter_ingestion", "scan_extracted_chapters"]
