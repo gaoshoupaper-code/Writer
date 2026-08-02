@@ -26,7 +26,13 @@ from pydantic import BaseModel
 from app.dossier import repo
 from app.dossier.extractor import COMPILE_RULE_VERSION
 from app.dossier.eligibility import list_creation_trace_candidates
+from app.dossier.evidence_override import (
+    EvidenceOverrideError,
+    approve_evidence_override,
+    revoke_evidence_override,
+)
 from app.view.traces import load_trace_detail
+from app.trace.access import require_product_owner
 from app.trace.facts import (
     ConsumptionRejected,
     add_lineage,
@@ -113,17 +119,15 @@ async def start_compile(req: CompileStartRequest) -> CompileStartResponse:
         )
 
     # 新建卷宗 + 后台编译
+    # provenance 判定（FR-004/DEC-004）：
+    #   - 源 trace 带有效人工确认（已确认未撤回）→ partial（基于停止 trace 恢复的半成品）
+    #   - 否则有 producer 同 trace 的产物 → trace_time（运行时产物）
+    #   - 否则 → compile_time_snapshot（编纂时补采）
+    provenance = _decide_dossier_provenance(trace_id)
     dossier_id = repo.create_dossier(
         trace_id, owner_user_id,
         compile_rule_version=COMPILE_RULE_VERSION,
-        provenance=(
-            "trace_time"
-            if db.query_one(
-                "SELECT 1 AS found FROM artifact_revisions WHERE producer_trace_id=? LIMIT 1",
-                (trace_id,),
-            )
-            else "compile_time_snapshot"
-        ),
+        provenance=provenance,
     )
     recorder = get_recorder()
     if recorder is None:
@@ -163,6 +167,27 @@ async def start_compile(req: CompileStartRequest) -> CompileStartResponse:
         status="started",
         compile_trace_id=compile_trace_id,
     )
+
+
+def _decide_dossier_provenance(trace_id: str) -> str:
+    """判定新建卷宗的 provenance（FR-004/DEC-004）。
+
+    partial 优先：源 trace 带有效人工确认（approved=1 且未撤回）→ partial。
+    否则按既有规则：有运行时产物 → trace_time；无 → compile_time_snapshot。
+    单查询合并：runs 行 + EXISTS 运行时产物一起取，减少 start_compile 热点 DB 往返。
+    """
+    row = db.query_one(
+        """SELECT
+             (evidence_override_approved=1 AND evidence_override_revoked_at IS NULL) AS is_partial,
+             EXISTS(SELECT 1 FROM artifact_revisions WHERE producer_trace_id=r.trace_id LIMIT 1) AS has_runtime
+           FROM runs r WHERE trace_id=?""",
+        (trace_id,),
+    )
+    if row is None:
+        return "compile_time_snapshot"
+    if row.get("is_partial"):
+        return "partial"
+    return "trace_time" if row.get("has_runtime") else "compile_time_snapshot"
 
 
 async def _run_compile_bg(
@@ -392,6 +417,87 @@ def drill_evidence(dossier_id: str, evidence_id: str, request: Request) -> dict[
         "evidence_id": evidence_id,
         "trace_id": dossier["trace_id"],
         "event": payload,
+    }
+
+
+# ── 人工确认进证据编纂（REQ-20260802-211032）─────────────────────
+# 产品负责人对"用户主动停止但有价值"的 cancelled+user_stop trace 发起确认：
+# 确认后立即恢复半成品产物，该 trace 准入证据编纂。三层资格闸门同源放行。
+
+
+class EvidenceOverrideApproveRequest(BaseModel):
+    trace_id: str
+    reason: str
+
+
+@router.post("/evidence-override/approve")
+async def approve_evidence_override_endpoint(
+    req: EvidenceOverrideApproveRequest, request: Request
+) -> dict[str, Any]:
+    """确认一条用户主动停止的 trace 有价值，立即恢复半成品并准入证据编纂。
+
+    仅产品负责人可调用（DEC-005/FR-005）。确认人身份从 SSO session 取，不接受请求体自报。
+    RSK-003/NFR-001：approve_evidence_override 内含 recover_trace_artifacts（同步阻塞：
+    load hydrated events + 线性化重建 + sha256 + 多表写入），大 trace 秒级耗时。
+    用 asyncio.to_thread 丢线程池，避免阻塞事件循环（与 _run_compile_bg 同模式）。
+    """
+    approver = require_product_owner(request)
+    try:
+        result = await asyncio.to_thread(
+            approve_evidence_override,
+            req.trace_id, approver_user_id=approver, reason=req.reason,
+        )
+    except EvidenceOverrideError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return result
+
+
+@router.post("/evidence-override/revoke/{trace_id}")
+async def revoke_evidence_override_endpoint(
+    trace_id: str, request: Request
+) -> dict[str, Any]:
+    """撤回人工确认。仅清退确认标记，已恢复产物与已编卷宗保留只读（DEC-003/FR-003）。
+
+    仅产品负责人可调用。幂等：对未确认或已撤回的 trace 撤回无副作用。
+    NFR-002：撤回人/时间记入 access_audit 审计链，可追溯。
+    """
+    from app.trace.access import audit_content_access
+
+    revoker = require_product_owner(request)
+    try:
+        result = revoke_evidence_override(trace_id)
+    except EvidenceOverrideError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    audit_content_access(request, "evidence_override_revoke", "trace", trace_id)
+    return result
+
+
+@router.get("/evidence-override/{trace_id}")
+def get_evidence_override_state(trace_id: str, request: Request) -> dict[str, Any]:
+    """查 trace 的人工确认状态（供前端判断是否显示确认/撤回按钮 + 撤回标注）。
+
+    仅产品负责人可读取完整状态（含 approver/reason 审计字段，FR-005/NFR-002）。
+    """
+    require_product_owner(request)
+    row = db.query_one(
+        """SELECT evidence_override_approved, evidence_override_approver,
+                  evidence_override_reason, evidence_override_approved_at,
+                  evidence_override_revoked_at
+           FROM runs WHERE trace_id=?""",
+        (trace_id,),
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="trace 不存在")
+    approved = bool(row.get("evidence_override_approved"))
+    revoked_at = row.get("evidence_override_revoked_at")
+    return {
+        "trace_id": trace_id,
+        "approved": approved and not revoked_at,
+        "ever_approved": approved,
+        "revoked_at": revoked_at,
+        "approver": row.get("evidence_override_approver"),
+        "reason": row.get("evidence_override_reason"),
+        "approved_at": row.get("evidence_override_approved_at"),
     }
 
 

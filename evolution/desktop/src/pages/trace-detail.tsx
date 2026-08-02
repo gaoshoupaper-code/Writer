@@ -13,8 +13,11 @@ import {
   getTraceIntegrity,
   stopActiveSession,
   resolveTrace,
+  getEvidenceOverrideState,
+  approveEvidenceOverride,
+  revokeEvidenceOverride,
 } from "@/lib/api";
-import type { IntegrityDiagnosis } from "@/lib/api";
+import type { IntegrityDiagnosis, EvidenceOverrideState } from "@/lib/api";
 import type { TraceNode, TraceRunSummary, TraceContextSegment, TraceLogEvent } from "@/lib/types";
 
 /**
@@ -55,6 +58,10 @@ export default function TraceDetailPage() {
   // ── 完整性结构化诊断（FR-003 / AC-004）：非 verified 时拉取具体缺口 ──
   const [integrityDiagnosis, setIntegrityDiagnosis] = useState<IntegrityDiagnosis | null>(null);
   const [integrityLoading, setIntegrityLoading] = useState(false);
+
+  // ── 人工确认进证据编纂（REQ-20260802-211032）：cancelled+user_stop trace 的确认/撤回 ──
+  const [overrideState, setOverrideState] = useState<EvidenceOverrideState | null>(null);
+  const [overrideLoading, setOverrideLoading] = useState(false);
 
   const activeRun: TraceRunSummary | null = detail?.run ?? null;
   const nodes = detail?.nodes ?? [];
@@ -162,6 +169,68 @@ export default function TraceDetailPage() {
     fetchDiag();
     return () => { ignore = true; };
   }, [traceId, activeRun?.integrity_status, activeRun?.status]);
+
+  // 人工确认状态：cancelled+user_stop 的创作 trace 才拉取（决定是否显示确认/撤回按钮）。
+  // 其他状态不拉取，避免无谓请求。确认/撤回操作后立即刷新。
+  const isApprovableUserStop =
+    activeRun?.status === "cancelled" && activeRun?.cancel_audit?.reason === "user_stop";
+  useEffect(() => {
+    if (!traceId || !isApprovableUserStop) {
+      setOverrideState(null);
+      return;
+    }
+    let ignore = false;
+    getEvidenceOverrideState(traceId)
+      .then((state) => {
+        if (!ignore) setOverrideState(state);
+      })
+      .catch(() => {
+        // 状态拉取失败不阻断页面，默认不显示按钮
+        if (!ignore) setOverrideState(null);
+      });
+    return () => { ignore = true; };
+  }, [traceId, isApprovableUserStop]);
+
+  const refreshOverrideState = useCallback(async () => {
+    if (!traceId || !isApprovableUserStop) return;
+    try {
+      const state = await getEvidenceOverrideState(traceId);
+      setOverrideState(state);
+    } catch {
+      /* 刷新失败静默 */
+    }
+  }, [traceId, isApprovableUserStop]);
+
+  const handleApproveOverride = useCallback(async () => {
+    if (!traceId || overrideLoading) return;
+    const reason = window.prompt("请输入确认理由（这条停止的 trace 为何有价值？）");
+    if (!reason || !reason.trim()) return;
+    setOverrideLoading(true);
+    setActionError(null);
+    try {
+      await approveEvidenceOverride(traceId, reason.trim());
+      await refreshOverrideState();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "确认失败");
+    } finally {
+      setOverrideLoading(false);
+    }
+  }, [traceId, overrideLoading, refreshOverrideState]);
+
+  const handleRevokeOverride = useCallback(async () => {
+    if (!traceId || overrideLoading) return;
+    if (!window.confirm("确认撤回？撤回后该 trace 不再能新增编纂（已编卷宗保留只读）。")) return;
+    setOverrideLoading(true);
+    setActionError(null);
+    try {
+      await revokeEvidenceOverride(traceId);
+      await refreshOverrideState();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "撤回失败");
+    } finally {
+      setOverrideLoading(false);
+    }
+  }, [traceId, overrideLoading, refreshOverrideState]);
 
   // 抽屉内 LLM 输入消息（从懒加载的 events 找 start 事件的 input.messages）
   const drawerInputMessages = useMemo(() => {
@@ -393,9 +462,42 @@ export default function TraceDetailPage() {
               </button>
             </div>
           )}
+          {/* 人工确认进证据编纂（REQ-20260802-211032，FR-001/FR-003）：
+              cancelled+user_stop 的创作 trace 显示确认/撤回入口。
+              已确认显示"撤回确认"；未确认显示"确认有价值并编纂"；
+              撤回后（ever_approved 且 revoked_at 非 null）显示已撤回标注 + 可重新确认。 */}
+          {isApprovableUserStop && overrideState && !overrideState.approved && (
+            <button
+              type="button"
+              className="resolve-button override-approve"
+              disabled={overrideLoading}
+              onClick={handleApproveOverride}
+              title="确认这条用户主动停止的 trace 有价值，恢复半成品并进入证据编纂"
+            >
+              {overrideLoading ? "处理中…" : overrideState.ever_approved ? "重新确认并编纂" : "确认有价值并编纂"}
+            </button>
+          )}
+          {isApprovableUserStop && overrideState && overrideState.approved && (
+            <button
+              type="button"
+              className="resolve-button override-revoke"
+              disabled={overrideLoading}
+              onClick={handleRevokeOverride}
+              title="撤回确认（已编卷宗保留只读，该 trace 不再能新增编纂）"
+            >
+              {overrideLoading ? "处理中…" : "撤回确认"}
+            </button>
+          )}
         </div>
         {actionError && (
           <div className="action-error">{actionError}</div>
+        )}
+        {/* EDGE-004：已撤回确认的 trace 显示标注，避免误以为卷宗仍代表当前判断 */}
+        {isApprovableUserStop && overrideState?.ever_approved && overrideState.revoked_at && (
+          <div className="override-revoked-hint">
+            该 trace 的人工确认已于 {new Date(overrideState.revoked_at).toLocaleString("zh-CN", { hour12: false })} 撤回。
+            已编卷宗保留只读，不再代表当前有效判断；重新确认可再次编纂。
+          </div>
         )}
         {run.status === "interrupted" && run.interrupted_reason && (
           <div className="interrupted-hint">

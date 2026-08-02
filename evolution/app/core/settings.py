@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     # SSO 回调结果进程内缓存 TTL（秒）。避免每个请求都内网往返 executor。
     sso_cache_ttl_seconds: int = 60
 
+    # 产品负责人白名单（REQ-20260802-211032，DEC-005）：允许对"用户主动停止但有价值"
+    # 的 trace 发起人工确认进证据编纂的 executor user_id（逗号分隔）。复用 SSO 写入的
+    # request.state.user_id 做服务端真强制。留空时退化为放行（开发模式兼容，与
+    # allowed_user_ids 同构），生产环境须填配置否则功能不安全（线上验证须确认已填）。
+    product_owner_user_ids: str = ""
+
     # 内网通知 token（executor → evolution /api/ingestion/notify 的鉴权）。
     # 替换旧 InternalKeyMiddleware 的 X-Internal-Key 机制。
     # 生成：python -c "import secrets; print(secrets.token_urlsafe(32))"

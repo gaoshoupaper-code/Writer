@@ -42,6 +42,32 @@ class CreationTraceEligibility:
     artifact_revision_count: int = 0
 
 
+def _is_approved_user_stop(row: dict[str, Any]) -> bool:
+    """判定 row 是否为"已人工确认的用户主动停止 trace"（CON-002 放行条件）。
+
+    四者同时成立才放行：
+      - status == 'cancelled'
+      - cancel_audit.reason == 'user_stop'（cancel_audit 为 NULL 不放行）
+      - evidence_override_approved == 1（产品负责人已确认）
+      - evidence_override_revoked_at 为 NULL（未被撤回）
+    任一不满足返回 False，落到 status=completed 缺口挡死。
+    """
+    if str(row.get("status") or "") != "cancelled":
+        return False
+    if not row.get("evidence_override_approved"):
+        return False
+    if row.get("evidence_override_revoked_at"):
+        return False
+    cancel_audit_raw = row.get("cancel_audit")
+    if not cancel_audit_raw:
+        return False
+    try:
+        cancel_audit = json.loads(cancel_audit_raw) if isinstance(cancel_audit_raw, str) else cancel_audit_raw
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return isinstance(cancel_audit, dict) and cancel_audit.get("reason") == "user_stop"
+
+
 def assess_creation_trace(trace_id: str) -> CreationTraceEligibility:
     """同时判定创作来源资格、传输完整性和业务证据完整性。"""
     row = db.query_one("SELECT * FROM runs WHERE trace_id=?", (trace_id,))
@@ -62,8 +88,18 @@ def assess_creation_trace(trace_id: str) -> CreationTraceEligibility:
         source_gaps.append("service=executor")
     if row.get("workload") != "creation":
         source_gaps.append("workload=creation")
-    if row.get("status") != "completed":
-        source_gaps.append("status=completed")
+
+    # 来源资格（CON-002 三层同源的唯一放行点）：
+    # 标准路径 status='completed' 直接放行；或"已人工确认的用户主动停止 trace"放行——
+    # 必须三者同时成立：status='cancelled' + cancel_audit.reason='user_stop' +
+    # evidence_override_approved=1。缺任一（含 cancel_timeout/interrupted/cancel_audit
+    # 为 NULL/未确认）一律按 status=completed 缺口挡死，不无差别放宽闸门。
+    status = str(row.get("status") or "")
+    if status != "completed":
+        approved = _is_approved_user_stop(row)
+        if not approved:
+            source_gaps.append("status=completed")
+
     transport_integrity = str(row.get("integrity_status") or "legacy")
     if transport_integrity != "verified":
         source_gaps.append("integrity_status=verified")
@@ -158,7 +194,16 @@ def list_creation_trace_candidates(*, limit: int, offset: int) -> dict[str, Any]
            FROM runs r
            LEFT JOIN user_cache uc ON r.owner_user_id=uc.user_id
            WHERE r.schema_version>=2 AND r.service='executor' AND r.workload='creation'
-             AND r.status='completed' AND r.integrity_status='verified'
+             AND r.integrity_status='verified'
+             AND (
+               r.status='completed'
+               OR (
+                 r.status='cancelled'
+                 AND json_extract(r.cancel_audit, '$.reason')='user_stop'
+                 AND r.evidence_override_approved=1
+                 AND r.evidence_override_revoked_at IS NULL
+               )
+             )
            ORDER BY r.started_at DESC"""
     )
     candidates: list[dict[str, Any]] = []

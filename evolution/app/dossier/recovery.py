@@ -28,6 +28,33 @@ _VERSIONED_ARTIFACT_PREFIXES = (
     "/character/", "/storyline/", "/detail/", "/chapter/", "/review/",
 )
 _LINE_PREFIX = re.compile(r"^\s*(\d+)(?:\.(\d+))?\t(.*)$")
+
+
+def _is_approved_cancelled_user_stop(run_row: dict[str, Any]) -> bool:
+    """判定 run_row 是否为"已人工确认的用户主动停止 trace"（与 eligibility 同源条件）。
+
+    四者同时成立：status='cancelled' + cancel_audit.reason='user_stop' +
+    evidence_override_approved=1 + revoked_at 为 NULL（未撤回）。recovery 在
+    allow_cancelled_approved=True 时复用本判定。
+    """
+    if str(run_row.get("status") or "") != "cancelled":
+        return False
+    if not run_row.get("evidence_override_approved"):
+        return False
+    if run_row.get("evidence_override_revoked_at"):
+        return False
+    cancel_audit_raw = run_row.get("cancel_audit")
+    if not cancel_audit_raw:
+        return False
+    try:
+        cancel_audit = (
+            json.loads(cancel_audit_raw)
+            if isinstance(cancel_audit_raw, str)
+            else cancel_audit_raw
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return isinstance(cancel_audit, dict) and cancel_audit.get("reason") == "user_stop"
 _MAX_LINEARIZATIONS = 200_000
 
 
@@ -73,15 +100,31 @@ def recover_trace_artifacts(
     *,
     expected_head_count: int | None = None,
     recorder: EvolutionTraceRecorder | None = None,
+    allow_cancelled_approved: bool = False,
 ) -> dict[str, Any]:
-    """恢复源 Trace 的唯一最终头并写入新的 sealed recovery Trace。"""
+    """恢复源 Trace 的唯一最终头并写入新的 sealed recovery Trace。
+
+    allow_cancelled_approved（REQ-20260802-211032，FR-002）：默认 False 保持旧行为
+    （仅 completed trace 可恢复）。为 True 时放宽到接受"已人工确认的用户主动停止
+    trace"（status='cancelled' + cancel_audit.reason='user_stop' +
+    evidence_override_approved=1）。hash 校验与重建算法完全不变——只放宽 source
+    终态准入；停止前已成功 write 的半成品照常走确定性恢复。
+    """
     source_run = db.query_one("SELECT * FROM runs WHERE trace_id=?", (source_trace_id,))
     if source_run is None:
         raise TracePayloadRecoveryError(f"source trace not found: {source_trace_id}")
     if source_run.get("service") != "executor" or source_run.get("workload") != "creation":
         raise TracePayloadRecoveryError("source trace is not an executor creation trace")
-    if source_run.get("status") != "completed" or source_run.get("integrity_status") != "verified":
-        raise TracePayloadRecoveryError("source trace is not completed and transport-verified")
+    status = str(source_run.get("status") or "")
+    integrity = str(source_run.get("integrity_status") or "")
+    if integrity != "verified":
+        raise TracePayloadRecoveryError("source trace is not transport-verified")
+    # completed 走标准路径；cancelled 仅在显式授权且满足"已确认 user_stop"三条件时放行。
+    if status != "completed":
+        if not (allow_cancelled_approved and _is_approved_cancelled_user_stop(source_run)):
+            raise TracePayloadRecoveryError(
+                "source trace is not completed and transport-verified"
+            )
 
     existing = _existing_recovery(source_trace_id)
     if existing is not None:

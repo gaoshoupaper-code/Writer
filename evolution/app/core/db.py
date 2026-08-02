@@ -430,7 +430,7 @@ def init_db() -> None:
                 version             INTEGER NOT NULL,           -- 同 trace 的版本号（1,2,3...）
                 is_current          INTEGER NOT NULL DEFAULT 0, -- 1=当前推荐版本
                 status              TEXT NOT NULL DEFAULT 'pending',  -- pending|compiling|ready|partial|failed|superseded
-                provenance          TEXT NOT NULL,              -- trace_time|compile_time_snapshot
+                provenance          TEXT NOT NULL,              -- trace_time|compile_time_snapshot|partial（基于停止 trace 恢复的半成品）
                 compile_rule_version TEXT NOT NULL,             -- 编译规则版本（用于判断是否需重编译）
                 manifest_json       TEXT,                       -- 清单层：契约/版本/完整度/适用维度
                 facts_json          TEXT,                       -- 事实层：阶段/委派/产物/错误/review链/指标（客观）
@@ -1357,6 +1357,17 @@ def _init_trace_v2_tables(conn: sqlite3.Connection) -> None:
             ("trace_phase", "TEXT"),
             ("cancel_audit", "TEXT"),
             ("lifecycle_revision", "INTEGER NOT NULL DEFAULT 0"),
+            # 人工确认证据编纂资格（REQ-20260802-211032，DEC-001）：
+            # 对"用户主动停止但有价值"的 cancelled+user_stop trace，产品负责人手动确认后
+            # 准入证据编纂。状态完全落在这些正交审计列上，绝不触碰 status 列（CON-001
+            # 终态单调性）。approved=1 即当前生效确认；revoked_at 非 NULL 表示已撤回
+            # （重新确认时整体覆盖，approver 取最新）。与 evidence_status 缓存列独立，
+            # 不会被 assess_creation_trace 重算覆盖。
+            ("evidence_override_approved", "INTEGER NOT NULL DEFAULT 0"),
+            ("evidence_override_approver", "TEXT"),
+            ("evidence_override_reason", "TEXT"),
+            ("evidence_override_approved_at", "TEXT"),
+            ("evidence_override_revoked_at", "TEXT"),
         ):
             if column not in run_columns:
                 conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {ddl}")

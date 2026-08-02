@@ -416,6 +416,64 @@ export async function getDossierCandidates(
   );
 }
 
+// ── 人工确认进证据编纂（REQ-20260802-211032）──
+// 产品负责人对"用户主动停止但有价值"的 cancelled+user_stop trace 发起确认。
+
+export type EvidenceOverrideState = {
+  trace_id: string;
+  approved: boolean;
+  ever_approved: boolean;
+  revoked_at: string | null;
+  approver: string | null;
+  reason: string | null;
+  approved_at: string | null;
+};
+
+export type EvidenceOverrideApproveResult = {
+  trace_id: string;
+  approved: boolean;
+  approver: string;
+  recovery: {
+    recovered_count: number;
+    status: string;
+    skipped: boolean;
+    error?: string;
+    recovery_trace_id?: string;
+    reason?: string;
+  };
+};
+
+export async function getEvidenceOverrideState(
+  traceId: string,
+): Promise<EvidenceOverrideState> {
+  return evoJson<EvidenceOverrideState>(
+    `/api/dossier/evidence-override/${encodeURIComponent(traceId)}`,
+    { method: "GET" },
+  );
+}
+
+export async function approveEvidenceOverride(
+  traceId: string,
+  reason: string,
+): Promise<EvidenceOverrideApproveResult> {
+  return evoJson<EvidenceOverrideApproveResult>(
+    `/api/dossier/evidence-override/approve`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ trace_id: traceId, reason }),
+    },
+  );
+}
+
+export async function revokeEvidenceOverride(
+  traceId: string,
+): Promise<{ trace_id: string; revoked: boolean; noop: boolean }> {
+  return evoJson(`/api/dossier/evidence-override/revoke/${encodeURIComponent(traceId)}`, {
+    method: "POST",
+  });
+}
+
 export async function getLineage(
   objectType: LineageObjectType,
   objectId: string,
