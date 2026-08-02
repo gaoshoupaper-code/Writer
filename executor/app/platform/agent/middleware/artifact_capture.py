@@ -65,7 +65,31 @@ class PlatformArtifactCaptureMiddleware(AgentMiddleware):
     ) -> Any:
         if not self._is_supported_write(request):
             return await handler(request)
-        result = await handler(request)
+        # 临时诊断：记录 handler（真正 write）执行前后文件状态，定位
+        # 「ToolMessage success 但文件不存在」是 handler 没跑还是 write 内部失败。
+        tool_call = getattr(request, "tool_call", {})
+        args = _mapping_value(tool_call, "args") or {}
+        _dpath = _normalize_path(
+            _mapping_value(args, "file_path") or _mapping_value(args, "path")
+        )
+        _dcid = str(_mapping_value(tool_call, "id") or "")[-10:]
+        _dbefore = self._exists_for_diag(_dpath)
+        try:
+            result = await handler(request)
+        except BaseException as _hexc:
+            logger.warning(
+                "AWRAP DIAG handler-raised trace_id=%s file=%s call=%s "
+                "before=%s exc=%r",
+                self.trace_id, _dpath, _dcid, _dbefore, _hexc,
+            )
+            raise
+        _dafter = self._exists_for_diag(_dpath)
+        logger.info(
+            "AWRAP DIAG trace_id=%s file=%s call=%s result=%s "
+            "before=%s after=%s",
+            self.trace_id, _dpath, _dcid,
+            type(result).__name__, _dbefore, _dafter,
+        )
         self._capture_if_successful(request, result)
         return result
 
@@ -123,6 +147,17 @@ class PlatformArtifactCaptureMiddleware(AgentMiddleware):
         target = (root / file_path.lstrip("/")).resolve()
         target.relative_to(root)
         return target.read_text(encoding="utf-8")
+
+    def _exists_for_diag(self, file_path: str) -> str:
+        """临时诊断：返回文件存在性 + mtime（容错，仅供 AWRAP DIAG）。"""
+        try:
+            root = self.workspace_root.resolve()
+            target = root / file_path.lstrip("/")
+            if target.exists():
+                return f"Y(m={target.stat().st_mtime:.4f})"
+            return "N"
+        except Exception as e:
+            return f"err({type(e).__name__})"
 
     def _diagnostic_snapshot(self, file_path: str, write_result: Any) -> str:
         """临时诊断：write 已返回但回读失败时，收集现场快照。
