@@ -20,7 +20,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, get_args, get_origin
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
@@ -37,12 +37,36 @@ logger = logging.getLogger(__name__)
 #   - 字段名与 store._RECORD_TYPES 的语义字段一一对应（ingestion 直接转存）
 
 
-class ChapterDigestRecord(BaseModel):
+class _TolerantRecord(BaseModel):
+    """容错基类：LLM（尤其 glm/gpt）常把"无值"字段返成显式 null，
+    而 pydantic 的 str 字段（即便 default=""）收到 None 会报校验错。
+
+    本基类在 model_validate 之前把 annotation 为 str 的字段中值为 None 的转成空串，
+    让 LLM 返回 null 与省略字段语义一致（都落到 default）。
+    仅作用于 str 字段；int/list/dict 等其它类型不受影响（LLM 返 null 给这些类型
+    本身是更严重的错，应暴露而非吞掉）。
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _null_str_to_empty(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data  # 非 dict 输入（如已构造的对象）透传
+        for field_name, field_info in cls.model_fields.items():
+            # 只处理 annotation 是纯 str 的字段（排除 str | None / int / list 等）
+            if field_info.annotation is not str:
+                continue
+            if data.get(field_name) is None:
+                data[field_name] = ""  # None → 空串，让 default 语义生效
+        return data
+
+
+class ChapterDigestRecord(_TolerantRecord):
     summary: str = Field(description="本章事件/状态变化/场景骨架摘要，2-4句")
     key_events: list[str] = Field(default_factory=list, description="本章关键事件列表（如 ['E005 迷药控制','E006 初次羞辱']）")
 
 
-class SceneRecord(BaseModel):
+class SceneRecord(_TolerantRecord):
     scene_id: str = Field(description="场景标识，如 'ch7-scene1'")
     location: str = Field(default="", description="场景地点")
     participants: list[str] = Field(default_factory=list, description="参与角色名列表")
@@ -52,7 +76,7 @@ class SceneRecord(BaseModel):
     evidence_span: str = Field(description="支撑此场景的原文引用句")
 
 
-class CharacterStateRecord(BaseModel):
+class CharacterStateRecord(_TolerantRecord):
     name: str = Field(description="角色名（与character/下文件一致）")
     goal: str = Field(default="", description="本章展现的当前目标")
     knowledge: list[str] = Field(default_factory=list, description="本章新增/确认的已知信息")
@@ -63,7 +87,7 @@ class CharacterStateRecord(BaseModel):
     evidence_span: str = Field(description="支撑此状态的原文引用句")
 
 
-class RelationshipStateRecord(BaseModel):
+class RelationshipStateRecord(_TolerantRecord):
     char_a: str = Field(description="角色A名")
     char_b: str = Field(description="角色B名")
     relation_type: str = Field(default="", description="关系类型（师徒/宿敌/盟友/恋人等）")
@@ -72,7 +96,7 @@ class RelationshipStateRecord(BaseModel):
     evidence_span: str = Field(description="支撑此关系的原文引用句")
 
 
-class ObjectStateRecord(BaseModel):
+class ObjectStateRecord(_TolerantRecord):
     """关键物品状态（视题材启用，言情类可空）。"""
     name: str = Field(description="物品名")
     owner: str = Field(default="", description="持有者")
@@ -81,7 +105,7 @@ class ObjectStateRecord(BaseModel):
     evidence_span: str = Field(description="支撑此物品状态的原文引用句")
 
 
-class PlotPromiseRecord(BaseModel):
+class PlotPromiseRecord(_TolerantRecord):
     """伏笔/承诺。论文 §3.2 的 open/closed 状态机是 NWM 碾压点。"""
     promise_id: str = Field(description="伏笔唯一标识（语义ID，如 '复仇之约'/'玉佩秘密'，跨章节同名表示同一伏笔）")
     thread_id: str = Field(default="", description="所属故事线")
@@ -93,7 +117,7 @@ class PlotPromiseRecord(BaseModel):
     evidence_span: str = Field(description="支撑此伏笔的原文引用句")
 
 
-class NarrativeFunctionRecord(BaseModel):
+class NarrativeFunctionRecord(_TolerantRecord):
     """叙事功能。论文 §3.2 的 focalization/reveal/dramatic function 是碾压点。"""
     scene_ref: str = Field(default="", description="关联场景ID")
     focalized_observer: str = Field(default="", description="视角人物（此场景通过谁的感知呈现）")
@@ -104,7 +128,7 @@ class NarrativeFunctionRecord(BaseModel):
     evidence_span: str = Field(description="支撑此功能的原文引用句")
 
 
-class WorldFactRecord(BaseModel):
+class WorldFactRecord(_TolerantRecord):
     """世界设定。"""
     fact: str = Field(description="世界规则/设定陈述")
     category: str = Field(default="", description="类别（势力/技术/魔法体系/社会结构等）")
