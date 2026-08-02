@@ -104,13 +104,16 @@ export function TraceChainTimeline({ nodes, activeRun, activeNodeId, onSelectNod
     setHasNewNodes(false);
   }, []);
 
-  // ── 高亮效果：从图检测跳转过来时，展开父 agent、滚动到目标位置并高亮 ──
+  // ── 高亮效果 A：从图检测跳转过来时，展开父 agent + 滚动定位（只跑一次）──
+  // 故意只依赖 highlightedNodeId：它不变就不该重滚。原来把 nodes 放进依赖，
+  // 而轮询每秒产生新 nodes 引用 → effect 每秒重跑 → scrollIntoView(center)
+  // 反复把节点拉回中间，且每次 cleanup 重置清除定时器，导致"3 秒后清除"永不
+  // 到期、页面来回上下滚动不受控（根因）。
   useEffect(() => {
     if (!highlightedNodeId) return;
-    // 找到目标节点
     const targetNode = nodes.find((n) => n.node_id === highlightedNodeId);
     if (!targetNode) return;
-    // 确保父 agent 未折叠
+    // 确保父 agent 未折叠（折叠状态下目标行不在 DOM 里，scrollIntoView 找不到）
     if (targetNode.parent_node_id && collapsedAgents.has(targetNode.parent_node_id)) {
       setCollapsedAgents((prev) => {
         const next = new Set(prev);
@@ -118,19 +121,33 @@ export function TraceChainTimeline({ nodes, activeRun, activeNodeId, onSelectNod
         return next;
       });
     }
-    // 滚动到目标（使用 requestAnimationFrame 等待 DOM 更新）
-    requestAnimationFrame(() => {
+    // 滚动到目标：父 agent 展开后行需几帧才进 DOM，用 rAF 轮询至多 N 次后放弃
+    // （不会再随轮询重试——避免回到反复拉扯的旧行为）。
+    let cancelled = false;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 10; // ~160ms，足够 React 完成 agent 展开 + 节点渲染
+    const tryScroll = () => {
+      if (cancelled) return;
       const el = nodeRowRefs.current.get(highlightedNodeId);
       if (el) {
         el.scrollIntoView({ behavior: "smooth", block: "center" });
+        return;
       }
-    });
-    // 3 秒后自动清除高亮
-    const timer = setTimeout(() => {
-      onClearHighlight?.();
-    }, 3000);
+      attempts += 1;
+      if (attempts < MAX_ATTEMPTS) requestAnimationFrame(tryScroll);
+    };
+    requestAnimationFrame(tryScroll);
+    return () => { cancelled = true; };
+    // nodes / collapsedAgents 只在 highlightedNodeId 变化当次读取最新值，不作为依赖。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [highlightedNodeId]);
+
+  // ── 高亮效果 B：3 秒后自动清除（只在 highlightedNodeId 变化时启动一次）──
+  useEffect(() => {
+    if (!highlightedNodeId) return;
+    const timer = setTimeout(() => onClearHighlight?.(), 3000);
     return () => clearTimeout(timer);
-  }, [highlightedNodeId, nodes]);
+  }, [highlightedNodeId, onClearHighlight]);
 
   // 过滤掉 run 节点
   const chainNodes = nodes.filter((n) => n.kind !== "run");

@@ -124,9 +124,14 @@ class TraceProjector:
             elif event.type in {"cancel_requested", "run_cancelled", "cancel_timeout"}:
                 # EVD-014：取消时间线事件投影为可见控制节点（旧 projector 完全丢弃）。
                 state.add_cancel_node(event)
+            elif event.type == "middleware_assembly":
+                # 声明性元数据（executor 装配中间件时记录"Trace → Credits → ..."），
+                # 不是执行步骤。投影成可见节点只会在调用链开头堆噪音。事件仍保留在
+                # event_payloads 表（审计/统计可用），只是不进调用链展示。
+                # 注意：middleware_intervention 是实际拦截行为，下面分支继续投影。
+                pass
             elif event.type in {
                 "skill_activation",
-                "middleware_assembly",
                 "middleware_intervention",
                 "artifact_revision",
                 "hitl",
