@@ -59,6 +59,9 @@ export default function TraceDetailPage() {
   const activeRun: TraceRunSummary | null = detail?.run ?? null;
   const nodes = detail?.nodes ?? [];
   const todos = detail?.todos ?? [];
+  // loop 节点 = LLM 节点（前端 loopIndex 即对 LLM 节点编号）。
+  // 平均耗时 = 总耗时 ÷ loop 数，语义为"平均每轮 loop 的真实墙钟耗时"。
+  const loopCount = nodes.filter((n) => n.kind === "llm").length;
 
   const drawerNode: TraceNode | null = drawerNodeId
     ? nodes.find((n) => n.node_id === drawerNodeId) ?? null
@@ -476,6 +479,14 @@ export default function TraceDetailPage() {
         <div className="summary-item">
           <label>节点数</label>
           <span>{nodes.filter((n) => n.kind !== "run").length}</span>
+        </div>
+        <div className="summary-item">
+          <label>平均耗时</label>
+          <span>
+            {run.duration_ms != null && loopCount > 0
+              ? formatDuration(run.duration_ms / loopCount)
+              : "—"}
+          </span>
         </div>
         <div className="summary-item">
           <label>工作负载</label>
