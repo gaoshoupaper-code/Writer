@@ -56,7 +56,31 @@ class PlatformArtifactCaptureMiddleware(AgentMiddleware):
     def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
         if not self._is_supported_write(request):
             return handler(request)
-        result = handler(request)
+        # 临时诊断（同步路径）：并行 write_file 实际走同步 wrap_tool_call，
+        # 记录 handler 前后文件状态，区分 handler 没跑 vs write 内部失败。
+        tool_call = getattr(request, "tool_call", {})
+        args = _mapping_value(tool_call, "args") or {}
+        _dpath = _normalize_path(
+            _mapping_value(args, "file_path") or _mapping_value(args, "path")
+        )
+        _dcid = str(_mapping_value(tool_call, "id") or "")[-10:]
+        _dbefore = self._exists_for_diag(_dpath)
+        try:
+            result = handler(request)
+        except BaseException as _hexc:
+            logger.warning(
+                "WRAP DIAG handler-raised trace_id=%s file=%s call=%s "
+                "before=%s exc=%r",
+                self.trace_id, _dpath, _dcid, _dbefore, _hexc,
+            )
+            raise
+        _dafter = self._exists_for_diag(_dpath)
+        logger.info(
+            "WRAP DIAG trace_id=%s file=%s call=%s result=%s "
+            "before=%s after=%s",
+            self.trace_id, _dpath, _dcid,
+            type(result).__name__, _dbefore, _dafter,
+        )
         self._capture_if_successful(request, result)
         return result
 
