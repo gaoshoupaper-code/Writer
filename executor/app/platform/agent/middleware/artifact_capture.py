@@ -75,7 +75,7 @@ class PlatformArtifactCaptureMiddleware(AgentMiddleware):
             )
             raise
         _dafter = self._exists_for_diag(_dpath)
-        logger.info(
+        logger.warning(
             "WRAP DIAG trace_id=%s file=%s call=%s result=%s "
             "before=%s after=%s",
             self.trace_id, _dpath, _dcid,
@@ -108,7 +108,7 @@ class PlatformArtifactCaptureMiddleware(AgentMiddleware):
             )
             raise
         _dafter = self._exists_for_diag(_dpath)
-        logger.info(
+        logger.warning(
             "AWRAP DIAG trace_id=%s file=%s call=%s result=%s "
             "before=%s after=%s",
             self.trace_id, _dpath, _dcid,
@@ -128,6 +128,22 @@ class PlatformArtifactCaptureMiddleware(AgentMiddleware):
     def _capture_if_successful(self, request: Any, result: Any) -> None:
         if isinstance(result, ToolMessage) and getattr(result, "status", None) == "error":
             return
+        # 临时诊断：打印调用栈，定位谁调用了 _capture_if_successful
+        # （WRAP/AWRAP 诊断 0 条但此方法被调用 → 说明走了别的调用路径）
+        import traceback
+        stk = traceback.format_stack()
+        # 精简：只保留非 stdlib 的关键帧
+        slim = [s.strip() for s in stk if "site-packages" not in s and "traceback" not in s]
+        logger.warning(
+            "CAPTURE-CALLER DIAG trace_id=%s file=%s stack=%s",
+            self.trace_id,
+            _normalize_path(
+                (_mapping_value(getattr(request, "tool_call", {}), "args") or {}).get("file_path")
+                or (_mapping_value(getattr(request, "tool_call", {}), "args") or {}).get("path")
+                or ""
+            ),
+            " | ".join(slim[-6:]),
+        )
         tool_call = getattr(request, "tool_call", {})
         args = _mapping_value(tool_call, "args") or {}
         file_path = _normalize_path(
