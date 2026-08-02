@@ -14,6 +14,45 @@ from langchain_core.messages import ToolMessage
 logger = logging.getLogger(__name__)
 
 
+# 临时诊断：monkey-patch FilesystemBackend.write，记录每次调用的线程/路径/结果，
+# 定位「ToolMessage success 但文件不存在」。导入即生效，定位后移除。
+try:
+    import os as _os
+    import threading as _threading
+    import deepagents.backends.filesystem as _fs
+
+    _orig_write = _fs.FilesystemBackend.write
+
+    def _patched_write(self, file_path, content):  # type: ignore[no-untyped-def]
+        tid = _threading.get_ident()
+        try:
+            resolved = self._resolve_path(file_path)
+            existed_before = resolved.exists()
+        except Exception as _e:
+            resolved = f"<unresolvable:{_e!r}>"
+            existed_before = "unresolvable"
+        result = _orig_write(self, file_path, content)
+        try:
+            exists_after = _os.path.exists(str(resolved)) if isinstance(resolved, _os.PathLike) or isinstance(resolved, str) else "?"
+        except Exception:
+            exists_after = "?"
+        wr_err = getattr(result, "error", None)
+        logger.warning(
+            "FSWRITE DIAG tid=%s file=%r resolved=%s existed_before=%s "
+            "exists_after=%s result=%s error=%r",
+            tid, file_path, resolved, existed_before, exists_after,
+            type(result).__name__, wr_err,
+        )
+        return result
+
+    if not getattr(_fs.FilesystemBackend.write, "_patched", False):
+        _patched_write._patched = True  # type: ignore[attr-defined]
+        _fs.FilesystemBackend.write = _patched_write
+        logger.warning("FSWRITE DIAG patch installed")
+except Exception as _e:
+    logger.warning("FSWRITE DIAG patch FAILED: %r", _e)
+
+
 _WRITE_TOOLS = frozenset({"write_file", "edit_file"})
 _VERSIONED_ARTIFACT_PATHS = frozenset({
     "/demand.md",
