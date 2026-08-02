@@ -68,7 +68,7 @@ def make_writer_tools(backend) -> list:
     """构建写工具集（5 写 + 1 edit）。
 
     Args:
-        backend: FilesystemBackend 实例（virtual_mode=True，root_dir=harnesses/current/）
+        backend: FilesystemBackend 实例（virtual_mode=True，root_dir=harnesses/repo/）
     """
     if backend is None:
         raise ValueError("writers 需要 backend 实例（make_evolve_tools 传入）")

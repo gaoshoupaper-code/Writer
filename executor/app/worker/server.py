@@ -4,13 +4,13 @@ worker 进程 = A/B 回放/变体的隔离执行环境。给定一个 Agent 包�
 worker 能隔离地跑一次生成并吐 trace。
 
 架构定位（Phase 7）：
-  生产路径（D8=X）：executor 同进程 import current 包，不走 worker。
+  生产路径（D8=X）：executor 同进程 import harness 包（harnesses/repo），不走 worker。
   A/B/回放路径（D7=②）：每个变体起独立 worker 子进程，指向解压后的临时包目录。
   子进程隔离天然解决 sys.modules 冲突（同进程跑多个包版本会撞模块名）。
 
   worker 与生产路径的差异只在"包从哪来"：
-  - 生产：package_loader.load_current_package()（固定 evolution/harnesses/current/）
-  - worker：按 --package-path 加载（current 或临时解压目录）
+  - 生产：package_loader.load_current_package()（固定 harnesses/repo 工作目录）
+  - worker：按 --package-path 加载（工作目录或临时解压目录）
   装配入口统一是 package.assemble(ctx)，逻辑无差异。
 
 设计依据：设计文档 D7=②（子进程隔离）+ D8=X（生产同进程，仅 A/B 子进程）。
@@ -59,8 +59,8 @@ def create_worker_app(
             (req: GenerateRequest) -> AsyncIterator[dict]
             实际部署时注入 MetaAgentService.generate_stream（含 SSE 编排、trace、checkpoint）。
             None 时 /generate/stream 返回 501（骨架降级，供测试）。
-        package_path: worker 锁定的包路径（current 或临时解压目录）。
-            None = 用 settings.harness_package_path（默认 current）。
+        package_path: worker 锁定的包路径（工作目录或临时解压目录）。
+            None = 用 settings.harness_package_path（默认 harnesses/repo）。
     """
     app = FastAPI(title="self-harness worker (Phase 7)")
 
@@ -135,14 +135,14 @@ def run_worker(
     """启动 worker 进程（Phase 7 包化）。
 
     流程：
-      1. 确定包路径（传入或默认 current）
+      1. 确定包路径（传入或默认工作目录 harnesses/repo）
       2. 加载包（验证 assemble 可用）
       3. 注入 generate_fn（MetaAgentService.generate_stream）
       4. 启动 uvicorn
 
     Args:
         port: 监听端口
-        package_path: 包路径（current 或临时解压目录）。None = current。
+        package_path: 包路径（工作目录或临时解压目录）。None = harnesses/repo。
         generate_fn: 生成函数（注入）。None 时尝试从 MetaAgentService 构造；
                      构造失败则 /generate/stream 返回 501（降级）。
     """
@@ -205,6 +205,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="self-harness worker (Phase 7)")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--package-path", type=str, default=None,
-                        help="Agent 包路径（current 或临时解压目录）。默认 current。")
+                        help="Agent 包路径（工作目录或临时解压目录）。默认 harnesses/repo。")
     args = parser.parse_args()
     run_worker(args.port, package_path=args.package_path)

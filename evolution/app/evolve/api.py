@@ -538,7 +538,7 @@ def stop_session(session_id: str) -> dict[str, Any]:
     立即标记 cancelling 并返回（DEC-002），后台 asyncio task 在 10 秒时限内
     收敛到 cancelled。
 
-    已知边界：Agent 若停在改源码中途，harnesses/current/ 下可能留脏文件，
+    已知边界：Agent 若停在改源码中途，harnesses/repo/ 下可能留脏文件，
     本端点不清理（由用户手动 stash / 重置）。
     """
     session = ev_db.get_session(session_id)

@@ -1,6 +1,6 @@
 """Agent 包透视 API（D8）。
 
-GET /api/agent-package：扫描 evolution/harnesses/current/ 包目录，返回六段结构：
+GET /api/agent-package：扫描 harness 工作目录（harnesses/repo）包目录，返回六段结构：
   manifest / prompts / skills / middleware / subagents / assemble。
 
 prompts 双层语义：包内 prompts/*.md = 当前部署快照；prompts 表 = 版本历史。
@@ -19,13 +19,14 @@ from typing import Any
 from fastapi import APIRouter
 
 import app.core.db as db
+from app.core.settings import settings
 
 logger = logging.getLogger("evolution.agent_package")
 
 router = APIRouter(tags=["agent-package"])
 
-# 包目录：项目根/evolution/harnesses/current
-_PACKAGE_DIR = Path(__file__).resolve().parent.parent.parent / "harnesses" / "current"
+# 包目录：harness 工作目录（harnesses/repo）
+_PACKAGE_DIR = settings.harness_work_dir_path
 
 # middleware 文件名 → 类名映射（去 .py）。用于 schema_lock 的 C 类判定。
 _C_CLASS_BASENAMES = {"goal"}

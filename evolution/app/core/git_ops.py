@@ -2,7 +2,7 @@
 
 封装 evolution 对 harness 工作目录的 git 操作：commit 变更 + push 到 bare repo。
 
-工作目录（harnesses/current/）是 evolution 编辑源码的地方（决策 D11a）。
+工作目录（harnesses/repo/）是 evolution 编辑源码的地方（决策 D11a）。
 每次 ship 或产候选时，evolution commit 变更并 push 到 bare repo（决策 D7a/D10b）。
 executor 从 bare repo pull/clone（在 git_sync.py 实现）。
 

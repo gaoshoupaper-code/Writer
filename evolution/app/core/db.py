@@ -1110,7 +1110,7 @@ def _migrate_llm_configs_scope(conn: sqlite3.Connection) -> None:
 def _drop_legacy_harness_tables(conn: sqlite3.Connection) -> None:
     """幂等迁移：DROP 废弃的 surface_versions + harness_manifests（Phase 7，D10=b1）。
 
-    harness 定义从 DB 行变成 Agent 包目录（evolution/harnesses/current/）。
+    harness 定义从 DB 行变成 Agent 包目录（evolution/harnesses/repo/）。
     surface 级版本管理被整包级快照（harness_snapshots）取代。
 
     幂等：DROP TABLE IF EXISTS 重复执行不报错。

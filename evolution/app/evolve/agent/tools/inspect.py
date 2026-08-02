@@ -28,7 +28,7 @@ def make_inspect_tools() -> list:
     def list_elements() -> str:
         """列出 harness 包内所有要素的文件清单（按目录归类）。
 
-        返回 harnesses/current/ 下的目录树，让你快速了解包里有哪些要素文件：
+        返回 harnesses/repo/ 下的目录树，让你快速了解包里有哪些要素文件：
         - prompts/    提示词（可改）
         - middleware/ 中间件（可改）
         - tools/      工具定义（可改）

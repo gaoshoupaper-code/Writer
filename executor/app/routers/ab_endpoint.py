@@ -85,7 +85,7 @@ def _clear_package_modules() -> None:
 def load_package_at(source_root: Path):
     """importlib 加载指定 source_root 的 harness 包。
 
-    source_root = evolution/harnesses/current/（生产或候选改动后的目录）。
+    source_root = evolution/harnesses/repo/（生产或候选改动后的工作目录）。
     """
     import importlib.util
 

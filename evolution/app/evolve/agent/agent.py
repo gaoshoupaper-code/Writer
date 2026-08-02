@@ -15,7 +15,7 @@
   )
 
 输入：trace_id + 评估报告（从 evaluation_sessions 表加载到 ctx.eval_snapshot）
-产出：harnesses/current/ 代码改动 + design_doc.md + change_log.md → 待审（pending_review）
+产出：harnesses/repo/ 代码改动 + design_doc.md + change_log.md → 待审（pending_review）
 """
 from __future__ import annotations
 
@@ -324,7 +324,7 @@ async def build_evolve_agent(ctx: EvolveContext):
 
     model = build_agent_model(temperature=0.2)
 
-    # FilesystemBackend：专用写工具内部调用它落盘到 harnesses/current/
+    # FilesystemBackend：专用写工具内部调用它落盘到 harnesses/repo/
     # virtual_mode=True：root_dir 作为虚拟根，阻止绝对路径 / .. 越界（S5/S13）
     backend = FilesystemBackend(
         root_dir=str(settings.harness_work_dir_path),

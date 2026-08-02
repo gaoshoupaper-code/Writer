@@ -116,11 +116,11 @@ write_design_doc / write_change_log）会被中间件拦截——这是硬约束
 
 # ④ Agent 要素全景
 
-Writer 的创作 Agent 打成一个自包含的 **harness 包**（`harnesses/current/`）。
+Writer 的创作 Agent 打成一个自包含的 **harness 包**（`harnesses/repo/`）。
 包里有九个要素——前六个是包内独立目录的要素，第七个 memory 是横切跨多类的协同链，
 后两个（assemble 续 + State）是你需要理解但不在包目录里的框架层要素：
 
-### 包内要素（harnesses/current/ 目录下）
+### 包内要素（harnesses/repo/ 目录下）
 
 | 要素 | 目录 | 是什么 | 起什么作用 |
 |------|------|--------|-----------|

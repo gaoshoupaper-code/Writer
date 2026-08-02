@@ -434,7 +434,7 @@ def _execute_ab(task_id: str, req: "ABRunRequest") -> None:
     共享 workspace，通过 Queue 回传 trace_id。
     """
     task_state = _ab_tasks.get(task_id) or {}
-    # source_root：快照版本按 source_commit checkout；working 包用 harnesses/current
+    # source_root：快照版本按 source_commit checkout；working 包用 harnesses/repo
     checked_out: Path | None = None
     worker = None
     try:
@@ -450,11 +450,13 @@ def _execute_ab(task_id: str, req: "ABRunRequest") -> None:
             checked_out = source_root
             logger.info("快照执行: task=%s commit=%s → %s", task_id, req.source_commit, source_root)
         else:
-            # working 包：harness 包工作目录（生产路径 current）
+            # working 包：harness 工作目录（harnesses/repo，与生产同源）
             source_root = Path(writer_settings.harness_package_path).resolve()
             if not source_root.exists():
-                # 回退：从 evolution 工作目录找
-                source_root = Path(__file__).resolve().parents[3] / "evolution" / "harnesses" / "current"
+                raise RuntimeError(
+                    f"working 包路径不存在: {source_root}"
+                    "（harness_package_path 配置错误或 harness 未初始化）"
+                )
 
         workspace_root = Path(writer_settings.workspace_root).resolve()
         worker = IsolatedGenerationWorker(

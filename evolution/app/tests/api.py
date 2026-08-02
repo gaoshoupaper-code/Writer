@@ -162,8 +162,8 @@ class StartTestResponse(BaseModel):
 
 
 def _working_commit() -> str:
-    """读 harnesses/current 的 git HEAD 短 hash（失败返回空串）。"""
-    pkg = Path(settings._evolution_root) / "harnesses" / "current"
+    """读 harness 工作目录（harnesses/repo）的 git HEAD 短 hash（失败返回空串）。"""
+    pkg = settings.harness_work_dir_path
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -237,7 +237,7 @@ def _trigger_executor(
 ) -> str:
     """调 executor /internal/ab/run，返回 task_id。
 
-    working: baseline=true + source_commit=None（executor 用 harnesses/current 硬编码装配）
+    working: baseline=true + source_commit=None（executor 用 harnesses/repo 工作树装配）
     snapshot: baseline=false + source_commit（executor 按 commit checkout 源码装配，
               config=None 用源码包内硬编码 assemble）
 
