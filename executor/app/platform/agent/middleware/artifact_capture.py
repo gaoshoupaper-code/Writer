@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.messages import ToolMessage
+
+logger = logging.getLogger(__name__)
 
 
 _WRITE_TOOLS = frozenset({"write_file", "edit_file"})
@@ -97,6 +100,10 @@ class PlatformArtifactCaptureMiddleware(AgentMiddleware):
                 content_hash=content_hash,
             )
         except Exception as exc:
+            # 临时诊断（定位 EvidenceCaptureError 根因）：
+            # write 已返回成功(result)，但回读文件失败。收集现场快照确认
+            # 文件到底在不在、write 返回了什么、目录里有什么。
+            diag = self._diagnostic_snapshot(file_path, result)
             marker = getattr(self.recorder, "_mark_capture_degraded", None)
             if callable(marker):
                 marker(
@@ -107,7 +114,8 @@ class PlatformArtifactCaptureMiddleware(AgentMiddleware):
             if self.strict:
                 raise EvidenceCaptureError(
                     f"ArtifactRevision capture failed for {tool_name} "
-                    f"{file_path} ({tool_call_id or 'missing tool_call_id'}): {exc}"
+                    f"{file_path} ({tool_call_id or 'missing tool_call_id'}): {exc} "
+                    f"| DIAG {diag}"
                 ) from exc
 
     def _read_workspace_file(self, file_path: str) -> str:
@@ -115,6 +123,75 @@ class PlatformArtifactCaptureMiddleware(AgentMiddleware):
         target = (root / file_path.lstrip("/")).resolve()
         target.relative_to(root)
         return target.read_text(encoding="utf-8")
+
+    def _diagnostic_snapshot(self, file_path: str, write_result: Any) -> str:
+        """临时诊断：write 已返回但回读失败时，收集现场快照。
+
+        只在异常路径调用，不影响正常性能。确认文件物理存在性与 write 返回值，
+        用于钉死「write 成功返回但文件不存在」的根因（路径错位 / 并发取消 / 其他）。
+        全程容错——诊断自身绝不能掩盖原始异常。
+        """
+        try:
+            root = self.workspace_root.resolve()
+        except Exception as e:
+            return f"root_resolve_err={e!r}"
+        target = (root / file_path.lstrip("/"))
+        try:
+            target_resolved = target.resolve()
+        except Exception as e:
+            target_resolved = f"<unresolvable:{e!r}>"
+
+        parts: list[str] = []
+        # 1. write 返回值（成功标志）
+        wr_type = type(write_result).__name__
+        wr_error = getattr(write_result, "error", None)
+        wr_path = getattr(write_result, "path", None)
+        if wr_error:
+            parts.append(f"write_result={wr_type}(ERROR={wr_error!r})")
+        elif wr_path is not None:
+            parts.append(f"write_result={wr_type}(OK path={wr_path!r})")
+        else:
+            # ToolMessage 或其他——只看 status，不打内容
+            status = getattr(write_result, "status", None)
+            parts.append(f"write_result={wr_type}(status={status!r})")
+
+        # 2. 回读目标路径（绝对）
+        parts.append(f"target={target_resolved}")
+        parts.append(f"root_exists={root.exists()}")
+
+        # 3. 目标文件存在性 + stat（含精确 mtime，可对照 LLM 写入时刻）
+        try:
+            st = target.stat()
+            parts.append(
+                f"target_exists=True size={st.st_size} "
+                f"mtime={st.st_mtime:.6f}"
+            )
+        except FileNotFoundError:
+            parts.append("target_exists=False(FileNotFoundError)")
+        except Exception as e:
+            parts.append(f"target_stat_err={type(e).__name__}:{e}")
+
+        # 4. 父目录列表（看同批次其他文件在不在）
+        parent = target.parent
+        try:
+            siblings = sorted(parent.iterdir(), key=lambda p: p.name)
+            entries = []
+            for child in siblings:
+                try:
+                    cst = child.stat()
+                    entries.append(f"{child.name}({cst.st_size}B,m={cst.st_mtime:.4f})")
+                except Exception:
+                    entries.append(f"{child.name}(stat_err)")
+            parts.append(f"parent={parent.name} entries={entries}")
+        except Exception as e:
+            parts.append(f"parent_list_err={type(e).__name__}:{e}")
+
+        diag = " ".join(parts)
+        logger.warning(
+            "EvidenceCapture DIAG trace_id=%s agent=%s file=%s :: %s",
+            self.trace_id, self.agent_name, file_path, diag,
+        )
+        return diag
 
 
 def _mapping_value(mapping: object, key: str) -> Any:
