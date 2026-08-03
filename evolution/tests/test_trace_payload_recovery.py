@@ -77,6 +77,39 @@ class TracePayloadRecoveryTest(unittest.TestCase):
         with self.assertRaises(TracePayloadRecoveryError):
             reconstruct_artifact_heads(operations, [])
 
+    def test_multiple_overwrite_writes_recover_last_content(self) -> None:
+        """同一文件多次 write_file 全量覆盖写（非 edit），取最后一次的 content。
+
+        真实创作中 agent 可能对同一文件多次 write_file 覆盖（而非 write+edit）。
+        旧逻辑只接受首次 write 导致这类 trace 恢复失败；修复后 write_file 是
+        覆盖语义，最终内容 = sequence 最后一次 write 的 content。
+        """
+        operations = [
+            _operation("write-1", 1, 2, "write_file", {"content": "第一版"}),
+            _operation("write-2", 3, 4, "write_file", {"content": "第二版"}),
+            _operation("write-3", 5, 6, "write_file", {"content": "第三版"}),
+        ]
+
+        head = reconstruct_artifact_heads(operations, [])[0]
+
+        self.assertEqual(head.content, "第三版")
+        self.assertEqual(head.final_operation.event_id, "write-3")
+
+    def test_write_then_overwrite_then_edit_recover_correctly(self) -> None:
+        """混合序列：write → 覆盖 write → edit，最终基于第二次 write 的内容做 edit。"""
+        operations = [
+            _operation("write-1", 1, 2, "write_file", {"content": "旧内容"}),
+            _operation("write-2", 3, 4, "write_file", {"content": "基础正文"}),
+            _operation(
+                "edit", 5, 6, "edit_file",
+                {"old_string": "基础", "new_string": "最终"},
+            ),
+        ]
+
+        head = reconstruct_artifact_heads(operations, [])[0]
+
+        self.assertEqual(head.content, "最终正文")
+
     def test_read_observation_constrains_an_overlapping_edit_order(self) -> None:
         operations = [
             _operation("write", 1, 2, "write_file", {"content": "AB"}),

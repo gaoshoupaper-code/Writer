@@ -360,7 +360,11 @@ _INVALID = object()
 def _apply_operation(content: str | None, operation: ToolInterval) -> str | object:
     if operation.tool_name == "write_file":
         value = operation.args.get("content")
-        return value if content is None and isinstance(value, str) else _INVALID
+        # write_file 是覆盖写：无论 content 当前是 None（首次建立）还是已有值
+        # （后续覆盖写），都用新 content 完全替换。真实创作中同一文件多次
+        # write_file 全量覆盖是合法用法，旧逻辑只接受首次 write 会导致这类
+        # trace 恢复失败（0 个确定性 hash）。
+        return value if isinstance(value, str) else _INVALID
     if content is None:
         return _INVALID
     old_string = operation.args.get("old_string")
