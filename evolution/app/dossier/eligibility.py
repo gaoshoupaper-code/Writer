@@ -282,17 +282,21 @@ def _has_frozen_contract(events: list[TraceLogEvent], trace_id: str) -> bool:
 def _successful_versioned_writes(events: list[TraceLogEvent]) -> list[tuple[str, str]]:
     writes: list[tuple[str, str]] = []
     for event in events:
+        # 必须先 hydrate 再判 is_successful_tool_end：raw event 的 tool_output 为 None
+        # （payload 未读入字段），会把业务拦截失败（status=error，如"已达生成上限"）
+        # 误判为成功，导致 expected_writes 虚高、证据闸门误报 missing。
+        # recovery._collect_intervals 用的是已 hydrate 的 events，这里须保持一致。
+        hydrated = hydrate_event(event)
         if (
-            not is_successful_tool_end(event)
-            or event.tool_name not in _WRITE_TOOLS
-            or not event.tool_call_id
+            not is_successful_tool_end(hydrated)
+            or hydrated.tool_name not in _WRITE_TOOLS
+            or not hydrated.tool_call_id
         ):
             continue
-        hydrated = hydrate_event(event)
         args = hydrated.tool_args if isinstance(hydrated.tool_args, dict) else {}
         path = _normalize_path(args.get("file_path") or args.get("path"))
         if _is_versioned_artifact_path(path):
-            writes.append((event.tool_call_id, path))
+            writes.append((hydrated.tool_call_id, path))
     return writes
 
 
