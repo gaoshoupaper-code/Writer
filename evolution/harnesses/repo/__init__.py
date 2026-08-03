@@ -174,16 +174,24 @@ def _make_quality_callback(ctx: RuntimeContext):
         return None
 
     def _callback(quality_data: dict) -> None:
+        # CON-001：status 是 TraceLogEvent 的必填采集状态字段（contracts/trace/__init__.py），
+        # append_event 在 recorder.py:351 硬读 values["status"]。漏传会导致每次召回
+        # 抛 KeyError 并被下面的 except 吞掉——埋点永远写不进 trace（EVD-001 根因）。
+        # 这里显式传 "running"（与同代码库其余 run_meta 写入一致，EVD-002）。
         try:
             recorder.append_event(trace_id, {
                 "type": "run_meta",
+                "status": "running",
                 "source": "middleware",
                 "agent_name": "writing",
                 "input": {"memory_quality": quality_data},
             })
-        except Exception:
-            # 埋点失败不影响写作流程（静默吞掉）
-            pass
+        except Exception as e:
+            # FR-003/CON-002：埋点失败仍不阻断写作（降级语义不变），但改为可观测 warning
+            # ——不再静默吞掉，便于定位 recorder 不可用/序列化失败等真实失败路径（EDGE-003）。
+            logger.warning(
+                "memory_quality 埋点写入失败，trace_id=%s 原因=%s", trace_id, e,
+            )
 
     return _callback
 

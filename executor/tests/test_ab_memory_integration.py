@@ -190,11 +190,16 @@ class TestChapterExtractionTrigger(unittest.TestCase):
     """AC-002/AC-006：章节抽取触发器 + 失败可观测（FR-002/NFR-001）。"""
 
     def test_trigger_chapter_ingestion_calls_extract_and_publish(self) -> None:
-        """trigger_chapter_ingestion 转发到 extract_and_publish_sync（FR-002 抽触发器）。"""
+        """trigger_chapter_ingestion 转发到 extract_and_publish_sync（FR-002 抽触发器）。
+
+        FR-002 接线后透传 publish_callback（默认 None 不埋点，向后兼容）。
+        """
         from app.domains.writing.events import trigger_chapter_ingestion
         with patch("app.domains.writing.events.extract_and_publish_sync", return_value={}) as mock_extract:
             trigger_chapter_ingestion(Path("/tmp/ws"), "ws-id", 3)
-            mock_extract.assert_called_once_with(Path("/tmp/ws"), "ws-id", 3)
+            mock_extract.assert_called_once_with(
+                Path("/tmp/ws"), "ws-id", 3, publish_callback=None,
+            )
 
     def test_trigger_chapter_ingestion_swallows_extract_errors(self) -> None:
         """抽取失败由 extract_and_publish_sync 写 unhealthy flag，不阻断调用方（NFR-001）。

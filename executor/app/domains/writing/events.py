@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,8 @@ from typing import Any
 from app.domains.writing.expert_agent.services.storyline_graph import generate_storyline_graph
 from app.platform.memory import extract_and_publish_sync
 from app.platform.streaming import sse as _sse
+
+logger = logging.getLogger(__name__)
 
 
 # ======================================================================
@@ -184,7 +187,7 @@ class WritingEventSink:
     请求级隔离：每次 generate_stream 新建实例。
     """
 
-    def __init__(self, thread) -> None:
+    def __init__(self, thread, trace_recorder=None, trace_id: str | None = None) -> None:
         self._thread = thread
         self._workspace_path = Path(thread.workspace_path)
         self._owner_id = getattr(thread, "user_id", None)
@@ -192,6 +195,13 @@ class WritingEventSink:
         self._workspace_id = f"{self._owner_id}_{self._workspace_path.name}"
         self._active_tasks: dict[str, dict] = {}
         self._subagent_call_counts: dict[str, int] = {}
+        # FR-002：持有 trace_recorder + trace_id，用于构造章节抽取入库的 publish_callback
+        #（写 trace run_meta 事件，与 harness 的 _make_quality_callback 对齐）。None 不埋点。
+        self._trace_recorder = trace_recorder
+        self._trace_id = trace_id
+        # 构造一次、多章复用（与 A/B 路径 ab_ingestion_cb 对称）。trace_recorder/trace_id
+        # 在本实例生命周期内不变，闭包词法捕获安全。None 时为 None（不埋点）。
+        self._ingestion_cb = _make_ingestion_publish_callback(trace_recorder, trace_id)
 
     async def on_event(self, event: dict) -> list[str]:
         """处理一个 agent 事件，返回要 yield 的 SSE 帧（可空列表）。"""
@@ -351,15 +361,48 @@ class WritingEventSink:
             output_payload["chapter_index"] = chapter_index
         # NWM Causal Publish Flow：extract → embed → store（FR-002 抽触发器，生产/A/B 复用同一逻辑）
         # 抽取器未启用时 trigger_chapter_ingestion 内部直接 return（记忆功能关闭）
+        # FR-002：self._ingestion_cb 在 __init__ 构造一次（含 status 字段，CON-001 必填）。
         await asyncio.to_thread(
-            trigger_chapter_ingestion, self._workspace_path, self._workspace_id, chapter_index
+            trigger_chapter_ingestion,
+            self._workspace_path, self._workspace_id, chapter_index,
+            self._ingestion_cb,
         )
+
+
+def _make_ingestion_publish_callback(trace_recorder, trace_id: str | None):
+    """构造章节抽取入库埋点回调（FR-002，写 trace run_meta 事件）。
+
+    与 harness 的 _make_quality_callback 对齐：写 type=run_meta、含 status 字段
+    （CON-001 必填），input.memory_ingestion 携带抽取统计。trace_recorder 或 trace_id
+    为 None 时返回 None（不埋点，向后兼容）。构造方式与召回侧回调一致，使章节抽取入库
+    事件真正写进 trace 的 run_meta 通道（EVD-003：原设施建好但从未接线）。
+    """
+    if trace_recorder is None or not trace_id:
+        return None
+
+    def _callback(ingestion_data: dict) -> None:
+        try:
+            trace_recorder.append_event(trace_id, {
+                "type": "run_meta",
+                "status": "running",
+                "source": "middleware",
+                "agent_name": "writing",
+                "input": {"memory_ingestion": ingestion_data},
+            })
+        except Exception as e:
+            # FR-003/CON-002：埋点失败不阻断主流程（降级语义不变），改为可观测 warning（EDGE-003）。
+            logger.warning(
+                "memory_ingestion 埋点写入失败，trace_id=%s 原因=%s", trace_id, e,
+            )
+
+    return _callback
 
 
 def trigger_chapter_ingestion(
     workspace_path: Path,
     workspace_id: str,
     chapter_index: int,
+    publish_callback=None,
 ) -> None:
     """章节完成后触发逐章抽取入库（FR-002 抽触发器，生产路径与 A/B 路径复用）。
 
@@ -367,11 +410,17 @@ def trigger_chapter_ingestion(
     解耦出纯粹的"章节抽取入库"副作用，供生产路径（经 sink 包装）和 A/B 路径（stream 循环
     在 super-step 边界检测到新章节后直接调用）复用同一逻辑，避免分叉。
 
+    publish_callback（FR-002）：章节抽取入库统计回调（写 trace run_meta），由调用方
+    （生产路径 WritingEventSink 或 A/B 路径）构造传入。None 不埋点（向后兼容）。
+
     抽取/向量化/入库失败由 extract_and_publish_sync 写 .memory_unhealthy flag（D-R5-1 降级语义），
     下次召回检测到 unhealthy 则降级全量注入，不阻断创作主流程（NFR-001 可观测不静默）。
     抽取器未启用时内部直接 return {}（记忆功能关闭，无副作用）。
     """
-    extract_and_publish_sync(workspace_path, workspace_id, chapter_index)
+    extract_and_publish_sync(
+        workspace_path, workspace_id, chapter_index,
+        publish_callback=publish_callback,
+    )
 
 
 def scan_extracted_chapters(workspace_path: Path, already_extracted: set[int]) -> set[int]:

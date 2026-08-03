@@ -609,7 +609,8 @@ class MetaAgentService(BaseAgentService):
         )
 
         # 领域事件分发：章节号/字数/task 派发等 writing 专属逻辑封装在 WritingEventSink（M4 抽离）
-        sink = WritingEventSink(thread)
+        # FR-002：传入 trace_recorder + trace_id，供 sink 构造章节抽取入库埋点回调（写 trace run_meta）。
+        sink = WritingEventSink(thread, self.trace_recorder, trace.trace_id)
 
         sse_iter, result = await run_agent_stream(
             agent, agent_input, config,

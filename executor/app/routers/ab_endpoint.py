@@ -293,14 +293,25 @@ def run_ab_generation(
         # 与生产路径复用同一 trigger_chapter_ingestion（DEC-002 抽触发器方案），不破坏
         # 逐 super-step 取消能力（CON-001：抽取在 super-step 边界同步执行，取消时已完成的
         # 章节已抽取、未完成的不触发——EDGE-001）。
-        from app.domains.writing.events import scan_extracted_chapters, trigger_chapter_ingestion
+        from app.domains.writing.events import (
+            _make_ingestion_publish_callback,
+            scan_extracted_chapters,
+            trigger_chapter_ingestion,
+        )
+
+        # FR-002：A/B 路径构造章节抽取入库埋点回调（写 trace run_meta），与生产路径对齐。
+        # 复用同一 _make_ingestion_publish_callback，使 A/B trace 也含 memory_ingestion 事件，
+        # evolution 侧可统计入库成功/失败。
+        ab_ingestion_cb = _make_ingestion_publish_callback(trace_recorder, trace_id)
 
         extracted_chapters: set[int] = set()
         cancelled = False
         for _chunk in agent.stream(agent_input, config=run_config):
             # FR-002：检测本次 super-step 新写盘的章节，触发逐章抽取入库（Causal Publish Flow）。
             for ch_idx in sorted(scan_extracted_chapters(workspace_path, extracted_chapters)):
-                trigger_chapter_ingestion(workspace_path, ab_memory_workspace_id, ch_idx)
+                trigger_chapter_ingestion(
+                    workspace_path, ab_memory_workspace_id, ch_idx, ab_ingestion_cb,
+                )
                 extracted_chapters.add(ch_idx)
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True

@@ -243,7 +243,8 @@ async def extract_and_publish(
         "chapter-%d 抽取入库完成：workspace=%s stats=%s duration=%dms",
         chapter_index, workspace_id, stats, duration_ms,
     )
-    # 抽取质量埋点（Phase 4 由 events.py 接入 publish_callback 写 trace run_meta）
+    # FR-002：publish_callback 由 trigger_chapter_ingestion 调用链接线传入（None 不埋点，
+    # 向后兼容记忆功能关闭场景）。
     if publish_callback is not None:
         try:
             publish_callback({
@@ -254,8 +255,12 @@ async def extract_and_publish(
                 "ok": True,
                 "error": None,
             })
-        except Exception:
-            pass  # 埋点失败不影响主流程
+        except Exception as e:
+            # FR-003/CON-002：埋点失败不阻断抽取入库主流程（降级语义不变），但改为可观测 warning，
+            # 不再静默吞掉——便于定位 recorder 不可用/序列化失败等真实失败路径（EDGE-003）。
+            logger.warning(
+                "章节抽取入库埋点失败，chapter=%d 原因=%s", chapter_index, e,
+            )
     return stats
 
 
@@ -436,14 +441,22 @@ def extract_and_publish_sync(
     workspace_path: Path,
     workspace_id: str,
     chapter_index: int,
+    *,
+    publish_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, int]:
     """同步包装：在线程里跑 asyncio 事件循环执行抽取入库。
 
     被 events.py 的 _on_writing_chapter_done 通过 asyncio.to_thread 调用。
     失败时写 .memory_unhealthy flag（D-R5-1 降级语义）。
+
+    publish_callback（FR-002）：章节抽取入库统计回调（写 trace run_meta），由
+    trigger_chapter_ingestion 调用链接线传入。None 不埋点（向后兼容）。
     """
     try:
-        return asyncio.run(extract_and_publish(workspace_path, workspace_id, chapter_index))
+        return asyncio.run(extract_and_publish(
+            workspace_path, workspace_id, chapter_index,
+            publish_callback=publish_callback,
+        ))
     except MemoryExtractError as e:
         _mark_unhealthy(workspace_path, f"chapter-{chapter_index} 抽取失败：{e}")
         logger.error("chapter-%d 抽取失败：%s", chapter_index, e, exc_info=True)
